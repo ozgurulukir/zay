@@ -224,12 +224,14 @@ pub const DatabaseBackendKind = enum {
     local,
     zay_service,
     turso_http,
+    d1_http,
     postgres_native,
 
     pub fn fromString(str: []const u8) ?DatabaseBackendKind {
         if (std.mem.eql(u8, str, "local") or std.mem.eql(u8, str, "local_sqlite") or std.mem.eql(u8, str, "sqlite")) return .local;
         if (std.mem.eql(u8, str, "zay_service") or std.mem.eql(u8, str, "remote_service") or std.mem.eql(u8, str, "service")) return .zay_service;
         if (std.mem.eql(u8, str, "turso_http") or std.mem.eql(u8, str, "turso") or std.mem.eql(u8, str, "libsql")) return .turso_http;
+        if (std.mem.eql(u8, str, "d1_http") or std.mem.eql(u8, str, "d1") or std.mem.eql(u8, str, "cloudflare_d1") or std.mem.eql(u8, str, "cloudflare")) return .d1_http;
         if (std.mem.eql(u8, str, "postgres_native") or std.mem.eql(u8, str, "postgres") or std.mem.eql(u8, str, "postgresql")) return .postgres_native;
         return null;
     }
@@ -239,6 +241,7 @@ pub const DatabaseBackendKind = enum {
             .local => "local",
             .zay_service => "zay_service",
             .turso_http => "turso_http",
+            .d1_http => "d1_http",
             .postgres_native => "postgres_native",
         };
     }

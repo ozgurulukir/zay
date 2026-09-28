@@ -427,7 +427,7 @@ Zay supports delegating its internal session storage (`src/session/`) and applic
 - **Supported Backends (`database.backend`):**
   - `local` / `local_sqlite`: Local embedded SQLite file (`~/.config/zay/sessions.sqlite`).
   - `turso_http` / `turso` / `libsql`: Direct, native LibSQL Hrana v2 pipeline over HTTP. Reaches Turso Cloud directly with automatic `libsql://` -> `https://.../v2/pipeline` normalization, single-roundtrip pipeline batching, and zero daemon requirements.
-  - `d1_http` / `d1` / `cloudflare_d1`: Direct, native Cloudflare D1 client over Cloudflare's REST API (`POST .../d1/database/{id}/query`). Supports `d1://<account_id>/<database_id>` shorthand, atomic batch statement arrays, and zero daemon requirements.
+  - `d1_http` / `d1` / `cloudflare_d1`: Direct, native Cloudflare D1 client over Cloudflare's REST API (`POST .../d1/database/{id}/query`). Supports `d1://<account_id>/<database_id>` shorthand, atomic `{ "batch": [...] }` requests, and zero daemon requirements.
   - `zay_service` / `remote_service`: Python or containerized database companion service supporting SQLite and PostgreSQL.
 - **Roaming User Synchronization:** Sessions and lane manifests record the local machine hostname (`host_id`), allowing filtering and clean multi-host coexistence.
 - **Fail-Safe Local Fallback:** If the external database server or remote cloud endpoint is unreachable or offline during startup, Zay emits a warning diagnostic and seamlessly falls back to the local embedded `sessions.sqlite` without crashing.

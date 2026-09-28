@@ -80,34 +80,22 @@ pub const Client = struct {
         const response_bytes = try self.fetch(aa, io, payload);
 
         const parsed = std.json.parseFromSlice(std.json.Value, aa, response_bytes, .{}) catch return error.InvalidResponse;
-        if (parsed.value != .object) return error.InvalidResponse;
-
-        if (parsed.value.object.get("success")) |s| {
-            if (s == .bool and !s.bool) {
-                logErrors(parsed.value);
-                return error.QueryFailed;
-            }
-        }
-
-        const result_arr = parsed.value.object.get("result") orelse return error.InvalidResponse;
-        if (result_arr != .array or result_arr.array.items.len == 0) return error.InvalidResponse;
-
-        const first_result = result_arr.array.items[0];
-        if (first_result != .object) return error.InvalidResponse;
-
-        if (first_result.object.get("success")) |s| {
-            if (s == .bool and !s.bool) return error.QueryFailed;
-        }
+        const results = try requireResultItems(parsed.value, 1);
+        const first_result = try requireSuccessfulResult(parsed.value, results[0]);
 
         var changes: i32 = 0;
         var last_id: ?i64 = null;
         if (first_result.object.get("meta")) |meta| {
-            if (meta == .object) {
-                if (meta.object.get("changes")) |c| {
-                    if (c == .integer) changes = @intCast(c.integer);
-                }
-                if (meta.object.get("last_row_id")) |lri| {
-                    if (lri == .integer) last_id = lri.integer;
+            if (meta != .object) return error.InvalidResponse;
+            if (meta.object.get("changes")) |value| {
+                if (value != .integer) return error.InvalidResponse;
+                changes = std.math.cast(i32, value.integer) orelse return error.InvalidResponse;
+            }
+            if (meta.object.get("last_row_id")) |value| {
+                if (value == .integer) {
+                    last_id = value.integer;
+                } else if (value != .null) {
+                    return error.InvalidResponse;
                 }
             }
         }
@@ -129,20 +117,8 @@ pub const Client = struct {
         const response_bytes = try self.fetch(aa, io, payload);
 
         const parsed = std.json.parseFromSlice(std.json.Value, aa, response_bytes, .{}) catch return error.InvalidResponse;
-        if (parsed.value != .object) return error.InvalidResponse;
-
-        if (parsed.value.object.get("success")) |s| {
-            if (s == .bool and !s.bool) {
-                logErrors(parsed.value);
-                return error.QueryFailed;
-            }
-        }
-
-        const result_arr = parsed.value.object.get("result") orelse return error.InvalidResponse;
-        if (result_arr != .array or result_arr.array.items.len == 0) return error.InvalidResponse;
-
-        const first_result = result_arr.array.items[0];
-        if (first_result != .object) return error.InvalidResponse;
+        const results = try requireResultItems(parsed.value, 1);
+        const first_result = try requireSuccessfulResult(parsed.value, results[0]);
 
         const rows_val = first_result.object.get("results") orelse return error.InvalidResponse;
         if (rows_val != .array) return error.InvalidResponse;
@@ -158,20 +134,19 @@ pub const Client = struct {
 
         if (rows_val.array.items.len > 0) {
             const first_row = rows_val.array.items[0];
-            if (first_row == .object) {
-                for (first_row.object.keys()) |key| {
-                    try columns_list.append(self.allocator, try aa.dupe(u8, key));
-                    try types_list.append(self.allocator, .text);
-                }
+            if (first_row != .object) return error.InvalidResponse;
+            for (first_row.object.keys()) |key| {
+                try columns_list.append(self.allocator, try aa.dupe(u8, key));
+                try types_list.append(self.allocator, .null);
             }
 
             for (rows_val.array.items) |row_val| {
-                if (row_val != .object) continue;
+                if (row_val != .object) return error.InvalidResponse;
                 var cells = try aa.alloc(db.Value, columns_list.items.len);
                 for (columns_list.items, 0..) |col_name, col_idx| {
                     if (row_val.object.get(col_name)) |cell_val| {
                         cells[col_idx] = try parseD1JsonValue(aa, cell_val);
-                        if (rows_list.items.len == 0) {
+                        if (types_list.items[col_idx] == .null) {
                             types_list.items[col_idx] = inferColumnType(cells[col_idx]);
                         }
                     } else {
@@ -179,6 +154,10 @@ pub const Client = struct {
                     }
                 }
                 try rows_list.append(self.allocator, cells);
+            }
+
+            for (types_list.items) |*column_type| {
+                if (column_type.* == .null) column_type.* = .text;
             }
         }
 
@@ -211,31 +190,12 @@ pub const Client = struct {
         const response_bytes = try self.fetch(aa, io, payload);
 
         const parsed = std.json.parseFromSlice(std.json.Value, aa, response_bytes, .{}) catch return error.InvalidResponse;
-        if (parsed.value != .object) return error.InvalidResponse;
-
-        if (parsed.value.object.get("success")) |s| {
-            if (s == .bool and !s.bool) {
-                logErrors(parsed.value);
-                return error.QueryFailed;
-            }
-        }
-
-        const result_arr = parsed.value.object.get("result") orelse return error.InvalidResponse;
-        if (result_arr != .array) return error.InvalidResponse;
-
-        var ok_count: usize = 0;
-        for (result_arr.array.items) |res_item| {
-            if (res_item == .object) {
-                if (res_item.object.get("success")) |item_s| {
-                    if (item_s == .bool and !item_s.bool) return error.QueryFailed;
-                }
-                ok_count += 1;
-            }
-        }
+        const results = try requireResultItems(parsed.value, statements.len);
+        for (results) |result| _ = try requireSuccessfulResult(parsed.value, result);
 
         return BatchResult{
-            .success = (ok_count == statements.len),
-            .results_count = ok_count,
+            .success = true,
+            .results_count = results.len,
         };
     }
 
@@ -267,10 +227,12 @@ pub const Client = struct {
                 else => continue,
             };
 
-            const pragma_sql = try std.fmt.allocPrint(aa, "PRAGMA table_info(\"{s}\")", .{table_name});
-            defer aa.free(pragma_sql);
-
-            var pragma_res = self.query(io, pragma_sql, &.{}) catch continue;
+            const table_param = [_]db.Value{.{ .text = table_name }};
+            var pragma_res = self.query(
+                io,
+                "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
+                &table_param,
+            ) catch continue;
             defer pragma_res.deinit();
 
             var cols_list: std.ArrayList(ColumnSchema) = .empty;
@@ -370,6 +332,38 @@ pub const Client = struct {
     }
 };
 
+fn requireResultItems(root: std.json.Value, expected_count: usize) ![]std.json.Value {
+    if (root != .object) return error.InvalidResponse;
+
+    const success = root.object.get("success") orelse return error.InvalidResponse;
+    if (success != .bool) return error.InvalidResponse;
+    if (!success.bool) {
+        logErrors(root);
+        return error.QueryFailed;
+    }
+
+    const result = root.object.get("result") orelse return error.InvalidResponse;
+    if (result != .array or result.array.items.len != expected_count) {
+        return error.InvalidResponse;
+    }
+    return result.array.items;
+}
+
+fn requireSuccessfulResult(root: std.json.Value, result: std.json.Value) !std.json.Value {
+    if (result != .object) return error.InvalidResponse;
+
+    const success = result.object.get("success") orelse return error.InvalidResponse;
+    if (success != .bool) return error.InvalidResponse;
+    if (!success.bool) {
+        logErrors(root);
+        if (result.object.get("error")) |message| {
+            if (message == .string) log.warn("d1 query error: {s}", .{message.string});
+        }
+        return error.QueryFailed;
+    }
+    return result;
+}
+
 fn logErrors(val: std.json.Value) void {
     if (val != .object) return;
     if (val.object.get("errors")) |errs| {
@@ -387,7 +381,8 @@ fn logErrors(val: std.json.Value) void {
 
 fn inferColumnType(val: db.Value) ColumnType {
     return switch (val) {
-        .null, .text => .text,
+        .null => .null,
+        .text => .text,
         .int => .int,
         .float => .float,
         .blob => .blob,
@@ -422,24 +417,15 @@ fn parseD1JsonValue(allocator: std.mem.Allocator, val: std.json.Value) !db.Value
 }
 
 pub fn serializeD1Value(writer: anytype, allocator: std.mem.Allocator, val: db.Value) !void {
+    _ = allocator;
     switch (val) {
         .null => try writer.writeAll("null"),
         .int => |i| try writer.print("{d}", .{i}),
         .float => |f| try writer.print("{d}", .{f}),
         .text => |t| try std.json.Stringify.value(t, .{}, writer),
-        .blob => |b| {
-            const encoded_len = std.base64.standard.Encoder.calcSize(b.len);
-            var buf: [512]u8 = undefined;
-            if (encoded_len <= buf.len) {
-                _ = std.base64.standard.Encoder.encode(&buf, b);
-                try std.json.Stringify.value(buf[0..encoded_len], .{}, writer);
-            } else {
-                const heap_buf = try allocator.alloc(u8, encoded_len);
-                defer allocator.free(heap_buf);
-                _ = std.base64.standard.Encoder.encode(heap_buf, b);
-                try std.json.Stringify.value(heap_buf, .{}, writer);
-            }
-        },
+        // The public D1 REST API has no tagged binary parameter encoding.
+        // Sending base64 here would silently store TEXT instead of a BLOB.
+        .blob => return error.UnsupportedValue,
     }
 }
 
@@ -461,12 +447,12 @@ pub fn serializeD1Payload(allocator: std.mem.Allocator, statements: []const Batc
     if (statements.len == 1) {
         try serializeD1Statement(&out.writer, allocator, statements[0].sql, statements[0].params);
     } else {
-        try out.writer.writeByte('[');
+        try out.writer.writeAll("{\"batch\":[");
         for (statements, 0..) |stmt, i| {
             if (i > 0) try out.writer.writeByte(',');
             try serializeD1Statement(&out.writer, allocator, stmt.sql, stmt.params);
         }
-        try out.writer.writeByte(']');
+        try out.writer.writeAll("]}");
     }
 
     return out.toOwnedSlice();
@@ -477,9 +463,14 @@ pub fn normalizeD1Url(allocator: std.mem.Allocator, input_url: []const u8) ![]u8
 
     if (std.mem.startsWith(u8, trimmed, "d1://")) {
         const rest = trimmed[5..];
-        var parts = std.mem.tokenizeAny(u8, rest, "/:");
-        const account_id = parts.next() orelse return error.InvalidUrl;
-        const database_id = parts.next() orelse return error.InvalidUrl;
+        const separator = std.mem.indexOfAny(u8, rest, "/:") orelse return error.InvalidUrl;
+        const account_id = rest[0..separator];
+        const database_id = rest[separator + 1 ..];
+        if (account_id.len == 0 or database_id.len == 0 or
+            std.mem.indexOfAny(u8, database_id, "/:") != null)
+        {
+            return error.InvalidUrl;
+        }
         return std.fmt.allocPrint(allocator, "https://api.cloudflare.com/client/v4/accounts/{s}/d1/database/{s}/query", .{ account_id, database_id });
     }
 
@@ -491,7 +482,7 @@ pub fn normalizeD1Url(allocator: std.mem.Allocator, input_url: []const u8) ![]u8
         return std.fmt.allocPrint(allocator, "{s}/query", .{without_slash});
     }
 
-    return allocator.dupe(u8, trimmed);
+    return error.InvalidUrl;
 }
 
 test "normalizeD1Url normalizes d1 protocol and https endpoints" {
@@ -512,9 +503,12 @@ test "normalizeD1Url normalizes d1 protocol and https endpoints" {
     const url4 = try normalizeD1Url(gpa, "https://api.cloudflare.com/client/v4/accounts/acc123/d1/database/db456/query");
     defer gpa.free(url4);
     try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/acc123/d1/database/db456/query", url4);
+
+    try std.testing.expectError(error.InvalidUrl, normalizeD1Url(gpa, "d1://account/database/extra"));
+    try std.testing.expectError(error.InvalidUrl, normalizeD1Url(gpa, "ftp://account/database"));
 }
 
-test "serializeD1Payload serializes single statement and batch array" {
+test "serializeD1Payload serializes single statement and batch envelope" {
     const gpa = std.testing.allocator;
 
     const p1 = [_]db.Value{ .{ .int = 42 }, .{ .text = "hello" }, .{ .null = {} } };
@@ -535,9 +529,45 @@ test "serializeD1Payload serializes single statement and batch array" {
     const payload2 = try serializeD1Payload(gpa, &batch_stmts);
     defer gpa.free(payload2);
 
-    try std.testing.expect(std.mem.startsWith(u8, payload2, "[{"));
-    try std.testing.expect(std.mem.endsWith(u8, payload2, "}]"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload2, .{});
+    defer parsed.deinit();
+    const batch = parsed.value.object.get("batch") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), batch.array.items.len);
     try std.testing.expect(std.mem.indexOf(u8, payload2, "UPDATE t SET a = 1") != null);
+}
+
+test "serializeD1Value rejects blobs instead of storing base64 text" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedValue,
+        serializeD1Value(&out.writer, gpa, .{ .blob = "binary" }),
+    );
+}
+
+test "D1 response validation rejects failed and incomplete batches" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const failed_json =
+        \\{"success":true,"result":[{"success":false,"error":"constraint failed"}]}
+    ;
+    const failed = try std.json.parseFromSlice(std.json.Value, aa, failed_json, .{});
+    const failed_items = try requireResultItems(failed.value, 1);
+    try std.testing.expectError(
+        error.QueryFailed,
+        requireSuccessfulResult(failed.value, failed_items[0]),
+    );
+
+    const incomplete_json =
+        \\{"success":true,"result":[{"success":true}]}
+    ;
+    const incomplete = try std.json.parseFromSlice(std.json.Value, aa, incomplete_json, .{});
+    try std.testing.expectError(error.InvalidResponse, requireResultItems(incomplete.value, 2));
 }
 
 test "parseD1JsonValue correctly converts booleans, integers, strings and nulls" {
