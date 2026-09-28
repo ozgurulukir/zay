@@ -64,8 +64,10 @@ pub const SessionManager = struct {
             };
         }
         var connection = try db.Connection.open(path, .{});
-        errdefer connection.close();
-        var b = try SessionBackend.openLocal(gpa, connection, host_id);
+        var b = SessionBackend.openLocal(gpa, connection, host_id) catch |err| {
+            connection.close();
+            return err;
+        };
         errdefer b.deinit();
         try session_migration.migrateBackend(&b, io);
         return .{
@@ -261,6 +263,15 @@ pub const SessionManager = struct {
     /// the `on delete cascade` foreign key). Safe to call on a non-existent
     /// id — the statement simply matches no rows.
     pub fn deleteSession(self: *SessionManager, session_id: []const u8) Error!void {
+        if (self.backend.kind == .remote_service) {
+            const params = [_]backend_mod.SqlParam{.{ .text = session_id }};
+            const statements = [_]db.service.BatchStatement{
+                .{ .sql = "delete from prompt_history where session_id = ?", .params = &params },
+                .{ .sql = "delete from session_entries where session_id = ?", .params = &params },
+                .{ .sql = "delete from sessions where id = ?", .params = &params },
+            };
+            return self.backend.execBatch(self.io, &statements);
+        }
         const sql = "delete from sessions where id = ?";
         try self.backend.exec(self.io, sql, &.{.{ .text = session_id }});
     }
@@ -294,6 +305,15 @@ pub const Session = struct {
         assert(payload_json.len > 0);
         fillHex(self.manager.io, id_out);
         try self.insertEntry(id_out, kind, role, payload_json);
+    }
+
+    pub fn appendQueuedPayload(self: *Session, kind: []const u8, role: ?[]const u8, payload_json: []const u8, title: ?[]const u8, id_out: *[entry_id_len]u8) Error!void {
+        assert(self.manager.backend.kind == .remote_service);
+        assert(kind.len > 0);
+        assert(payload_json.len > 0);
+        fillHex(self.manager.io, id_out);
+        const parent: ?[]const u8 = if (self.leaf_entry_id) |*leaf_id| leaf_id.slice() else null;
+        try self.insertEntryWithParentAndTitle(id_out, parent, kind, role, payload_json, title);
     }
 
     pub fn info(self: *Session, title: []const u8, id_out: *[entry_id_len]u8) Error!void {
@@ -594,11 +614,15 @@ pub const Session = struct {
     }
 
     fn insertEntryWithParent(self: *Session, id: *const [entry_id_len]u8, parent_id: ?[]const u8, kind: []const u8, role: ?[]const u8, payload_json: []const u8) Error!void {
+        try self.insertEntryWithParentAndTitle(id, parent_id, kind, role, payload_json, null);
+    }
+
+    fn insertEntryWithParentAndTitle(self: *Session, id: *const [entry_id_len]u8, parent_id: ?[]const u8, kind: []const u8, role: ?[]const u8, payload_json: []const u8, title: ?[]const u8) Error!void {
         assert(kind.len > 0);
         assert(payload_json.len > 0);
         const timestamp_ms = nowMs(self.manager.io);
         const sql = "insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms) values (?, ?, ?, ?, ?, ?, ?)";
-        try self.manager.backend.exec(self.manager.io, sql, &.{
+        const insert_params = [_]backend_mod.SqlParam{
             .{ .text = id[0..] },
             .{ .text = self.id.slice() },
             if (parent_id) |parent| .{ .text = parent } else .null,
@@ -606,9 +630,31 @@ pub const Session = struct {
             if (role) |r| .{ .text = r } else .null,
             .{ .text = payload_json },
             .{ .int = timestamp_ms },
-        });
+        };
+        if (self.manager.backend.kind == .remote_service) {
+            const update_params = [_]backend_mod.SqlParam{
+                .{ .text = id[0..] },
+                .{ .int = timestamp_ms },
+                .{ .text = self.id.slice() },
+            };
+            const title_params = [_]backend_mod.SqlParam{
+                .{ .text = title orelse "" },
+                .{ .int = timestamp_ms },
+                .{ .text = self.id.slice() },
+            };
+            const statements = [_]db.service.BatchStatement{
+                .{ .sql = sql, .params = &insert_params },
+                .{ .sql = "update sessions set leaf_entry_id = ?, updated_at_ms = ? where id = ?", .params = &update_params },
+                .{ .sql = "update sessions set title = ?, updated_at_ms = ? where id = ?", .params = &title_params },
+            };
+            const count: usize = if (title == null) 2 else 3;
+            try self.manager.backend.execBatch(self.manager.io, statements[0..count]);
+        } else {
+            assert(title == null);
+            try self.manager.backend.exec(self.manager.io, sql, &insert_params);
+            try self.updateLeaf(id[0..]);
+        }
         self.leaf_entry_id = .{ .bytes = id.* };
-        try self.updateLeaf(id[0..]);
     }
 
     pub fn setTitle(self: *Session, title: []const u8) Error!void {

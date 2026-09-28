@@ -83,9 +83,16 @@ pub const SessionBackend = struct {
             },
             .remote_service => {
                 const svc = self.remote orelse return error.MissingConnection;
-                _ = try svc.exec(io, sql, params);
+                const result = try svc.exec(io, sql, params);
+                if (!result.success) return error.QueryFailed;
             },
         }
+    }
+
+    pub fn execBatch(self: *SessionBackend, io: std.Io, statements: []const db.service.BatchStatement) !void {
+        const svc = self.remote orelse return error.MissingConnection;
+        const result = try svc.batch(io, statements);
+        if (!result.success or result.results_count != statements.len) return error.QueryFailed;
     }
 
     pub fn query(self: *SessionBackend, io: std.Io, sql: []const u8, params: []const SqlParam) !QueryResult {
@@ -161,14 +168,17 @@ pub const SessionBackend = struct {
     }
 
     pub fn beginTransaction(self: *SessionBackend, io: std.Io) !void {
+        if (self.kind == .remote_service) return error.UnsupportedTransaction;
         try self.exec(io, "BEGIN", &.{});
     }
 
     pub fn commitTransaction(self: *SessionBackend, io: std.Io) !void {
+        if (self.kind == .remote_service) return error.UnsupportedTransaction;
         try self.exec(io, "COMMIT", &.{});
     }
 
     pub fn rollbackTransaction(self: *SessionBackend, io: std.Io) !void {
+        if (self.kind == .remote_service) return error.UnsupportedTransaction;
         try self.exec(io, "ROLLBACK", &.{});
     }
 };
