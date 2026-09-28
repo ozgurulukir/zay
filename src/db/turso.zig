@@ -6,7 +6,7 @@
 //! Features:
 //!   - Zero external dependencies: speaks native JSON over standard HTTP/TLS
 //!   - Supports single `exec` and `query` operations with parameter binding (Hrana format)
-//!   - Atomic multi-statement batch transactions (`BEGIN` ... `COMMIT` in a single pipeline roundtrip)
+//!   - Atomic multi-statement batch transactions in a single pipeline roundtrip
 //!   - Direct schema inspection using SQLite system tables and pragmas
 //!   - Health checks reporting SQLite version and engine identity
 //!   - URL scheme normalization (`libsql://` -> `https://`, auto-appending `/v2/pipeline`)
@@ -111,44 +111,28 @@ pub const Client = struct {
         if (parsed.value != .object) return error.InvalidResponse;
 
         const results_arr = parsed.value.object.get("results") orelse return error.InvalidResponse;
-        if (results_arr != .array or results_arr.array.items.len == 0) return error.InvalidResponse;
+        if (results_arr != .array or results_arr.array.items.len != 2) return error.InvalidResponse;
 
-        const first_result = results_arr.array.items[0];
-        if (first_result != .object) return error.InvalidResponse;
-
-        const res_type = first_result.object.get("type");
-        if (res_type == null or res_type.? != .string) return error.InvalidResponse;
-
-        if (std.mem.eql(u8, res_type.?.string, "error")) {
-            if (first_result.object.get("error")) |err_obj| {
-                if (err_obj == .object) {
-                    if (err_obj.object.get("message")) |msg| {
-                        if (msg == .string) log.warn("turso.exec error: {s}", .{msg.string});
-                    }
-                }
-            }
-            return error.QueryFailed;
-        }
-
-        if (!std.mem.eql(u8, res_type.?.string, "ok")) return error.InvalidResponse;
-
-        const resp_obj = first_result.object.get("response") orelse return error.InvalidResponse;
-        if (resp_obj != .object) return error.InvalidResponse;
+        const resp_obj = try requireOkResponse(results_arr.array.items[0], "execute", "exec");
+        try validateCloseResponse(results_arr.array.items[1], "exec close");
 
         const result_data = resp_obj.object.get("result") orelse return error.InvalidResponse;
         if (result_data != .object) return error.InvalidResponse;
 
         var changes: i32 = 0;
         if (result_data.object.get("affected_row_count")) |arc| {
-            if (arc == .integer) changes = @intCast(arc.integer);
+            if (arc != .integer) return error.InvalidResponse;
+            changes = std.math.cast(i32, arc.integer) orelse return error.InvalidResponse;
         }
 
         var last_id: ?i64 = null;
         if (result_data.object.get("last_insert_rowid")) |lir| {
             if (lir == .string) {
-                last_id = std.fmt.parseInt(i64, lir.string, 10) catch null;
+                last_id = std.fmt.parseInt(i64, lir.string, 10) catch return error.InvalidResponse;
             } else if (lir == .integer) {
                 last_id = lir.integer;
+            } else if (lir != .null) {
+                return error.InvalidResponse;
             }
         }
 
@@ -172,29 +156,10 @@ pub const Client = struct {
         if (parsed.value != .object) return error.InvalidResponse;
 
         const results_arr = parsed.value.object.get("results") orelse return error.InvalidResponse;
-        if (results_arr != .array or results_arr.array.items.len == 0) return error.InvalidResponse;
+        if (results_arr != .array or results_arr.array.items.len != 2) return error.InvalidResponse;
 
-        const first_result = results_arr.array.items[0];
-        if (first_result != .object) return error.InvalidResponse;
-
-        const res_type = first_result.object.get("type");
-        if (res_type == null or res_type.? != .string) return error.InvalidResponse;
-
-        if (std.mem.eql(u8, res_type.?.string, "error")) {
-            if (first_result.object.get("error")) |err_obj| {
-                if (err_obj == .object) {
-                    if (err_obj.object.get("message")) |msg| {
-                        if (msg == .string) log.warn("turso.query error: {s}", .{msg.string});
-                    }
-                }
-            }
-            return error.QueryFailed;
-        }
-
-        if (!std.mem.eql(u8, res_type.?.string, "ok")) return error.InvalidResponse;
-
-        const resp_obj = first_result.object.get("response") orelse return error.InvalidResponse;
-        if (resp_obj != .object) return error.InvalidResponse;
+        const resp_obj = try requireOkResponse(results_arr.array.items[0], "execute", "query");
+        try validateCloseResponse(results_arr.array.items[1], "query close");
 
         const result_data = resp_obj.object.get("result") orelse return error.InvalidResponse;
         if (result_data != .object) return error.InvalidResponse;
@@ -208,43 +173,44 @@ pub const Client = struct {
         const num_cols = cols_val.array.items.len;
         var columns = try aa.alloc([]const u8, num_cols);
         var types = try aa.alloc(db.ColumnType, num_cols);
+        const infer_types = try aa.alloc(bool, num_cols);
 
         for (cols_val.array.items, 0..) |col_item, i| {
             if (col_item != .object) return error.InvalidResponse;
             const name_val = col_item.object.get("name") orelse return error.InvalidResponse;
-            columns[i] = try aa.dupe(u8, if (name_val == .string) name_val.string else "unknown");
+            if (name_val != .string) return error.InvalidResponse;
+            columns[i] = try aa.dupe(u8, name_val.string);
 
             const decl_val = col_item.object.get("decltype");
-            const decl_str = if (decl_val != null and decl_val.? == .string) decl_val.?.string else "text";
-            types[i] = parseTypeString(decl_str);
+            infer_types[i] = decl_val == null or decl_val.? == .null or
+                (decl_val.? == .string and decl_val.?.string.len == 0);
+            if (!infer_types[i] and decl_val.? != .string) return error.InvalidResponse;
+            types[i] = if (infer_types[i]) .text else parseTypeString(decl_val.?.string);
         }
 
         var rows = try aa.alloc([]db.Value, rows_val.array.items.len);
         for (rows_val.array.items, 0..) |row_item, row_idx| {
             if (row_item != .array) return error.InvalidResponse;
+            if (row_item.array.items.len != num_cols) return error.InvalidResponse;
             var cells = try aa.alloc(db.Value, num_cols);
             for (row_item.array.items, 0..) |cell_val, col_idx| {
-                if (col_idx >= num_cols) break;
                 cells[col_idx] = try parseHranaValue(aa, cell_val);
-            }
-            // Fill any missing trailing columns with null
-            for (row_item.array.items.len..num_cols) |col_idx| {
-                cells[col_idx] = .null;
             }
             rows[row_idx] = cells;
         }
 
-        // Infer column types from the first non-null row cells when decltype was absent/generic
-        if (rows.len > 0) {
-            for (0..num_cols) |c_idx| {
-                if (types[c_idx] == .text) {
-                    const sample = rows[0][c_idx];
+        for (0..num_cols) |c_idx| {
+            if (infer_types[c_idx]) {
+                for (rows) |row| {
+                    const sample = row[c_idx];
                     switch (sample) {
                         .int => types[c_idx] = .int,
                         .float => types[c_idx] = .float,
                         .blob => types[c_idx] = .blob,
-                        else => {},
+                        .text => types[c_idx] = .text,
+                        .null => continue,
                     }
+                    break;
                 }
             }
         }
@@ -272,29 +238,11 @@ pub const Client = struct {
         if (parsed.value != .object) return error.InvalidResponse;
 
         const results_arr = parsed.value.object.get("results") orelse return error.InvalidResponse;
-        if (results_arr != .array) return error.InvalidResponse;
+        if (results_arr != .array or results_arr.array.items.len != 2) return error.InvalidResponse;
 
-        // Expect results: [BEGIN, stmt_1, ..., stmt_N, COMMIT, close]
-        // results_arr.items.len should be statements.len + 3
-        var ok_count: usize = 0;
-        for (results_arr.array.items) |res_item| {
-            if (res_item != .object) return error.InvalidResponse;
-            const r_type = res_item.object.get("type");
-            if (r_type == null or r_type.? != .string) return error.InvalidResponse;
-            if (std.mem.eql(u8, r_type.?.string, "error")) {
-                if (res_item.object.get("error")) |err_obj| {
-                    if (err_obj == .object) {
-                        if (err_obj.object.get("message")) |msg| {
-                            if (msg == .string) log.warn("turso.batch error: {s}", .{msg.string});
-                        }
-                    }
-                }
-                return error.QueryFailed;
-            }
-            if (std.mem.eql(u8, r_type.?.string, "ok")) {
-                ok_count += 1;
-            }
-        }
+        const batch_response = try requireOkResponse(results_arr.array.items[0], "batch", "batch");
+        try validateBatchResult(batch_response, statements.len);
+        try validateCloseResponse(results_arr.array.items[1], "batch close");
 
         return BatchResult{
             .success = true,
@@ -329,8 +277,12 @@ pub const Client = struct {
         errdefer table_schemas.deinit(aa);
 
         for (table_names.items) |tbl_name| {
-            const pragma_sql = try std.fmt.allocPrint(aa, "PRAGMA table_info(\"{s}\")", .{tbl_name});
-            var info_query = self.query(io, pragma_sql, &.{}) catch continue;
+            const table_param = [_]db.Value{.{ .text = tbl_name }};
+            var info_query = self.query(
+                io,
+                "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
+                &table_param,
+            ) catch continue;
             defer info_query.deinit();
 
             var cols: std.ArrayList(ColumnSchema) = .empty;
@@ -425,6 +377,87 @@ pub const Client = struct {
     }
 };
 
+fn requireOkResponse(item: std.json.Value, expected_type: []const u8, operation: []const u8) !std.json.Value {
+    if (item != .object) return error.InvalidResponse;
+
+    const result_type = item.object.get("type") orelse return error.InvalidResponse;
+    if (result_type != .string) return error.InvalidResponse;
+    if (std.mem.eql(u8, result_type.string, "error")) {
+        logResponseError(operation, item.object.get("error"));
+        return error.QueryFailed;
+    }
+    if (!std.mem.eql(u8, result_type.string, "ok")) return error.InvalidResponse;
+
+    const response = item.object.get("response") orelse return error.InvalidResponse;
+    if (response != .object) return error.InvalidResponse;
+    const response_type = response.object.get("type") orelse return error.InvalidResponse;
+    if (response_type != .string or !std.mem.eql(u8, response_type.string, expected_type)) {
+        return error.InvalidResponse;
+    }
+    return response;
+}
+
+fn logResponseError(operation: []const u8, error_value: ?std.json.Value) void {
+    const err_obj = error_value orelse return;
+    if (err_obj != .object) return;
+    const message = err_obj.object.get("message") orelse return;
+    if (message == .string) log.warn("turso.{s} error: {s}", .{ operation, message.string });
+}
+
+fn validateCloseResponse(item: std.json.Value, operation: []const u8) !void {
+    if (item != .object) return error.InvalidResponse;
+
+    const result_type = item.object.get("type") orelse return error.InvalidResponse;
+    if (result_type != .string) return error.InvalidResponse;
+    if (std.mem.eql(u8, result_type.string, "error")) {
+        // The statement has already completed, so surfacing a close failure as
+        // a query failure could make a caller retry a committed mutation.
+        logResponseError(operation, item.object.get("error"));
+        return;
+    }
+    if (!std.mem.eql(u8, result_type.string, "ok")) return error.InvalidResponse;
+
+    const response = item.object.get("response") orelse return error.InvalidResponse;
+    if (response != .object) return error.InvalidResponse;
+    const response_type = response.object.get("type") orelse return error.InvalidResponse;
+    if (response_type != .string or !std.mem.eql(u8, response_type.string, "close")) {
+        return error.InvalidResponse;
+    }
+}
+
+fn validateBatchResult(batch_response: std.json.Value, statement_count: usize) !void {
+    const result = batch_response.object.get("result") orelse return error.InvalidResponse;
+    if (result != .object) return error.InvalidResponse;
+
+    const step_results = result.object.get("step_results") orelse return error.InvalidResponse;
+    const step_errors = result.object.get("step_errors") orelse return error.InvalidResponse;
+    if (step_results != .array or step_errors != .array) return error.InvalidResponse;
+
+    const step_count = statement_count + 3;
+    if (step_results.array.items.len != step_count or step_errors.array.items.len != step_count) {
+        return error.InvalidResponse;
+    }
+
+    const commit_step = statement_count + 1;
+    for (0..commit_step + 1) |step| {
+        const step_result = step_results.array.items[step];
+        const step_error = step_errors.array.items[step];
+        if (step_error != .null) {
+            logResponseError("batch", step_error);
+            return error.QueryFailed;
+        }
+        if (step_result != .object) return error.QueryFailed;
+    }
+
+    const rollback_step = commit_step + 1;
+    if (step_results.array.items[rollback_step] != .null or
+        step_errors.array.items[rollback_step] != .null)
+    {
+        logResponseError("batch rollback", step_errors.array.items[rollback_step]);
+        return error.QueryFailed;
+    }
+}
+
 fn parseTypeString(s: []const u8) db.ColumnType {
     if (std.ascii.eqlIgnoreCase(s, "int") or std.ascii.eqlIgnoreCase(s, "integer")) return .int;
     if (std.ascii.eqlIgnoreCase(s, "float") or std.ascii.eqlIgnoreCase(s, "real") or std.ascii.eqlIgnoreCase(s, "double")) return .float;
@@ -434,52 +467,45 @@ fn parseTypeString(s: []const u8) db.ColumnType {
 }
 
 pub fn parseHranaValue(aa: std.mem.Allocator, cell_val: std.json.Value) !db.Value {
-    if (cell_val != .object) return .null;
-    const type_val = cell_val.object.get("type");
-    const type_str = if (type_val != null and type_val.? == .string) type_val.?.string else "null";
+    if (cell_val != .object) return error.InvalidResponse;
+    const type_val = cell_val.object.get("type") orelse return error.InvalidResponse;
+    if (type_val != .string) return error.InvalidResponse;
+    const type_str = type_val.string;
 
     if (std.mem.eql(u8, type_str, "null")) {
         return .null;
     } else if (std.mem.eql(u8, type_str, "integer")) {
-        if (cell_val.object.get("value")) |v| {
-            if (v == .string) {
-                const num = std.fmt.parseInt(i64, v.string, 10) catch 0;
-                return .{ .int = num };
-            } else if (v == .integer) {
-                return .{ .int = v.integer };
-            }
+        const value = cell_val.object.get("value") orelse return error.InvalidResponse;
+        if (value == .string) {
+            const number = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidResponse;
+            return .{ .int = number };
+        } else if (value == .integer) {
+            return .{ .int = value.integer };
         }
-        return .{ .int = 0 };
+        return error.InvalidResponse;
     } else if (std.mem.eql(u8, type_str, "float")) {
-        if (cell_val.object.get("value")) |v| {
-            if (v == .float) {
-                return .{ .float = v.float };
-            } else if (v == .integer) {
-                return .{ .float = @floatFromInt(v.integer) };
-            }
+        const value = cell_val.object.get("value") orelse return error.InvalidResponse;
+        if (value == .float) {
+            return .{ .float = value.float };
+        } else if (value == .integer) {
+            return .{ .float = @floatFromInt(value.integer) };
         }
-        return .{ .float = 0.0 };
+        return error.InvalidResponse;
     } else if (std.mem.eql(u8, type_str, "text")) {
-        if (cell_val.object.get("value")) |v| {
-            if (v == .string) {
-                return .{ .text = try aa.dupe(u8, v.string) };
-            }
-        }
-        return .{ .text = try aa.dupe(u8, "") };
+        const value = cell_val.object.get("value") orelse return error.InvalidResponse;
+        if (value != .string) return error.InvalidResponse;
+        return .{ .text = try aa.dupe(u8, value.string) };
     } else if (std.mem.eql(u8, type_str, "blob")) {
-        if (cell_val.object.get("base64")) |v| {
-            if (v == .string) {
-                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(v.string) catch v.string.len;
-                const decoded_buf = try aa.alloc(u8, decoded_len);
-                std.base64.standard.Decoder.decode(decoded_buf, v.string) catch {
-                    return .{ .blob = try aa.dupe(u8, v.string) };
-                };
-                return .{ .blob = decoded_buf };
-            }
-        }
-        return .{ .blob = try aa.dupe(u8, "") };
+        const value = cell_val.object.get("base64") orelse return error.InvalidResponse;
+        if (value != .string) return error.InvalidResponse;
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(value.string) catch
+            return error.InvalidResponse;
+        const decoded_buf = try aa.alloc(u8, decoded_len);
+        std.base64.standard.Decoder.decode(decoded_buf, value.string) catch
+            return error.InvalidResponse;
+        return .{ .blob = decoded_buf };
     }
-    return .null;
+    return error.InvalidResponse;
 }
 
 pub fn serializeHranaValue(writer: anytype, allocator: std.mem.Allocator, val: db.Value) !void {
@@ -514,43 +540,47 @@ pub fn serializeHranaValue(writer: anytype, allocator: std.mem.Allocator, val: d
     }
 }
 
-pub fn serializeHranaStatement(writer: anytype, allocator: std.mem.Allocator, sql: []const u8, params: []const db.Value) !void {
-    try writer.writeAll("{\"type\":\"execute\",\"stmt\":{\"sql\":");
+fn serializeHranaStmt(writer: anytype, allocator: std.mem.Allocator, sql: []const u8, params: []const db.Value) !void {
+    try writer.writeAll("{\"sql\":");
     try std.json.Stringify.value(sql, .{}, writer);
     try writer.writeAll(",\"args\":[");
     for (params, 0..) |p, i| {
         if (i > 0) try writer.writeByte(',');
         try serializeHranaValue(writer, allocator, p);
     }
-    try writer.writeAll("]}}");
+    try writer.writeAll("]}");
+}
+
+pub fn serializeHranaStatement(writer: anytype, allocator: std.mem.Allocator, sql: []const u8, params: []const db.Value) !void {
+    try writer.writeAll("{\"type\":\"execute\",\"stmt\":");
+    try serializeHranaStmt(writer, allocator, sql, params);
+    try writer.writeByte('}');
 }
 
 pub fn serializePipelinePayload(allocator: std.mem.Allocator, statements: []const BatchStatement, in_transaction: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try out.writer.writeAll("{\"requests\":[");
-    var wrote_first = false;
-
     if (in_transaction) {
-        try out.writer.writeAll("{\"type\":\"execute\",\"stmt\":{\"sql\":\"BEGIN\"}}");
-        wrote_first = true;
-    }
+        try out.writer.writeAll("{\"requests\":[{\"type\":\"batch\",\"batch\":{\"steps\":[");
+        try out.writer.writeAll("{\"stmt\":{\"sql\":\"BEGIN\"}}");
 
-    for (statements) |stmt| {
-        if (wrote_first) try out.writer.writeByte(',');
-        try serializeHranaStatement(&out.writer, allocator, stmt.sql, stmt.params);
-        wrote_first = true;
-    }
+        for (statements, 0..) |stmt, i| {
+            try out.writer.print(",{{\"condition\":{{\"type\":\"ok\",\"step\":{d}}},\"stmt\":", .{i});
+            try serializeHranaStmt(&out.writer, allocator, stmt.sql, stmt.params);
+            try out.writer.writeByte('}');
+        }
 
-    if (in_transaction) {
-        if (wrote_first) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"type\":\"execute\",\"stmt\":{\"sql\":\"COMMIT\"}}");
-        wrote_first = true;
+        const commit_step = statements.len + 1;
+        try out.writer.print(",{{\"condition\":{{\"type\":\"ok\",\"step\":{d}}},\"stmt\":{{\"sql\":\"COMMIT\"}}}}", .{commit_step - 1});
+        try out.writer.print(",{{\"condition\":{{\"type\":\"not\",\"cond\":{{\"type\":\"ok\",\"step\":{d}}}}},\"stmt\":{{\"sql\":\"ROLLBACK\"}}}}", .{commit_step});
+        try out.writer.writeAll("]}},{\"type\":\"close\"}]}");
+    } else {
+        assert(statements.len == 1);
+        try out.writer.writeAll("{\"requests\":[");
+        try serializeHranaStatement(&out.writer, allocator, statements[0].sql, statements[0].params);
+        try out.writer.writeAll(",{\"type\":\"close\"}]}");
     }
-
-    if (wrote_first) try out.writer.writeByte(',');
-    try out.writer.writeAll("{\"type\":\"close\"}]}");
 
     return out.toOwnedSlice();
 }
@@ -575,7 +605,7 @@ test "pipelineUrl correctly normalizes libsql and https URLs" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8080/v2/pipeline", url4);
 }
 
-test "serializePipelinePayload formats valid Hrana pipeline JSON with parameters" {
+test "serializePipelinePayload makes transactional batches conditional" {
     const gpa = std.testing.allocator;
 
     const params = [_]db.Value{
@@ -590,12 +620,51 @@ test "serializePipelinePayload formats valid Hrana pipeline JSON with parameters
     const payload = try serializePipelinePayload(gpa, &stmts, true);
     defer gpa.free(payload);
 
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload, .{});
+    defer parsed.deinit();
+
+    const requests = parsed.value.object.get("requests").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), requests.len);
+    const steps = requests[0].object.get("batch").?.object.get("steps").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), steps.len);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"BEGIN\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"COMMIT\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"ROLLBACK\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"not\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"integer\",\"value\":\"123\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"text\",\"value\":\"session-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"null\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"close\"") != null);
+}
+
+test "validateBatchResult accepts commit and rejects rollback" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const committed_response =
+        \\{
+        \\  "type": "batch",
+        \\  "result": {
+        \\    "step_results": [{}, {}, {}, null],
+        \\    "step_errors": [null, null, null, null]
+        \\  }
+        \\}
+    ;
+    const committed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), committed_response, .{});
+    try validateBatchResult(committed.value, 1);
+
+    const rolled_back_response =
+        \\{
+        \\  "type": "batch",
+        \\  "result": {
+        \\    "step_results": [{}, null, null, {}],
+        \\    "step_errors": [null, {"message": "constraint failed"}, null, null]
+        \\  }
+        \\}
+    ;
+    const rolled_back = try std.json.parseFromSlice(std.json.Value, arena.allocator(), rolled_back_response, .{});
+    try std.testing.expectError(error.QueryFailed, validateBatchResult(rolled_back.value, 1));
 }
 
 test "parseHranaValue parses integers, text, floats, blobs, and nulls" {
@@ -631,4 +700,22 @@ test "parseHranaValue parses integers, text, floats, blobs, and nulls" {
 
     const v4 = try parseHranaValue(aa, items[4]);
     try std.testing.expectEqualStrings("Hello", v4.blob);
+}
+
+test "parseHranaValue rejects malformed values" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const json_str =
+        \\[
+        \\  {"type": "integer", "value": "not-an-integer"},
+        \\  {"type": "blob", "base64": "%%%"}
+        \\]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, aa, json_str, .{});
+
+    try std.testing.expectError(error.InvalidResponse, parseHranaValue(aa, parsed.value.array.items[0]));
+    try std.testing.expectError(error.InvalidResponse, parseHranaValue(aa, parsed.value.array.items[1]));
 }

@@ -439,5 +439,5 @@ Zay unifies local embedded SQLite and external REST database servers through `Se
    `src/db/turso.zig` implements a native LibSQL Hrana v2 pipeline client over HTTP (`POST /v2/pipeline`). It talks directly to Turso Cloud without needing an external Python daemon or local proxy:
    - **URL normalization:** Automatically normalizes `libsql://<db>.turso.io` or `https://<db>.turso.io/` to `https://<db>.turso.io/v2/pipeline`.
    - **Hrana v2 JSON parameter mapping:** Encodes values into tagged `{ "type": "...", "value": "..." }` Hrana objects (with 64-bit integers string-encoded and blobs base64-encoded).
-   - **Batch execution:** Groups all statements in a single HTTP request wrapped between `BEGIN` and `COMMIT` steps ending with `close`, fulfilling the `INV-DB-BATCH` invariant across the network in a single roundtrip.
-   - **Schema introspection:** Queries `sqlite_master` and `PRAGMA table_info` through the pipeline for table definitions and column details.
+   - **Batch execution:** Sends one Hrana `batch` request whose conditional steps run `BEGIN`, each statement, and `COMMIT` only after the previous step succeeds. A final conditional `ROLLBACK` runs whenever commit did not succeed, fulfilling `INV-DB-BATCH` in one roundtrip. Separate pipeline `execute` requests are not atomic because Hrana continues after request errors.
+   - **Schema introspection:** Queries `sqlite_master` and the parameterized `pragma_table_info(?)` table-valued function through the pipeline for table definitions and column details.
