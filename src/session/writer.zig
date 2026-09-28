@@ -419,7 +419,7 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
     assert(entry.payload_json.len > 0);
 
     const should_write_title = !writer.title_written and entry.title_candidate != null;
-    if (writer.manager.backend.kind == .remote_service) {
+    if (writer.manager.backend.kind != .local_sqlite) {
         var id: [entry_id_len]u8 = undefined;
         const title = if (should_write_title) entry.title_candidate else null;
         try writer.session.appendQueuedPayload(entry.kind, entry.role, entry.payload_json, title, &id);

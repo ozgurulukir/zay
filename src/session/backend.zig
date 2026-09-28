@@ -47,6 +47,7 @@ pub const SessionBackend = struct {
     remote: ?db.Service = null,
     remote_url: ?[]const u8 = null,
     remote_token: ?[]const u8 = null,
+    turso: ?db.Turso = null,
     host_id: []const u8,
 
     pub fn openLocal(gpa: std.mem.Allocator, conn: db.Connection, host_id: []const u8, path: []const u8) !SessionBackend {
@@ -58,6 +59,7 @@ pub const SessionBackend = struct {
             .local = conn,
             .local_path = owned_path,
             .remote = null,
+            .turso = null,
             .host_id = try gpa.dupe(u8, host_id),
         };
     }
@@ -76,6 +78,27 @@ pub const SessionBackend = struct {
             .remote = client,
             .remote_url = owned_url,
             .remote_token = owned_token,
+            .turso = null,
+            .host_id = try gpa.dupe(u8, host_id),
+        };
+    }
+
+    pub fn openTurso(gpa: std.mem.Allocator, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) !SessionBackend {
+        const owned_url = try gpa.dupe(u8, url);
+        errdefer gpa.free(owned_url);
+        const owned_token = if (auth_token) |t| try gpa.dupe(u8, t) else null;
+        errdefer if (owned_token) |t| gpa.free(t);
+
+        const client = db.Turso.init(gpa, owned_url, owned_token);
+        return .{
+            .gpa = gpa,
+            .kind = .turso_http,
+            .local = null,
+            .local_path = null,
+            .remote = null,
+            .remote_url = owned_url,
+            .remote_token = owned_token,
+            .turso = client,
             .host_id = try gpa.dupe(u8, host_id),
         };
     }
@@ -89,8 +112,7 @@ pub const SessionBackend = struct {
             .local_sqlite => {
                 if (self.local) |*conn| conn.close();
             },
-            .remote_service => {},
-            .turso_http, .postgres_native => {},
+            .remote_service, .turso_http, .postgres_native => {},
         }
         self.* = undefined;
     }
@@ -114,14 +136,30 @@ pub const SessionBackend = struct {
                 const result = try svc.exec(io, sql, params);
                 if (!result.success) return error.QueryFailed;
             },
-            .turso_http, .postgres_native => return error.BackendNotImplemented,
+            .turso_http => {
+                const client = self.turso orelse return error.MissingConnection;
+                const result = try client.exec(io, sql, params);
+                if (!result.success) return error.QueryFailed;
+            },
+            .postgres_native => return error.BackendNotImplemented,
         }
     }
 
     pub fn execBatch(self: *SessionBackend, io: std.Io, statements: []const db.service.BatchStatement) !void {
-        const svc = self.remote orelse return error.MissingConnection;
-        const result = try svc.batch(io, statements);
-        if (!result.success or result.results_count != statements.len) return error.QueryFailed;
+        switch (self.kind) {
+            .local_sqlite => return error.UnsupportedTransaction,
+            .remote_service => {
+                const svc = self.remote orelse return error.MissingConnection;
+                const result = try svc.batch(io, statements);
+                if (!result.success or result.results_count != statements.len) return error.QueryFailed;
+            },
+            .turso_http => {
+                const client = self.turso orelse return error.MissingConnection;
+                const result = try client.batch(io, statements);
+                if (!result.success or result.results_count != statements.len) return error.QueryFailed;
+            },
+            .postgres_native => return error.BackendNotImplemented,
+        }
     }
 
     pub fn query(self: *SessionBackend, io: std.Io, sql: []const u8, params: []const SqlParam) !QueryResult {
@@ -194,7 +232,11 @@ pub const SessionBackend = struct {
                 const svc = self.remote orelse return error.MissingConnection;
                 return try svc.query(io, sql, params);
             },
-            .turso_http, .postgres_native => return error.BackendNotImplemented,
+            .turso_http => {
+                const client = self.turso orelse return error.MissingConnection;
+                return try client.query(io, sql, params);
+            },
+            .postgres_native => return error.BackendNotImplemented,
         }
     }
 
@@ -228,4 +270,23 @@ pub fn resolveHostId(gpa: std.mem.Allocator, env_map: ?*const std.process.Enviro
         }
     }
     return try gpa.dupe(u8, "default-host");
+}
+
+test "BackendKind correctly identifies turso_http" {
+    try std.testing.expectEqual(BackendKind.turso_http, BackendKind.fromString("turso_http").?);
+    try std.testing.expectEqual(BackendKind.turso_http, BackendKind.fromString("turso").?);
+    try std.testing.expectEqual(BackendKind.turso_http, BackendKind.fromString("libsql").?);
+    try std.testing.expectEqualStrings("turso_http", BackendKind.turso_http.asString());
+}
+
+test "SessionBackend openTurso initializes and deinits cleanly without leaks" {
+    const gpa = std.testing.allocator;
+    var backend = try SessionBackend.openTurso(gpa, "https://my-db.turso.io", "secret-token", "test-host");
+    defer backend.deinit();
+
+    try std.testing.expectEqual(BackendKind.turso_http, backend.kind);
+    try std.testing.expectEqualStrings("https://my-db.turso.io", backend.remote_url.?);
+    try std.testing.expectEqualStrings("secret-token", backend.remote_token.?);
+    try std.testing.expectEqualStrings("test-host", backend.host_id);
+    try std.testing.expect(backend.turso != null);
 }

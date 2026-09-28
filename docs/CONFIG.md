@@ -389,18 +389,36 @@ Zay to apply changes. See `docs/plugins/` for the full plugin development guide.
 
 ### External Database & Roaming Session Configuration
 
-Zay supports delegating its internal session storage (`src/session/`) and application database inspection to a standalone database service (see `tools/db_server/`). This enables roaming users to access and sync their full session history, timeline branches, and resume points across multiple development machines.
+Zay supports delegating its internal session storage (`src/session/`) and application database inspection to a remote database service (such as `tools/db_server/`) or directly to **Turso / LibSQL Cloud** over HTTP (`turso_http`). This enables roaming users to access and sync their full session history, timeline branches, and resume points across multiple development machines without managing a local proxy.
 
 ```json
 {
-  "databaseServerUrl": "http://127.0.0.1:8766",
-  "databaseAuthToken": "your-secret-token"
+  "database": {
+    "backend": "turso_http",
+    "url": "libsql://my-database-org.turso.io",
+    "authToken": "your-turso-jwt-token"
+  }
 }
 ```
 
-- **Roaming User Synchronization:** When `databaseServerUrl` is configured, Zay initializes `SessionManager` against the remote REST service (`SessionBackend.remote_service`) instead of the local SQLite database. Sessions and lane manifests record the local machine hostname (`host_id`), allowing filtering and clean multi-host coexistence.
-- **Fail-Safe Local Fallback:** If the external database server is unreachable or offline during startup, Zay emits a warning diagnostic and seamlessly falls back to the local embedded `~/.config/zay/sessions.db` without crashing.
-- **Agent Database Tool:** Setting `databaseServerUrl` also activates the built-in `database` tool for the agent, enabling schema inspection (`inspect_schema`), read-only SQL queries (`query`), and DDL/DML execution (`execute`).
+Or when using the local/remote companion service (`zay_service`):
+```json
+{
+  "database": {
+    "backend": "zay_service",
+    "url": "http://127.0.0.1:8766",
+    "authToken": "your-secret-token"
+  }
+}
+```
+
+- **Supported Backends (`database.backend`):**
+  - `local` / `local_sqlite`: Local embedded SQLite file (`~/.config/zay/sessions.sqlite`).
+  - `turso_http` / `turso` / `libsql`: Direct, native LibSQL Hrana v2 pipeline over HTTP. Reaches Turso Cloud directly with automatic `libsql://` -> `https://.../v2/pipeline` normalization, single-roundtrip pipeline batching, and zero daemon requirements.
+  - `zay_service` / `remote_service`: Python or containerized database companion service supporting SQLite and PostgreSQL.
+- **Roaming User Synchronization:** Sessions and lane manifests record the local machine hostname (`host_id`), allowing filtering and clean multi-host coexistence.
+- **Fail-Safe Local Fallback:** If the external database server or Turso endpoint is unreachable or offline during startup, Zay emits a warning diagnostic and seamlessly falls back to the local embedded `sessions.sqlite` without crashing.
+- **Agent Database Tool:** Setting an external database backend or server URL also activates the built-in `database` tool for the agent, enabling schema inspection (`inspect_schema`), read-only SQL queries (`query`), and DDL/DML execution (`execute`).
 
 ---
 

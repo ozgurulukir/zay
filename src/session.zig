@@ -116,6 +116,21 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn initTurso(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
+        assert(url.len > 0);
+        var b = try SessionBackend.openTurso(gpa, url, auth_token, host_id);
+        errdefer b.deinit();
+        try session_migration.migrateBackend(&b, io);
+        const conn = db.Connection.open(":memory:", .{}) catch return error.SystemResources;
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .backend = b,
+            .connection = conn,
+            .host_id = b.host_id,
+        };
+    }
+
     pub fn initFromConfig(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -183,7 +198,20 @@ pub const SessionManager = struct {
                 }
                 return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
             },
-            .turso_http, .postgres_native => {
+            .turso_http => {
+                if (resolved_url) |url| {
+                    if (url.len > 0) {
+                        if (initTurso(gpa, io, url, resolved_token, host_slice)) |turso_mgr| {
+                            return turso_mgr;
+                        } else |err| {
+                            const log = std.log.scoped(.session);
+                            log.warn("session.turso_db_fallback url={s} err={s}", .{ url, @errorName(err) });
+                        }
+                    }
+                }
+                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
+            },
+            .postgres_native => {
                 const log = std.log.scoped(.session);
                 log.warn("session.backend_not_implemented backend={s}; falling back to local storage", .{@tagName(kind)});
                 return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
@@ -192,7 +220,7 @@ pub const SessionManager = struct {
     }
 
     pub fn deinit(self: *SessionManager) void {
-        if (self.backend.kind == .remote_service) {
+        if (self.backend.kind != .local_sqlite) {
             self.connection.close();
         }
         self.backend.deinit();
@@ -305,7 +333,7 @@ pub const SessionManager = struct {
     /// the `on delete cascade` foreign key). Safe to call on a non-existent
     /// id — the statement simply matches no rows.
     pub fn deleteSession(self: *SessionManager, session_id: []const u8) Error!void {
-        if (self.backend.kind == .remote_service) {
+        if (self.backend.kind != .local_sqlite) {
             const params = [_]backend_mod.SqlParam{.{ .text = session_id }};
             const statements = [_]db.service.BatchStatement{
                 .{ .sql = "delete from prompt_history where session_id = ?", .params = &params },
@@ -350,7 +378,7 @@ pub const Session = struct {
     }
 
     pub fn appendQueuedPayload(self: *Session, kind: []const u8, role: ?[]const u8, payload_json: []const u8, title: ?[]const u8, id_out: *[entry_id_len]u8) Error!void {
-        assert(self.manager.backend.kind == .remote_service);
+        assert(self.manager.backend.kind != .local_sqlite);
         assert(kind.len > 0);
         assert(payload_json.len > 0);
         fillHex(self.manager.io, id_out);
@@ -673,7 +701,7 @@ pub const Session = struct {
             .{ .text = payload_json },
             .{ .int = timestamp_ms },
         };
-        if (self.manager.backend.kind == .remote_service) {
+        if (self.manager.backend.kind != .local_sqlite) {
             const update_params = [_]backend_mod.SqlParam{
                 .{ .text = id[0..] },
                 .{ .int = timestamp_ms },
