@@ -127,18 +127,19 @@ pub fn toggleBackgroundModal(app: *App) void {
     app.background_modal_state.modal = !app.background_modal_state.modal;
     app.background_modal_state.selection = 0;
     app.background_modal_state.cancel_focus = false;
+    app.background_modal_state.log_expanded = false;
 }
 
 pub fn handleBackgroundModalKey(app: *App, key: vaxis.Key) bool {
     const count = runningBackgroundCount(app);
     if (count == 0) return false;
     if (app.background_modal_state.selection >= count) app.background_modal_state.selection = count - 1;
-    if (key.matches(vaxis.Key.up, .{})) {
+    if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
         if (app.background_modal_state.selection > 0) app.background_modal_state.selection -= 1;
         app.background_modal_state.cancel_focus = false;
         return true;
     }
-    if (key.matches(vaxis.Key.down, .{})) {
+    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
         if (app.background_modal_state.selection + 1 < count) app.background_modal_state.selection += 1;
         app.background_modal_state.cancel_focus = false;
         return true;
@@ -149,6 +150,11 @@ pub fn handleBackgroundModalKey(app: *App, key: vaxis.Key) bool {
     }
     if (key.matches(vaxis.Key.right, .{})) {
         app.background_modal_state.cancel_focus = true;
+        return true;
+    }
+    // Space toggles the live log-tail panel for the selected job (#37).
+    if (key.matches(' ', .{})) {
+        app.background_modal_state.log_expanded = !app.background_modal_state.log_expanded;
         return true;
     }
     if (app.background_modal_state.cancel_focus and key.matches(vaxis.Key.enter, .{})) {

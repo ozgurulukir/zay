@@ -228,6 +228,8 @@ pub const BackgroundModalState = struct {
     modal: bool = false,
     selection: usize = 0,
     cancel_focus: bool = false,
+    /// Space-toggled live log-tail panel for the selected job (#37).
+    log_expanded: bool = false,
     pending: std.ArrayList(BackgroundDelivery) = .empty,
 };
 
