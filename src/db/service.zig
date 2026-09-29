@@ -23,7 +23,17 @@ pub const Error = error{
     OutOfMemory,
     UriMissingHost,
     UnsupportedScheme,
+    InvalidEndpoint,
+    ResponseTooLarge,
+    ConstraintFailed,
+    SqlSyntaxError,
+    InvalidParameter,
 };
+
+/// Shared maximum database response body accepted from a remote backend
+/// (#159). An unexpectedly large query/error response fails with
+/// `error.ResponseTooLarge` instead of accumulating unbounded memory.
+pub const response_max_bytes: usize = 16 * 1024 * 1024;
 
 pub const HealthStatus = struct {
     status: []const u8,
