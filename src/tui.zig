@@ -1273,7 +1273,12 @@ pub fn run(
     // the seam and are freed in `App.deinit`.
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
-    defer fw_app.deinit();
+    defer {
+        // The console handle is owned by Vaxis, so drain queued Win32
+        // key-release records before it closes that handle.
+        os.discardConsoleInput();
+        fw_app.deinit();
+    }
 
     // Init the global toast bus (needs an io handle for its mutex) and apply
     // the config's toast settings.
