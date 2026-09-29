@@ -153,11 +153,18 @@ pub const CompactionSettings = struct {
     /// (see `context/assembly.zig`). Minimum 1.
     keep_recent_tool_turns: u32 = context_assembly.default_keep_recent_tool_turns,
     /// Byte cap applied to tool results older than `keep_recent_tool_turns` —
-    /// a head+tail sandwich (first half + last half, joined by
+    /// a head+tail sandwich (first half + last half, joined with
     /// `common.elideMiddle`) keeps both the start and the conclusion, with a
     /// "[... N of M bytes elided to save context ...]" notice.
-    /// Defaults match the previous hardcoded constant in context/assembly.zig.
+    /// Defaults match the previous hardcoded constant in `context/assembly.zig`.
     historical_tool_cap_bytes: u32 = context_assembly.default_historical_tool_cap_bytes,
+    /// Replace image blocks in OLDER user messages with a deterministic
+    /// re-mention stub when assembling each request (#122) — only the newest
+    /// user message keeps its images. Saves the base64 re-upload every
+    /// follow-up turn; the model can re-attach any image by @-mentioning the
+    /// path named in the stub. Disable for providers that keep server-side
+    /// image state or when every image must stay attached.
+    evict_history_images: bool = true,
 };
 
 /// Toast notification settings for the generic toast bus. All fields are

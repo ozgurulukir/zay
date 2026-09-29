@@ -189,7 +189,7 @@ pub fn estimateMessageTokens(message: ai.ChatMessage) u32 {
     };
     var tokens: u32 = 0;
     for (content) |block| {
-        tokens +|= blockTokens(block);
+        tokens +|= estimateBlockTokens(block);
     }
     return tokens;
 }
@@ -209,7 +209,7 @@ pub fn estimateMessageTokensCapped(message: ai.ChatMessage, cap_bytes: u32) u32 
     return tokens;
 }
 
-fn blockTokens(block: ai.ContentBlock) u32 {
+pub fn estimateBlockTokens(block: ai.ContentBlock) u32 {
     return switch (block) {
         .text => |text| divCeil(saturatingLen(text.text), tokens_per_char_divisor),
         .reasoning => |reasoning| divCeil(saturatingLen(reasoning.text), tokens_per_char_divisor),

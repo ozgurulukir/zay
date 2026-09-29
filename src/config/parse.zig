@@ -278,6 +278,7 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.compaction.keep_recent_tokens != d.keep_recent_tokens) target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
     if (updates.compaction.keep_recent_tool_turns != d.keep_recent_tool_turns) target.compaction.keep_recent_tool_turns = updates.compaction.keep_recent_tool_turns;
     if (updates.compaction.historical_tool_cap_bytes != d.historical_tool_cap_bytes) target.compaction.historical_tool_cap_bytes = updates.compaction.historical_tool_cap_bytes;
+    if (updates.compaction.evict_history_images != d.evict_history_images) target.compaction.evict_history_images = updates.compaction.evict_history_images;
 }
 
 /// After applying legacy-field updates, mirror the changes onto
@@ -911,6 +912,7 @@ fn parseCompaction(value: std.json.Value) CompactionSettings {
         // Minimum 1: a 0 cap would render every pruned result empty.
         if (v >= 1) comp.historical_tool_cap_bytes = v;
     }
+    if (boolFieldCompat(value, "evictHistoryImages", "evict_history_images")) |b| comp.evict_history_images = b;
     return comp;
 }
 
@@ -1919,6 +1921,10 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
     if (comp.historical_tool_cap_bytes != d.historical_tool_cap_bytes) {
         try writeKeyNoIndent(writer, "historicalToolCapBytes", &wrote_any);
         try writer.print("{d}", .{comp.historical_tool_cap_bytes});
+    }
+    if (!comp.evict_history_images) {
+        try writeKeyNoIndent(writer, "evictHistoryImages", &wrote_any);
+        try writer.writeAll("false");
     }
     try writer.writeByte('}');
 }
@@ -4206,4 +4212,28 @@ test "parseFile accepts a UTF-8 BOM" {
     defer config.deinit(gpa);
     try std.testing.expectEqual(DatabaseBackendKind.turso_http, config.database.backend.?);
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "parseCompaction accepts evictHistoryImages and writeCompaction round-trips it" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const json =
+        \\{"context":{"compaction":{"threshold":0.75,"evictHistoryImages":false}}}
+    ;
+    var parsed = try parseFile(gpa, "<test>", json, &sink);
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqual(false, parsed.context.compaction.evict_history_images);
+
+    // Default stays enabled and is omitted from serialization.
+    var defaults: std.ArrayList(Diagnostic) = .empty;
+    defer defaults.deinit(gpa);
+    var parsed_default = try parseFile(gpa, "<test>", "{}", &defaults);
+    defer parsed_default.deinit(gpa);
+    try std.testing.expectEqual(true, parsed_default.context.compaction.evict_history_images);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try writeCompaction(&buf.writer, parsed.context.compaction);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"evictHistoryImages\":false") != null);
 }
