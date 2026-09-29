@@ -381,6 +381,73 @@ pub const Client = struct {
         io: std.Io,
         payload: []const u8,
     ) ![]const u8 {
+        // Windows has no socket-level timeout through the std Io backend (the
+        // AFD driver's handles are not ws2_32 SOCKETs), so the whole exchange
+        // is raced against a deadline instead — the same approach as the MCP
+        // HTTP transport. POSIX applies SO_RCVTIMEO inside the unbounded path.
+        if (os.is_windows) {
+            return self.fetchPipelineBounded(allocator, io, payload);
+        }
+        return self.fetchPipelineUnbounded(allocator, io, payload);
+    }
+
+    const FetchOutcome = union(enum) {
+        body: []const u8,
+        failure: anyerror,
+    };
+
+    const FetchEvent = union(enum) {
+        fetch: FetchOutcome,
+        timeout: void,
+    };
+
+    fn fetchPipelineBounded(
+        self: *const Client,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        payload: []const u8,
+    ) ![]const u8 {
+        var events: [2]FetchEvent = undefined;
+        var select = std.Io.Select(FetchEvent).init(io, &events);
+        defer select.cancelDiscard();
+
+        try select.concurrent(.fetch, fetchPipelineTask, .{ self, allocator, io, payload });
+        try select.concurrent(.timeout, fetchDeadlineTask, .{ io, self.timeout_seconds });
+
+        const event = select.await() catch |err| return err;
+        return switch (event) {
+            .fetch => |outcome| switch (outcome) {
+                .body => |body| body,
+                .failure => |err| err,
+            },
+            // A late-completing fetch's body is arena-backed and freed by the
+            // caller's teardown; cancelDiscard reaps the task safely.
+            .timeout => error.ServerTimeout,
+        };
+    }
+
+    fn fetchPipelineTask(
+        self: *const Client,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        payload: []const u8,
+    ) FetchOutcome {
+        const body = self.fetchPipelineUnbounded(allocator, io, payload) catch |err| {
+            return .{ .failure = err };
+        };
+        return .{ .body = body };
+    }
+
+    fn fetchDeadlineTask(io: std.Io, timeout_seconds: u32) void {
+        io.sleep(std.Io.Duration.fromMilliseconds(@as(i64, timeout_seconds) * 1000), .awake) catch {};
+    }
+
+    fn fetchPipelineUnbounded(
+        self: *const Client,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        payload: []const u8,
+    ) ![]const u8 {
         const url = try pipelineUrl(allocator, self.endpoint);
         defer allocator.free(url);
 
@@ -444,7 +511,9 @@ pub const Client = struct {
         };
 
         if (!http.isSuccess(code)) {
-            log.warn("turso HTTP {d} error response: {s}", .{ code, body });
+            // Head-cut the body: warn lines route into the toast bus when the
+            // TUI is up, and a misconfigured host can return a huge HTML page.
+            log.warn("turso HTTP {d} error response: {s}", .{ code, http.logBytesHead(body) });
             allocator.free(body);
             return error.HttpError;
         }
@@ -996,15 +1065,15 @@ test "oversized pipeline responses fail with ResponseTooLarge" {
 }
 
 // #159: a server that sends the head then stalls the body must hit the
-// socket read timeout. POSIX-only: Windows has no socket-level timeout
-// through the std Io backend (see http.setSocketTimeout).
+// configured deadline. POSIX applies SO_RCVTIMEO after the head; Windows
+// races the whole exchange against a timer (same mechanism as the MCP HTTP
+// transport), so the same timeout holds on both platforms.
 test "stalled pipeline body times out" {
-    if (os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     const responses = [_]mock_http_server.Response{
-        .{ .status = .ok, .body = "{}", .body_delay_ms = 1500 },
+        .{ .status = .ok, .body = "{}", .body_delay_ms = 3000 },
     };
     var server = try mock_http_server.MockHttpServer.init(io, &responses);
     defer server.deinit();
