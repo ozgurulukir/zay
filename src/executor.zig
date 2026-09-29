@@ -11,6 +11,7 @@ const lua_mod = @import("lua/root.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const os = @import("os.zig");
+const result_cache_mod = @import("tools/result_cache.zig");
 const schema_mod = @import("tools/schema.zig");
 const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
@@ -168,6 +169,9 @@ pub const ExecutorService = struct {
     /// Tool registry (builtin + plugin + MCP). null falls back to
     /// `builtinRegistry` only, which is what tests use.
     tool_registry: ?*tools.ToolRegistry = null,
+    /// Session-scoped result cache (#5), borrowed from the Agent. null
+    /// disables caching entirely.
+    result_cache: ?*result_cache_mod.ResultCache = null,
     /// Per-turn or per-batch scratch allocator (e.g. TurnArena) for temporary JSON
     /// parsing, schema validation, and argument coercion. Defaults to gpa when unspecified.
     scratch_allocator: std.mem.Allocator,
@@ -196,6 +200,9 @@ pub const ExecutorService = struct {
         lane_requester: ?*anyopaque = null,
         skills: []const skill_mod.Skill = &.{},
         cancel_requested: ?*const std.atomic.Value(bool) = null,
+        /// Session-scoped result cache (#5); borrowed from the Agent (one
+        /// session), null disables caching (tests, headless runs).
+        result_cache: ?*result_cache_mod.ResultCache = null,
     };
 
     pub fn init(options: InitOptions) ExecutorService {
@@ -208,6 +215,7 @@ pub const ExecutorService = struct {
             .cwd = options.cwd,
             .contained = options.contained,
             .tool_registry = options.tool_registry,
+            .result_cache = options.result_cache,
             .ctx = .{
                 .cancel_requested = options.cancel_requested,
                 .bash_classifier_url = options.bash_classifier_url,
@@ -397,6 +405,27 @@ pub const ExecutorService = struct {
                 return shell_impl.runBackground(self.gpa, self.io, self.cwd, call.arguments, manager, self.ctx.owner_generation);
             }
         }
+        // Tool-result cache (#5): identical read-only shell calls within one
+        // session replay the earlier output instead of re-executing. Hits are
+        // marked, mutating commands clear the cache (inside lookupShell),
+        // and everything but single read-only commands bypasses.
+        if (self.result_cache) |cache| {
+            if (std.mem.eql(u8, call.name, tools.shell_tool.name)) {
+                switch (cache.lookupShell(call.arguments)) {
+                    .hit => |output| return output,
+                    .bypass => {},
+                    .miss => {
+                        const output = try self.produceViaRegistry(call);
+                        cache.storeShell(call.arguments, &output);
+                        return output;
+                    },
+                }
+            }
+        }
+        return self.produceViaRegistry(call);
+    }
+
+    fn produceViaRegistry(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
         if (self.tool_registry) |r| {
             const slice = try r.all(self.gpa);
             return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments, &self.ctx);
@@ -876,6 +905,73 @@ test "valid pwsh call still dispatches after schema validation" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "pwsh-ok") != null);
+}
+
+// #5: identical read-only shell calls replay from the session cache; a
+// mutating command invalidates it. Runs on both hosts (bash/pwsh verb
+// variants are host-appropriate).
+test "executor replays identical read-only shell calls from the result cache" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var cache = result_cache_mod.ResultCache.init(gpa);
+    defer cache.deinit();
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = cwd,
+        .result_cache = &cache,
+    });
+
+    const pwd_args = if (os.is_windows)
+        "{\"command\":\"Get-Location\",\"description\":\"where am I\"}"
+    else
+        "{\"command\":\"pwd\",\"description\":\"where am I\"}";
+
+    // First run executes for real — no cache marker.
+    const call1 = try makeCall(gpa, "c1", tools.shell_tool.name, pwd_args);
+    defer freeCall(gpa, call1);
+    var r1 = try executor.runOne(call1);
+    defer r1.deinit(gpa);
+    try std.testing.expect(!r1.failed);
+    try std.testing.expect(std.mem.indexOf(u8, r1.content, "[cached result") == null);
+
+    // Identical command with a different description replays the marked hit.
+    const replay_args = if (os.is_windows)
+        "{\"description\":\"recheck\",\"command\":\"Get-Location\"}"
+    else
+        "{\"description\":\"recheck\",\"command\":\"pwd\"}";
+    const call2 = try makeCall(gpa, "c2", tools.shell_tool.name, replay_args);
+    defer freeCall(gpa, call2);
+    var r2 = try executor.runOne(call2);
+    defer r2.deinit(gpa);
+    try std.testing.expect(!r2.failed);
+    try std.testing.expect(std.mem.indexOf(u8, r2.content, "[cached result") != null);
+
+    // A mutating command clears the cache (and runs uncached itself).
+    const mkdir_args = if (os.is_windows)
+        "{\"command\":\"$null = New-Item -ItemType Directory -Force .zig-cache/rc-test\",\"description\":\"mkdir\"}"
+    else
+        "{\"command\":\"mkdir -p .zig-cache/rc-test\",\"description\":\"mkdir\"}";
+    const call3 = try makeCall(gpa, "c3", tools.shell_tool.name, mkdir_args);
+    defer freeCall(gpa, call3);
+    var r3 = try executor.runOne(call3);
+    defer r3.deinit(gpa);
+    try std.testing.expect(!r3.failed);
+
+    // After the mutation the same read-only call executes for real again.
+    const call4 = try makeCall(gpa, "c4", tools.shell_tool.name, pwd_args);
+    defer freeCall(gpa, call4);
+    var r4 = try executor.runOne(call4);
+    defer r4.deinit(gpa);
+    try std.testing.expect(!r4.failed);
+    try std.testing.expect(std.mem.indexOf(u8, r4.content, "[cached result") == null);
+}
+
+fn freeCall(gpa: std.mem.Allocator, call: ai.ToolCall) void {
+    gpa.free(call.call_id.value);
+    gpa.free(call.name);
+    gpa.free(call.arguments);
 }
 
 test "executor rejects bash call with missing required argument" {

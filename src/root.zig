@@ -21,6 +21,7 @@ pub const executor = @import("executor.zig");
 pub const image_resize = @import("image_resize.zig");
 pub const os = @import("os.zig");
 pub const paths = @import("paths.zig");
+pub const result_cache = @import("tools/result_cache.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
 pub const skill = @import("skill.zig");

@@ -11,6 +11,7 @@ const context_mod = @import("context/manager.zig");
 const context_assembly = @import("context/assembly.zig");
 const executor_mod = @import("executor.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
+const result_cache_mod = @import("tools/result_cache.zig");
 const request_limiter_mod = @import("request_limiter.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
@@ -119,6 +120,10 @@ pub const Agent = struct {
     compaction_client: ai.LanguageModel = .none,
     /// Optional local classifier endpoint for bash approval gating.
     bash_classifier_url: ?[]const u8 = null,
+    /// Session-scoped cache for identical read-only shell results (#5).
+    /// Lives on the Agent (one session), not the per-batch ExecutorService,
+    /// so hits span turns.
+    result_cache: result_cache_mod.ResultCache,
     database_server_url: ?[]const u8 = null,
     database_auth_token: ?[]const u8 = null,
     /// Optional synchronous approval hook used by the TUI worker.
@@ -194,6 +199,7 @@ pub const Agent = struct {
             .cwd = cwd,
             .client = client,
             .context_manager = .{ .gpa = gpa },
+            .result_cache = result_cache_mod.ResultCache.init(gpa),
         };
     }
 
@@ -250,6 +256,7 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         self.tool_view_cache.deinit(self.gpa);
+        self.result_cache.deinit();
         // Wait for any background summarizer before tearing down the state it
         // reads (the client), then release its result.
         self.drainBackgroundCompaction();
@@ -775,6 +782,7 @@ pub const Agent = struct {
             .database_auth_token = self.database_auth_token,
             .session_backend = if (self.context_manager.session_writer) |sw| &sw.manager.backend else null,
             .cancel_requested = self.cancel_requested,
+            .result_cache = &self.result_cache,
         });
         const results = executor.runAll(tool_calls, bridge.observer()) catch |err| {
             if (err == error.Canceled) {
