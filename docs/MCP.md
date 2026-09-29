@@ -86,6 +86,14 @@ secrets never written back) also covers AI provider headers
 (`providers.<name>.headers`), expanded once per client attach — see
 [Configuration Guide — Provider Configuration](CONFIG.md#provider-configuration).
 
+**Project-layer trust parity.** When an `mcpServers` entry (or a provider
+header) comes from the *project* config (`<cwd>/.zay/config.json`) and its
+`url`/`headers` carry `{env:VAR}` placeholders, Zay logs a warning at load
+naming the server, destination, and header names — never the values — and the
+expansion still applies at connect time. This mirrors the provider-header
+policy: project-layer expansion is visible, not blocked; see
+[Configuration Guide — Project-Layer Trust](CONFIG.md#project-layer-trust--environment-expansion).
+
 Two common auth shapes for remote servers:
 
 ```json

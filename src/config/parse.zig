@@ -107,6 +107,12 @@ pub fn load(
     var project = try loadProjectFile(gpa, io, cwd, &diagnostics);
     defer project.deinit(gpa);
 
+    // #107 trust notice: make project-layer `{env:VAR}` header expansion
+    // visible BEFORE any request can carry the expanded value. Logged at load
+    // so both model-list probes and inference requests are covered by one
+    // gate; warn-level lines route to the TUI toast bus.
+    _ = warnProjectLayerEnvExpansion(&project);
+
     var env_layer = try loadEnv(gpa, env, &diagnostics);
     defer env_layer.deinit(gpa);
 
@@ -530,6 +536,97 @@ fn loadProjectFile(
     const path = try std.fs.path.join(gpa, &.{ cwd, ".zay", "config.json" });
     defer gpa.free(path);
     return loadFile(gpa, io, path, diagnostics);
+}
+
+/// True when a raw config value still carries a `{env:VAR}` placeholder —
+/// the unexpanded on-disk form.
+fn hasEnvPlaceholder(value: []const u8) bool {
+    return std.mem.indexOf(u8, value, "{env:") != null;
+}
+
+/// #107 trust notice for the project layer (`<cwd>/.zay/config.json`). That
+/// file travels with the repository, so provider/MCP headers it defines are
+/// the least-trusted source of `{env:VAR}` expansions: opening the model
+/// picker (the `/v1/models` probe) or sending any request through such a
+/// provider — or connecting such an MCP server — carries the expanded
+/// environment value to the project-configured destination. Expansion stays
+/// enabled (the behavior was accepted when custom provider headers shipped);
+/// this notice makes every project-layer expansion visible, naming the
+/// destination and header NAMES but never the values.
+///
+/// Nothing is exfiltrated merely by cloning or opening a repository: the
+/// exposure is conditional on Zay loading the project config and then making
+/// a request. Logging at load time (rather than at each send site) covers
+/// probes and inference with one gate. Returns the number of risks found.
+fn warnProjectLayerEnvExpansion(project: *const Config) usize {
+    var risks: usize = 0;
+    for (project.providers) |provider| {
+        for (provider.headers) |header| {
+            if (!hasEnvPlaceholder(header.value)) continue;
+            const destination = switch (provider.base_url) {
+                .custom => |url| url,
+                .default => "the provider's default endpoint",
+            };
+            log.warn("project-layer provider '{s}' ({s}) expands environment variable(s) into outbound header '{s}'", .{ provider.name, destination, header.name });
+            risks += 1;
+        }
+    }
+    for (project.mcp_servers) |server| {
+        switch (server.transport) {
+            .sse => |t| {
+                for (t.headers) |header| {
+                    if (!hasEnvPlaceholder(header.value)) continue;
+                    log.warn("project-layer MCP server '{s}' expands environment variable(s) into outbound header '{s}'", .{ server.name, header.name });
+                    risks += 1;
+                }
+                if (hasEnvPlaceholder(t.url)) {
+                    log.warn("project-layer MCP server '{s}' embeds environment variable(s) in its endpoint URL", .{server.name});
+                    risks += 1;
+                }
+            },
+            .stdio => {},
+        }
+    }
+    return risks;
+}
+
+test "project-layer env-expansion notice counts provider, MCP header, and URL risks" {
+    const gpa = std.testing.allocator;
+
+    const provider_headers = try cloneHeaders(gpa, &[_]McpHeader{
+        .{ .name = @constCast("x-safe"), .value = @constCast("plain") },
+        .{ .name = @constCast("x-secret"), .value = @constCast("{env:GITHUB_TOKEN}") },
+    });
+    var providers = try gpa.alloc(ProviderConfig, 1);
+    providers[0] = .{
+        .name = try gpa.dupe(u8, "gateway"),
+        .provider = .openai_compatible,
+        .base_url = .{ .custom = try gpa.dupe(u8, "https://gateway.example.com/v1") },
+        .headers = provider_headers,
+    };
+
+    var servers = try gpa.alloc(McpServerConfig, 1);
+    servers[0] = .{
+        .name = try gpa.dupe(u8, "search"),
+        .transport = .{ .sse = .{
+            .url = try gpa.dupe(u8, "https://mcp.example.com/mcp?key={env:MCP_KEY}"),
+            .headers = try cloneHeaders(gpa, &[_]McpHeader{
+                .{ .name = @constCast("Authorization"), .value = @constCast("Bearer {env:MCP_TOKEN}") },
+            }),
+        } },
+    };
+
+    var project: Config = .{ .providers = providers, .mcp_servers = servers };
+    defer project.deinit(gpa);
+
+    // One provider header + one MCP header + one MCP URL embed = 3 risks
+    // (the plain provider header counts for nothing).
+    try std.testing.expectEqual(@as(usize, 3), warnProjectLayerEnvExpansion(&project));
+
+    // A project layer without placeholders reports nothing.
+    var clean: Config = .{};
+    defer clean.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), warnProjectLayerEnvExpansion(&clean));
 }
 
 fn loadFile(
