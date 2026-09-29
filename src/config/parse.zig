@@ -564,7 +564,11 @@ fn parseFile(
     bytes: []const u8,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !Config {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| {
+    // Windows editors commonly save UTF-8 JSON with a BOM. The JSON grammar
+    // starts at the first object byte, so remove that transport marker before
+    // handing the document to the strict parser.
+    const json_bytes = if (std.mem.startsWith(u8, bytes, "\xEF\xBB\xBF")) bytes[3..] else bytes;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{}) catch |err| {
         try appendConfigError(gpa, diagnostics, path, "invalid JSON: {s}", .{@errorName(err)});
         return .{};
     };
@@ -4087,4 +4091,22 @@ test "provider headers overlay replaces wholesale and absent keeps lower" {
     try applyProviderOverlay(gpa, &target, updates_without_headers);
     try std.testing.expectEqual(@as(usize, 1), target.providers[0].headers.len);
     try std.testing.expectEqualStrings("x-new", target.providers[0].headers[0].name);
+}
+test "parseFile accepts a UTF-8 BOM" {
+    const gpa = std.testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(gpa);
+        diagnostics.deinit(gpa);
+    }
+
+    var config = try parseFile(
+        gpa,
+        "<bom>",
+        "\xEF\xBB\xBF{\"database\":{\"backend\":\"turso_http\"}}",
+        &diagnostics,
+    );
+    defer config.deinit(gpa);
+    try std.testing.expectEqual(DatabaseBackendKind.turso_http, config.database.backend.?);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
