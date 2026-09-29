@@ -232,7 +232,14 @@ pub const Client = struct {
                 io,
                 "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
                 &table_param,
-            ) catch continue;
+            ) catch |err| {
+                // A missing table is not an error here — pragma_table_info
+                // returns zero rows for one — so every failure on this path
+                // is transport/auth/protocol and must not silently shrink
+                // the reported schema (turso parity, #160).
+                log.warn("d1.schema: pragma_table_info failed for table \"{s}\": {s}", .{ table_name, @errorName(err) });
+                return err;
+            };
             defer pragma_res.deinit();
 
             var cols_list: std.ArrayList(ColumnSchema) = .empty;

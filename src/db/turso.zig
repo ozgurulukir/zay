@@ -10,11 +10,15 @@
 //!   - Direct schema inspection using SQLite system tables and pragmas
 //!   - Health checks reporting SQLite version and engine identity
 //!   - URL scheme normalization (`libsql://` -> `https://`, auto-appending `/v2/pipeline`)
+//!   - Endpoint validation before transport (https, or loopback http only)
+//!   - Socket read timeout + bounded response bodies on every pipeline request
 
 const std = @import("std");
 const http = @import("../http.zig");
 const db = @import("../db.zig");
+const os = @import("../os.zig");
 const service = @import("service.zig");
+const mock_http_server = @import("../ai/mock_http_server.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.turso);
@@ -35,6 +39,12 @@ pub const SchemaResult = service.SchemaResult;
 ///   - `https://my-db.turso.io`  -> `https://my-db.turso.io/v2/pipeline`
 ///   - `http://127.0.0.1:8080`   -> `http://127.0.0.1:8080/v2/pipeline`
 ///   - `https://.../v2/pipeline` -> unchanged
+///
+/// Validation (#159) happens here, BEFORE any network activity: `https` is
+/// always accepted, plain `http` only for loopback endpoints (local libsql/
+/// sqld dev servers), and anything else — wrong scheme, missing host,
+/// embedded credentials, unparseable URL — fails with `UnsupportedScheme` /
+/// `InvalidEndpoint`.
 pub fn pipelineUrl(allocator: std.mem.Allocator, raw_url: []const u8) ![]u8 {
     assert(raw_url.len > 0);
     var base = raw_url;
@@ -45,17 +55,44 @@ pub fn pipelineUrl(allocator: std.mem.Allocator, raw_url: []const u8) ![]u8 {
     }
 
     const trimmed = std.mem.trimEnd(u8, base, "/");
+    var candidate: []u8 = undefined;
     if (std.mem.endsWith(u8, trimmed, "/v2/pipeline")) {
         if (scheme_override) |s| {
-            return std.fmt.allocPrint(allocator, "{s}{s}", .{ s, trimmed });
+            candidate = try std.fmt.allocPrint(allocator, "{s}{s}", .{ s, trimmed });
+        } else {
+            candidate = try allocator.dupe(u8, trimmed);
         }
-        return allocator.dupe(u8, trimmed);
+    } else if (scheme_override) |s| {
+        candidate = try std.fmt.allocPrint(allocator, "{s}{s}/v2/pipeline", .{ s, trimmed });
+    } else {
+        candidate = try std.fmt.allocPrint(allocator, "{s}/v2/pipeline", .{trimmed});
     }
+    errdefer allocator.free(candidate);
 
-    if (scheme_override) |s| {
-        return std.fmt.allocPrint(allocator, "{s}{s}/v2/pipeline", .{ s, trimmed });
+    const uri = std.Uri.parse(candidate) catch return error.InvalidEndpoint;
+    // Embedded credentials in a database endpoint are almost certainly a
+    // mis-pasted URL; reject rather than silently send them as auth material.
+    if (uri.user != null or uri.password != null) return error.InvalidEndpoint;
+    const host_component = uri.host orelse return error.InvalidEndpoint;
+    if (host_component.isEmpty()) return error.InvalidEndpoint;
+    var host_buffer: [256]u8 = undefined;
+    const host = host_component.toRaw(&host_buffer) catch return error.InvalidEndpoint;
+
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        // Always accepted.
+    } else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
+        // Plain HTTP is only permitted for loopback endpoints.
+        if (!isLoopbackHost(host)) return error.UnsupportedScheme;
+    } else {
+        return error.UnsupportedScheme;
     }
-    return std.fmt.allocPrint(allocator, "{s}/v2/pipeline", .{trimmed});
+    return candidate;
+}
+
+fn isLoopbackHost(host: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (std.ascii.eqlIgnoreCase(host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
+    return std.ascii.startsWithIgnoreCase(host, "127.");
 }
 
 pub const Client = struct {
@@ -63,6 +100,9 @@ pub const Client = struct {
     endpoint: []const u8,
     auth_token: ?[]const u8 = null,
     timeout_seconds: u32 = 15,
+    /// Response-body ceiling; over-cap responses fail with
+    /// `error.ResponseTooLarge`. Field (not constant) so tests can shrink it.
+    response_max_bytes: usize = service.response_max_bytes,
 
     pub fn init(allocator: std.mem.Allocator, endpoint: []const u8, auth_token: ?[]const u8) Client {
         assert(endpoint.len > 0);
@@ -282,7 +322,14 @@ pub const Client = struct {
                 io,
                 "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
                 &table_param,
-            ) catch continue;
+            ) catch |err| {
+                // A missing table is not an error here — pragma_table_info
+                // returns zero rows for one — so every failure on this path
+                // is transport/auth/protocol and must not silently shrink
+                // the reported schema (#160).
+                log.warn("turso.schema: pragma_table_info failed for table \"{s}\": {s}", .{ tbl_name, @errorName(err) });
+                return err;
+            };
             defer info_query.deinit();
 
             var cols: std.ArrayList(ColumnSchema) = .empty;
@@ -334,15 +381,14 @@ pub const Client = struct {
         io: std.Io,
         payload: []const u8,
     ) ![]const u8 {
-        var response_body: std.Io.Writer.Allocating = .init(allocator);
-        errdefer response_body.deinit();
-        var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
-
-        var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
-        defer http_client.deinit();
-
         const url = try pipelineUrl(allocator, self.endpoint);
         defer allocator.free(url);
+
+        // `timeoutAwareIo` translates the EAGAIN of an expired SO_RCVTIMEO
+        // into `error.Timeout` (Io.Threaded treats it as a programmer bug
+        // otherwise); `setSocketTimeout` below applies the timeout itself.
+        var http_client: std.http.Client = .{ .allocator = allocator, .io = http.timeoutAwareIo(io) };
+        defer http_client.deinit();
 
         const auth_header: ?[]u8 = if (self.auth_token) |t|
             try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
@@ -350,32 +396,77 @@ pub const Client = struct {
             null;
         defer if (auth_header) |a| allocator.free(a);
 
-        const status = http_client.fetch(.{
-            .method = .POST,
-            .location = .{ .url = url },
-            .payload = payload,
-            .response_writer = &response_body.writer,
-            .redirect_buffer = &redirect_buffer,
-            .keep_alive = true,
+        var req = http_client.request(.POST, std.Uri.parse(url) catch return error.InvalidEndpoint, .{
             .headers = .{
                 .content_type = .{ .override = http.content_type_json },
                 .authorization = if (auth_header) |a| .{ .override = a } else .omit,
             },
-        }) catch |err| switch (err) {
-            error.ConnectionRefused, error.ConnectionResetByPeer => return error.ConnectionRefused,
-            else => return err,
+        }) catch |err| return mapTransportError(err);
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var send_buffer: [http.body_buffer_bytes]u8 = undefined;
+        var body_writer = req.sendBodyUnflushed(&send_buffer) catch |err| return mapTransportError(err);
+        body_writer.writer.writeAll(payload) catch |err| return mapTransportError(err);
+        body_writer.end() catch |err| return mapTransportError(err);
+        req.connection.?.flush() catch |err| return mapTransportError(err);
+
+        var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
+        var http_response = req.receiveHead(&redirect_buffer) catch |err| return mapTransportError(err);
+
+        const code: u16 = @intFromEnum(http_response.head.status);
+        if (code == 401 or code == 403) return error.Unauthorized;
+
+        // Socket-level read timeout: a stalled response body fails with
+        // `error.ServerTimeout` instead of blocking the caller forever.
+        // Applied after the head so the (fast) head exchange is unaffected.
+        if (req.connection) |conn| http.setSocketTimeout(conn, self.timeout_seconds);
+
+        var transfer_buffer: [http.transfer_buffer_bytes]u8 = undefined;
+        var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = http_response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+
+        // Bounded accumulation (#159): over-cap bodies fail with
+        // `error.ResponseTooLarge` rather than exhausting memory.
+        const body = reader.allocRemaining(allocator, .limited(self.response_max_bytes)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ResponseTooLarge,
+            else => {
+                // Prefer the recorded socket error: a read failure wraps the
+                // SO_RCVTIMEO timeout as its reason.
+                if (err == error.ReadFailed) {
+                    if (req.connection) |conn| {
+                        if (conn.stream_reader.err) |reason| return mapTransportError(reason);
+                    }
+                }
+                return mapTransportError(err);
+            },
         };
 
-        const code: u16 = @intFromEnum(status.status);
-        if (code == 401 or code == 403) return error.Unauthorized;
         if (!http.isSuccess(code)) {
-            log.warn("turso HTTP {d} error response: {s}", .{ code, response_body.written() });
+            log.warn("turso HTTP {d} error response: {s}", .{ code, body });
+            allocator.free(body);
             return error.HttpError;
         }
-
-        return response_body.toOwnedSlice();
+        return body;
     }
 };
+
+/// Collapse connection-level transport failures onto the backend's coarse
+/// connection error, and the SO_RCVTIMEO timeout onto `ServerTimeout`;
+/// anything more specific propagates unchanged.
+fn mapTransportError(err: anyerror) anyerror {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.BrokenPipe,
+        error.ConnectionFailed,
+        => error.ConnectionRefused,
+        error.Timeout => error.ServerTimeout,
+        else => err,
+    };
+}
 
 fn requireOkResponse(item: std.json.Value, expected_type: []const u8, operation: []const u8) !std.json.Value {
     if (item != .object) return error.InvalidResponse;
@@ -718,4 +809,96 @@ test "parseHranaValue rejects malformed values" {
 
     try std.testing.expectError(error.InvalidResponse, parseHranaValue(aa, parsed.value.array.items[0]));
     try std.testing.expectError(error.InvalidResponse, parseHranaValue(aa, parsed.value.array.items[1]));
+}
+
+// #159: invalid endpoints must fail in pipelineUrl — BEFORE any network
+// activity. Wrong schemes, plain http off-loopback, embedded credentials,
+// and missing hosts are all configuration errors, not runtime surprises.
+test "pipelineUrl rejects invalid endpoints before transport" {
+    const gpa = std.testing.allocator;
+
+    try std.testing.expectError(error.UnsupportedScheme, pipelineUrl(gpa, "ftp://db.example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, pipelineUrl(gpa, "ws://db.example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, pipelineUrl(gpa, "http://db.example.com"));
+    try std.testing.expectError(error.InvalidEndpoint, pipelineUrl(gpa, "https://user:pass@db.example.com"));
+    try std.testing.expectError(error.InvalidEndpoint, pipelineUrl(gpa, "https:///v2/pipeline"));
+
+    // Local dev endpoints over plain http stay allowed.
+    const local = try pipelineUrl(gpa, "http://localhost:8080");
+    defer gpa.free(local);
+    try std.testing.expectEqualStrings("http://localhost:8080/v2/pipeline", local);
+}
+
+// #159: an oversized response body must fail with ResponseTooLarge instead
+// of accumulating without bound. The cap is a field so the test can shrink it.
+test "oversized pipeline responses fail with ResponseTooLarge" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "0123456789abcdefghij" }, // 20 bytes > cap
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(endpoint);
+    var client = Client.init(gpa, endpoint, null);
+    client.response_max_bytes = 16;
+
+    try std.testing.expectError(error.ResponseTooLarge, client.query(io, "SELECT 1", &.{}));
+}
+
+// #159: a server that sends the head then stalls the body must hit the
+// socket read timeout. POSIX-only: Windows has no socket-level timeout
+// through the std Io backend (see http.setSocketTimeout).
+test "stalled pipeline body times out" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "{}", .body_delay_ms = 1500 },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(endpoint);
+    var client = Client.init(gpa, endpoint, null);
+    client.timeout_seconds = 1;
+
+    try std.testing.expectError(error.ServerTimeout, client.query(io, "SELECT 1", &.{}));
+}
+
+// #160: a failed per-table pragma query must fail the whole schema request.
+// Before the fix, `catch continue` turned transport/auth/SQL failures into a
+// silently omitted table — the tool reported an incomplete schema as success.
+test "schema propagates pragma_table_info failures instead of omitting tables" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const listing_body =
+        \\{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"name"}],"rows":[[{"type":"text","value":"sessions"}]]}}},{"type":"ok","response":{"type":"close"}}]}
+    ;
+    const responses = [_]mock_http_server.Response{
+        // 1st roundtrip: sqlite_master lists one table.
+        .{ .status = .ok, .body = listing_body },
+        // 2nd roundtrip: pragma_table_info dies mid-request (HTTP 500).
+        .{ .status = .internal_server_error, .body = "boom" },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(endpoint);
+    const client = Client.init(gpa, endpoint, null);
+
+    try std.testing.expectError(error.HttpError, client.schema(io, null));
 }
