@@ -499,33 +499,196 @@ pub fn freePrunedViews(gpa: std.mem.Allocator, views: []ai.MessageView) void {
     gpa.free(views);
 }
 
+/// History image eviction with re-mention stubs (#122). Chat-completions
+/// APIs are stateless, so every image block re-uploads its base64 on every
+/// follow-up turn until compaction prunes the message. This pass replaces
+/// image blocks in OLDER user messages with a deterministic text stub — the
+/// model can re-attach any file by `@`-mentioning the path shown in the
+/// stub, mirroring how the `@`-mention markers already read.
+///
+/// Recency window: only the NEWEST user message keeps its images. Once a
+/// message stops being the newest user message its stub form never changes
+/// again, so the prompt-cache prefix pays exactly one miss per eviction and
+/// is stable thereafter. Affected messages become OWNED copies (borrowed
+/// history is never mutated); unaffected views keep their borrow/own state
+/// exactly as `pruneHistoricalToolResultsViews` left it. The stub text embeds
+/// the (already XML-escaped) `src` from the message's own `<image src="…"/>`
+/// marker when the pairing is unambiguous, and the decoded byte size.
+pub fn evictHistoryImagesViews(gpa: std.mem.Allocator, views: []ai.MessageView) !void {
+    if (views.len == 0) return;
+
+    var newest_user: ?usize = null;
+    for (views, 0..) |view, i| {
+        const msg = view.message();
+        if (msg.* == .user) newest_user = i;
+    }
+    const newest = newest_user orelse return;
+
+    for (views[0..newest]) |*view| {
+        // Only user messages can carry image blocks; tool prunes above may
+        // have left `.owned` copies — stub those the same way.
+        const msg = view.message();
+        if (msg.* != .user) continue;
+        if (!userMessageHasImage(msg.*)) continue;
+        view.* = .{ .owned = try stubImagesInUserMessage(gpa, msg.*) };
+    }
+}
+
+fn userMessageHasImage(msg: ai.ChatMessage) bool {
+    for (msg.user.content) |block| {
+        if (block == .image) return true;
+    }
+    return false;
+}
+
+/// Owned copy of a user message with every image block replaced by its
+/// re-mention stub. Text blocks are cloned (owned); the stub owns its bytes.
+fn stubImagesInUserMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage) !ai.ChatMessage {
+    var srcs: std.ArrayList([]const u8) = .empty;
+    defer srcs.deinit(gpa);
+    collectAttachedImageSrcs(gpa, msg.user.content, &srcs) catch {};
+
+    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
+    errdefer {
+        for (blocks.items) |*block| block.deinit(gpa);
+        blocks.deinit(gpa);
+    }
+
+    var image_index: usize = 0;
+    for (msg.user.content) |block| {
+        if (block == .image) {
+            const src: ?[]const u8 = if (image_index < srcs.items.len) srcs.items[image_index] else null;
+            image_index += 1;
+            const stub = try makeImageStub(gpa, block.image, src);
+            errdefer gpa.free(stub);
+            try blocks.append(gpa, .{ .text = .{ .text = stub } });
+        } else {
+            try blocks.append(gpa, try cloneContentBlock(gpa, block));
+        }
+    }
+    return .{ .user = .{ .content = try blocks.toOwnedSlice(gpa) } };
+}
+
+/// Collect the `src` values of every successful (non-error) `<image …/>`
+/// marker across the message's text blocks, in order. The attach path emits
+/// exactly one marker per attached image in mention order, so marker k pairs
+/// with image block k. Returned slices borrow from the text blocks (safe:
+/// the stub copies them into its own allocation before the caller reads on).
+fn collectAttachedImageSrcs(
+    gpa: std.mem.Allocator,
+    content: []const ai.ContentBlock,
+    out: *std.ArrayList([]const u8),
+) !void {
+    for (content) |block| {
+        if (block != .text) continue;
+        var rest = block.text.text;
+        while (std.mem.indexOf(u8, rest, "<image src=\"")) |open| {
+            const after = rest[open + "<image src=\"".len ..];
+            const close = std.mem.indexOfScalar(u8, after, '"') orelse break;
+            const src = after[0..close];
+            // Error markers (`<image src="…" error="…"/>`) name images that
+            // were NOT attached — they never pair with an image block.
+            const is_error = std.mem.startsWith(u8, after[close..], "\" error=");
+            if (!is_error and src.len > 0) {
+                try out.append(gpa, src);
+            }
+            rest = after[close..];
+        }
+    }
+}
+
+/// Human-readable byte size for the stub, e.g. `2.4 MB` / `812 KB` / `900 B`.
+fn formatStubSize(buf: []u8, bytes: usize) []const u8 {
+    if (bytes >= 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d:.1} MB", .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)}) catch "large";
+    }
+    if (bytes >= 1024) {
+        return std.fmt.bufPrint(buf, "{d:.0} KB", .{@as(f64, @floatFromInt(bytes)) / 1024.0}) catch "large";
+    }
+    return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "small";
+}
+
+fn makeImageStub(gpa: std.mem.Allocator, img: ai.ImageBlock, src: ?[]const u8) ![]u8 {
+    var size_buf: [24]u8 = undefined;
+    const decoded = std.base64.standard.Decoder.calcSizeForSlice(img.data_base64) catch
+        (img.data_base64.len * 3 / 4);
+    const size_text = formatStubSize(&size_buf, decoded);
+    if (src) |s| {
+        // `s` is already XML-escaped (it came from a marker) and the stub is
+        // stable text inside the cache prefix.
+        return std.fmt.allocPrint(
+            gpa,
+            "[image: {s} ({s}) — shown in an earlier turn; mention @{s} to view it again]",
+            .{ s, size_text, s },
+        );
+    }
+    return std.fmt.allocPrint(
+        gpa,
+        "[image ({s}, {s}) — shown in an earlier turn; mention the image's @path from the text above to view it again]",
+        .{ img.mime_type, size_text },
+    );
+}
+
 /// Estimate the token footprint of `messages[from_index..]` as the *pruned*
 /// request would actually send it: historical tool messages (below the cutoff
 /// computed over the FULL slice, so trailing messages get the same kept/pruned
 /// verdict the next request will) count with their text capped at
 /// `historical_tool_cap_bytes`; everything else counts in full. This keeps the
 /// watermark estimator and the wire request in agreement (TD-9).
+/// Token estimate for one evicted image stub (#122). The stub is bounded,
+/// fixed-shape text (~100–150 bytes), so a constant keeps the watermark
+/// estimator and the wire request in agreement (TD-9) without duplicating
+/// the stub formatter.
+pub const evicted_image_stub_tokens: u32 = 40;
+
 pub fn estimatePrunedTokensRange(
     messages: []const ai.ChatMessage,
     from_index: usize,
     keep_recent_tool_turns: u32,
     historical_tool_cap_bytes: u32,
+    evict_history_images: bool,
 ) u32 {
     assert(from_index <= messages.len);
     const maybe_cutoff = computeCutoff(messages, keep_recent_tool_turns);
     const pruning_active = maybe_cutoff != null;
     const cutoff_index = maybe_cutoff orelse 0;
+    // The eviction window mirrors `evictHistoryImagesViews`: only the newest
+    // user message keeps its images.
+    var newest_user: ?usize = null;
+    if (evict_history_images) {
+        for (messages, 0..) |*msg, i| {
+            if (msg.* == .user) newest_user = i;
+        }
+    }
     var total: u32 = 0;
     var index: usize = from_index;
     while (index < messages.len) : (index += 1) {
         const message = messages[index];
         if (pruning_active and index < cutoff_index and message == .tool) {
             total +|= compaction.estimateMessageTokensCapped(message, historical_tool_cap_bytes);
+        } else if (evict_history_images and message == .user and
+            newest_user != null and index < newest_user.? and userMessageHasImage(message))
+        {
+            total +|= estimateUserMessageWithEvictedImages(message);
         } else {
             total +|= compaction.estimateMessageTokens(message);
         }
     }
     return total;
+}
+
+/// Token estimate for a user message whose image blocks were replaced by
+/// stubs on the wire: text blocks at full length, each image at the stub
+/// constant.
+fn estimateUserMessageWithEvictedImages(message: ai.ChatMessage) u32 {
+    var tokens: u32 = 0;
+    for (message.user.content) |block| {
+        tokens +|= if (block == .image)
+            evicted_image_stub_tokens
+        else
+            compaction.estimateBlockTokens(block);
+    }
+    return tokens;
 }
 
 test "estimatePrunedTokensRange matches the bytes the pruned request sends" {
@@ -539,7 +702,7 @@ test "estimatePrunedTokensRange matches the bytes the pruned request sends" {
     defer for (&messages) |*m| m.deinit(gpa);
 
     const cap: u32 = 100;
-    const estimated = estimatePrunedTokensRange(&messages, 0, 1, cap);
+    const estimated = estimatePrunedTokensRange(&messages, 0, 1, cap, false);
     // message 0 capped at 100 bytes (~25 tokens) + message 1 (~1 token) +
     // message 2 in full (~1000 tokens).
     const expected = compaction.estimateMessageTokensCapped(messages[0], cap) +
@@ -565,8 +728,8 @@ test "trailing estimate uses the full-history cutoff verdict" {
     defer for (&messages) |*m| m.deinit(gpa);
 
     const cap: u32 = 100;
-    const full = estimatePrunedTokensRange(&messages, 0, 1, cap);
-    const trailing = estimatePrunedTokensRange(&messages, 1, 1, cap);
+    const full = estimatePrunedTokensRange(&messages, 0, 1, cap, false);
+    const trailing = estimatePrunedTokensRange(&messages, 1, 1, cap, false);
     // full = pruned(msg0) + msg1 + msg2 + msg3; trailing = msg1 + msg2 + msg3.
     try std.testing.expectEqual(full - compaction.estimateMessageTokensCapped(messages[0], cap), trailing);
 }
@@ -1746,4 +1909,87 @@ test "branch name with XML characters is escaped in the git environment block" {
         // No raw `</git_environment>` can appear inside the block itself.
         try std.testing.expect(std.mem.indexOf(u8, block, "</git_environment>") == null);
     }
+}
+
+// ─── #122: history image eviction ────────────────────────────────────────
+
+fn makeMarkerImageUserMessage(gpa: std.mem.Allocator, src: []const u8, data: []const u8) !ai.ChatMessage {
+    const blocks = try gpa.alloc(ai.ContentBlock, 2);
+    errdefer gpa.free(blocks);
+    const marker = try std.fmt.allocPrint(gpa, "look <image src=\"{s}\" />", .{src});
+    errdefer gpa.free(marker);
+    blocks[0] = .{ .text = .{ .text = marker } };
+    blocks[1] = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/png"),
+        .data_base64 = try gpa.dupe(u8, data),
+    } };
+    return .{ .user = .{ .content = blocks } };
+}
+
+test "evictHistoryImagesViews stubs older images, keeps the newest, never mutates history" {
+    const gpa = std.testing.allocator;
+    var messages: [3]ai.ChatMessage = undefined;
+    messages[0] = try makeMarkerImageUserMessage(gpa, "photo.png", "QUJD"); // older user message
+    messages[1] = try makeTextMessage(gpa, .assistant, "looks great");
+    messages[2] = try makeMarkerImageUserMessage(gpa, "chart.png", "REVG"); // newest user message
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const views = try gpa.alloc(ai.MessageView, 3);
+    for (&messages, 0..) |*m, i| views[i] = .{ .borrowed = m };
+    defer freePrunedViews(gpa, views);
+
+    try evictHistoryImagesViews(gpa, views);
+
+    // Older user message: OWNED copy, image replaced by a stub naming the
+    // file and its decoded size, text block preserved.
+    try std.testing.expect(views[0] == .owned);
+    const older = views[0].owned.user.content;
+    try std.testing.expectEqual(@as(usize, 2), older.len);
+    try std.testing.expect(older[0] == .text);
+    try std.testing.expect(older[1] == .text);
+    try std.testing.expect(std.mem.indexOf(u8, older[1].text.text, "[image: photo.png (3 B)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, older[1].text.text, "mention @photo.png to view it again") != null);
+
+    // Newest user message: still BORROWED (zero-copy) with the image intact.
+    try std.testing.expect(views[2] == .borrowed);
+    try std.testing.expect(views[2].borrowed.user.content[1] == .image);
+    try std.testing.expect(views[2].borrowed.user.content[1].image.data_base64.ptr ==
+        messages[2].user.content[1].image.data_base64.ptr);
+
+    // Borrowed history was never mutated: the older message still carries its
+    // real image block.
+    try std.testing.expect(messages[0].user.content[1] == .image);
+    try std.testing.expectEqualStrings("QUJD", messages[0].user.content[1].image.data_base64);
+}
+
+test "evictHistoryImagesViews leaves non-image and single-user histories untouched" {
+    const gpa = std.testing.allocator;
+    var messages: [2]ai.ChatMessage = undefined;
+    messages[0] = try makeTextMessage(gpa, .user, "plain");
+    messages[1] = try makeImageUserMessage(gpa);
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const views = try gpa.alloc(ai.MessageView, 2);
+    for (&messages, 0..) |*m, i| views[i] = .{ .borrowed = m };
+    defer freePrunedViews(gpa, views);
+
+    // The only user message IS the newest — nothing to evict, all borrowed.
+    try evictHistoryImagesViews(gpa, views);
+    try std.testing.expect(views[0] == .borrowed);
+    try std.testing.expect(views[1] == .borrowed);
+}
+
+test "estimatePrunedTokensRange counts evicted images as stub tokens" {
+    const gpa = std.testing.allocator;
+    var messages: [2]ai.ChatMessage = undefined;
+    messages[0] = try makeImageUserMessage(gpa); // older
+    messages[1] = try makeTextMessage(gpa, .user, "next");
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    const evicting = estimatePrunedTokensRange(&messages, 0, 5, 4096, true);
+    const keeping = estimatePrunedTokensRange(&messages, 0, 5, 4096, false);
+    // With eviction, message 0 counts one stub (evicted_image_stub_tokens)
+    // instead of a full image estimate.
+    try std.testing.expectEqual(keeping - compaction.estimateMessageTokens(messages[0]) + evicted_image_stub_tokens, evicting);
+    try std.testing.expect(evicting < keeping);
 }

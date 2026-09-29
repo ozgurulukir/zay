@@ -576,6 +576,13 @@ pub const Agent = struct {
                 self.compaction_settings.historical_tool_cap_bytes,
             );
             defer context_assembly.freePrunedViews(self.gpa, prompt_messages);
+            // #122: evict images from OLDER user messages into re-mention
+            // stubs before serialization — the newest user message keeps its
+            // images, the cache prefix stays stable afterwards, and the
+            // `defer freePrunedViews` above releases the owned stub copies.
+            if (self.compaction_settings.evict_history_images) {
+                try context_assembly.evictHistoryImagesViews(self.gpa, prompt_messages);
+            }
 
             // A permit is held only for the request itself (not across tool
             // execution), so a long bash call on one lane never head-of-line
@@ -1336,6 +1343,7 @@ pub const Agent = struct {
             anchor_count,
             self.compaction_settings.keep_recent_tool_turns,
             self.compaction_settings.historical_tool_cap_bytes,
+            self.compaction_settings.evict_history_images,
         );
     }
 
@@ -1346,6 +1354,7 @@ pub const Agent = struct {
             0,
             self.compaction_settings.keep_recent_tool_turns,
             self.compaction_settings.historical_tool_cap_bytes,
+            self.compaction_settings.evict_history_images,
         );
     }
 
