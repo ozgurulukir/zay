@@ -402,13 +402,18 @@ pub const ExecutorService = struct {
         }
         if (self.ctx.background_manager) |manager| {
             if (std.mem.eql(u8, call.name, tools.shell_tool.name) and shell_impl.wantsBackground(self.gpa, call.arguments)) {
+                // A background job can mutate anything its command touches —
+                // drop every cached read result before it starts (#5).
+                if (self.result_cache) |cache| cache.clear();
                 return shell_impl.runBackground(self.gpa, self.io, self.cwd, call.arguments, manager, self.ctx.owner_generation);
             }
         }
         // Tool-result cache (#5): identical read-only shell calls within one
         // session replay the earlier output instead of re-executing. Hits are
         // marked, mutating commands clear the cache (inside lookupShell),
-        // and everything but single read-only commands bypasses.
+        // and everything but single read-only commands bypasses. Any
+        // NON-shell tool (plugin bash bridge, MCP, database, lane) may
+        // mutate state a cached read captured — clear before it runs.
         if (self.result_cache) |cache| {
             if (std.mem.eql(u8, call.name, tools.shell_tool.name)) {
                 switch (cache.lookupShell(call.arguments)) {
@@ -420,6 +425,8 @@ pub const ExecutorService = struct {
                         return output;
                     },
                 }
+            } else {
+                cache.clear();
             }
         }
         return self.produceViaRegistry(call);

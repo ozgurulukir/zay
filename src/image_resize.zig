@@ -141,18 +141,32 @@ fn blendOverWhite(c: u64, a: u64) u8 {
 
 /// `writeToMemory` renders into the caller's buffer; the result is a slice
 /// INTO that buffer, so it is duped out before the buffer is freed. The
-/// buffer is sized from the destination pixels — after downscaling the long
-/// edge is <= target, so `w*h*3 + slack` cannot overflow and comfortably
-/// bounds a q85 JPEG of the same pixels.
+/// initial size covers ordinary q85 output; high-entropy content (noise,
+/// heavy dithering) can exceed raw RGB by ~30%, so one doubling retry
+/// covers the pathological case before degrading to `.unchanged`.
+///
+/// Known limitation: zigimg 0.1.0 has no EXIF support, so the re-encode
+/// drops the orientation tag — a portrait phone photo whose bytes rely on
+/// EXIF rotation arrives landscape. Providers that read EXIF server-side
+/// from the ORIGINAL bytes would have shown it upright; after downscale
+/// they cannot. Accepted for now (the wire-size win dominates); revisit
+/// when zigimg grows EXIF handling.
 fn encodeJpeg(gpa: std.mem.Allocator, image: zigimg.Image) ![]u8 {
-    const buf_len = image.width * image.height * 3 + 4096;
-    const buf = try gpa.alloc(u8, buf_len);
-    defer gpa.free(buf);
-    const written = try image.writeToMemory(gpa, buf, .{ .jpeg = .{
-        .quality = jpeg_quality,
-        .auto_convert = true,
-    } });
-    return gpa.dupe(u8, written);
+    var scale: usize = 3;
+    while (true) {
+        const buf_len = image.width * image.height * scale + 4096;
+        const buf = try gpa.alloc(u8, buf_len);
+        defer gpa.free(buf);
+        if (image.writeToMemory(gpa, buf, .{ .jpeg = .{
+            .quality = jpeg_quality,
+            .auto_convert = true,
+        } })) |written| {
+            return gpa.dupe(u8, written);
+        } else |err| {
+            if (err != error.NoSpaceLeft or scale >= 12) return err;
+            scale *= 2;
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -269,9 +283,9 @@ test "compositeResize averages boxes and composites alpha over white" {
     };
     var dst = [_]zigimg.color.Rgb24{.{ .r = 0, .g = 0, .b = 0 }};
     compositeResize(&src, 2, 2, &dst, 1, 1);
-    try std.testing.expectEqual(@as(u8, 128), dst[0].r);
-    try std.testing.expectEqual(@as(u8, 128), dst[0].g);
-    try std.testing.expectEqual(@as(u8, 128), dst[0].b);
+    try std.testing.expectEqual(@as(u8, 127), dst[0].r); // 510/4 truncates
+    try std.testing.expectEqual(@as(u8, 127), dst[0].g);
+    try std.testing.expectEqual(@as(u8, 127), dst[0].b);
 
     // Fully transparent red over white -> white.
     const transparent = [_]zigimg.color.Rgba32{
