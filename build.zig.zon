@@ -36,6 +36,13 @@
             .url = "git+https://github.com/rockorager/libvaxis.git#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
             .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
         },
+        // Pinned to the SAME commit vaxis uses so both resolve to one copy.
+        // Direct use: @-mention image downscaling (#119). vaxis also pulls it
+        // in for its own image rendering.
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg#d695acd97c02e57bb151e8f659d1280f5cd6ca70",
+            .hash = "zigimg-0.1.0-8_eo2oyaFwBZwJpmqPkCfVXWBrHcqbYwmrp1I6bTD3lI",
+        },
         .uucode = .{
             .url = "git+https://github.com/jacobsandlund/uucode#0620982aa8db310997b9e84305aaa102f60b4f30",
             .hash = "uucode-0.2.0-ZZjBPji8VABcj6beXwjg4uj-K7oqjvLubm_mjacFLh1Q",

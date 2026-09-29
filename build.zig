@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zigimg_dep = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const websocket_vendor_mod = b.createModule(.{
         .root_source_file = b.path("vendor/websocket.zig/src/websocket.zig"),
         .target = target,
@@ -80,6 +84,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "bounded_queue", .module = bounded_queue_mod },
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+            .{ .name = "zigimg", .module = zigimg_dep.module("zigimg") },
             .{ .name = "websocket", .module = websocket_mod },
             .{ .name = "logger", .module = logger_mod },
             .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
