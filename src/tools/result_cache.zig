@@ -36,18 +36,23 @@ const max_total_bytes: usize = 768 * 1024;
 
 /// First tokens whose single-invocation form cannot mutate state. VCS tools
 /// are gated further by `vcs_readonly_subcommands`.
+///
+/// Deliberately EXCLUDED despite being mostly read-only: `find`
+/// (`-delete`/`-exec` mutate), `sort` (`-o` writes), `hostname` (setter
+/// form), `date` (`-s` sets the clock), `xargs`/`awk`/`sed` (arbitrary
+/// side effects). When in doubt, leave it out — a missed cache hit costs a
+/// re-run; a wrongly cached mutation silently replays stale state.
 const read_only_verbs = [_][]const u8{
-    "ls",       "cat",          "head",        "tail",          "wc",       "file",          "stat",
-    "du",       "df",           "pwd",         "which",         "where",    "whoami",        "uname",
-    "date",     "id",           "hostname",    "printenv",      "echo",     "grep",          "egrep",
-    "fgrep",    "rg",           "find",        "fd",            "diff",     "cmp",           "sort",
-    "uniq",     "cut",          "jq",          "dir",           "type",
+    "ls",       "cat",           "head",        "tail",     "wc",           "file",        "stat",
+    "du",       "df",            "pwd",         "which",    "where",        "whoami",      "uname",
+    "id",       "printenv",      "echo",        "grep",     "egrep",        "fgrep",       "rg",
+    "fd",       "diff",          "cmp",         "uniq",     "cut",          "jq",          "dir",
+    "type",
     // PowerShell read cmdlets (names arrive in any casing).
-        "get-childitem", "get-content",
-    "get-item", "get-location", "get-process", "select-string", "get-date", "get-command",
+        "get-childitem", "get-content", "get-item", "get-location", "get-process", "select-string",
+    "get-date", "get-command",
     // VCS drivers — subcommand-gated below.
-      "git",
-    "hg",       "svn",
+      "git",         "hg",       "svn",
 };
 
 /// `git`-family subcommands that only ever read. `branch`/`tag`/`remote`/
@@ -55,6 +60,12 @@ const read_only_verbs = [_][]const u8{
 const vcs_readonly_subcommands = [_][]const u8{
     "status", "log",      "diff",     "show",       "blame",    "rev-parse", "describe",
     "reflog", "ls-files", "shortlog", "merge-base", "annotate", "cat",
+};
+
+/// Argument fragments that turn a nominally read-only command into a writer
+/// (`git diff --output=f.patch`, `jq` filter side effects stay out by verb).
+const forbidden_argument_fragments = [_][]const u8{
+    "--output", "-output=",
 };
 
 /// Shell metacharacters that make a command non-single (or enable command
@@ -69,6 +80,11 @@ pub fn isReadOnlyShellCommand(command: []const u8) bool {
     if (trimmed.len == 0) return false;
     for (forbidden_metachars) |mc| {
         if (std.mem.indexOfScalar(u8, trimmed, mc) != null) return false;
+    }
+    // Nominally read-only commands with writer forms (`git diff --output=…`)
+    // are rejected by fragment before the verb allowlist runs.
+    for (forbidden_argument_fragments) |frag| {
+        if (std.mem.indexOf(u8, trimmed, frag) != null) return false;
     }
 
     var tokens = std.mem.tokenizeAny(u8, trimmed, " \t");
@@ -178,14 +194,13 @@ pub const ResultCache = struct {
         }
         if (self.map.get(parsed.command)) |index| {
             const entry = &self.entries.items[index];
-            const dup = dupeOutput(self.gpa, &entry.output) catch return .miss;
-            const marked = markCached(self.gpa, dup) catch {
-                var mut = dup;
-                mut.deinit(self.gpa);
+            var dup = dupeOutput(self.gpa, &entry.output) catch return .miss;
+            markCached(self.gpa, &dup) catch {
+                dup.deinit(self.gpa);
                 return .miss;
             };
             log.info("tool result cache hit ({d}B command)", .{parsed.command.len});
-            return .{ .hit = marked };
+            return .{ .hit = dup };
         }
         return .miss;
     }
@@ -205,9 +220,9 @@ pub const ResultCache = struct {
             self.gpa.free(key);
             return;
         };
-        self.total_bytes += dup.stdout.len + dup.stderr.len;
+        self.total_bytes += outputFootprint(&dup);
         self.entries.append(self.gpa, .{ .key = key, .output = dup }) catch {
-            self.total_bytes -= dup.stdout.len + dup.stderr.len;
+            self.total_bytes -= outputFootprint(&dup);
             self.gpa.free(key);
             var mut = dup;
             mut.deinit(self.gpa);
@@ -215,7 +230,7 @@ pub const ResultCache = struct {
         };
         self.map.put(self.gpa, key, self.entries.items.len - 1) catch {
             const removed = self.entries.pop().?;
-            self.total_bytes -= removed.output.stdout.len + removed.output.stderr.len;
+            self.total_bytes -= outputFootprint(&removed.output);
             self.gpa.free(removed.key);
             var mut = removed.output;
             mut.deinit(self.gpa);
@@ -230,7 +245,7 @@ pub const ResultCache = struct {
         {
             const removed = self.entries.orderedRemove(0);
             _ = self.map.remove(removed.key);
-            self.total_bytes -= removed.output.stdout.len + removed.output.stderr.len;
+            self.total_bytes -= outputFootprint(&removed.output);
             self.gpa.free(removed.key);
             var mut = removed.output;
             mut.deinit(self.gpa);
@@ -270,6 +285,8 @@ fn parseShellArgs(gpa: std.mem.Allocator, arguments_json: []const u8) !ShellArgs
 }
 
 /// Deep-copy an `Output` so cache entries and hits own independent storage.
+/// Each field is cleaned up on its own failure, so any error return leaves
+/// nothing behind.
 pub fn dupeOutput(gpa: std.mem.Allocator, output: *const common.Output) !common.Output {
     var dup: common.Output = .{
         .stdout = try gpa.dupe(u8, output.stdout),
@@ -282,23 +299,58 @@ pub fn dupeOutput(gpa: std.mem.Allocator, output: *const common.Output) !common.
     }
     switch (output.display) {
         .none => {},
-        .text => |body| dup.display = .{ .text = try gpa.dupe(u8, body) },
-        .diff => |body| dup.display = .{ .diff = try gpa.dupe(u8, body) },
+        .text => |body| {
+            const copy = try gpa.dupe(u8, body);
+            errdefer gpa.free(copy);
+            dup.display = .{ .text = copy };
+        },
+        .diff => |body| {
+            const copy = try gpa.dupe(u8, body);
+            errdefer gpa.free(copy);
+            dup.display = .{ .diff = copy };
+        },
     }
     if (output.observation) |obs| {
         switch (obs) {
-            .complete => |text| dup.observation = .{ .complete = try gpa.dupe(u8, text) },
-            .truncated_tail => |tail| dup.observation = .{ .truncated_tail = .{
-                .text = try gpa.dupe(u8, tail.text),
-                .total_lines = tail.total_lines,
-                .shown_lines = tail.shown_lines,
-                .total_bytes = tail.total_bytes,
-                .shown_bytes = tail.shown_bytes,
-                .full_output_path = try gpa.dupe(u8, tail.full_output_path),
-            } },
+            .complete => |text| {
+                const copy = try gpa.dupe(u8, text);
+                errdefer gpa.free(copy);
+                dup.observation = .{ .complete = copy };
+            },
+            .truncated_tail => |tail| {
+                const text_copy = try gpa.dupe(u8, tail.text);
+                errdefer gpa.free(text_copy);
+                const path_copy = try gpa.dupe(u8, tail.full_output_path);
+                errdefer gpa.free(path_copy);
+                dup.observation = .{ .truncated_tail = .{
+                    .text = text_copy,
+                    .total_lines = tail.total_lines,
+                    .shown_lines = tail.shown_lines,
+                    .total_bytes = tail.total_bytes,
+                    .shown_bytes = tail.shown_bytes,
+                    .full_output_path = path_copy,
+                } };
+            },
         }
     }
     return dup;
+}
+
+/// Retained-byte footprint of a cached entry: every owned body, not just
+/// stdout/stderr — a truncated-tail observation can carry the bulk.
+fn outputFootprint(output: *const common.Output) usize {
+    var total = output.stdout.len + output.stderr.len;
+    switch (output.display) {
+        .none => {},
+        .text, .diff => |body| total += body.len,
+    }
+    if (output.observation) |obs| {
+        switch (obs) {
+            .complete => |text| total += text.len,
+            .truncated_tail => |tail| total += tail.text.len + tail.full_output_path.len,
+        }
+    }
+    return total;
 }
 
 const cache_marker = "[cached result of an identical earlier call this session — run a mutating command or change the command to refresh]\n";
@@ -306,25 +358,27 @@ const cache_marker = "[cached result of an identical earlier call this session �
 /// Prefix the cached marker onto a hit's rendered surfaces so the model
 /// knows the output is a replay and may be stale. `formatLlmObservation`
 /// prefers `observation` over `stdout`, so whichever surface exists gets the
-/// marker (both, when both do).
-fn markCached(gpa: std.mem.Allocator, output: common.Output) !common.Output {
-    var mut = output;
+/// marker (both, when both do). Mutates `output` IN PLACE and only swaps a
+/// field after its replacement allocation succeeded, so a caller's
+/// deinit-on-error path stays valid on every failure.
+fn markCached(gpa: std.mem.Allocator, output: *common.Output) !void {
+    {
+        const marked = try std.fmt.allocPrint(gpa, "{s}{s}", .{ cache_marker, output.stdout });
+        gpa.free(output.stdout);
+        output.stdout = marked;
+    }
 
-    const marked_stdout = try std.fmt.allocPrint(gpa, "{s}{s}", .{ cache_marker, output.stdout });
-    gpa.free(mut.stdout);
-    mut.stdout = marked_stdout;
-
-    if (mut.observation) |obs| {
+    if (output.observation) |obs| {
         switch (obs) {
             .complete => |text| {
                 const marked = try std.fmt.allocPrint(gpa, "{s}{s}", .{ cache_marker, text });
-                gpa.free(mut.observation.?.complete);
-                mut.observation = .{ .complete = marked };
+                gpa.free(output.observation.?.complete);
+                output.observation = .{ .complete = marked };
             },
             .truncated_tail => |tail| {
                 const marked = try std.fmt.allocPrint(gpa, "{s}{s}", .{ cache_marker, tail.text });
-                gpa.free(mut.observation.?.truncated_tail.text);
-                mut.observation = .{ .truncated_tail = .{
+                gpa.free(output.observation.?.truncated_tail.text);
+                output.observation = .{ .truncated_tail = .{
                     .text = marked,
                     .total_lines = tail.total_lines,
                     .shown_lines = tail.shown_lines + 1,
@@ -335,7 +389,6 @@ fn markCached(gpa: std.mem.Allocator, output: common.Output) !common.Output {
             },
         }
     }
-    return mut;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -356,6 +409,17 @@ test "isReadOnlyShellCommand accepts single read-only verbs" {
     try std.testing.expect(!isReadOnlyShellCommand("git status && npm test"));
     try std.testing.expect(!isReadOnlyShellCommand("cat $(which git)"));
     try std.testing.expect(!isReadOnlyShellCommand("ls | grep foo"));
+
+    // Verbs with mutating FORMS are excluded outright (review follow-up):
+    // a wrongly cached mutation replays stale state as ground truth.
+    try std.testing.expect(!isReadOnlyShellCommand("find . -name '*.log' -delete"));
+    try std.testing.expect(!isReadOnlyShellCommand("find . -exec rm -rf {} +"));
+    try std.testing.expect(!isReadOnlyShellCommand("sort -o out.txt in.txt"));
+    try std.testing.expect(!isReadOnlyShellCommand("hostname newname"));
+    try std.testing.expect(!isReadOnlyShellCommand("date -s '2020-01-01'"));
+    // Read-only verbs with writer flags are rejected by fragment.
+    try std.testing.expect(!isReadOnlyShellCommand("git diff --output=patch.diff"));
+    try std.testing.expect(!isReadOnlyShellCommand("git show --output=f.txt HEAD"));
 }
 
 test "cache hit, miss, and mutation invalidation" {
