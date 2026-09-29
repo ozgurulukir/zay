@@ -1487,10 +1487,10 @@ test "prompt contract: POSIX and Windows system prompts satisfy core invariants"
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane enter") == null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "lane leave") == null);
 
-    // 6. Session history uses the platform-config placeholder, not a hardcoded
-    // POSIX path that is wrong on Windows.
-    try std.testing.expect(std.mem.indexOf(u8, common, "${CONFIG_DIR}/sessions.sqlite") != null);
-    try std.testing.expect(std.mem.indexOf(u8, common, "~/.config/zay/sessions.sqlite") == null);
+    // 6. Session history deliberately names no storage path at all — the
+    // builtin `database` tool resolves the active backend — and must never
+    // regress to a hardcoded sessions path that is wrong on Windows.
+    try std.testing.expect(std.mem.indexOf(u8, common, "sessions.sqlite") == null);
 }
 
 test "prompt contract: handover prompt includes summary placeholder and provenance rule" {

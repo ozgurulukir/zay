@@ -235,6 +235,13 @@ const remote_migrations = [_]RemoteMigration{
     },
 };
 
+// The steady-state gate compares against `schema_version`; the unit list must
+// end exactly there, or a unit added beyond it would never apply to databases
+// already recorded at `schema_version`.
+comptime {
+    assert(remote_migrations[remote_migrations.len - 1].version == schema_version);
+}
+
 /// Adapter presenting a `*SessionBackend` as the migration engine's executor.
 /// The engine is generic over this shape so tests can drive the exact same
 /// code against a local SQLite connection (no sockets).
