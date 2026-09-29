@@ -474,8 +474,7 @@ fn requireOkResponse(item: std.json.Value, expected_type: []const u8, operation:
     const result_type = item.object.get("type") orelse return error.InvalidResponse;
     if (result_type != .string) return error.InvalidResponse;
     if (std.mem.eql(u8, result_type.string, "error")) {
-        logResponseError(operation, item.object.get("error"));
-        return error.QueryFailed;
+        return classifyProviderError(item.object.get("error"), operation);
     }
     if (!std.mem.eql(u8, result_type.string, "ok")) return error.InvalidResponse;
 
@@ -488,11 +487,67 @@ fn requireOkResponse(item: std.json.Value, expected_type: []const u8, operation:
     return response;
 }
 
+/// Log a Turso/LibSQL error object's code+message for diagnosis.
+fn logProviderError(operation: []const u8, error_value: ?std.json.Value) void {
+    const err_obj = error_value orelse {
+        log.warn("turso.{s} error: (no error object)", .{operation});
+        return;
+    };
+    if (err_obj != .object) {
+        log.warn("turso.{s} error: (malformed error object)", .{operation});
+        return;
+    }
+    const message: []const u8 = if (err_obj.object.get("message")) |m|
+        (if (m == .string) m.string else "")
+    else
+        "";
+    const code: []const u8 = if (err_obj.object.get("code")) |c|
+        (if (c == .string) c.string else "")
+    else
+        "";
+    log.warn("turso.{s} error code={s} message={s}", .{ operation, code, message });
+}
+
+/// Inspect a Turso/LibSQL error object (`{"message": ..., "code": ...}`) and
+/// return a distinguishable error class (#162): callers can tell constraint,
+/// syntax, and generic provider failures apart without parsing logs. The
+/// code+message are always logged here for diagnosis.
+fn classifyProviderError(error_value: ?std.json.Value, operation: []const u8) Error {
+    logProviderError(operation, error_value);
+    if (error_value == null or error_value.? != .object) return error.QueryFailed;
+    const err_obj = error_value.?;
+
+    const message: []const u8 = if (err_obj.object.get("message")) |m|
+        (if (m == .string) m.string else "")
+    else
+        "";
+    const code: []const u8 = if (err_obj.object.get("code")) |c|
+        (if (c == .string) c.string else "")
+    else
+        "";
+
+    // Classification keys off the provider error code first (SQLite extended
+    // codes like SQLITE_CONSTRAINT_FOREIGNKEY) and falls back to the message
+    // text, since sqld deployments frequently omit the code field.
+    if (std.ascii.indexOfIgnoreCase(code, "CONSTRAINT") != null or
+        std.ascii.indexOfIgnoreCase(message, "constraint") != null or
+        std.ascii.indexOfIgnoreCase(message, "unique") != null or
+        std.ascii.indexOfIgnoreCase(message, "foreign key") != null)
+    {
+        return error.ConstraintFailed;
+    }
+    if (std.ascii.indexOfIgnoreCase(code, "SQLITE_ERROR") != null or
+        std.ascii.indexOfIgnoreCase(message, "syntax error") != null)
+    {
+        return error.SqlSyntaxError;
+    }
+    return error.QueryFailed;
+}
+
 fn logResponseError(operation: []const u8, error_value: ?std.json.Value) void {
-    const err_obj = error_value orelse return;
-    if (err_obj != .object) return;
-    const message = err_obj.object.get("message") orelse return;
-    if (message == .string) log.warn("turso.{s} error: {s}", .{ operation, message.string });
+    // Kept for the close-ambiguity path, where the error is observed but must
+    // not fail the operation (see validateCloseResponse).
+    logProviderError(operation, error_value);
 }
 
 fn validateCloseResponse(item: std.json.Value, operation: []const u8) !void {
@@ -503,6 +558,8 @@ fn validateCloseResponse(item: std.json.Value, operation: []const u8) !void {
     if (std.mem.eql(u8, result_type.string, "error")) {
         // The statement has already completed, so surfacing a close failure as
         // a query failure could make a caller retry a committed mutation.
+        // Observe only: the provider code+message are logged via
+        // classifyProviderError for diagnosis (#162).
         logResponseError(operation, item.object.get("error"));
         return;
     }
@@ -517,6 +574,11 @@ fn validateCloseResponse(item: std.json.Value, operation: []const u8) !void {
 }
 
 fn validateBatchResult(batch_response: std.json.Value, statement_count: usize) !void {
+    // Defensive shape validation (#162): do not assume the caller handed us
+    // an object — a malformed response is InvalidResponse, never a query
+    // failure the caller might retry.
+    if (batch_response != .object) return error.InvalidResponse;
+
     const result = batch_response.object.get("result") orelse return error.InvalidResponse;
     if (result != .object) return error.InvalidResponse;
 
@@ -534,17 +596,16 @@ fn validateBatchResult(batch_response: std.json.Value, statement_count: usize) !
         const step_result = step_results.array.items[step];
         const step_error = step_errors.array.items[step];
         if (step_error != .null) {
-            logResponseError("batch", step_error);
-            return error.QueryFailed;
+            return classifyProviderError(step_error, "batch step");
         }
-        if (step_result != .object) return error.QueryFailed;
+        if (step_result != .object) return error.InvalidResponse;
     }
 
     const rollback_step = commit_step + 1;
     if (step_results.array.items[rollback_step] != .null or
         step_errors.array.items[rollback_step] != .null)
     {
-        logResponseError("batch rollback", step_errors.array.items[rollback_step]);
+        log.warn("turso.batch rollback executed after commit step", .{});
         return error.QueryFailed;
     }
 }
@@ -610,6 +671,10 @@ pub fn serializeHranaValue(writer: anytype, allocator: std.mem.Allocator, val: d
             try writer.writeAll("}");
         },
         .float => |v| {
+            // NaN/Infinity are not representable in JSON — reject them before
+            // they can produce an invalid payload the provider would refuse
+            // with a confusing error (#162).
+            if (!std.math.isFinite(v)) return error.InvalidParameter;
             try writer.writeAll("{\"type\":\"float\",\"value\":");
             try writer.print("{d}", .{v});
             try writer.writeAll("}");
@@ -750,12 +815,91 @@ test "validateBatchResult accepts commit and rejects rollback" {
         \\  "type": "batch",
         \\  "result": {
         \\    "step_results": [{}, null, null, {}],
-        \\    "step_errors": [null, {"message": "constraint failed"}, null, null]
+        \\    "step_errors": [null, {"message": "constraint failed", "code": "SQLITE_CONSTRAINT_PRIMARYKEY"}, null, null]
         \\  }
         \\}
     ;
     const rolled_back = try std.json.parseFromSlice(std.json.Value, arena.allocator(), rolled_back_response, .{});
-    try std.testing.expectError(error.QueryFailed, validateBatchResult(rolled_back.value, 1));
+    // Constraint-class failures are distinguishable from generic provider
+    // failures (#162) — callers can branch without parsing logs.
+    try std.testing.expectError(error.ConstraintFailed, validateBatchResult(rolled_back.value, 1));
+}
+
+// #162: batch validation must independently validate response shape. A
+// non-object batch response or a malformed step entry is a protocol error
+// (InvalidResponse), not a query failure a caller might retry; provider
+// error objects classify into distinct error classes.
+test "validateBatchResult validates shape and classifies provider errors" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Non-object input: InvalidResponse even though the caller was supposed
+    // to pre-validate (requireOkResponse) — defense in depth.
+    const not_object = try std.json.parseFromSlice(std.json.Value, aa, "123", .{});
+    try std.testing.expectError(error.InvalidResponse, validateBatchResult(not_object.value, 1));
+
+    // A step_result entry with the wrong shape is a protocol violation.
+    const bad_step_shape =
+        \\{
+        \\  "type": "batch",
+        \\  "result": {
+        \\    "step_results": [{}, "not-an-object", {}, null],
+        \\    "step_errors": [null, null, null, null]
+        \\  }
+        \\}
+    ;
+    const bad_shape = try std.json.parseFromSlice(std.json.Value, aa, bad_step_shape, .{});
+    try std.testing.expectError(error.InvalidResponse, validateBatchResult(bad_shape.value, 1));
+
+    // A syntax-class provider error classifies distinctly.
+    const syntax_error =
+        \\{
+        \\  "type": "batch",
+        \\  "result": {
+        \\    "step_results": [{}, null, null, {}],
+        \\    "step_errors": [null, {"message": "near \"FRUM\": syntax error"}, null, null]
+        \\  }
+        \\}
+    ;
+    const syntax = try std.json.parseFromSlice(std.json.Value, aa, syntax_error, .{});
+    try std.testing.expectError(error.SqlSyntaxError, validateBatchResult(syntax.value, 1));
+}
+
+// #162: NaN and infinities are not representable in JSON; they must be
+// rejected at serialization time with a dedicated invalid-parameter error.
+test "serializeHranaValue rejects non-finite floats" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try std.testing.expectError(
+        error.InvalidParameter,
+        serializeHranaValue(&out.writer, gpa, .{ .float = std.math.nan(f64) }),
+    );
+    try std.testing.expectError(
+        error.InvalidParameter,
+        serializeHranaValue(&out.writer, gpa, .{ .float = std.math.inf(f64) }),
+    );
+    // A finite float still serializes.
+    try serializeHranaValue(&out.writer, gpa, .{ .float = 1.5 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"type\":\"float\"") != null);
+}
+
+// #162: a close-response failure is observed (code+message logged) but must
+// NOT fail the operation — the statement already completed, and surfacing
+// the failure could make a caller retry a committed mutation.
+test "validateCloseResponse observes error results without failing" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const close_error =
+        \\{"type":"error","error":{"message":"io error","code":"HRANA_CLOSED"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), close_error, .{});
+    try validateCloseResponse(parsed.value, "test close");
 }
 
 test "parseHranaValue parses integers, text, floats, blobs, and nulls" {
