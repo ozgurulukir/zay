@@ -1301,10 +1301,10 @@ test "countRows matches render across widths and content shapes" {
     const Case = struct { name: []const u8, text: []const u8, min_width: u16 };
     const cases = [_]Case{
         .{ .name = "plain_long", .text = "the quick brown fox jumps over the lazy dog repeatedly", .min_width = 1 },
-        .{ .name = "list_multiline", .text = "- this is a list item with enough words to wrap across several lines at moderate widths", .min_width = 3 },
-        .{ .name = "quote_multiline", .text = "> quoted text that is long enough to wrap across multiple terminal lines here now", .min_width = 3 },
+        .{ .name = "list_multiline", .text = "- this is a list item with enough words to wrap across several lines at moderate widths", .min_width = 1 },
+        .{ .name = "quote_multiline", .text = "> quoted text that is long enough to wrap across multiple terminal lines here now", .min_width = 1 },
         .{ .name = "heading_wrap", .text = "# A fairly long heading that should wrap at narrower widths", .min_width = 1 },
-        .{ .name = "list_longword", .text = "- short then aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail", .min_width = 3 },
+        .{ .name = "list_longword", .text = "- short then aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail", .min_width = 1 },
         .{ .name = "cjk", .text = "日本語の文章です this is mixed ascii and wide chars wrapping", .min_width = 1 },
         .{ .name = "many_short", .text = "a b c d e f g h i j k l m n o p q r s t u v w x y z", .min_width = 1 },
         .{ .name = "multiword_hardwrap", .text = "aa bb cc dd ee ff", .min_width = 1 },
@@ -1326,6 +1326,29 @@ test "countRows matches render across widths and content shapes" {
     }
 }
 
+// Regression (#134): list/quote content uses continuation_indent = 2, and the
+// hard-break loop used to commit rows forever without advancing when
+// width <= 2 left zero capacity. These exact repros must terminate — a
+// regression shows up as this test hanging, not failing an assertion.
+test "list and quote wrapping terminate at width <= 2" {
+    const gpa = std.testing.allocator;
+    const repros = [_][]const u8{
+        "- a b c",
+        "> a b c",
+        "- aaaaaaaaaaaaaaaaaaaa",
+        "> aaaaaaaaaaaaaaaaaaaa",
+    };
+    for (repros) |text| {
+        for ([_]u16{ 1, 2 }) |w| {
+            const counted = countRows(gpa, text, w);
+            var out = try render(gpa, text, w);
+            defer out.deinit(gpa);
+            try std.testing.expectEqual(counted, @as(u16, @intCast(out.rows.len)));
+            try std.testing.expect(counted > 0);
+        }
+    }
+}
+
 // Invariant behind `renderLimited`'s byte-bound capacity estimate: every
 // rendered row consumes at least one input byte, except the single empty-body
 // row (table border rows are paid for by the >=3-byte lines that produce them).
@@ -1342,8 +1365,8 @@ test "rendered rows never exceed text length plus one" {
         .{ .name = "mixed_blank", .text = "a\n\n\nb\n", .min_width = 1 },
         .{ .name = "whitespace_only", .text = "   \n\t\n", .min_width = 1 },
         .{ .name = "heading", .text = "# A fairly long heading that should wrap at narrower widths", .min_width = 1 },
-        .{ .name = "list_longword", .text = "- short then aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail", .min_width = 3 },
-        .{ .name = "quote", .text = "> quoted text that is long enough to wrap across multiple terminal lines here now", .min_width = 3 },
+        .{ .name = "list_longword", .text = "- short then aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tail", .min_width = 1 },
+        .{ .name = "quote", .text = "> quoted text that is long enough to wrap across multiple terminal lines here now", .min_width = 1 },
         .{ .name = "table_cjk", .text = "| Name | Value |\n| --- | --- |\n| 日本語のとても長い内容 | beta with words that wrap |\n", .min_width = 1 },
         .{ .name = "code", .text = "```\ncode line one\n\ncode line two\n```\n", .min_width = 1 },
     };
