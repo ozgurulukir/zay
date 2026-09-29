@@ -364,13 +364,46 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (background_visible) {
+        // Live log-tail panel (#37): re-read the selected job's log each
+        // frame while expanded — one bounded 64 KiB tail read via the shared
+        // `readLogTailBounded` (the same helper the `background` tool uses),
+        // so following an active job costs nothing measurable and the panel
+        // auto-scrolls (the newest lines always fit the visible window).
+        var log_text: []const u8 = "";
+        var log_note: []const u8 = "";
+        if (app.background_modal_state.log_expanded) {
+            if (app.background) |manager| {
+                if (manager.snapshot(app.gpa) catch null) |views| {
+                    defer tui.background_mod.BackgroundManager.freeViews(app.gpa, views);
+                    if (views.len > 0) {
+                        const sel = @min(app.background_modal_state.selection, views.len - 1);
+                        // The note outlives `views` — dupe into the frame arena.
+                        log_note = std.fmt.allocPrint(ctx.arena, "{s}", .{views[sel].log_path}) catch views[sel].log_path;
+                        log_text = background_jobs.background_tool.readLogTailBounded(
+                            app.io,
+                            ctx.arena,
+                            views[sel].log_path,
+                            @intCast(background_jobs.log_tail_max_lines),
+                        ) catch "";
+                    }
+                }
+            }
+        }
         var jobs_view: background_jobs.BackgroundJobsWidget = .{ .props = .{
             .manager = app.background,
             .selection = app.background_modal_state.selection,
             .cancel_focus = app.background_modal_state.cancel_focus,
+            .log_expanded = app.background_modal_state.log_expanded,
+            .log_text = log_text,
+            .log_note = log_note,
         } };
-        const rows: u16 = @intCast(@min(@as(usize, 8), app.runningBackgroundCount()));
-        const panel_height: u16 = @min(layout.input_row, rows + 4);
+        const rows: usize = @min(@as(usize, 8), app.runningBackgroundCount());
+        const panel_height = background_jobs.panelHeight(
+            rows,
+            app.background_modal_state.log_expanded,
+            log_text,
+            layout.input_row,
+        );
         children[idx] = .{
             .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
             .surface = try jobs_view.widget().draw(ctx.withConstraints(
