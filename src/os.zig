@@ -233,6 +233,7 @@ const windows = if (is_windows) struct {
     const UINT = u32;
     extern "kernel32" fn SetConsoleOutputCP(wCodePageID: UINT) callconv(.winapi) BOOL;
     extern "kernel32" fn SetConsoleCP(wCodePageID: UINT) callconv(.winapi) BOOL;
+    extern "kernel32" fn FlushConsoleInputBuffer(hConsoleInput: HANDLE) callconv(.winapi) BOOL;
 
     // Job Object surface (kill-on-close process trees). Byte-identical to the
     // definitions in `background.zig` — foreground capture teardown and
@@ -302,5 +303,15 @@ pub fn initConsoleUtf8() void {
     if (comptime is_windows) {
         _ = windows.SetConsoleOutputCP(65001);
         _ = windows.SetConsoleCP(65001);
+    }
+}
+
+/// Discard Win32 input records left over when the TUI exits on a key press.
+/// Vaxis enables Win32 input mode so Windows can preserve key-release and
+/// modifier information; a queued release otherwise reaches the shell as its
+/// CSI-underscore encoding.
+pub fn discardConsoleInput() void {
+    if (comptime is_windows) {
+        _ = windows.FlushConsoleInputBuffer(std.Io.File.stdin().handle);
     }
 }
