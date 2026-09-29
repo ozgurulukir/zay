@@ -139,6 +139,53 @@ test "buildUserMessage embeds text files and attaches images" {
     try std.testing.expectEqualStrings("image/png", blocks[1].image.mime_type);
 }
 
+test "buildUserMessage downsizes oversized image mentions to JPEG" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const zigimg = @import("zigimg");
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    // A noise PNG comfortably over the 1 MB downscale threshold — the exact
+    // shape of an oversized photo mention. Dimensions stay under the 1568 px
+    // edge so the re-encode (not the resize) is what the assertions see.
+    var img = try zigimg.Image.create(gpa, 1024, 1024, .rgb24);
+    defer img.deinit(gpa);
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+    for (img.pixels.rgb24) |*px| {
+        px.* = .{ .r = rand.int(u8), .g = rand.int(u8), .b = rand.int(u8) };
+    }
+    const png_buf = try gpa.alloc(u8, 1024 * 1024 * 3 + 65536);
+    defer gpa.free(png_buf);
+    const png = try img.writeToMemory(gpa, png_buf, .{ .png = .{} });
+    try std.testing.expect(png.len > 1024 * 1024);
+
+    const rel_dir = ".zig-cache/at-mention-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    try writeTestFile(io, rel_dir ++ "/noise.png", png);
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "look @noise.png");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[1] == .image);
+    // The downscale path swapped the container: attached bytes are JPEG.
+    try std.testing.expectEqualStrings("image/jpeg", blocks[1].image.mime_type);
+
+    const b64 = blocks[1].image.data_base64;
+    const decoded = try gpa.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(b64));
+    defer gpa.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, b64);
+    try std.testing.expect(std.mem.startsWith(u8, decoded, "\xff\xd8\xff"));
+}
+
 test "buildUserMessage with no mentions is a lone text block" {
     const gpa = std.testing.allocator;
     const blocks = try buildUserMessage(gpa, std.testing.io, ".", "plain prompt");

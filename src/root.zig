@@ -18,6 +18,7 @@ pub const context = @import("context/manager.zig");
 pub const context_assembly = @import("context/assembly.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
+pub const image_resize = @import("image_resize.zig");
 pub const os = @import("os.zig");
 pub const paths = @import("paths.zig");
 pub const search = @import("search.zig");

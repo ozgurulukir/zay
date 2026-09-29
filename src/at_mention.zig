@@ -18,6 +18,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const common = @import("tools/common.zig");
+const image_resize = @import("image_resize.zig");
 const sigil_query = @import("sigil_query.zig");
 const skill_mod = @import("skill.zig");
 
@@ -239,9 +240,22 @@ fn attachOrMarkImage(
             // payload — rescued by the sniff, nothing to report.
             try writeImageMarker(writer, path, null);
             if (blocks_out) |blocks| {
-                const encoded = try encodeBase64(gpa, bytes);
+                // Oversized JPEG/PNG photos are downscaled to the provider
+                // vision edge and re-encoded JPEG before attach (#119); a
+                // decode failure attaches the original bytes instead.
+                var attach_bytes: []const u8 = bytes;
+                var downscaled: ?[]u8 = null;
+                defer if (downscaled) |d| gpa.free(d);
+                const result = image_resize.downscaleIfNeeded(gpa, bytes) catch
+                    image_resize.Downscale{ .unchanged = {} };
+                if (result == .jpeg) {
+                    downscaled = result.jpeg;
+                    attach_bytes = downscaled.?;
+                }
+                const encoded = try encodeBase64(gpa, attach_bytes);
                 errdefer gpa.free(encoded);
-                const mime_owned = try gpa.dupe(u8, sniffed);
+                const mime: []const u8 = if (downscaled != null) "image/jpeg" else sniffed;
+                const mime_owned = try gpa.dupe(u8, mime);
                 errdefer gpa.free(mime_owned);
                 try blocks.append(gpa, .{ .image = .{ .mime_type = mime_owned, .data_base64 = encoded } });
             }
