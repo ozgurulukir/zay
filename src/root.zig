@@ -586,6 +586,7 @@ test {
     // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
     _ = @import("ai/text_tool_call.zig");
     _ = @import("ai/model_compat.zig");
+    _ = @import("ai/json.zig");
     _ = @import("ai/openai_request.zig");
     _ = @import("ai/responses_request.zig");
     _ = @import("ai/responses_events.zig");

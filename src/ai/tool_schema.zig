@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const ai = @import("../ai.zig");
+const wire_json = @import("json.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
 
@@ -112,9 +113,9 @@ fn writeToolDefinition(
         .completions => try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":"),
         .responses => try writer.writeAll("{\"type\":\"function\",\"name\":"),
     }
-    try std.json.Stringify.value(name, .{}, writer);
+    try wire_json.writeString(writer, gpa, name);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(desc, .{}, writer);
+    try wire_json.writeString(writer, gpa, desc);
     // Strict structured-outputs mode is OpenAI-only. Gateways that don't
     // support it silently break function-calling, so it's opt-in via
     // `ai.Config.strict`. The leading comma is always written so the next
@@ -124,7 +125,7 @@ fn writeToolDefinition(
     } else {
         try writer.writeAll(",\"parameters\":");
     }
-    try writeParameters(writer, schema, strict);
+    try writeParameters(gpa, writer, schema, strict);
     switch (envelope) {
         // Close the inner `function` object (the outer tool object is closed
         // by the common `}` below; the Responses envelope has no inner object).
@@ -134,13 +135,18 @@ fn writeToolDefinition(
     try writer.writeByte('}');
 }
 
-fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: bool) !void {
+fn writeParameters(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    schema: tools_common.Schema,
+    strict: bool,
+) !void {
     try writer.writeAll("{\"type\":\"object\",\"additionalProperties\":");
     try writer.writeAll(if (!strict and schema.allow_extra_properties) "true" else "false");
     try writer.writeAll(",\"properties\":{");
     for (schema.properties, 0..) |prop, p| {
         if (p > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(prop.name, .{}, writer);
+        try wire_json.writeString(writer, gpa, prop.name);
         try writer.writeAll(":{\"type\":");
         const kind_str = kindName(prop.kind);
         if (prop.acceptsNull()) {
@@ -149,14 +155,14 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: 
             try std.json.Stringify.value(kind_str, .{}, writer);
         }
         try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(prop.description, .{}, writer);
+        try wire_json.writeString(writer, gpa, prop.description);
         // Emit enum constraint when present.
         if (prop.enum_values) |ev| {
             if (ev.len > 0) {
                 try writer.writeAll(",\"enum\":[");
                 for (ev, 0..) |v, ei| {
                     if (ei > 0) try writer.writeByte(',');
-                    try std.json.Stringify.value(v, .{}, writer);
+                    try wire_json.writeString(writer, gpa, v);
                 }
                 if (prop.acceptsNull()) try writer.writeAll(",null");
                 try writer.writeByte(']');
@@ -192,7 +198,7 @@ fn writeParameters(writer: *std.Io.Writer, schema: tools_common.Schema, strict: 
         if (!strict and !prop.required) continue;
         if (!required_first) try writer.writeByte(',');
         required_first = false;
-        try std.json.Stringify.value(prop.name, .{}, writer);
+        try wire_json.writeString(writer, gpa, prop.name);
     }
     try writer.writeAll("]}");
 }
@@ -397,4 +403,31 @@ test "tool contract: strict schema closes provider arguments while non-strict ho
 
     try std.testing.expect(std.mem.indexOf(u8, strict_json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, loose_json, "\"additionalProperties\":true") != null);
+}
+
+test "tool schema repairs invalid UTF-8 in provider strings" {
+    const gpa = std.testing.allocator;
+    const specs = [_]ToolSpec{.{
+        .name = "tool\xff",
+        .description = "description\xff",
+        .schema = .{
+            .properties = &.{.{
+                .name = "argument\xff",
+                .kind = .string,
+                .description = "argument description\xff",
+                .required = true,
+                .enum_values = &.{ "value\xff" },
+            }},
+        },
+    }};
+    const json = try buildToolsJson(gpa, &specs, true, .responses);
+    defer gpa.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"tool\xef\xbf\xbd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"description\xef\xbf\xbd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"argument\xef\xbf\xbd\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"argument description\xef\xbf\xbd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"value\xef\xbf\xbd\"") != null);
 }
