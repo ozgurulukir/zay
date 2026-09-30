@@ -452,8 +452,9 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         // (`at_search.drainAtSearch` polls the async backend and promotes
         // failures into the notice on the tick). Draw builds the view from
         // prepared state only — no polling, no backend reads.
-        var at_view: tui.AtSearchWidget = .{ .content = tui.buildAtSearchContent(app) };
-        const panel_height = at_search.panelHeight(app.at_search.results().len);
+        const at_content = tui.buildAtSearchContent(app);
+        var at_view: tui.AtSearchWidget = .{ .content = at_content };
+        const panel_height = at_search.panelHeight(at_content.results.len, at_content.notice.len > 0);
         const panel_width = @min(@as(u16, 72), max_width);
         children[idx] = .{
             .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
