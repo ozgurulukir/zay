@@ -705,7 +705,7 @@ pub const Agent = struct {
                 return;
             }
             if (self.tool_access == .none) return error.ToolAccessDenied;
-            try Agent.runToolBatch(L, self, tool_calls, &stream_context, l, turn_allocator);
+            if (try Agent.runToolBatch(L, self, tool_calls, &stream_context, l, turn_allocator)) return;
             // Mid-turn we only inject messages explicitly marked to steer, and
             // only from the front so FIFO order holds — a default-queued
             // message ahead of a steer one keeps it waiting for turn end.
@@ -762,7 +762,7 @@ pub const Agent = struct {
         stream_context: *const StreamContext(L),
         listener: L,
         turn_allocator: std.mem.Allocator,
-    ) !void {
+    ) !bool {
         var bridge: ExecutorBridge(L) = .{
             .agent = self,
             .listener = listener,
@@ -800,10 +800,21 @@ pub const Agent = struct {
             return err;
         };
         defer self.gpa.free(results);
-        errdefer for (results) |*r| r.deinit(self.gpa);
+        var end_turn = false;
+        for (results) |result| {
+            if (result.end_turn) {
+                end_turn = true;
+                break;
+            }
+        }
+        // `takeToolResults` owns cleanup for a partial persistence failure and
+        // marks every moved result undefined on success. Do not add an
+        // errdefer over `results` here: listener errors arrive after the move
+        // and would otherwise deinitialize already-moved fields.
         try self.takeToolResults(results);
         self.snapshotAfterBatch();
         try listener.emit(.tool_batch_finished);
+        return end_turn;
     }
 
     /// Delegate to the extracted git-shadow snapshotter (agent/snapshotter.zig).
@@ -2353,6 +2364,37 @@ test "run completes a scripted text turn and streams deltas through the observer
     try std.testing.expectEqual(@as(usize, 2), messages.len);
     try std.testing.expectEqualStrings("say hi", messages[0].text());
     try std.testing.expectEqualStrings("hello from the script", messages[1].text());
+}
+
+test "background launch ends the model turn until completion is delivered" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{ai.scripted_client.step.toolCall(
+        tools.shell_tool.name,
+        "{\"command\":\"echo bg\",\"description\":\"start background test\",\"run_in_background\":true}",
+    )});
+
+    var manager = background_mod.BackgroundManager.init(io, gpa);
+    defer manager.shutdownAll();
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    agent.background_manager = &manager;
+    try agent.addUser("start the background command");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // The launch result is persisted, but it must not trigger a second model
+    // request that can poll `background.status` before completion delivery.
+    try std.testing.expectEqual(@as(u32, 1), client.prompts_answered);
+    const messages = agent.messages();
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages[2].text(), "Started in the background") != null);
 }
 
 test "run retries once when the provider truncates tool-call arguments (scripted, socket-free)" {
