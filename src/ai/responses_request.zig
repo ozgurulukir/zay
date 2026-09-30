@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const ai = @import("../ai.zig");
+const wire_json = @import("json.zig");
 const model_compat = @import("model_compat.zig");
 const responses_core = @import("responses_core.zig");
 const stream_parser = @import("stream_parser.zig");
@@ -24,7 +25,7 @@ pub fn writeRequestPayload(
     tools_json: []const u8,
 ) !void {
     try out.writeAll("{\"model\":");
-    try std.json.Stringify.value(config.model, .{}, out);
+    try wire_json.writeString(out, gpa, config.model);
     try out.writeAll(",\"input\":[");
     var written: u32 = 0;
     for (messages) |*view| {
@@ -44,15 +45,15 @@ pub fn writeRequestPayload(
     try out.writeAll(",\"tool_choice\":\"auto\"");
     if (config.system_prompt.len > 0) {
         try out.writeAll(",\"instructions\":");
-        try std.json.Stringify.value(config.system_prompt, .{}, out);
+        try wire_json.writeString(out, gpa, config.system_prompt);
     }
     if (config.session_id.len > 0 and !config.disable_prompt_cache) {
         try out.writeAll(",\"prompt_cache_key\":");
-        try std.json.Stringify.value(config.session_id, .{}, out);
+        try wire_json.writeString(out, gpa, config.session_id);
     }
     if (responses_config.text_verbosity) |verbosity| {
         try out.writeAll(",\"text\":{\"verbosity\":");
-        try std.json.Stringify.value(verbosity, .{}, out);
+        try wire_json.writeString(out, gpa, verbosity);
         try out.writeByte('}');
     }
     if (responses_config.parallel_tool_calls) |enabled| {
@@ -103,7 +104,7 @@ fn writeInputMessage(
 ) !void {
     switch (message) {
         .assistant => return writeAssistantItems(out, message, gpa, log_name, scrub_encrypted_reasoning),
-        .tool => return writeToolOutput(out, message),
+        .tool => return writeToolOutput(out, gpa, message),
         .system => {
             try out.writeAll("{\"type\":\"message\",\"role\":\"system\",\"content\":");
             try writeInputContent(out, gpa, message.system.content);
@@ -174,10 +175,10 @@ fn writeAssistantItems(
                 try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"");
                 if (text.responses_item_id) |id| {
                     try out.writeAll(",\"id\":");
-                    try std.json.Stringify.value(id, .{}, out);
+                    try wire_json.writeString(out, gpa, id);
                 }
                 try out.writeAll(",\"content\":[{\"type\":\"output_text\",\"text\":");
-                try std.json.Stringify.value(text.text, .{}, out);
+                try wire_json.writeString(out, gpa, text.text);
                 try out.writeAll(",\"annotations\":[]}]}");
             },
             .reasoning => |reasoning| {
@@ -195,37 +196,37 @@ fn writeAssistantItems(
                     }
                 } else {
                     try out.writeAll("{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":");
-                    try std.json.Stringify.value(reasoning.text, .{}, out);
+                    try wire_json.writeString(out, gpa, reasoning.text);
                     try out.writeAll("}]}");
                 }
             },
-            .tool_call => |call| try writeFunctionCall(out, call),
+            .tool_call => |call| try writeFunctionCall(out, gpa, call),
             .image => try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}"),
         }
     }
     if (first) try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"\"}");
 }
 
-fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
+fn writeFunctionCall(out: *std.Io.Writer, gpa: std.mem.Allocator, call: ai.ToolCall) !void {
     try out.writeAll("{\"type\":\"function_call\",\"call_id\":");
-    try std.json.Stringify.value(call.call_id.slice(), .{}, out);
+    try wire_json.writeString(out, gpa, call.call_id.slice());
     if (call.responses_item_id) |id| {
         try out.writeAll(",\"id\":");
-        try std.json.Stringify.value(id, .{}, out);
+        try wire_json.writeString(out, gpa, id);
     }
     try out.writeAll(",\"name\":");
-    try std.json.Stringify.value(call.name, .{}, out);
+    try wire_json.writeString(out, gpa, call.name);
     try out.writeAll(",\"arguments\":");
     const args = stream_parser.sanitizeToolArguments(call.arguments);
-    try std.json.Stringify.value(args, .{}, out);
+    try wire_json.writeString(out, gpa, args);
     try out.writeByte('}');
 }
 
-fn writeToolOutput(out: *std.Io.Writer, message: ai.ChatMessage) !void {
+fn writeToolOutput(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-    try std.json.Stringify.value(message.tool.call_id.slice(), .{}, out);
+    try wire_json.writeString(out, gpa, message.tool.call_id.slice());
     try out.writeAll(",\"output\":");
-    try std.json.Stringify.value(message.text(), .{}, out);
+    try wire_json.writeString(out, gpa, message.text());
     try out.writeByte('}');
 }
 
@@ -237,7 +238,7 @@ fn writeInputContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []cons
             .text => |text| {
                 if (count > 0) try out.writeByte(',');
                 try out.writeAll("{\"type\":\"input_text\",\"text\":");
-                try std.json.Stringify.value(text.text, .{}, out);
+                try wire_json.writeString(out, gpa, text.text);
                 try out.writeByte('}');
                 count += 1;
             },
@@ -250,7 +251,7 @@ fn writeInputContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []cons
                 try data_uri.writer.writeAll(image.mime_type);
                 try data_uri.writer.writeAll(";base64,");
                 try data_uri.writer.writeAll(image.data_base64);
-                try std.json.Stringify.value(data_uri.written(), .{}, out);
+                try wire_json.writeString(out, gpa, data_uri.written());
                 try out.writeByte('}');
                 count += 1;
             },
@@ -439,6 +440,31 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_xyz789\"") != null);
     // Negative: must NOT serialize CallId as an object
     try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":{\"value\":") == null);
+}
+
+test "writeRequestPayload keeps invalid tool output as a JSON string" {
+    const gpa = std.testing.allocator;
+    const tool_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    tool_blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok\xff") } };
+    var tool_message: ai.ChatMessage = .{ .tool = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_invalid_utf8") },
+        .content = tool_blocks,
+    } };
+    defer tool_message.deinit(gpa);
+
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .reasoning = null,
+    };
+    const views = [_]ai.MessageView{.{ .borrowed = &tool_message }};
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[]");
+
+    try std.testing.expect(std.mem.indexOf(u8, payload.written(), "\"output\":[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.written(), "\"output\":\"ok\xef\xbf\xbd\"") != null);
 }
 
 test "writeRequestPayload clips xhigh reasoning effort for minimal dialect (Responses API)" {
@@ -735,4 +761,27 @@ test "writeRequestPayload escapes an input image data URI with special character
     try std.testing.expect(std.mem.indexOf(u8, body, "image/\"") == null);
     // The JSON-escaped quote (backslash-quote) must be present instead.
     try std.testing.expect(std.mem.indexOf(u8, body, "image/\\\"") != null);
+}
+
+test "writeRequestPayload repairs invalid UTF-8 in text verbosity" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+
+    try writeRequestPayload(
+        &payload.writer,
+        gpa,
+        config,
+        .{ .text_verbosity = "low\xff" },
+        &.{},
+        "[]",
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, payload.written(), "\"verbosity\":\"low\xef\xbf\xbd\"") != null);
 }

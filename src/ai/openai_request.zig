@@ -13,6 +13,7 @@ const std = @import("std");
 const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
+const wire_json = @import("json.zig");
 const model_compat = @import("model_compat.zig");
 const stream_parser = @import("stream_parser.zig");
 
@@ -39,7 +40,7 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
     }
     if (message == .tool) {
         try out.writeAll(",\"tool_call_id\":");
-        try std.json.Stringify.value(message.tool.call_id.slice(), .{}, out);
+        try wire_json.writeString(out, gpa, message.tool.call_id.slice());
     }
     if (message == .assistant) {
         var wrote_calls = false;
@@ -51,7 +52,7 @@ fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMes
             } else {
                 try out.writeByte(',');
             }
-            try writeToolCall(out, block.tool_call);
+            try writeToolCall(out, gpa, block.tool_call);
         }
         if (wrote_calls) try out.writeByte(']');
     }
@@ -67,39 +68,7 @@ fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
             .reasoning, .image, .tool_call => {},
         }
     }
-    try writeJsonString(out, gpa, aw.written());
-}
-
-/// Serialize `text` as a JSON string, repairing invalid UTF-8 first. Some
-/// MCP/tool results can contain stray bytes; `std.json.Stringify.value` on a
-/// `[]u8` with invalid UTF-8 falls back to emitting an array of integers
-/// (`[89,111,117,...]`) instead of a string, which providers reject with
-/// `400 invalid message format`. Replace invalid sequences with U+FFFD rather
-/// than sending a malformed JSON string.
-fn writeJsonString(out: *std.Io.Writer, gpa: std.mem.Allocator, text: []const u8) !void {
-    if (std.unicode.utf8ValidateSlice(text)) {
-        try std.json.Stringify.value(text, .{}, out);
-        return;
-    }
-    const repaired = try gpa.alloc(u8, text.len * 4);
-    defer gpa.free(repaired);
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        if (i + len <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..len])) {
-            @memcpy(repaired[j..][0..len], text[i..][0..len]);
-            j += len;
-        } else {
-            // replacement character for invalid sequence
-            repaired[j] = 0xef;
-            repaired[j + 1] = 0xbf;
-            repaired[j + 2] = 0xbd;
-            j += 3;
-        }
-        i += len;
-    }
-    try std.json.Stringify.value(repaired[0..j], .{}, out);
+    try wire_json.writeString(out, gpa, aw.written());
 }
 
 fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
@@ -110,7 +79,7 @@ fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
             .text => |text| {
                 if (count > 0) try out.writeByte(',');
                 try out.writeAll("{\"type\":\"text\",\"text\":");
-                try writeJsonString(out, gpa, text.text);
+                try wire_json.writeString(out, gpa, text.text);
                 try out.writeByte('}');
                 count += 1;
             },
@@ -123,7 +92,7 @@ fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
                 try data_uri.writer.writeAll(image.mime_type);
                 try data_uri.writer.writeAll(";base64,");
                 try data_uri.writer.writeAll(image.data_base64);
-                try std.json.Stringify.value(data_uri.written(), .{}, out);
+                try wire_json.writeString(out, gpa, data_uri.written());
                 try out.writeAll("}}");
                 count += 1;
             },
@@ -133,14 +102,14 @@ fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
     try out.writeByte(']');
 }
 
-fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
+fn writeToolCall(out: *std.Io.Writer, gpa: std.mem.Allocator, tool_call: ai.ToolCall) !void {
     try out.writeAll("{\"id\":");
-    try std.json.Stringify.value(tool_call.call_id.slice(), .{}, out);
+    try wire_json.writeString(out, gpa, tool_call.call_id.slice());
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
-    try std.json.Stringify.value(tool_call.name, .{}, out);
+    try wire_json.writeString(out, gpa, tool_call.name);
     try out.writeAll(",\"arguments\":");
     const args = stream_parser.sanitizeToolArguments(tool_call.arguments);
-    try std.json.Stringify.value(args, .{}, out);
+    try wire_json.writeString(out, gpa, args);
     try out.writeAll("}}");
 }
 
@@ -233,7 +202,7 @@ pub fn writeRequestPayload(
     };
 
     try out.writeAll("{\"model\":");
-    try std.json.Stringify.value(model, .{}, out);
+    try wire_json.writeString(out, gpa, model);
     try out.writeAll(",\"messages\":[");
     for (effective_messages, 0..) |*view, index| {
         if (index > 0) try out.writeByte(',');
@@ -281,10 +250,10 @@ pub fn writeRequestPayload(
         if (session_id.len > 0) {
             if (dialect.usesNativeSessionId()) {
                 try out.writeAll(",\"session_id\":");
-                try std.json.Stringify.value(session_id, .{}, out);
+                try wire_json.writeString(out, gpa, session_id);
             } else if (dialect.allowsPromptCacheKey()) {
                 try out.writeAll(",\"prompt_cache_key\":");
-                try std.json.Stringify.value(session_id, .{}, out);
+                try wire_json.writeString(out, gpa, session_id);
             }
         }
     }
