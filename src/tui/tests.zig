@@ -38,6 +38,7 @@ const transcript_mod = @import("../transcript.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
 const tools_mod = @import("../tools.zig");
 const draw_root_layout = @import("root_layout.zig");
+const background_delivery = @import("background_delivery.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
 const App = tui.App;
@@ -347,6 +348,234 @@ test "lane column props preserve active/focused border and splash suppression" {
     app.cached_config.tui.highlight_focused_border = false;
     const knob_off = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true);
     try std.testing.expect(!knob_off.border_style.dim);
+}
+
+// ─── Scripted smoke harness ───────────────────────────────────────────────
+// Drives the REAL draw + event-router paths (drawRoot, captureEvent) so the
+// plan's manual smoke list has a scripted, deterministic counterpart. The
+// real-terminal PTY run (REPORTS/pty-smoke/) covers what needs a live exe.
+
+/// Flatten a rendered surface tree into text (rows joined by '\n', child
+/// surfaces appended after their parent) so smoke tests can assert on what
+/// the draw path produced. Parent surfaces with an empty buffer (composite
+/// nodes like drawRoot's root) contribute only their children.
+fn collectSurfaceText(arena: std.mem.Allocator, surface: vxfw.Surface, out: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    if (surface.buffer.len > 0) {
+        var row: u16 = 0;
+        while (row < surface.size.height) : (row += 1) {
+            var col: u16 = 0;
+            while (col < surface.size.width) : (col += 1) {
+                const cell = surface.readCell(col, row);
+                if (cell.default) continue;
+                try out.appendSlice(arena, cell.char.grapheme);
+            }
+            try out.append(arena, '\n');
+        }
+    }
+    for (surface.children) |child| try collectSurfaceText(arena, child.surface, out);
+}
+
+/// Draw the real `drawRoot` at the given size and return the flattened
+/// frame text (arena-owned; valid until the arena resets).
+fn renderRootFrame(app: *App, ar: *std.heap.ArenaAllocator, width: u16, height: u16) ![]const u8 {
+    _ = ar.reset(.retain_capacity);
+    var root: RootWidget = .{ .app = app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = ar.allocator(),
+        .min = .{},
+        .max = .{ .width = width, .height = height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try draw_root_layout.drawRoot(app, root.widget(), ctx);
+    var text: std.ArrayList(u8) = .empty;
+    try collectSurfaceText(ar.allocator(), surface, &text);
+    return text.items;
+}
+
+/// Whether the flattened frame contains `line` as an exact row.
+fn frameHasExactLine(frame: []const u8, line: []const u8) bool {
+    var it = std.mem.splitScalar(u8, frame, '\n');
+    while (it.next()) |row| {
+        if (std.mem.eql(u8, row, line)) return true;
+    }
+    return false;
+}
+
+test "scripted smoke: background modal opens, follows the live log, swaps it on selection, and closes" {
+    if (!@import("../os.zig").is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Log files outlive the manager's teardown window; delete them after
+    // app.deinit has killed the jobs (LIFO defer order below).
+    var log_paths: [2]?[]u8 = .{ null, null };
+    defer for (log_paths) |p| {
+        if (p) |path| {
+            std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+            gpa.free(path);
+        }
+    };
+
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A REAL manager with two REAL long-running pwsh jobs, exactly what the
+    // Ctrl+O modal shows in daily use. App.deinit runs manager.deinit()
+    // (shutdownAll), which kills the sleeping children.
+    const manager = try gpa.create(tui.background_mod.BackgroundManager);
+    manager.* = tui.background_mod.BackgroundManager.init(io, gpa);
+    app.background = manager;
+
+    var env_map = try @import("platform").getEnvMap(gpa);
+    defer env_map.deinit();
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    const spawn_job = struct {
+        fn run(m: *tui.background_mod.BackgroundManager, marker: []const u8, cwd_p: []const u8, env: *const std.process.Environ.Map) !tui.background_mod.BackgroundManager.StartResult {
+            const cmd = try std.fmt.allocPrint(std.testing.allocator, "Write-Output '{s}'; Start-Sleep -Seconds 20", .{marker});
+            defer std.testing.allocator.free(cmd);
+            return m.start(.{
+                .command = cmd,
+                .cwd = cwd_p,
+                .env_map = env,
+                .owner_generation = 1,
+                .shell_path = @import("../tools/pwsh_exec.zig").shellPath(std.testing.io),
+                .command_mode = .stdin_dash_command,
+                .stderr_merge_prefix = "",
+                .stderr_merge_suffix = "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }",
+            });
+        }
+    }.run;
+
+    // Block-scoped errdefers discharge when the StartResults are consumed.
+    {
+        var job_a = try spawn_job(manager, "ALPHA-TAIL-LINE", cwd, &env_map);
+        errdefer job_a.deinit(gpa);
+        var job_b = try spawn_job(manager, "BRAVO-TAIL-LINE", cwd, &env_map);
+        errdefer job_b.deinit(gpa);
+        log_paths[0] = try gpa.dupe(u8, job_a.log_path);
+        log_paths[1] = try gpa.dupe(u8, job_b.log_path);
+        job_a.deinit(gpa);
+        job_b.deinit(gpa);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // Ctrl+O open path: the modal opens and the cache fills BEFORE the
+    // first frame — no empty first paint.
+    app.toggleBackgroundModal();
+    try std.testing.expect(app.getBackgroundModal());
+    try std.testing.expectEqual(@as(usize, 2), app.background_modal_state.cache.?.views.len);
+
+    // Frame with both job rows.
+    const frame1 = try renderRootFrame(&app, &arena, 80, 24);
+    try std.testing.expect(std.mem.indexOf(u8, frame1, "Background Jobs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame1, "ALPHA-TAIL-LINE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame1, "BRAVO-TAIL-LINE") != null);
+
+    // Space expands the log panel through the REAL key router; the tail
+    // fills from the selected job's real log file.
+    var root: RootWidget = .{ .app = &app };
+    var ev_arena = std.heap.ArenaAllocator.init(gpa);
+    defer ev_arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = ev_arena.allocator(), .cmds = .empty };
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = ' ' } });
+    try std.testing.expect(app.background_modal_state.log_expanded);
+
+    // Follow the tail the way the tick does (bounded poll while pwsh
+    // flushes its first output line), and verify at two window sizes —
+    // the "resize during this state" smoke step.
+    var expanded: []const u8 = "";
+    var attempts: u32 = 0;
+    while (attempts < 200) : (attempts += 1) {
+        _ = background_delivery.refreshBackgroundModalCache(&app, true);
+        expanded = try renderRootFrame(&app, &arena, 80, 24);
+        if (frameHasExactLine(expanded, "ALPHA-TAIL-LINE")) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(frameHasExactLine(expanded, "ALPHA-TAIL-LINE"));
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "── log:") != null);
+    // Only the SELECTED job's tail is in the log panel (the other marker
+    // appears solely inside its command row, never as an exact line).
+    try std.testing.expect(!frameHasExactLine(expanded, "BRAVO-TAIL-LINE"));
+
+    const resized = try renderRootFrame(&app, &arena, 110, 34);
+    try std.testing.expect(frameHasExactLine(resized, "ALPHA-TAIL-LINE"));
+
+    // ↓ moves the selection: the log panel swaps to the other job's tail.
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
+    var swapped: []const u8 = "";
+    attempts = 0;
+    while (attempts < 200) : (attempts += 1) {
+        _ = background_delivery.refreshBackgroundModalCache(&app, true);
+        swapped = try renderRootFrame(&app, &arena, 80, 24);
+        if (frameHasExactLine(swapped, "BRAVO-TAIL-LINE")) break;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(frameHasExactLine(swapped, "BRAVO-TAIL-LINE"));
+    try std.testing.expect(!frameHasExactLine(swapped, "ALPHA-TAIL-LINE"));
+
+    // Esc closes the modal and drops the cached display data.
+    try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+    try std.testing.expect(!app.getBackgroundModal());
+    try std.testing.expect(app.background_modal_state.cache == null);
+    const closed = try renderRootFrame(&app, &arena, 80, 24);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "Background Jobs") == null);
+}
+
+test "scripted smoke: split lanes render both panes and click-to-focus switches panes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane2 = try gpa.create(Thread);
+    lane2.* = .{};
+    // Owned by the thread; freed by app.deinit's thread teardown.
+    lane2.title = try gpa.dupe(u8, "side-lane");
+    try app.threads.append(lane2);
+    app.split_mode = .dual;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // Both panes render their own titles; the draw also stashes the split
+    // geometry the mouse router shares with the render path. The window is
+    // above the default min_split_width (140) so dual actually splits.
+    const frame = try renderRootFrame(&app, &arena, 160, 34);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "untitled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "side-lane") != null);
+    try std.testing.expectEqual(@as(usize, 2), app.split_rect_count);
+
+    // Click the right (worker) pane through the REAL mouse route.
+    const right = app.split_rects[1];
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+    try RootWidget.captureEvent(&root, &ctx, .{ .mouse = .{
+        .col = @intCast(right.col + right.width / 2),
+        .row = @intCast(right.row + 1),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+
+    // Clicking the driver pane (lane 0) leaves the focus alone.
+    const left = app.split_rects[0];
+    try RootWidget.captureEvent(&root, &ctx, .{ .mouse = .{
+        .col = @intCast(left.col + left.width / 2),
+        .row = @intCast(left.row + 1),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
 }
 
 test "file picker in-place query updates preserve results while debouncing" {
