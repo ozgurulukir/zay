@@ -605,14 +605,26 @@ pub const SessionManager = struct {
     ) Error![]u8 {
         assert(session_id.len > 0);
         assert(cwd.len > 0);
+        const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
+        defer self.gpa.free(cwd_key);
+
+        // Resolve a null key without writing anything first. The mapping and
+        // the selected-session stamp must share one transaction/batch; an
+        // earlier ensureProjectForCwd call could leave a location behind when
+        // the subsequent session update failed.
+        var owned_key: ?[]u8 = null;
+        var minted_buffer: [project_key_len]u8 = undefined;
         const resolved: []const u8 = if (project_key) |key| blk: {
             _ = try session_type.ProjectKey.validate(key);
             break :blk key;
-        } else try self.ensureProjectForCwd(self.gpa, cwd);
-        defer if (project_key == null) self.gpa.free(@constCast(resolved));
+        } else blk: {
+            owned_key = try self.lookupProjectKeyForCwdKey(cwd_key);
+            if (owned_key) |existing| break :blk existing;
+            self.mintProjectKey(&minted_buffer);
+            break :blk minted_buffer[0..];
+        };
+        defer if (owned_key) |key| self.gpa.free(key);
 
-        const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
-        defer self.gpa.free(cwd_key);
         const timestamp_ms = nowMs(self.io);
 
         const update_sql = "update sessions set project_key = ?, updated_at_ms = ? where id = ?";
@@ -706,17 +718,11 @@ pub const SessionManager = struct {
         const same_host = summary_host_id == null or
             std.ascii.eqlIgnoreCase(summary_host_id.?, self.host_id);
         if (same_host and directoryExists(self.io, summary_cwd)) {
-            const key = try self.ensureProjectForCwd(self.gpa, summary_cwd);
-            defer self.gpa.free(key);
-            // Best-effort backfill: the resume proceeds even if the stamping
-            // write fails (the binding itself already persisted).
-            const stamp_sql = "update sessions set project_key = ? where id = ?";
-            self.backend.exec(self.io, stamp_sql, &.{
-                .{ .text = key }, .{ .text = session_id },
-            }) catch |err| {
-                const log = std.log.scoped(.session);
-                log.warn("session.project.legacy_backfill_failed id={s} err={s}", .{ session_id, @errorName(err) });
-            };
+            // The verified legacy bind uses the same atomic path as the
+            // explicit picker bind, so a roaming write cannot leave a
+            // project_locations row without stamping this session.
+            const key = try self.bindProjectCwd(self.gpa, session_id, null, summary_cwd);
+            self.gpa.free(key);
             return .{ .ready = .{ .cwd = try gpa.dupe(u8, summary_cwd) } };
         }
         return .{ .needs_project_root = .{

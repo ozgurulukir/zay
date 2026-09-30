@@ -210,17 +210,13 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer if (resolved_host) |h| runtime_gpa.free(h);
     const host_id: []const u8 = resolved_host orelse "default-host";
 
-    // Auto-resume: the driver's pinned session when it still resolves, else
-    // the most recently updated session whose cwd matches the launch root
-    // (`resolveStartupResumeId`'s internal fallback — an exact-cwd match is
-    // a stronger local signal than a project binding), else the newest
-    // session of the launch root's bound project across hosts. The pin
-    // exists because lane sessions share the driver's cwd — a lane that
-    // wrote entries after the driver's last message used to hijack
-    // auto-resume via findLatest. Startup stays non-interactive: a root
-    // without a binding starts a new session rather than prompting for a
-    // project root. Every degraded lookup logs — "no resume" must stay
-    // distinguishable from "resume lookup failed" in zay.log.
+    // Auto-resume: the driver's pinned session when it still resolves, then
+    // the newest session of an already-bound launch project across hosts, and
+    // finally the legacy exact-cwd query when no project binding exists (or
+    // has no sessions). Startup stays non-interactive: an unbound root starts
+    // a new session rather than prompting for a project root. Every degraded
+    // lookup logs — "no resume" must stay distinguishable from "resume
+    // lookup failed" in zay.log.
     const resume_session_id = blk: {
         const db_backend = load_result.config.effectiveDatabaseBackend();
         const session_backend_kind: ?session.BackendKind = switch (db_backend) {
@@ -230,29 +226,33 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .d1_http => .d1_http,
             .postgres_native => .postgres_native,
         };
-        var manager = session.SessionManager.initFromModularConfig(
+        const store = session.SessionStore{
+            .kind = session_backend_kind,
+            .url = load_result.config.effectiveDatabaseUrl(),
+            .token = load_result.config.effectiveDatabaseAuthToken(),
+            .path = load_result.config.effectiveDatabasePath(),
+        };
+        var manager = session.SessionManager.initStore(
             runtime_gpa,
             init.io,
             home_dir,
-            session_backend_kind,
-            load_result.config.effectiveDatabaseUrl(),
-            load_result.config.effectiveDatabaseAuthToken(),
-            load_result.config.effectiveDatabasePath(),
-            init.environ_map,
+            store,
+            host_id,
+            true,
         ) catch |err| {
             log.warn("session.autoresume.store_open_failed err={s}", .{@errorName(err)});
             break :blk null;
         };
         defer manager.deinit();
-        // 1+2. Validated driver pin, else the exact-cwd latest. A non-null
-        // result's allocation passes to the caller (freed with
-        // `resume_session_id`) — never deferred-freed here.
-        const pinned = lane_recovery.resolveStartupResumeId(runtime_gpa, &manager, cwd) catch |err| resume_fallback: {
+        // 1. Validated driver pin. A non-null result's allocation passes to
+        // the caller (freed with `resume_session_id`) — never deferred-freed
+        // here.
+        const pinned = lane_recovery.resolveStartupDriverPin(runtime_gpa, &manager, cwd) catch |err| resume_fallback: {
             log.warn("session.autoresume.pin_lookup_failed err={s}", .{@errorName(err)});
             break :resume_fallback null;
         };
         if (pinned) |id| break :blk id;
-        // 3. Project-scoped latest — only when the launch root is already
+        // 2. Project-scoped latest — only when the launch root is already
         // bound on this host (never a speculative bind at startup).
         const project_key_opt = manager.projectKeyForCwd(runtime_gpa, cwd) catch |err| resume_fallback: {
             log.warn("session.autoresume.project_lookup_failed err={s}", .{@errorName(err)});
@@ -266,7 +266,13 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             };
             if (latest) |id| break :blk id;
         }
-        break :blk null;
+        // 3. Legacy exact-cwd fallback for rows that predate project keys or
+        // for a bound project with no completed session yet.
+        const legacy = manager.findLatest(runtime_gpa, cwd) catch |err| resume_fallback: {
+            log.warn("session.autoresume.legacy_latest_failed err={s}", .{@errorName(err)});
+            break :resume_fallback null;
+        };
+        break :blk legacy;
     };
     if (resume_session_id) |id| {
         defer runtime_gpa.free(id);
@@ -315,7 +321,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // is kept fresh mid-run by installRuntime (via recovery.syncDriverPin).
     lane_recovery.recordStartupDriverPin(runtime_gpa, init.io, home_dir, cwd, &agent_runtime.session_writer);
 
-    try tui.run(init, agent_runtime, tui_config, tui_gpa, recovered);
+    try tui.run(init, agent_runtime, tui_config, tui_gpa, host_id, recovered);
 
     // Clean exit: park every still-'open' manifest row, so `state='open'`
     // later can only mean "open when the crash hit" — never a lane from an
