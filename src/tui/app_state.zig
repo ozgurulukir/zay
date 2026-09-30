@@ -31,6 +31,7 @@ const vxfw = vaxis.vxfw;
 const telemetry_mod = @import("telemetry.zig");
 
 const MentionSearchKind = tui.MentionSearchKind;
+const background_mod = @import("../background.zig");
 
 /// State for the @-mention search popup. The logical state is a 3-arm
 /// union: closed (no popup), indexing (a background scan is in flight),
@@ -232,6 +233,58 @@ pub const BackgroundModalState = struct {
     /// Space-toggled live log-tail panel for the selected job (#37).
     log_expanded: bool = false,
     pending: std.ArrayList(BackgroundDelivery) = .empty,
+
+    /// Cached modal display data (AD-2 of the draw-purity plan): the draw
+    /// path renders this verbatim and never snapshots the manager or reads
+    /// log files. `refreshBackgroundModalCache` (background_delivery.zig) is
+    /// the ONLY writer; it runs from tick and key processing. Owned; freed
+    /// by the refresher on close/invalidate and by `deinitSharedServices`.
+    cache: ?Cache = null,
+    /// Earliest time the cache may refresh again while the modal idles open.
+    /// Key-driven changes (open/selection/expand/cancel) refresh immediately
+    /// and re-arm this gate.
+    next_refresh: ?std.Io.Timestamp = null,
+
+    /// Owned snapshot of the background manager's job views plus the
+    /// selected job's bounded log tail for the expanded panel.
+    pub const Cache = struct {
+        views: []const background_mod.BackgroundManager.JobView = &.{},
+        /// Selected job's log tail; empty while the panel is collapsed.
+        log_text: []const u8 = "",
+        /// Log panel header: the selected job's log path.
+        log_note: []const u8 = "",
+
+        pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
+            if (self.views.len > 0) background_mod.BackgroundManager.freeViews(gpa, self.views);
+            self.deinitTail(gpa);
+        }
+
+        /// Free the owned log tail/note (keeps the cached job views). Must
+        /// use the allocator that produced them (`app.gpa`).
+        pub fn deinitTail(self: *Cache, gpa: std.mem.Allocator) void {
+            if (self.log_text.len > 0) {
+                gpa.free(self.log_text);
+                self.log_text = "";
+            }
+            if (self.log_note.len > 0) {
+                gpa.free(self.log_note);
+                self.log_note = "";
+            }
+        }
+    };
+
+    /// True when the idle-refresh gate has expired (or was never armed).
+    pub fn refreshDue(self: *const BackgroundModalState, io: std.Io) bool {
+        const deadline = self.next_refresh orelse return true;
+        const now = std.Io.Timestamp.now(io, .awake);
+        return now.nanoseconds >= deadline.nanoseconds;
+    }
+
+    /// Arm the idle-refresh gate `ms` from now.
+    pub fn armRefresh(self: *BackgroundModalState, io: std.Io, ms: u64) void {
+        const now = std.Io.Timestamp.now(io, .awake);
+        self.next_refresh = .{ .nanoseconds = now.nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
+    }
 };
 
 /// The four scrollable list views used by overlays: session resume,

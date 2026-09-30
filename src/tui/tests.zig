@@ -37,6 +37,7 @@ const test_helpers = @import("test_helpers.zig");
 const transcript_mod = @import("../transcript.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
 const tools_mod = @import("../tools.zig");
+const draw_root_layout = @import("root_layout.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
 const App = tui.App;
@@ -271,10 +272,81 @@ test "file picker starts its deferred search after debounce expires" {
 
     var result_polls: u32 = 0;
     while (app.at_search.open.results.items.len == 0 and result_polls < 100) : (result_polls += 1) {
-        try at_search_mod.pollAtSearch(&app);
+        _ = try at_search_mod.drainAtSearch(&app);
         std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expect(app.at_search.open.results.items.len > 0);
+}
+
+test "at-search drain promotes a backend failure into the popup notice before drawing" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    // Force the shared search backend into the failed state; restore the
+    // global afterwards (other tests observe it).
+    search_mod.backend.state = .{ .failed = .{ .message = try gpa.dupe(u8, "index walk exploded") } };
+    defer {
+        gpa.free(search_mod.backend.state.failed.message);
+        search_mod.backend.state = .idle;
+    }
+
+    app.at_search = .{ .open = .{ .kind = .file, .query = "" } };
+    // Keep the debounced query from starting so the failure path is isolated.
+    app.at_search.refreshDebounce(app.io, 10_000);
+
+    // The lifecycle drain — not draw — turns the backend failure into the
+    // popup notice and reports a visible change.
+    try std.testing.expect(try at_search_mod.drainAtSearch(&app));
+    const notice = app.at_search.open.notice orelse return error.TestExpectedNotice;
+    try std.testing.expectEqualStrings("index walk exploded", notice);
+
+    // Repeated drains keep the notice stable and request no further redraw.
+    try std.testing.expect(!try at_search_mod.drainAtSearch(&app));
+    try std.testing.expectEqualStrings("index walk exploded", app.at_search.open.notice.?);
+}
+
+test "lane column props preserve active/focused border and splash suppression" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const sibling = try gpa.create(tui.Thread);
+    sibling.* = .{};
+    // Owned by the thread; freed by app.deinit's thread teardown.
+    sibling.title = try gpa.dupe(u8, "side");
+    try app.threads.append(sibling);
+
+    // Type into the shared input: only the pane whose lane owns it (the
+    // focused app.thread) suppresses its splash.
+    try app.inputs.input.insertSliceAtCursor("hello");
+
+    app.cached_config.tui.highlight_focused_border = true;
+    const accent = @import("style.zig").activePalette().border_label;
+
+    // Focused + knob on: high-contrast accent border, splash suppressed.
+    const focused_active = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true);
+    try std.testing.expect(focused_active.border_style.eql(accent));
+    try std.testing.expect(focused_active.splash_suppressed);
+    try std.testing.expectEqualStrings("untitled", focused_active.title);
+    try std.testing.expectEqualStrings("·", focused_active.state_glyph);
+    try std.testing.expect(focused_active.blackhole_visible == &app.metrics.blackhole_visible);
+
+    // Unfocused sibling: dim border, no splash suppression, own title.
+    const unfocused = draw_root_layout.buildLaneColumnProps(&app, sibling, 40, 10, false, false);
+    try std.testing.expect(unfocused.border_style.dim);
+    try std.testing.expect(!unfocused.splash_suppressed);
+    try std.testing.expectEqualStrings("side", unfocused.title);
+
+    // Knob off: focus falls back to the plain active (non-dim) style.
+    app.cached_config.tui.highlight_focused_border = false;
+    const knob_off = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true);
+    try std.testing.expect(!knob_off.border_style.dim);
 }
 
 test "file picker in-place query updates preserve results while debouncing" {
@@ -300,7 +372,7 @@ test "file picker in-place query updates preserve results while debouncing" {
         std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
     }
     while (app.at_search.open.results.items.len == 0 and wait_ticks < 100) : (wait_ticks += 1) {
-        try at_search_mod.pollAtSearch(&app);
+        _ = try at_search_mod.drainAtSearch(&app);
         std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expect(app.at_search.open.results.items.len > 0);
