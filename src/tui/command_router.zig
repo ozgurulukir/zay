@@ -201,6 +201,7 @@ const SessionPicker = struct {
         switch (app.nav.session_action) {
             .renaming => return handleRenameInput(app, key),
             .deleting => return handleDeleteConfirm(app, key),
+            .locating_project => return handleProjectRootInput(app, key),
             .blocked => {
                 // Any key dismisses the blocked-action popup.
                 app.cancelSessionAction();
@@ -287,6 +288,37 @@ const SessionPicker = struct {
             app.cancelSessionAction();
             return true;
         }
+        return true;
+    }
+
+    /// Text input for the project-root bind form. Enter submits (routed via
+    /// submitMode), Esc cancels without any mutation; printable keys append
+    /// to the buffer and everything else is swallowed.
+    fn handleProjectRootInput(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.cancelProjectRootBinding();
+            return true;
+        }
+        // Enter is handled by the submitMode session_picker dispatch; swallow
+        // it here so the raw key doesn't append to the buffer.
+        if (isEnterKey(key)) return true;
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            app.popSessionProjectRootInput();
+            return true;
+        }
+        if (key.text) |text| {
+            const trimmed = std.mem.trim(u8, text, "\r\n");
+            if (trimmed.len > 0) {
+                try app.input_buffers.project_root_text.appendSlice(app.gpa, trimmed);
+                return true;
+            }
+        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            const byte: u8 = @intCast(key.codepoint);
+            try app.input_buffers.project_root_text.append(app.gpa, byte);
+            return true;
+        }
+        // Swallow everything else (arrows, tab) — the bind form is the sole
+        // input target while this sub-state is active.
         return true;
     }
 };

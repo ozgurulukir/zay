@@ -144,7 +144,11 @@ pub const AgentRuntime = struct {
     /// Birth parameters for a runtime session — one named struct instead of
     /// a 10-positional-param contract where a transposition compiles
     /// silently. `session_id == null` starts a new session; non-null
-    /// resumes that session.
+    /// resumes that session. `host_id` is resolved ONCE at the process
+    /// boundary and propagated to every new/resumed/lane runtime
+    /// (INV-HOST-ID). `session_store` overrides the config-derived backend
+    /// selection — the resume picker passes the store the session was listed
+    /// from, so the id is never resolved against a different database.
     pub const Genesis = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -154,7 +158,9 @@ pub const AgentRuntime = struct {
         base_system_prompt: []const u8,
         config: config_mod.Config,
         diagnostics: []config_mod.Diagnostic,
+        host_id: []const u8,
         session_id: ?[]const u8 = null,
+        session_store: ?session_mod.SessionStore = null,
         template: ?*const AgentRuntime = null,
     };
 
@@ -258,18 +264,25 @@ pub const AgentRuntime = struct {
         const db_url = config.effectiveDatabaseUrl();
         const db_token = config.effectiveDatabaseAuthToken();
         const db_path = config.effectiveDatabasePath();
-        const session_backend_kind: ?session_mod.BackendKind = switch (db_backend) {
-            .local => .local_sqlite,
-            .zay_service => .remote_service,
-            .turso_http => .turso_http,
-            .d1_http => .d1_http,
-            .postgres_native => .postgres_native,
+        const store: session_mod.SessionStore = genesis.session_store orelse .{
+            .kind = switch (db_backend) {
+                .local => .local_sqlite,
+                .zay_service => .remote_service,
+                .turso_http => .turso_http,
+                .d1_http => .d1_http,
+                .postgres_native => .postgres_native,
+            },
+            .url = db_url,
+            .token = db_token,
+            .path = db_path,
         };
 
         if (session_id) |id| {
-            try target.session_writer.initResumeFromModularConfig(gpa, io, home_dir, id, session_backend_kind, db_url, db_token, db_path, null);
+            // Resume never falls back across stores: an unreachable remote
+            // store must fail loudly, not surface a misleading MissingSession.
+            try target.session_writer.initResumeFromStore(gpa, io, home_dir, id, store, genesis.host_id);
         } else {
-            try target.session_writer.initFromModularConfig(gpa, io, home_dir, session_dir, session_backend_kind, db_url, db_token, db_path, null);
+            try target.session_writer.initFromStore(gpa, io, home_dir, session_dir, store, genesis.host_id);
         }
         target.session_writer_started = true;
         errdefer target.session_writer.deinit();
@@ -1199,6 +1212,7 @@ test "attach during initSession keeps builtin tools when registry is unwired" {
         .session_dir = home_abs,
         .home_dir = home_abs,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{
             .model_selection = .{
                 .builtin = .{
@@ -1247,6 +1261,7 @@ test "attach rebuilds tools from the registry once it is wired" {
         .session_dir = home_abs,
         .home_dir = home_abs,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{
             .model_selection = .{
                 .builtin = .{
@@ -1321,6 +1336,7 @@ test "zen attach wires routing headers and session id into all chat clients" {
         .session_dir = home_abs,
         .home_dir = home_abs,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{},
         .diagnostics = &.{},
     });
@@ -1386,6 +1402,7 @@ test "attach parity: every role inherits plan fields across all adapters" {
             .session_dir = home_abs,
             .home_dir = home_abs,
             .base_system_prompt = "test system prompt",
+            .host_id = "test-host",
             .config = .{
                 .model_selection = .{
                     .builtin = .{
@@ -1446,6 +1463,7 @@ test "attach parity: every role inherits plan fields across all adapters" {
             .session_dir = home_abs,
             .home_dir = home_abs,
             .base_system_prompt = "test system prompt",
+            .host_id = "test-host",
             .config = .{
                 .model_selection = .{
                     .builtin = .{
@@ -1504,6 +1522,7 @@ test "attach parity: every role inherits plan fields across all adapters" {
             .session_dir = home_abs,
             .home_dir = home_abs,
             .base_system_prompt = "test system prompt",
+            .host_id = "test-host",
             .config = .{},
             .diagnostics = &.{},
         });
@@ -1606,6 +1625,7 @@ test "runtime agent aliases the owned cwd, not the borrowed input" {
         .session_dir = home_abs,
         .home_dir = home_abs,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{},
         .diagnostics = &.{},
     });

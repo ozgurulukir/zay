@@ -230,6 +230,7 @@ test "model status connected runtime reports its actual provider over stale cach
         .session_dir = home_abs,
         .home_dir = home_abs,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{
             .model_selection = .{ .builtin = .{
                 .provider = .ollama,

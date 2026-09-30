@@ -41,6 +41,8 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         .session_picker => {
             if (app.nav.session_action == .renaming) {
                 try app.input_buffers.session_rename_text.appendSlice(app.gpa, clean_text);
+            } else if (app.nav.session_action == .locating_project) {
+                try app.input_buffers.project_root_text.appendSlice(app.gpa, clean_text);
             } else {
                 try app.inputs.palette.insertSliceAtCursor(clean_text);
             }

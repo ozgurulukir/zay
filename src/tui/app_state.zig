@@ -176,11 +176,12 @@ pub const PickerStates = struct {
 pub const NavState = struct {
     pub const LanesPurpose = enum { manage, merge_dest };
     /// Sub-state of the session resume picker: browsing the list, typing a
-    /// new title (rename), confirming a deletion, or showing a blocked-action
-    /// popup (e.g. "cannot delete active session"). Follows the MCP `adding`
-    /// pattern — a sub-state that captures all keys until submitted or
-    /// cancelled.
-    pub const SessionAction = enum { browsing, renaming, deleting, blocked };
+    /// new title (rename), confirming a deletion, showing a blocked-action
+    /// popup (e.g. "cannot delete active session"), or typing a local
+    /// project-root path to bind a roaming session onto this host
+    /// (`locating_project`). Follows the MCP `adding` pattern — a sub-state
+    /// that captures all keys until submitted or cancelled.
+    pub const SessionAction = enum { browsing, renaming, deleting, blocked, locating_project };
     /// How the resume picker groups sessions. `flat` shows only the current
     /// project's sessions (no grouping). `project` groups by project
     /// directory. `date` groups by date (Today, Yesterday, This Week, etc.).
@@ -312,6 +313,9 @@ pub const InputBuffers = struct {
     /// Inline edit buffer for the resume picker's rename-session form.
     /// Owned; freed in `deinit`.
     session_rename_text: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the project-root bind form (roaming resume).
+    /// Owned; freed in `deinit`.
+    project_root_text: std.ArrayList(u8) = .empty,
 };
 
 /// Visual feedback state: the loading spinner frame, the black-hole

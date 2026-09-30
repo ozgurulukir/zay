@@ -180,6 +180,9 @@ fn deinitOwnedState(self: *App) void {
     self.input_buffers.settings_text.deinit(self.gpa);
     self.input_buffers.mcp_url.deinit(self.gpa);
     self.input_buffers.session_rename_text.deinit(self.gpa);
+    self.input_buffers.project_root_text.deinit(self.gpa);
+    if (self.host_id.len > 0) self.gpa.free(self.host_id);
+    if (self.pending_resume) |*pending| pending.deinit(self.gpa);
 }
 
 /// Periodic frame-level tick: drain agent events, model loads, diff refreshes,
@@ -842,12 +845,12 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     const target = switch (app.mode) {
         .command, .provider_picker, .model_picker, .tree_picker, .save_message, .search, .theme_picker => app.inputs.palette.widget(),
         // The session picker uses the palette input for filtering while
-        // browsing, but sub-states (rename/delete) handle keys via the
-        // command router — focus stays on root so the palette input
-        // doesn't swallow printable keys meant for the rename buffer.
+        // browsing, but sub-states (rename/delete/project-root bind) handle
+        // keys via the command router — focus stays on root so the palette
+        // input doesn't swallow printable keys meant for the sub-state buffer.
         .session_picker => switch (app.nav.session_action) {
             .browsing => app.inputs.palette.widget(),
-            .renaming, .deleting, .blocked => root.widget(),
+            .renaming, .deleting, .blocked, .locating_project => root.widget(),
         },
         // The diff viewer routes focus by sub-state: the comment editor and
         // the file-search field each host a drawn TextField; while browsing

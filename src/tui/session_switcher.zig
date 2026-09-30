@@ -9,6 +9,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
+const paths = @import("../paths.zig");
 const provider_model = @import("provider_model.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
@@ -22,22 +23,23 @@ const App = tui.App;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn resumeFoldIndex(app: *const App, cwd: []const u8) ?usize {
+fn resumeFoldIndex(app: *const App, group_key: []const u8) ?usize {
     for (app.resume_folded_projects.items, 0..) |folded, index| {
-        if (std.mem.eql(u8, folded, cwd)) return index;
+        if (std.mem.eql(u8, folded, group_key)) return index;
     }
     return null;
 }
 
-/// Build a cwd → max_updated_at_ms map for O(1) project-lookup in the sort
-/// comparator. Caller owns the map and its backing allocator.
+/// Build a GROUP-key → max_updated_at_ms map for O(1) project-lookup in the
+/// sort comparator. Caller owns the map and its backing allocator.
 fn buildProjectMaxMap(gpa: std.mem.Allocator, summaries: []const session_mod.SessionSummary) !std.StringHashMap(i64) {
     var map = std.StringHashMap(i64).init(gpa);
     errdefer map.deinit();
-    for (summaries) |summary| {
-        const entry = try map.getOrPut(summary.cwd);
+    for (summaries) |*summary| {
+        const key = resume_picker.groupKeyOf(summary);
+        const entry = try map.getOrPut(key);
         if (!entry.found_existing) {
-            entry.key_ptr.* = summary.cwd;
+            entry.key_ptr.* = key;
             entry.value_ptr.* = summary.updated_at_ms;
         } else {
             entry.value_ptr.* = @max(entry.value_ptr.*, summary.updated_at_ms);
@@ -46,38 +48,42 @@ fn buildProjectMaxMap(gpa: std.mem.Allocator, summaries: []const session_mod.Ses
     return map;
 }
 
-/// Sort comparator that uses a precomputed cwd → max_updated_at_ms map for O(1)
-/// project lookups instead of scanning all summaries per comparison.
+/// Sort comparator that uses a precomputed group-key → max_updated_at_ms map
+/// for O(1) project lookups instead of scanning all summaries per comparison.
 fn resumeSummaryLessThanWithMap(map: *const std.StringHashMap(i64), left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
-    if (std.mem.eql(u8, left.cwd, right.cwd)) return left.updated_at_ms > right.updated_at_ms;
+    const left_key = resume_picker.groupKeyOf(&left);
+    const right_key = resume_picker.groupKeyOf(&right);
+    if (std.mem.eql(u8, left_key, right_key)) return left.updated_at_ms > right.updated_at_ms;
 
-    const left_project_updated_at_ms = map.get(left.cwd) orelse std.math.minInt(i64);
-    const right_project_updated_at_ms = map.get(right.cwd) orelse std.math.minInt(i64);
+    const left_project_updated_at_ms = map.get(left_key) orelse std.math.minInt(i64);
+    const right_project_updated_at_ms = map.get(right_key) orelse std.math.minInt(i64);
     if (left_project_updated_at_ms != right_project_updated_at_ms) {
         return left_project_updated_at_ms > right_project_updated_at_ms;
     }
 
-    return std.mem.lessThan(u8, left.cwd, right.cwd);
+    return std.mem.lessThan(u8, left_key, right_key);
 }
 
 /// Legacy comparator (O(n) per comparison). Kept for the cross-module test in
 /// tui.zig. Prefer `resumeSummaryLessThanWithMap` for production use.
 pub fn resumeSummaryLessThan(summaries: []const session_mod.SessionSummary, left: session_mod.SessionSummary, right: session_mod.SessionSummary) bool {
-    if (std.mem.eql(u8, left.cwd, right.cwd)) return left.updated_at_ms > right.updated_at_ms;
+    const left_key = resume_picker.groupKeyOf(&left);
+    const right_key = resume_picker.groupKeyOf(&right);
+    if (std.mem.eql(u8, left_key, right_key)) return left.updated_at_ms > right.updated_at_ms;
 
-    const left_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, left.cwd);
-    const right_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, right.cwd);
+    const left_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, left_key);
+    const right_project_updated_at_ms = resumeProjectUpdatedAtMax(summaries, right_key);
     if (left_project_updated_at_ms != right_project_updated_at_ms) {
         return left_project_updated_at_ms > right_project_updated_at_ms;
     }
 
-    return std.mem.lessThan(u8, left.cwd, right.cwd);
+    return std.mem.lessThan(u8, left_key, right_key);
 }
 
-fn resumeProjectUpdatedAtMax(summaries: []const session_mod.SessionSummary, cwd: []const u8) i64 {
+fn resumeProjectUpdatedAtMax(summaries: []const session_mod.SessionSummary, group_key: []const u8) i64 {
     var updated_at_ms: i64 = std.math.minInt(i64);
-    for (summaries) |summary| {
-        if (!std.mem.eql(u8, summary.cwd, cwd)) continue;
+    for (summaries) |*summary| {
+        if (!std.mem.eql(u8, resume_picker.groupKeyOf(summary), group_key)) continue;
         updated_at_ms = @max(updated_at_ms, summary.updated_at_ms);
     }
     return updated_at_ms;
@@ -102,9 +108,52 @@ fn restoreCheckpointForBranch(app: *App, rt: *runtime_mod.AgentRuntime) !void {
 // Delegated public functions
 // ---------------------------------------------------------------------------
 
+/// The session store the picker (and every picker mutation) uses: the live
+/// config's backend selection — the SAME selection the runtime used at
+/// startup, so a remote session is never listed from one store and resumed
+/// against another (INV-BACKEND).
+pub fn currentSessionStore(app: *const App) session_mod.SessionStore {
+    const cfg = &app.cached_config;
+    const kind: session_mod.BackendKind = switch (cfg.effectiveDatabaseBackend()) {
+        .local => .local_sqlite,
+        .zay_service => .remote_service,
+        .turso_http => .turso_http,
+        .d1_http => .d1_http,
+        .postgres_native => .postgres_native,
+    };
+    return .{
+        .kind = kind,
+        .url = cfg.effectiveDatabaseUrl(),
+        .token = cfg.effectiveDatabaseAuthToken(),
+        .path = cfg.effectiveDatabasePath(),
+    };
+}
+
+fn hostIdOf(app: *const App) []const u8 {
+    return if (app.host_id.len > 0) app.host_id else "default-host";
+}
+
+/// Open the picker's session store with the SAME backend selection as the
+/// runtime. A configured remote store that cannot be reached surfaces as an
+/// error — never a silent local fallback, which would list a different
+/// database's sessions.
+fn openPickerStore(app: *App) !session_mod.SessionManager {
+    return session_mod.SessionManager.initStore(
+        app.gpa,
+        app.io,
+        app.liveRuntime().?.home_dir,
+        currentSessionStore(app),
+        hostIdOf(app),
+        false,
+    );
+}
+
 pub fn openResumePicker(app: *App) !void {
     app.closeAtSearch();
-    try app.reloadResumeSessions();
+    app.reloadResumeSessions() catch |err| {
+        try app.reportSessionSwitchError(err);
+        return;
+    };
     const summaries = app.resume_summaries.items;
     const filter = app.peekPaletteInput() catch "";
     defer if (filter.len > 0) app.gpa.free(filter);
@@ -119,25 +168,51 @@ pub fn openResumePicker(app: *App) !void {
 
 pub fn reloadResumeSessions(app: *App) !void {
     resumeClear(app);
-    var manager = try session_mod.SessionManager.initDefault(app.gpa, app.io, app.liveRuntime().?.home_dir);
+    var manager = try openPickerStore(app);
     defer manager.deinit();
-    const cwd = if (app.nav.resume_group_by != .flat) null else (app.repoRoot() orelse app.liveRuntime().?.cwd);
-    const summaries = try manager.list(app.gpa, cwd);
-    defer app.gpa.free(summaries);
-    try app.resume_summaries.appendSlice(app.gpa, summaries);
-    if (app.nav.resume_group_by != .flat) {
-        var map = try buildProjectMaxMap(app.gpa, app.resume_summaries.items);
-        defer map.deinit();
-        std.mem.sort(
-            session_mod.SessionSummary,
-            app.resume_summaries.items,
-            &map,
-            struct {
-                fn cmp(m: *const std.StringHashMap(i64), a: session_mod.SessionSummary, b: session_mod.SessionSummary) bool {
-                    return resumeSummaryLessThanWithMap(m, a, b);
-                }
-            }.cmp,
-        );
+    switch (app.nav.resume_group_by) {
+        .flat => {
+            // Flat mode lists the current root's project across hosts when
+            // the root has a binding; the legacy raw-cwd filter otherwise.
+            // Degradation is display-only but logged — a silent drop would
+            // look like "the other host's sessions vanished".
+            const root = app.repoRoot() orelse app.liveRuntime().?.cwd;
+            var listed: ?[]session_mod.SessionSummary = null;
+            const project_key_opt = manager.projectKeyForCwd(app.gpa, root) catch |err| key_fallback: {
+                log.warn("session.picker.project_lookup_failed err={s}", .{@errorName(err)});
+                break :key_fallback null;
+            };
+            if (project_key_opt) |project_key| {
+                defer app.gpa.free(project_key);
+                listed = manager.listByProject(app.gpa, project_key) catch |err| list_fallback: {
+                    log.warn("session.picker.project_list_failed err={s}", .{@errorName(err)});
+                    break :list_fallback null;
+                };
+            }
+            if (listed == null) listed = try manager.list(app.gpa, root);
+            defer app.gpa.free(listed.?);
+            try app.resume_summaries.appendSlice(app.gpa, listed.?);
+        },
+        .project, .date => {
+            const summaries = try manager.list(app.gpa, null);
+            defer app.gpa.free(summaries);
+            try app.resume_summaries.appendSlice(app.gpa, summaries);
+            // Sort by GROUP key (project_key when bound, else origin cwd) so
+            // project-mode grouping folds roaming sessions of one project
+            // into a single contiguous run.
+            var map = try buildProjectMaxMap(app.gpa, app.resume_summaries.items);
+            defer map.deinit();
+            std.mem.sort(
+                session_mod.SessionSummary,
+                app.resume_summaries.items,
+                &map,
+                struct {
+                    fn cmp(m: *const std.StringHashMap(i64), a: session_mod.SessionSummary, b: session_mod.SessionSummary) bool {
+                        return resumeSummaryLessThanWithMap(m, a, b);
+                    }
+                }.cmp,
+            );
+        },
     }
     if (app.nav.resume_selection >= try visibleResumeCount(app)) app.nav.resume_selection = 0;
     syncResumeListCursor(app);
@@ -158,12 +233,12 @@ pub fn visibleResumeCount(app: *App) !u32 {
 pub fn toggleSelectedResumeProject(app: *App) !void {
     const filter = try app.peekPaletteInput();
     defer app.gpa.free(filter);
-    const cwd = resume_picker.selectedProject(app.resume_summaries.items, filter, app.resume_folded_projects.items, app.nav.resume_selection) orelse return;
-    if (resumeFoldIndex(app, cwd)) |index| {
+    const group_key = resume_picker.selectedProject(app.resume_summaries.items, filter, app.resume_folded_projects.items, app.nav.resume_selection) orelse return;
+    if (resumeFoldIndex(app, group_key)) |index| {
         app.gpa.free(app.resume_folded_projects.items[index]);
         _ = app.resume_folded_projects.orderedRemove(index);
     } else {
-        try app.resume_folded_projects.append(app.gpa, try app.gpa.dupe(u8, cwd));
+        try app.resume_folded_projects.append(app.gpa, try app.gpa.dupe(u8, group_key));
     }
     if (app.nav.resume_selection >= try visibleResumeCount(app)) app.nav.resume_selection = 0;
     syncResumeListCursor(app);
@@ -178,8 +253,15 @@ pub fn resumeClear(app: *App) void {
     for (app.resume_summaries.items) |*summary| summary.deinit(app.gpa);
     app.resume_summaries.clearRetainingCapacity();
     // Reset any pending sub-state so it doesn't persist into the next open.
+    // A pending project-root bind is DISCARDED, not cancelled silently: the
+    // owned identity copy is freed (INV-TUI-BIND — reload never retains a
+    // raw selection across a list reload).
+    if (app.pending_resume) |*pending| pending.deinit(app.gpa);
+    app.pending_resume = null;
+    app.project_root_error = null;
     app.nav.session_action = .browsing;
     app.input_buffers.session_rename_text.clearRetainingCapacity();
+    app.input_buffers.project_root_text.clearRetainingCapacity();
 }
 
 pub fn syncResumeListCursor(app: *App) void {
@@ -311,7 +393,7 @@ pub fn confirmRenameSelectedSession(app: *App) !void {
     const text = std.mem.trim(u8, app.input_buffers.session_rename_text.items, " \t\r\n");
     if (text.len == 0) return;
     const summary = try app.selectedResumeSummary() orelse return;
-    var manager = try session_mod.SessionManager.initDefault(app.gpa, app.io, app.liveRuntime().?.home_dir);
+    var manager = try openPickerStore(app);
     defer manager.deinit();
     manager.renameSession(summary.id, text) catch |err| {
         app.nav.session_action = .browsing;
@@ -352,7 +434,7 @@ pub fn confirmDeleteSelectedSession(app: *App) !void {
     };
     const id = try app.gpa.dupe(u8, summary.id);
     defer app.gpa.free(id);
-    var manager = try session_mod.SessionManager.initDefault(app.gpa, app.io, app.liveRuntime().?.home_dir);
+    var manager = try openPickerStore(app);
     defer manager.deinit();
     manager.deleteSession(id) catch |err| {
         app.nav.session_action = .browsing;
@@ -373,6 +455,135 @@ pub fn cancelSessionAction(app: *App) void {
     app.input_buffers.session_rename_text.clearRetainingCapacity();
 }
 
+// ---------------------------------------------------------------------------
+// Roaming resume: project-root resolution and host binding
+// ---------------------------------------------------------------------------
+
+/// The resume front door: resolve the selected session onto this host and
+/// either switch immediately or enter the `.locating_project` sub-state for
+/// the user to type a local project root (INV-RESUME-CWD — never a silent
+/// switch onto a foreign or missing path).
+pub fn beginResumeSelectedSession(app: *App) !void {
+    if (app.thread.turn.isActive()) {
+        _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
+        return;
+    }
+    const summary = try app.selectedResumeSummary() orelse return;
+    const current_root = app.repoRoot() orelse app.liveRuntime().?.cwd;
+    var manager = openPickerStore(app) catch |err| {
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    defer manager.deinit();
+    var resolution = manager.resolveProjectCwd(
+        app.gpa,
+        summary.id,
+        summary.cwd,
+        summary.host_id,
+        summary.project_key,
+        current_root,
+    ) catch |err| {
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    switch (resolution) {
+        .ready => |root| {
+            defer resolution.deinit(app.gpa);
+            // Snapshot the store BEFORE the switch: a cross-project resume
+            // reloads the target project config inside createRuntimeImpl, and
+            // the id must resolve against the store that listed it (INV-BACKEND).
+            const store = currentSessionStore(app);
+            switchToSessionResolved(app, summary.id, root.cwd, store) catch |err| {
+                if (err == error.InFlightTurn) {
+                    _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
+                    return;
+                }
+                try app.reportSessionSwitchError(err);
+            };
+        },
+        .needs_project_root => |pending| {
+            // Ownership moves into the App state; free the union shell only.
+            app.pending_resume = pending;
+            resolution = undefined;
+            app.project_root_error = null;
+            app.input_buffers.project_root_text.clearRetainingCapacity();
+            app.nav.session_action = .locating_project;
+        },
+    }
+}
+
+/// Confirm the project-root bind (Enter in `.locating_project`): trim and
+/// validate the input, persist the binding + row stamp atomically, then
+/// resume through the SAME store the list came from. Any invalid input
+/// performs NO config, plugin, MCP, search, runtime, or session mutation
+/// (INV-TUI-BIND) — only an inline error is set.
+pub fn confirmProjectRootBinding(app: *App) !void {
+    const pending = &(app.pending_resume orelse return);
+    const raw = std.mem.trim(u8, app.input_buffers.project_root_text.items, " \t\r\n");
+    if (raw.len == 0) {
+        app.project_root_error = "Enter a directory path.";
+        return;
+    }
+    if (!std.fs.path.isAbsolute(raw)) {
+        app.project_root_error = "Path must be absolute.";
+        return;
+    }
+    // Existence + readability: open the directory. `realPathFileAbsoluteAlloc`
+    // then canonicalizes (resolves symlinks) so the stored cwd and cwd_key are
+    // a stable spelling of the same directory.
+    var dir = std.Io.Dir.cwd().openDir(app.io, raw, .{}) catch {
+        app.project_root_error = "Directory does not exist or is not readable.";
+        return;
+    };
+    dir.close(app.io);
+    const resolved = std.Io.Dir.realPathFileAbsoluteAlloc(app.io, raw, app.gpa) catch {
+        app.project_root_error = "Path could not be resolved.";
+        return;
+    };
+    defer app.gpa.free(resolved);
+
+    var manager = openPickerStore(app) catch |err| {
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    defer manager.deinit();
+    const key = manager.bindProjectCwd(app.gpa, pending.session_id, pending.project_key, resolved) catch |err| {
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    defer app.gpa.free(key);
+
+    // Binding persisted; the resume runs through the picker's store.
+    // Same snapshot discipline as beginResumeSelectedSession (INV-BACKEND).
+    const store = currentSessionStore(app);
+    const session_id = try app.gpa.dupe(u8, pending.session_id);
+    defer app.gpa.free(session_id);
+    switchToSessionResolved(app, session_id, resolved, store) catch |err| {
+        if (err == error.InFlightTurn) {
+            _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
+            return;
+        }
+        try app.reportSessionSwitchError(err);
+        return;
+    };
+    // On success the runtime switched; drop the consumed pending state.
+    if (app.pending_resume) |*consumed| consumed.deinit(app.gpa);
+    app.pending_resume = null;
+    app.project_root_error = null;
+    app.input_buffers.project_root_text.clearRetainingCapacity();
+}
+
+/// Cancel the project-root bind (Esc): return to browsing. No config,
+/// plugin, MCP, search, runtime, or session mutation (INV-TUI-BIND) — the
+/// owned pending identity is the only thing freed.
+pub fn cancelProjectRootBinding(app: *App) void {
+    if (app.pending_resume) |*pending| pending.deinit(app.gpa);
+    app.pending_resume = null;
+    app.project_root_error = null;
+    app.input_buffers.project_root_text.clearRetainingCapacity();
+    app.nav.session_action = .browsing;
+}
+
 pub fn switchToNewSession(app: *App) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
     const runtime = try createRuntime(app, app.liveRuntime().?.cwd, app.repoRoot() orelse app.liveRuntime().?.cwd, null);
@@ -387,8 +598,16 @@ pub fn switchToNewSession(app: *App) !void {
 }
 
 pub fn switchToSession(app: *App, session_id: []const u8, cwd: []const u8) !void {
+    return switchToSessionResolved(app, session_id, cwd, null);
+}
+
+/// Low-level resume boundary: accepts an ALREADY RESOLVED current-host root
+/// (INV-RESUME-CWD) plus the store the session was listed from (null = the
+/// runtime config's backend). The picker routes through
+/// `beginResumeSelectedSession`, which resolves the root first.
+pub fn switchToSessionResolved(app: *App, session_id: []const u8, cwd: []const u8, store: ?session_mod.SessionStore) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
-    const runtime = try createRuntime(app, cwd, app.repoRoot() orelse app.liveRuntime().?.cwd, session_id);
+    const runtime = try createRuntimeImpl(app, cwd, app.repoRoot() orelse app.liveRuntime().?.cwd, session_id, false, store);
     errdefer {
         runtime.deinit();
         app.gpa.destroy(runtime);
@@ -400,7 +619,7 @@ pub fn switchToSession(app: *App, session_id: []const u8, cwd: []const u8) !void
 }
 
 pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
-    return createRuntimeImpl(app, cwd, session_dir, session_id, false);
+    return createRuntimeImpl(app, cwd, session_dir, session_id, false, null);
 }
 
 /// Lane variant: resuming a session onto a worktree of THIS repo is not a
@@ -409,18 +628,19 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
 /// the worktree directory (and repointing plugins) and instead of letting the
 /// `anyLaneTurnActive` guard refuse while another lane runs a turn.
 pub fn createLaneRuntime(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
-    return createRuntimeImpl(app, cwd, session_dir, session_id, true);
+    return createRuntimeImpl(app, cwd, session_dir, session_id, true, null);
 }
 
-fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8, lane_same_project: bool) !*runtime_mod.AgentRuntime {
+fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8, lane_same_project: bool, session_store: ?session_mod.SessionStore) !*runtime_mod.AgentRuntime {
     const current = app.templateRuntime() orelse return error.NoActiveRuntime;
     // When resuming a session from a different project, don't use the current
     // runtime as template — skills and plugin prompts must load from the
-    // session's own cwd, not the current project's.
+    // session's own cwd, not the current project's. Separator- and
+    // case-tolerant comparison (pathsEqual), never a raw byte compare.
     const cross_project = if (lane_same_project)
         false
     else
-        (session_id != null and !std.mem.eql(u8, cwd, current.cwd));
+        (session_id != null and !paths.pathsEqual(cwd, current.cwd));
     // Guard: before any App-state mutation — refuse if any lane has an
     // active turn. Unloading Lua states and stripping tool records from the
     // shared registry while a worker dispatches through them is a
@@ -457,6 +677,9 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     errdefer app.gpa.destroy(runtime);
     const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
     errdefer current.gpa.free(diagnostics);
+    // Host identity carried from the process boundary (App init); tests that
+    // build a bare App fall back to the same sentinel the session layer uses.
+    const host_id: []const u8 = if (app.host_id.len > 0) app.host_id else "default-host";
     if (session_id) |id| {
         try runtime.initResume(.{
             .gpa = current.gpa,
@@ -467,7 +690,9 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             .base_system_prompt = current.base_system_prompt,
             .config = config.*,
             .diagnostics = diagnostics,
+            .host_id = host_id,
             .session_id = id,
+            .session_store = session_store,
             .template = template,
         });
     } else {
@@ -480,6 +705,7 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             .base_system_prompt = current.base_system_prompt,
             .config = config.*,
             .diagnostics = diagnostics,
+            .host_id = host_id,
             .template = template,
         });
     }
@@ -852,6 +1078,7 @@ test "refreshAllLaneTools pushes synced MCP and plugin tools into a non-viewed l
         .session_dir = home_abs,
         .home_dir = home_abs,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{
             .model_selection = .{
                 .builtin = .{
@@ -937,4 +1164,99 @@ test "refreshAllLaneTools pushes synced MCP and plugin tools into a non-viewed l
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Roaming resume tests (project-root bind sub-state)
+// ---------------------------------------------------------------------------
+
+/// Build an app with a REAL primary-lane runtime (the undo harness shape) so
+/// `openPickerStore` / runtime creation have a live home_dir to work with.
+fn makeBindTestApp(gpa: std.mem.Allocator, home_abs: []const u8, agent: *agent_mod.Agent) !App {
+    const test_helpers = @import("test_helpers.zig");
+    var app = try App.init(std.testing.io, gpa, agent);
+    const runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
+    app.thread.agent = &runtime.agent;
+    return app;
+}
+
+test "project-root bind form: invalid input mutates nothing" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try makeBindTestApp(gpa, home_abs, &agent);
+    defer app.deinit();
+
+    app.pending_resume = .{
+        .session_id = try gpa.dupe(u8, "a" ** 32),
+        .project_key = null,
+        .origin_cwd = try gpa.dupe(u8, "/other/host/repo"),
+        .origin_host_id = try gpa.dupe(u8, "desktop"),
+    };
+    app.nav.session_action = .locating_project;
+    // A lane turn is NOT active here; snapshot App state to prove zero mutation.
+    const mode_before = app.mode;
+
+    // Empty input → inline error, still in the sub-state.
+    try app.confirmProjectRootBinding();
+    try std.testing.expect(app.project_root_error != null);
+    try std.testing.expect(app.nav.session_action == .locating_project);
+    try std.testing.expect(app.mode == mode_before);
+    try std.testing.expect(app.pending_resume != null);
+
+    // Relative path → refused.
+    app.project_root_error = null;
+    try app.input_buffers.project_root_text.appendSlice(gpa, "relative/path");
+    try app.confirmProjectRootBinding();
+    try std.testing.expect(app.project_root_error != null);
+    try std.testing.expect(app.nav.session_action == .locating_project);
+
+    // Non-existent absolute path → refused, still no session/runtime writes.
+    app.project_root_error = null;
+    app.input_buffers.project_root_text.clearRetainingCapacity();
+    try app.input_buffers.project_root_text.appendSlice(gpa, "/definitely/not/a/real/dir");
+    try app.confirmProjectRootBinding();
+    try std.testing.expect(app.project_root_error != null);
+    try std.testing.expect(app.nav.session_action == .locating_project);
+    try std.testing.expect(app.pending_resume != null);
+    try std.testing.expect(app.mode == mode_before);
+}
+
+test "project-root bind cancel frees the pending identity and never writes" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try makeBindTestApp(gpa, home_abs, &agent);
+    defer app.deinit();
+
+    app.pending_resume = .{
+        .session_id = try gpa.dupe(u8, "b" ** 32),
+        .project_key = try gpa.dupe(u8, "pk-" ++ "c" ** 32),
+        .origin_cwd = try gpa.dupe(u8, "/other/host/repo"),
+        .origin_host_id = null,
+    };
+    app.nav.session_action = .locating_project;
+    try app.input_buffers.project_root_text.appendSlice(gpa, home_abs);
+
+    app.cancelProjectRootBinding();
+    try std.testing.expect(app.pending_resume == null);
+    try std.testing.expect(app.project_root_error == null);
+    try std.testing.expect(app.nav.session_action == .browsing);
+    try std.testing.expect(app.input_buffers.project_root_text.items.len == 0);
+    try std.testing.expect(app.mode == App.Mode.normal);
 }

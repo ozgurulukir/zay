@@ -51,6 +51,7 @@ pub fn hintText(hint: HintInputs) []const u8 {
             .renaming => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
             .deleting => "[Y] Delete" ++ symbols.separator_dot_padded ++ "[N/ESC] Cancel",
             .blocked => "[Any key] Dismiss",
+            .locating_project => "[ENTER] Bind & Resume" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         },
         .provider_picker => switch (hint.provider_stage) {
             .list => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
