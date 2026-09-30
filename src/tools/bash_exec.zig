@@ -290,6 +290,15 @@ fn captureLoginEnv(io: std.Io) ![]const u8 {
 const windows_bash_candidates = [_][]const u8{
     "C:\\Program Files\\Git\\bin\\bash.exe",
     "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+    "C:\\Git\\bin\\bash.exe",
+    "C:\\Git\\usr\\bin\\bash.exe",
+};
+
+const git_bash_relative_paths = [_][]const u8{
+    "bin\\bash.exe",
+    "usr\\bin\\bash.exe",
 };
 
 extern "kernel32" fn SetEnvironmentVariableW(
@@ -385,7 +394,98 @@ fn resolveBashPath(io: std.Io) []const u8 {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch continue;
         return path;
     }
+
+    const gpa = std.heap.page_allocator;
+    var environment = std.process.Environ.createMap(.{ .block = .global }, gpa) catch return "bash";
+    defer environment.deinit();
+    const path_value = environment.get("PATH") orelse return "bash";
+
+    if (findGitBashOnPath(io, gpa, path_value)) |path| return path;
+    if (findBashOnPath(io, gpa, path_value)) |path| return path;
     return "bash";
+}
+
+/// Find Git Bash beside a Git executable on PATH. Git for Windows commonly
+/// places `git.exe` in `<install>\\cmd` while Bash lives in `<install>\\bin`
+/// or `<install>\\usr\\bin`; deriving the install root handles non-C: drives
+/// and custom install directories without trusting an unqualified `bash.exe`.
+fn findGitBashOnPath(io: std.Io, gpa: std.mem.Allocator, path_value: []const u8) ?[]const u8 {
+    var path_it = std.mem.tokenizeScalar(u8, path_value, ';');
+    while (path_it.next()) |path_dir| {
+        if (!std.fs.path.isAbsolute(path_dir)) continue;
+        const git_path = std.fs.path.join(gpa, &.{ path_dir, "git.exe" }) catch continue;
+        const git_exists = blk: {
+            if (std.Io.Dir.accessAbsolute(io, git_path, .{})) |_| break :blk true else |_| break :blk false;
+        };
+        if (!git_exists) {
+            gpa.free(git_path);
+            continue;
+        }
+
+        const git_dir = std.fs.path.dirname(git_path) orelse {
+            gpa.free(git_path);
+            continue;
+        };
+        const install_dir = std.fs.path.dirname(git_dir) orelse {
+            gpa.free(git_path);
+            continue;
+        };
+        const bash_path = findGitBashInInstall(io, gpa, install_dir);
+        gpa.free(git_path);
+        if (bash_path) |path| return path;
+    }
+    return null;
+}
+
+fn findGitBashInInstall(io: std.Io, gpa: std.mem.Allocator, install_dir: []const u8) ?[]const u8 {
+    for (git_bash_relative_paths) |relative_path| {
+        const bash_path = std.fs.path.join(gpa, &.{ install_dir, relative_path }) catch continue;
+        if (std.Io.Dir.accessAbsolute(io, bash_path, .{})) |_| return bash_path else |_| {}
+        gpa.free(bash_path);
+    }
+    return null;
+}
+
+/// Search PATH for a usable Bash executable while skipping the Windows WSL
+/// launcher locations. If no Git installation is discoverable, a real Bash on
+/// PATH is still a valid fallback; the bare `bash` fallback must not select a
+/// known launcher path by accident.
+fn findBashOnPath(io: std.Io, gpa: std.mem.Allocator, path_value: []const u8) ?[]const u8 {
+    var path_it = std.mem.tokenizeScalar(u8, path_value, ';');
+    while (path_it.next()) |path_dir| {
+        if (!std.fs.path.isAbsolute(path_dir)) continue;
+        const bash_path = std.fs.path.join(gpa, &.{ path_dir, "bash.exe" }) catch continue;
+        if (isWindowsBashLauncherPath(bash_path)) {
+            gpa.free(bash_path);
+            continue;
+        }
+        if (std.Io.Dir.accessAbsolute(io, bash_path, .{})) |_| return bash_path else |_| {}
+        gpa.free(bash_path);
+    }
+    return null;
+}
+
+fn isWindowsBashLauncherPath(path: []const u8) bool {
+    return containsIgnoreCase(path, "\\WindowsApps\\") or
+        containsIgnoreCase(path, "/WindowsApps/") or
+        containsIgnoreCase(path, "\\System32\\") or
+        containsIgnoreCase(path, "/System32/");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+test "Windows Bash launcher paths are rejected" {
+    try std.testing.expect(isWindowsBashLauncherPath("C:\\Windows\\System32\\bash.exe"));
+    try std.testing.expect(isWindowsBashLauncherPath("C:/Users/test/AppData/Local/Microsoft/WindowsApps/bash.exe"));
+    try std.testing.expect(!isWindowsBashLauncherPath("D:\\Git\\usr\\bin\\bash.exe"));
 }
 
 test "bash captures stdout and exit code" {
