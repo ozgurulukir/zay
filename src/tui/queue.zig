@@ -242,6 +242,7 @@ test "appendSkillInvocationsToTranscript appends formatted skill title to transc
         .session_dir = home.path,
         .home_dir = home.path,
         .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
         .config = .{},
         .diagnostics = &.{},
     });

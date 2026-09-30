@@ -184,6 +184,13 @@ pub const App = struct {
     pasting: bool = false,
     mode: Mode = .normal,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
+    /// Pending roaming-resume bind (INV-TUI-BIND): owned copies of the
+    /// selected session's identity while the user types a project root.
+    /// Never retains a `SessionSummary*` — freed on cancel, reload, and deinit.
+    pending_resume: ?session_mod.PendingProjectBinding = null,
+    /// Inline validation error for the project-root bind form. Static
+    /// literals only — never owned memory.
+    project_root_error: ?[]const u8 = null,
     resume_folded_projects: std.ArrayList([]u8) = .empty,
     pickers: app_state.PickerStates,
     codex_signed_in: bool = false,
@@ -204,6 +211,11 @@ pub const App = struct {
     /// session resume can reload config (`.zay/config.json`) from the
     /// target project's cwd without re-reading the OS environment.
     environ_map: ?*std.process.Environ.Map = null,
+    /// Host identity, resolved once at App init from the environment
+    /// (INV-HOST-ID) and propagated through every new/resumed/lane runtime.
+    /// Empty in test harnesses — callers fall back to the session layer's
+    /// "default-host" sentinel.
+    host_id: []const u8 = "",
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
     /// Visual feedback state (loading spinner, black-hole intro, diff
     /// cache, git label) lives in MetricsState.
@@ -341,6 +353,7 @@ pub const App = struct {
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
         app.environ_map = environ_map;
+        app.host_id = session_mod.resolveHostId(gpa, environ_map) catch "";
         // Size the shared request limiter from the config knob (default 2 —
         // single lane is unaffected; 2 bounds the multi-lane burst).
         if (app.request_limiter) |limiter| {
@@ -974,6 +987,31 @@ pub const App = struct {
 
     pub fn cancelSessionAction(self: *App) void {
         session_switcher.cancelSessionAction(self);
+    }
+
+    pub fn popSessionProjectRootInput(self: *App) void {
+        const items = self.input_buffers.project_root_text.items;
+        if (items.len == 0) return;
+        var cut = items.len - 1;
+        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+        self.input_buffers.project_root_text.shrinkRetainingCapacity(cut);
+    }
+
+    /// Resolve the selected resume entry onto this host and either switch
+    /// immediately or enter the project-root bind sub-state.
+    pub fn beginResumeSelectedSession(self: *App) !void {
+        return session_switcher.beginResumeSelectedSession(self);
+    }
+
+    /// Confirm the project-root bind: validate, persist atomically, resume.
+    pub fn confirmProjectRootBinding(self: *App) !void {
+        return session_switcher.confirmProjectRootBinding(self);
+    }
+
+    /// Cancel the project-root bind: no config, plugin, MCP, runtime, or
+    /// session mutation (INV-TUI-BIND).
+    pub fn cancelProjectRootBinding(self: *App) void {
+        session_switcher.cancelProjectRootBinding(self);
     }
 
     pub fn reportConnectionError(self: *App, err: anyerror) !void {

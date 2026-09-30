@@ -27,6 +27,12 @@ pub const Content = struct {
     /// Rename text buffer (borrowed from `app.input_buffers.session_rename_text`).
     /// Only rendered while `action == .renaming`.
     rename_text: []const u8 = "",
+    /// Project-root bind form (borrowed from
+    /// `app.input_buffers.project_root_text`); rendered while
+    /// `action == .locating_project`.
+    project_root_text: []const u8 = "",
+    /// Inline validation error for the bind form (static literal).
+    project_root_error: ?[]const u8 = null,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
@@ -102,6 +108,17 @@ pub const Content = struct {
                 try panel.lineStyledAt(&surface, 2, "  Switch to another session first, then delete this one.", ctx, 2, p.tool_failed);
                 try panel.lineStyledAt(&surface, height -| 2, "[Any key] Dismiss", ctx, 2, p.thinking_body);
             },
+            .locating_project => {
+                try panel.lineStyledAt(&surface, 0, "Set Local Project Root", ctx, 2, p.panel_header);
+                try panel.lineStyledAt(&surface, 1, "  This session was created on another machine (or its directory", ctx, 2, p.thinking_body);
+                try panel.lineStyledAt(&surface, 2, "  is gone). Enter the local directory to bind it to this host.", ctx, 2, p.thinking_body);
+                const prompt = try std.fmt.allocPrint(ctx.arena, "  > {s}_", .{self.project_root_text});
+                try panel.lineStyledAt(&surface, 4, prompt, ctx, 2, p.selected_item);
+                if (self.project_root_error) |err_text| {
+                    try panel.lineStyledAt(&surface, 6, err_text, ctx, 2, p.tool_failed);
+                }
+                try panel.lineStyledAt(&surface, height -| 2, "[Enter] Bind & Resume  |  [Esc] Cancel", ctx, 2, p.thinking_body);
+            },
             .browsing => unreachable,
         }
         return surface;
@@ -164,12 +181,12 @@ const RowBuilder = struct {
     fn buildProject(self: *RowBuilder) !void {
         var summary_index: usize = 0;
         while (summary_index < self.summaries.len) {
-            const cwd = self.summaries[summary_index].cwd;
+            const group_key = groupKeyOf(&self.summaries[summary_index]);
             const end = projectEnd(self.summaries, summary_index);
             if (projectMatches(self.summaries[summary_index..end], self.filter)) {
-                const folded = projectFolded(self.folded_projects, cwd);
+                const folded = projectFolded(self.folded_projects, group_key);
                 const has_children = matchingChildCount(self.summaries[summary_index..end], self.filter) > 0;
-                try self.appendProject(cwd, end - summary_index, folded, has_children);
+                try self.appendProject(self.summaries[summary_index..end], folded, has_children);
                 if (!folded) {
                     const last_child = lastMatchingChild(self.summaries[summary_index..end], self.filter) orelse summary_index;
                     var child_index = summary_index;
@@ -227,11 +244,29 @@ const RowBuilder = struct {
         self.index += 1;
     }
 
-    fn appendProject(self: *RowBuilder, cwd: []const u8, count: usize, folded: bool, has_children: bool) !void {
+    fn appendProject(self: *RowBuilder, group: []const session_mod.SessionSummary, folded: bool, has_children: bool) !void {
+        // Display (roaming projects): the local mapped basename when any
+        // session of the project carries one; otherwise the first session's
+        // origin cwd. A bound group with NO local mapping on this host gets
+        // the explicit "project root required" marker.
+        var label_src: []const u8 = group[0].cwd;
+        var local_found = false;
+        for (group) |*summary| {
+            if (summary.local_cwd) |local| {
+                label_src = local;
+                local_found = true;
+                break;
+            }
+        }
+        const needs_root = group[0].project_key != null and !local_found;
+        const label = if (needs_root)
+            try std.fmt.allocPrint(self.ctx.arena, "{s} — project root required", .{baseName(label_src)})
+        else
+            baseName(label_src);
         const prefix = try tree_art.buildPrefix(self.ctx.arena, 0, false, &.{}, folded, has_children, has_children);
         self.rows[self.index] = .{
             .io = self.io,
-            .kind = .{ .project = .{ .cwd = cwd, .session_count = @intCast(@min(count, std.math.maxInt(u32))), .folded = folded, .prefix = prefix } },
+            .kind = .{ .project = .{ .label = label, .session_count = @intCast(@min(group.len, std.math.maxInt(u32))), .folded = folded, .prefix = prefix } },
             .selected = self.index == self.selection,
         };
         self.widgets[self.index] = self.rows[self.index].widget();
@@ -298,7 +333,7 @@ const Row = struct {
     };
 
     const Project = struct {
-        cwd: []const u8,
+        label: []const u8,
         session_count: u32,
         folded: bool,
         prefix: []const u8,
@@ -344,7 +379,7 @@ const Row = struct {
         try panel.lineStyledAt(surface, 0, project.prefix, ctx, col, prefix_style);
         col += @intCast(ctx.stringWidth(project.prefix));
 
-        const name = baseName(project.cwd);
+        const name = project.label;
         try panel.lineStyledAt(surface, 0, name, ctx, col, tui_style.onSelectionBg(p.markdown_code, self.selected));
         col += @intCast(ctx.stringWidth(name));
 
@@ -395,11 +430,11 @@ fn projectVisibleCount(summaries: []const session_mod.SessionSummary, filter: []
     var count: u32 = 0;
     var index: usize = 0;
     while (index < summaries.len) {
-        const cwd = summaries[index].cwd;
+        const group_key = groupKeyOf(&summaries[index]);
         const end = projectEnd(summaries, index);
         if (projectMatches(summaries[index..end], filter)) {
             count += 1;
-            if (!projectFolded(folded_projects, cwd)) {
+            if (!projectFolded(folded_projects, group_key)) {
                 var child_index = index;
                 while (child_index < end) : (child_index += 1) {
                     if (matches(&summaries[child_index], filter)) count += 1;
@@ -449,12 +484,12 @@ fn selectedProjectSummary(summaries: []const session_mod.SessionSummary, filter:
     var row: u32 = 0;
     var index: usize = 0;
     while (index < summaries.len) {
-        const cwd = summaries[index].cwd;
+        const group_key = groupKeyOf(&summaries[index]);
         const end = projectEnd(summaries, index);
         if (projectMatches(summaries[index..end], filter)) {
             if (row == selection) return null;
             row += 1;
-            if (!projectFolded(folded_projects, cwd)) {
+            if (!projectFolded(folded_projects, group_key)) {
                 var child_index = index;
                 while (child_index < end) : (child_index += 1) {
                     const summary = &summaries[child_index];
@@ -483,12 +518,12 @@ pub fn selectedProject(summaries: []const session_mod.SessionSummary, filter: []
     var row: u32 = 0;
     var index: usize = 0;
     while (index < summaries.len) {
-        const cwd = summaries[index].cwd;
+        const group_key = groupKeyOf(&summaries[index]);
         const end = projectEnd(summaries, index);
         if (projectMatches(summaries[index..end], filter)) {
-            if (row == selection) return cwd;
+            if (row == selection) return group_key;
             row += 1;
-            if (!projectFolded(folded_projects, cwd)) {
+            if (!projectFolded(folded_projects, group_key)) {
                 var child_index = index;
                 while (child_index < end) : (child_index += 1) {
                     if (matches(&summaries[child_index], filter)) row += 1;
@@ -535,10 +570,10 @@ fn matchingChildCount(summaries: []const session_mod.SessionSummary, filter: []c
 }
 
 fn projectEnd(summaries: []const session_mod.SessionSummary, start: usize) usize {
-    const cwd = summaries[start].cwd;
+    const key = groupKeyOf(&summaries[start]);
     var index = start + 1;
     while (index < summaries.len) : (index += 1) {
-        if (!std.mem.eql(u8, summaries[index].cwd, cwd)) break;
+        if (!std.mem.eql(u8, groupKeyOf(&summaries[index]), key)) break;
     }
     return index;
 }
@@ -548,6 +583,14 @@ pub fn projectFolded(folded_projects: []const []const u8, cwd: []const u8) bool 
         if (std.mem.eql(u8, folded, cwd)) return true;
     }
     return false;
+}
+
+/// Grouping identity of a summary: the logical project key when the session
+/// is bound, else the origin cwd (legacy rows). Sorting the list by this key
+/// makes project-mode grouping fold roaming sessions of one project — every
+/// host — into a single contiguous run.
+pub fn groupKeyOf(summary: *const session_mod.SessionSummary) []const u8 {
+    return summary.project_key orelse summary.cwd;
 }
 
 fn baseName(path: []const u8) []const u8 {

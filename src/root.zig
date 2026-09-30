@@ -198,10 +198,29 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     };
     defer if (hygiene_thread) |t| t.join();
 
+    // Host identity: resolved ONCE at the process boundary and carried
+    // through every runtime below (INV-HOST-ID) — never re-derived from a
+    // null env_map deeper in the stack, which used to record "default-host".
+    const resolved_host: ?[]u8 = session.resolveHostId(runtime_gpa, init.environ_map) catch blk: {
+        // Only allocation failure lands here; the sentinel merges this host
+        // into the shared "default-host" bucket, so say so in the log.
+        log.warn("session.host_id.resolve_failed; using default-host", .{});
+        break :blk null;
+    };
+    defer if (resolved_host) |h| runtime_gpa.free(h);
+    const host_id: []const u8 = resolved_host orelse "default-host";
+
     // Auto-resume: the driver's pinned session when it still resolves, else
-    // the most recently updated session for this cwd. The pin exists because
-    // lane sessions share the driver's cwd — a lane that wrote entries after
-    // the driver's last message used to hijack auto-resume via findLatest.
+    // the most recently updated session whose cwd matches the launch root
+    // (`resolveStartupResumeId`'s internal fallback — an exact-cwd match is
+    // a stronger local signal than a project binding), else the newest
+    // session of the launch root's bound project across hosts. The pin
+    // exists because lane sessions share the driver's cwd — a lane that
+    // wrote entries after the driver's last message used to hijack
+    // auto-resume via findLatest. Startup stays non-interactive: a root
+    // without a binding starts a new session rather than prompting for a
+    // project root. Every degraded lookup logs — "no resume" must stay
+    // distinguishable from "resume lookup failed" in zay.log.
     const resume_session_id = blk: {
         const db_backend = load_result.config.effectiveDatabaseBackend();
         const session_backend_kind: ?session.BackendKind = switch (db_backend) {
@@ -220,10 +239,34 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             load_result.config.effectiveDatabaseAuthToken(),
             load_result.config.effectiveDatabasePath(),
             init.environ_map,
-        ) catch break :blk null;
+        ) catch |err| {
+            log.warn("session.autoresume.store_open_failed err={s}", .{@errorName(err)});
+            break :blk null;
+        };
         defer manager.deinit();
-        const id = lane_recovery.resolveStartupResumeId(runtime_gpa, &manager, cwd) catch null;
-        break :blk id;
+        // 1+2. Validated driver pin, else the exact-cwd latest. A non-null
+        // result's allocation passes to the caller (freed with
+        // `resume_session_id`) — never deferred-freed here.
+        const pinned = lane_recovery.resolveStartupResumeId(runtime_gpa, &manager, cwd) catch |err| resume_fallback: {
+            log.warn("session.autoresume.pin_lookup_failed err={s}", .{@errorName(err)});
+            break :resume_fallback null;
+        };
+        if (pinned) |id| break :blk id;
+        // 3. Project-scoped latest — only when the launch root is already
+        // bound on this host (never a speculative bind at startup).
+        const project_key_opt = manager.projectKeyForCwd(runtime_gpa, cwd) catch |err| resume_fallback: {
+            log.warn("session.autoresume.project_lookup_failed err={s}", .{@errorName(err)});
+            break :resume_fallback null;
+        };
+        if (project_key_opt) |project_key| {
+            defer runtime_gpa.free(project_key);
+            const latest = manager.findLatestByProject(runtime_gpa, project_key) catch |err| resume_fallback: {
+                log.warn("session.autoresume.project_latest_failed err={s}", .{@errorName(err)});
+                break :resume_fallback null;
+            };
+            if (latest) |id| break :blk id;
+        }
+        break :blk null;
     };
     if (resume_session_id) |id| {
         defer runtime_gpa.free(id);
@@ -236,6 +279,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .base_system_prompt = system_prompt,
             .config = load_result.config,
             .diagnostics = load_result.takeDiagnostics(),
+            .host_id = host_id,
             .session_id = id,
         }) catch |err| {
             log.warn("session.resume.failed err={s}, starting new session", .{@errorName(err)});
@@ -248,6 +292,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
                 .base_system_prompt = system_prompt,
                 .config = load_result.config,
                 .diagnostics = load_result.takeDiagnostics(),
+                .host_id = host_id,
             });
         };
     } else {
@@ -260,6 +305,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .base_system_prompt = system_prompt,
             .config = load_result.config,
             .diagnostics = load_result.takeDiagnostics(),
+            .host_id = host_id,
         });
     }
     load_result.config.deinit(gpa);

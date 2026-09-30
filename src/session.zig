@@ -28,6 +28,12 @@ const EntryQueue = session_type.EntryQueue;
 pub const QueuedEntry = session_type.QueuedEntry;
 pub const CreateOptions = session_type.CreateOptions;
 pub const SessionSummary = session_type.SessionSummary;
+pub const ProjectKey = session_type.ProjectKey;
+pub const ProjectLocation = session_type.ProjectLocation;
+pub const ProjectRoot = session_type.ProjectRoot;
+pub const PendingProjectBinding = session_type.PendingProjectBinding;
+pub const ResumeResolution = session_type.ResumeResolution;
+pub const project_key_len = session_type.project_key_len;
 pub const lane_manifest = @import("session/lane_manifest.zig");
 pub const review_runs = @import("session/review_runs.zig");
 pub const EntryRecord = session_type.EntryRecord;
@@ -36,6 +42,19 @@ pub const CompactionBoundary = session_type.CompactionBoundary;
 pub const CompactionCut = session_type.CompactionCut;
 pub const EntryKind = session_type.EntryKind;
 pub const EntrySummary = session_type.EntrySummary;
+
+/// The backend selection a caller wants the session store to come from.
+/// Borrowed strings — a picker builds it from the live config right before
+/// use. `kind == null` falls back to `remote_service` when a url is present,
+/// else `local_sqlite`.
+pub const SessionStore = struct {
+    kind: ?BackendKind = null,
+    url: ?[]const u8 = null,
+    token: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+};
+
+pub const resolveHostId = backend_mod.resolveHostId;
 
 pub const SessionManager = struct {
     gpa: std.mem.Allocator,
@@ -157,6 +176,67 @@ pub const SessionManager = struct {
         return initFromModularConfig(gpa, io, home_dir, null, database_server_url, database_auth_token, null, env_map);
     }
 
+    /// One config-aware session-store open used by EVERY picker surface
+    /// (list, rename, delete, bind, resume — INV-BACKEND). `fallback_ok`
+    /// controls the fail-safe behavior when a configured remote store cannot
+    /// be reached: `true` warns and opens local SQLite (startup / new-session
+    /// semantics); `false` propagates the error so a remote session id is
+    /// never accidentally resolved against an unrelated local database.
+    pub fn initStore(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        home_dir: []const u8,
+        store: SessionStore,
+        host_id: []const u8,
+        fallback_ok: bool,
+    ) Error!SessionManager {
+        const kind: BackendKind = store.kind orelse (if (store.url != null and store.url.?.len > 0) .remote_service else .local_sqlite);
+        switch (kind) {
+            .local_sqlite => return initConfiguredLocal(gpa, io, home_dir, host_id, store.path),
+            .postgres_native => {
+                const log = std.log.scoped(.session);
+                log.warn("session.backend_not_implemented backend=postgres_native", .{});
+                // Honor fallback_ok like every other remote arm: a resume/picker
+                // open must never quietly talk to local SQLite when the
+                // configured backend is a different (unimplemented) store —
+                // the id would resolve against the wrong database.
+                if (!fallback_ok) return error.BackendNotImplemented;
+                return initConfiguredLocal(gpa, io, home_dir, host_id, store.path);
+            },
+            .remote_service, .turso_http, .d1_http => {
+                const url = store.url orelse "";
+                if (url.len == 0) {
+                    if (!fallback_ok) return error.MissingDatabaseUrl;
+                    return initConfiguredLocal(gpa, io, home_dir, host_id, store.path);
+                }
+                if (openRemoteStore(gpa, io, kind, url, store.token, host_id)) |manager| {
+                    return manager;
+                } else |err| {
+                    if (!fallback_ok) return err;
+                    const log = std.log.scoped(.session);
+                    log.warn("session.external_db_fallback url={s} err={s}", .{ url, @errorName(err) });
+                    return initConfiguredLocal(gpa, io, home_dir, host_id, store.path);
+                }
+            },
+        }
+    }
+
+    fn openRemoteStore(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        kind: BackendKind,
+        url: []const u8,
+        token: ?[]const u8,
+        host_id: []const u8,
+    ) Error!SessionManager {
+        return switch (kind) {
+            .remote_service => initRemote(gpa, io, url, token, host_id),
+            .turso_http => initTurso(gpa, io, url, token, host_id),
+            .d1_http => initD1(gpa, io, url, token, host_id),
+            else => unreachable,
+        };
+    }
+
     pub fn initFromModularConfig(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -196,55 +276,12 @@ pub const SessionManager = struct {
         const fallback_kind: backend_mod.BackendKind = if (resolved_url != null and resolved_url.?.len > 0) .remote_service else .local_sqlite;
         const kind = resolved_backend orelse fallback_kind;
 
-        switch (kind) {
-            .local_sqlite => {
-                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
-            },
-            .remote_service => {
-                if (resolved_url) |url| {
-                    if (url.len > 0) {
-                        if (initRemote(gpa, io, url, resolved_token, host_slice)) |remote_mgr| {
-                            return remote_mgr;
-                        } else |err| {
-                            const log = std.log.scoped(.session);
-                            log.warn("session.external_db_fallback url={s} err={s}", .{ url, @errorName(err) });
-                        }
-                    }
-                }
-                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
-            },
-            .turso_http => {
-                if (resolved_url) |url| {
-                    if (url.len > 0) {
-                        if (initTurso(gpa, io, url, resolved_token, host_slice)) |turso_mgr| {
-                            return turso_mgr;
-                        } else |err| {
-                            const log = std.log.scoped(.session);
-                            log.warn("session.turso_db_fallback url={s} err={s}", .{ url, @errorName(err) });
-                        }
-                    }
-                }
-                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
-            },
-            .d1_http => {
-                if (resolved_url) |url| {
-                    if (url.len > 0) {
-                        if (initD1(gpa, io, url, resolved_token, host_slice)) |d1_mgr| {
-                            return d1_mgr;
-                        } else |err| {
-                            const log = std.log.scoped(.session);
-                            log.warn("session.d1_db_fallback url={s} err={s}", .{ url, @errorName(err) });
-                        }
-                    }
-                }
-                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
-            },
-            .postgres_native => {
-                const log = std.log.scoped(.session);
-                log.warn("session.backend_not_implemented backend={s}; falling back to local storage", .{@tagName(kind)});
-                return initConfiguredLocal(gpa, io, home_dir, host_slice, resolved_path);
-            },
-        }
+        return initStore(gpa, io, home_dir, .{
+            .kind = kind,
+            .url = resolved_url,
+            .token = resolved_token,
+            .path = resolved_path,
+        }, host_slice, true);
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -270,11 +307,42 @@ pub const SessionManager = struct {
         const timestamp_ms = nowMs(self.io);
         const host = options.host_id orelse self.host_id;
 
-        const sql = "insert into sessions(id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, host_id) values (?, ?, ?, ?, ?, null, ?, ?, ?)";
+        // Project association (INV-PROJECT-ID): an explicit key wins (it is
+        // validated); otherwise reuse the most recent current-host binding
+        // for this cwd's normalized key, or mint a fresh opaque key. The
+        // location write (when needed) and the session insert land as ONE
+        // atomic unit (INV-DB-BATCH).
+        var minted_buffer: [project_key_len]u8 = undefined;
+        var minted = false;
+        var reused_key: ?[]u8 = null;
+        defer if (reused_key) |key| self.gpa.free(key);
+        const project_key: []const u8 = blk: {
+            if (options.project_key) |explicit| {
+                _ = try session_type.ProjectKey.validate(explicit);
+                break :blk explicit;
+            }
+            const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
+            defer self.gpa.free(cwd_key);
+            // The lookup's allocation outlives this block (project_key reads
+            // it for the insert below), so free happens via `reused_key`.
+            reused_key = try self.lookupProjectKeyForCwdKey(cwd_key);
+            if (reused_key) |existing| {
+                break :blk existing;
+            }
+            self.mintProjectKey(&minted_buffer);
+            minted = true;
+            break :blk minted_buffer[0..];
+        };
+        // An explicit key may be new to this host+cwd — map it. A reused
+        // binding's location row already exists and is left untouched.
+        const write_location = minted or options.project_key != null;
+
+        const sql = "insert into sessions(id, title, cwd, project_key, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, host_id) values (?, ?, ?, ?, ?, ?, null, ?, ?, ?)";
         const params = [_]backend_mod.SqlParam{
             .{ .text = session_id },
             if (options.title) |t| .{ .text = t } else .null,
             .{ .text = cwd },
+            .{ .text = project_key },
             .{ .int = timestamp_ms },
             .{ .int = timestamp_ms },
             if (options.model_provider) |mp| .{ .text = mp } else .null,
@@ -282,7 +350,40 @@ pub const SessionManager = struct {
             if (host.len > 0) .{ .text = host } else .null,
         };
 
-        try self.backend.exec(self.io, sql, &params);
+        if (write_location) {
+            const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
+            defer self.gpa.free(cwd_key);
+            if (self.backend.kind == .local_sqlite) {
+                try self.backend.beginTransaction(self.io);
+                errdefer self.backend.rollbackTransaction(self.io) catch {};
+                try self.upsertProjectLocationExec(project_key, cwd, cwd_key, timestamp_ms);
+                try self.backend.exec(self.io, sql, &params);
+                try self.backend.commitTransaction(self.io);
+            } else {
+                // Locations are CURRENT-host bindings (`self.host_id`) —
+                // never the session row's origin `host` (INV-HOST-BINDING).
+                const del_params = [_]backend_mod.SqlParam{
+                    .{ .text = project_key },
+                    .{ .text = self.host_id },
+                    .{ .text = cwd_key },
+                };
+                const ins_params = [_]backend_mod.SqlParam{
+                    .{ .text = project_key },
+                    .{ .text = self.host_id },
+                    .{ .text = cwd },
+                    .{ .text = cwd_key },
+                    .{ .int = timestamp_ms },
+                };
+                const statements = [_]db.service.BatchStatement{
+                    .{ .sql = "delete from project_locations where project_key = ? and host_id = ? and cwd_key = ?", .params = &del_params },
+                    .{ .sql = "insert into project_locations(project_key, host_id, cwd, cwd_key, updated_at_ms) values (?, ?, ?, ?, ?)", .params = &ins_params },
+                    .{ .sql = sql, .params = &params },
+                };
+                try self.backend.execBatch(self.io, &statements);
+            }
+        } else {
+            try self.backend.exec(self.io, sql, &params);
+        }
 
         const session = Session{
             .manager = self,
@@ -291,6 +392,37 @@ pub const SessionManager = struct {
         };
         assert(session.id.bytes.len == session_id_len);
         return session;
+    }
+
+    fn mintProjectKey(self: *SessionManager, buffer: *[project_key_len]u8) void {
+        const prefix = session_type.project_key_prefix;
+        @memcpy(buffer[0..prefix.len], prefix);
+        fillHex(self.io, buffer[prefix.len..]);
+    }
+
+    /// Newest `project_key` bound to `(current host, cwd_key)`, or null.
+    fn lookupProjectKeyForCwdKey(self: *SessionManager, cwd_key: []const u8) Error!?[]u8 {
+        const sql = "select project_key from project_locations where host_id = ? and cwd_key = ? order by updated_at_ms desc limit 1";
+        var qres = try self.backend.query(self.io, sql, &.{ .{ .text = self.host_id }, .{ .text = cwd_key } });
+        defer qres.deinit();
+        if (qres.rows.len == 0) return null;
+        return switch (qres.rows[0][0]) {
+            .text => |t| try self.gpa.dupe(u8, t),
+            else => null,
+        };
+    }
+
+    /// Local-exec dialect upsert of one `(project_key, host, cwd)` binding.
+    /// Caller owns the surrounding transaction.
+    fn upsertProjectLocationExec(self: *SessionManager, project_key: []const u8, cwd: []const u8, cwd_key: []const u8, timestamp_ms: i64) Error!void {
+        const sql = "insert or replace into project_locations(project_key, host_id, cwd, cwd_key, updated_at_ms) values (?, ?, ?, ?, ?)";
+        try self.backend.exec(self.io, sql, &.{
+            .{ .text = project_key },
+            .{ .text = self.host_id },
+            .{ .text = cwd },
+            .{ .text = cwd_key },
+            .{ .int = timestamp_ms },
+        });
     }
 
     pub fn @"resume"(self: *SessionManager, session_id: []const u8) Error!Session {
@@ -320,9 +452,9 @@ pub const SessionManager = struct {
 
     pub fn list(self: *SessionManager, gpa: std.mem.Allocator, cwd: ?[]const u8) Error![]SessionSummary {
         const sql = if (cwd == null)
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id from sessions where leaf_entry_id is not null order by updated_at_ms desc, id desc"
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id, project_key from sessions where leaf_entry_id is not null order by updated_at_ms desc, id desc"
         else
-            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc, id desc";
+            "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id, project_key from sessions where cwd = ? and leaf_entry_id is not null order by updated_at_ms desc, id desc";
 
         const params = if (cwd) |path|
             &[_]backend_mod.SqlParam{.{ .text = path }}
@@ -340,7 +472,51 @@ pub const SessionManager = struct {
         for (qres.rows) |row| {
             try summaries.append(gpa, try readSummaryFromRow(gpa, row));
         }
+        try fillLocalCwds(self, gpa, summaries.items);
         return summaries.toOwnedSlice(gpa);
+    }
+
+    /// Attach each summary's current-host mapped directory (`local_cwd`) so
+    /// the resume picker can show the local basename for a roaming project.
+    /// One query over this host's bindings; unbound or foreign-only projects
+    /// stay null. Best-effort: a failed lookup leaves the field null (the
+    /// list itself never fails) — but it is logged, because a silent null
+    /// makes every bound project render as "project root required".
+    fn fillLocalCwds(self: *SessionManager, gpa: std.mem.Allocator, summaries: []SessionSummary) Error!void {
+        var has_key = false;
+        for (summaries) |*s| {
+            if (s.project_key != null) has_key = true;
+        }
+        if (!has_key) return;
+        const sql = "select project_key, cwd from project_locations where host_id = ? order by updated_at_ms desc";
+        var qres = self.backend.query(self.io, sql, &.{.{ .text = self.host_id }}) catch |err| {
+            const log = std.log.scoped(.session);
+            log.warn("session.picker.local_cwd_fill_failed err={s}", .{@errorName(err)});
+            return;
+        };
+        defer qres.deinit();
+        var map = std.StringHashMap([]const u8).init(gpa);
+        defer map.deinit();
+        for (qres.rows) |row| {
+            const key = switch (row[0]) {
+                .text => |t| t,
+                else => continue,
+            };
+            const cwd = switch (row[1]) {
+                .text => |t| t,
+                else => continue,
+            };
+            // Rows are newest-first: keep the first (newest) binding per project.
+            const entry = try map.getOrPut(key);
+            if (!entry.found_existing) entry.value_ptr.* = cwd;
+        }
+        for (summaries) |*s| {
+            if (s.local_cwd != null) continue;
+            const key = s.project_key orelse continue;
+            if (map.get(key)) |cwd| {
+                s.local_cwd = try gpa.dupe(u8, cwd);
+            }
+        }
     }
 
     /// Find the most recently updated session for the given cwd. Returns null
@@ -350,6 +526,231 @@ pub const SessionManager = struct {
         var qres = try self.backend.query(self.io, sql, &.{.{ .text = cwd }});
         defer qres.deinit();
 
+        if (qres.rows.len == 0) return null;
+        switch (qres.rows[0][0]) {
+            .text => |t| return try gpa.dupe(u8, t),
+            else => return null,
+        }
+    }
+
+    // === project identity & host-local binding (schema v9) ==================
+    //
+    // A session belongs to a logical project (`sessions.project_key`, opaque);
+    // each host binds that project to one or more local roots in
+    // `project_locations`. A foreign or missing cwd is never used as a
+    // runtime root (INV-RESUME-CWD) — resolution returns
+    // `.needs_project_root` and the TUI asks for a verified local directory.
+
+    /// The current host's binding for `cwd`, or null. Caller owns the key.
+    pub fn projectKeyForCwd(self: *SessionManager, gpa: std.mem.Allocator, cwd: []const u8) Error!?[]u8 {
+        const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
+        defer self.gpa.free(cwd_key);
+        const found = try self.lookupProjectKeyForCwdKey(cwd_key);
+        if (found) |key| {
+            defer self.gpa.free(key);
+            return try gpa.dupe(u8, key);
+        }
+        return null;
+    }
+
+    /// Reuse the current-host binding for `cwd` or mint + persist a new one.
+    /// Caller owns the returned key.
+    pub fn ensureProjectForCwd(self: *SessionManager, gpa: std.mem.Allocator, cwd: []const u8) Error![]u8 {
+        const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
+        defer self.gpa.free(cwd_key);
+        if (try self.lookupProjectKeyForCwdKey(cwd_key)) |existing| {
+            defer self.gpa.free(existing);
+            return try gpa.dupe(u8, existing);
+        }
+        var buffer: [project_key_len]u8 = undefined;
+        self.mintProjectKey(&buffer);
+        const timestamp_ms = nowMs(self.io);
+        if (self.backend.kind == .local_sqlite) {
+            try self.backend.beginTransaction(self.io);
+            errdefer self.backend.rollbackTransaction(self.io) catch {};
+            try self.upsertProjectLocationExec(buffer[0..], cwd, cwd_key, timestamp_ms);
+            try self.backend.commitTransaction(self.io);
+        } else {
+            const del_params = [_]backend_mod.SqlParam{
+                .{ .text = buffer[0..] },
+                .{ .text = self.host_id },
+                .{ .text = cwd_key },
+            };
+            const ins_params = [_]backend_mod.SqlParam{
+                .{ .text = buffer[0..] },
+                .{ .text = self.host_id },
+                .{ .text = cwd },
+                .{ .text = cwd_key },
+                .{ .int = timestamp_ms },
+            };
+            const statements = [_]db.service.BatchStatement{
+                .{ .sql = "delete from project_locations where project_key = ? and host_id = ? and cwd_key = ?", .params = &del_params },
+                .{ .sql = "insert into project_locations(project_key, host_id, cwd, cwd_key, updated_at_ms) values (?, ?, ?, ?, ?)", .params = &ins_params },
+            };
+            try self.backend.execBatch(self.io, &statements);
+        }
+        return try gpa.dupe(u8, buffer[0..]);
+    }
+
+    /// Bind `project_key` (minted when null) to `cwd` on this host and stamp
+    /// the selected session row with it — the user-confirmed half of the lazy
+    /// legacy backfill. Binding + session update are one atomic unit. Caller
+    /// owns the returned key.
+    pub fn bindProjectCwd(
+        self: *SessionManager,
+        gpa: std.mem.Allocator,
+        session_id: []const u8,
+        project_key: ?[]const u8,
+        cwd: []const u8,
+    ) Error![]u8 {
+        assert(session_id.len > 0);
+        assert(cwd.len > 0);
+        const resolved: []const u8 = if (project_key) |key| blk: {
+            _ = try session_type.ProjectKey.validate(key);
+            break :blk key;
+        } else try self.ensureProjectForCwd(self.gpa, cwd);
+        defer if (project_key == null) self.gpa.free(@constCast(resolved));
+
+        const cwd_key = try paths.cwdKeyForHost(self.gpa, cwd);
+        defer self.gpa.free(cwd_key);
+        const timestamp_ms = nowMs(self.io);
+
+        const update_sql = "update sessions set project_key = ?, updated_at_ms = ? where id = ?";
+        const update_params = [_]backend_mod.SqlParam{
+            .{ .text = resolved },
+            .{ .int = timestamp_ms },
+            .{ .text = session_id },
+        };
+        if (self.backend.kind == .local_sqlite) {
+            try self.backend.beginTransaction(self.io);
+            errdefer self.backend.rollbackTransaction(self.io) catch {};
+            try self.upsertProjectLocationExec(resolved, cwd, cwd_key, timestamp_ms);
+            try self.backend.exec(self.io, update_sql, &update_params);
+            try self.backend.commitTransaction(self.io);
+        } else {
+            const del_params = [_]backend_mod.SqlParam{
+                .{ .text = resolved },
+                .{ .text = self.host_id },
+                .{ .text = cwd_key },
+            };
+            const ins_params = [_]backend_mod.SqlParam{
+                .{ .text = resolved },
+                .{ .text = self.host_id },
+                .{ .text = cwd },
+                .{ .text = cwd_key },
+                .{ .int = timestamp_ms },
+            };
+            const statements = [_]db.service.BatchStatement{
+                .{ .sql = "delete from project_locations where project_key = ? and host_id = ? and cwd_key = ?", .params = &del_params },
+                .{ .sql = "insert into project_locations(project_key, host_id, cwd, cwd_key, updated_at_ms) values (?, ?, ?, ?, ?)", .params = &ins_params },
+                .{ .sql = update_sql, .params = &update_params },
+            };
+            try self.backend.execBatch(self.io, &statements);
+        }
+        return try gpa.dupe(u8, resolved);
+    }
+
+    /// Resolve where the selected session should run on THIS host. Preference
+    /// order: the current runtime root when bound to the project; the newest
+    /// existing current-host location; otherwise an explicit request for a
+    /// project root. A legacy unbound row whose origin cwd still exists on
+    /// this host is lazily bound (same-host rows only — foreign rows keep
+    /// `default-host` ambiguity and always ask).
+    pub fn resolveProjectCwd(
+        self: *SessionManager,
+        gpa: std.mem.Allocator,
+        session_id: []const u8,
+        summary_cwd: []const u8,
+        summary_host_id: ?[]const u8,
+        project_key: ?[]const u8,
+        current_root: []const u8,
+    ) Error!ResumeResolution {
+        if (project_key) |key| {
+            _ = try session_type.ProjectKey.validate(key);
+            // 1. The current root, when this host already binds it.
+            const current_key = try paths.cwdKeyForHost(self.gpa, current_root);
+            defer self.gpa.free(current_key);
+            const bound_sql = "select cwd from project_locations where project_key = ? and host_id = ? and cwd_key = ?";
+            var bound = try self.backend.query(self.io, bound_sql, &.{
+                .{ .text = key }, .{ .text = self.host_id }, .{ .text = current_key },
+            });
+            defer bound.deinit();
+            if (bound.rows.len > 0) {
+                return .{ .ready = .{ .cwd = try gpa.dupe(u8, current_root) } };
+            }
+            // 2. The newest existing current-host location.
+            const list_sql = "select cwd from project_locations where project_key = ? and host_id = ? order by updated_at_ms desc";
+            var locations = try self.backend.query(self.io, list_sql, &.{ .{ .text = key }, .{ .text = self.host_id } });
+            defer locations.deinit();
+            for (locations.rows) |row| {
+                const cwd = switch (row[0]) {
+                    .text => |t| t,
+                    else => continue,
+                };
+                if (directoryExists(self.io, cwd)) {
+                    return .{ .ready = .{ .cwd = try gpa.dupe(u8, cwd) } };
+                }
+            }
+            // 3. Ask the user.
+            return .{ .needs_project_root = .{
+                .session_id = try gpa.dupe(u8, session_id),
+                .project_key = try gpa.dupe(u8, key),
+                .origin_cwd = try gpa.dupe(u8, summary_cwd),
+                .origin_host_id = if (summary_host_id) |h| try gpa.dupe(u8, h) else null,
+            } };
+        }
+
+        // Legacy row (project_key null). Same-host + existing cwd: lazily
+        // bind and resume there. Foreign/missing: ask — a SQL-only backfill
+        // on `default-host` rows could silently merge unrelated projects.
+        const same_host = summary_host_id == null or
+            std.ascii.eqlIgnoreCase(summary_host_id.?, self.host_id);
+        if (same_host and directoryExists(self.io, summary_cwd)) {
+            const key = try self.ensureProjectForCwd(self.gpa, summary_cwd);
+            defer self.gpa.free(key);
+            // Best-effort backfill: the resume proceeds even if the stamping
+            // write fails (the binding itself already persisted).
+            const stamp_sql = "update sessions set project_key = ? where id = ?";
+            self.backend.exec(self.io, stamp_sql, &.{
+                .{ .text = key }, .{ .text = session_id },
+            }) catch |err| {
+                const log = std.log.scoped(.session);
+                log.warn("session.project.legacy_backfill_failed id={s} err={s}", .{ session_id, @errorName(err) });
+            };
+            return .{ .ready = .{ .cwd = try gpa.dupe(u8, summary_cwd) } };
+        }
+        return .{ .needs_project_root = .{
+            .session_id = try gpa.dupe(u8, session_id),
+            .project_key = null,
+            .origin_cwd = try gpa.dupe(u8, summary_cwd),
+            .origin_host_id = if (summary_host_id) |h| try gpa.dupe(u8, h) else null,
+        } };
+    }
+
+    /// All sessions of one logical project, newest first — every host, since
+    /// the project key is the cross-host identity. Caller owns the slice.
+    pub fn listByProject(self: *SessionManager, gpa: std.mem.Allocator, project_key: []const u8) Error![]SessionSummary {
+        const sql = "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id, project_key from sessions where project_key = ? and leaf_entry_id is not null order by updated_at_ms desc, id desc";
+        var qres = try self.backend.query(self.io, sql, &.{.{ .text = project_key }});
+        defer qres.deinit();
+        var summaries: std.ArrayList(SessionSummary) = .empty;
+        errdefer {
+            for (summaries.items) |*summary| summary.deinit(gpa);
+            summaries.deinit(gpa);
+        }
+        for (qres.rows) |row| {
+            try summaries.append(gpa, try readSummaryFromRow(gpa, row));
+        }
+        try fillLocalCwds(self, gpa, summaries.items);
+        return summaries.toOwnedSlice(gpa);
+    }
+
+    /// Newest session of one logical project (startup auto-resume when the
+    /// launch root already has a binding). Caller owns the returned id.
+    pub fn findLatestByProject(self: *SessionManager, gpa: std.mem.Allocator, project_key: []const u8) Error!?[]u8 {
+        const sql = "select id from sessions where project_key = ? and leaf_entry_id is not null order by updated_at_ms desc, id desc limit 1";
+        var qres = try self.backend.query(self.io, sql, &.{.{ .text = project_key }});
+        defer qres.deinit();
         if (qres.rows.len == 0) return null;
         switch (qres.rows[0][0]) {
             .text => |t| return try gpa.dupe(u8, t),
@@ -550,11 +951,29 @@ pub const Session = struct {
 
     /// Load the summary for this session. Caller owns the memory.
     pub fn summary(self: *Session, gpa: std.mem.Allocator) Error!SessionSummary {
-        const sql = "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id from sessions where id = ?";
+        const sql = "select id, title, cwd, created_at_ms, updated_at_ms, leaf_entry_id, model_provider, model_id, reasoning_effort, host_id, project_key from sessions where id = ?";
         var qres = try self.manager.backend.query(self.manager.io, sql, &.{.{ .text = self.id.slice() }});
         defer qres.deinit();
         if (qres.rows.len == 0) return error.MissingSession;
-        return try readSummaryFromRow(gpa, qres.rows[0]);
+        var out = try readSummaryFromRow(gpa, qres.rows[0]);
+        errdefer out.deinit(gpa);
+        // Best-effort current-host mapping for display (resume picker): the
+        // project's NEWEST binding on this host — the origin cwd's key is
+        // meaningless here, it belongs to whichever machine created the row.
+        if (out.project_key) |key| {
+            const loc_sql = "select cwd from project_locations where project_key = ? and host_id = ? order by updated_at_ms desc limit 1";
+            var loc = self.manager.backend.query(self.manager.io, loc_sql, &.{
+                .{ .text = key }, .{ .text = self.manager.host_id },
+            }) catch return out;
+            defer loc.deinit();
+            if (loc.rows.len > 0) {
+                switch (loc.rows[0][0]) {
+                    .text => |t| out.local_cwd = try gpa.dupe(u8, t),
+                    else => {},
+                }
+            }
+        }
+        return out;
     }
 
     /// The git commit id of the nearest entry at or above the current leaf that
@@ -1143,6 +1562,10 @@ fn readSummaryFromRow(gpa: std.mem.Allocator, row: []const backend_mod.Value) Er
         .text => |t| try gpa.dupe(u8, t),
         else => null,
     } else null;
+    const project_key = if (row.len > 10) switch (row[10]) {
+        .text => |t| try gpa.dupe(u8, t),
+        else => null,
+    } else null;
 
     return .{
         .id = try gpa.dupe(u8, id_str),
@@ -1155,7 +1578,17 @@ fn readSummaryFromRow(gpa: std.mem.Allocator, row: []const backend_mod.Value) Er
         .model_id = model_id,
         .reasoning_effort = reasoning_effort,
         .host_id = host_id,
+        .project_key = project_key,
     };
+}
+
+/// Existence check for a directory path (the verified part of a binding:
+/// a stale location on this host is skipped during resolution, never
+/// executed as a runtime root).
+fn directoryExists(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
 }
 
 fn readEntryFromRow(gpa: std.mem.Allocator, row: []const backend_mod.Value) Error!EntryRecord {
@@ -1946,6 +2379,247 @@ test "initFromModularConfig with unimplemented backend gracefully falls back to 
     defer manager.deinit();
 
     try std.testing.expectEqual(BackendKind.local_sqlite, manager.backend.kind);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Project identity & host-local bindings (schema v9).
+// ─────────────────────────────────────────────────────────────────────────
+
+test "create reuses the binding for a cwd and mints distinct keys otherwise" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop");
+    defer manager.deinit();
+
+    var first = try manager.create("/work/repo", .{ .id = "a" ** session_id_len });
+    var second = try manager.create("/work/repo", .{ .id = "b" ** session_id_len });
+    var other = try manager.create("/work/other", .{ .id = "c" ** session_id_len });
+
+    var summary_a = try first.summary(gpa);
+    defer summary_a.deinit(gpa);
+    var summary_b = try second.summary(gpa);
+    defer summary_b.deinit(gpa);
+    var summary_c = try other.summary(gpa);
+    defer summary_c.deinit(gpa);
+
+    try std.testing.expect(summary_a.project_key != null);
+    try std.testing.expectEqualStrings(summary_a.project_key.?, summary_b.project_key.?);
+    try std.testing.expect(!std.mem.eql(u8, summary_a.project_key.?, summary_c.project_key.?));
+    // Keys match the validated opaque shape, never a path.
+    _ = try session_type.ProjectKey.validate(summary_a.project_key.?);
+    try std.testing.expectError(error.BadProjectKey, session_type.ProjectKey.validate("/work/repo"));
+}
+
+test "create accepts separator/trailing-slash spellings of the same directory" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop");
+    defer manager.deinit();
+
+    var first = try manager.create("/work/repo", .{ .id = "a" ** session_id_len });
+    // Same directory, different spelling: the binding must be reused.
+    var second = try manager.create("/work/repo/", .{ .id = "b" ** session_id_len });
+
+    var summary_a = try first.summary(gpa);
+    defer summary_a.deinit(gpa);
+    var summary_b = try second.summary(gpa);
+    defer summary_b.deinit(gpa);
+    try std.testing.expectEqualStrings(summary_a.project_key.?, summary_b.project_key.?);
+
+    // The lookup resolves across spellings too.
+    const key = (try manager.projectKeyForCwd(gpa, "/work/repo/")).?;
+    defer gpa.free(key);
+    try std.testing.expectEqualStrings(summary_a.project_key.?, key);
+}
+
+test "bindProjectCwd persists a binding and resolveProjectCwd returns the local root" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.Io.Dir.createDirPath(tmp.dir, std.testing.io, "checkout");
+
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop");
+    defer manager.deinit();
+
+    // Foreign-origin session: created under a path that does not exist here.
+    var session = try manager.create("/original/host/path", .{
+        .id = "d" ** session_id_len,
+        .host_id = "desktop",
+    });
+
+    var resolution = try manager.resolveProjectCwd(
+        gpa,
+        session.id.slice(),
+        "/original/host/path",
+        "desktop",
+        null,
+        ".",
+    );
+    defer resolution.deinit(gpa);
+    // Foreign row + missing cwd: an explicit request, never a fallback.
+    try std.testing.expect(resolution == .needs_project_root);
+    const pending = resolution.needs_project_root;
+    try std.testing.expectEqualStrings(session.id.slice(), pending.session_id);
+    try std.testing.expect(pending.project_key == null);
+    try std.testing.expectEqualStrings("desktop", pending.origin_host_id.?);
+
+    // The user binds a local root: the binding persists and the row is stamped.
+    const key = try manager.bindProjectCwd(gpa, session.id.slice(), pending.project_key, "checkout");
+    defer gpa.free(key);
+    _ = try session_type.ProjectKey.validate(key);
+
+    var stamped = try session.summary(gpa);
+    defer stamped.deinit(gpa);
+    try std.testing.expectEqualStrings(key, stamped.project_key.?);
+    try std.testing.expect(stamped.local_cwd != null);
+
+    // Re-resolution now finds the binding (current root "checkout" is bound).
+    {
+        var resolved = try manager.resolveProjectCwd(
+            gpa,
+            session.id.slice(),
+            "/original/host/path",
+            "desktop",
+            key,
+            "checkout",
+        );
+        defer resolved.deinit(gpa);
+        try std.testing.expect(resolved == .ready);
+        try std.testing.expect(paths.pathsEqual("checkout", resolved.ready.cwd));
+    }
+}
+
+test "resolveProjectCwd lazily binds a same-host legacy row with an existing cwd" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.Io.Dir.createDirPath(tmp.dir, std.testing.io, "repo");
+    const cwd = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    defer gpa.free(cwd);
+
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop");
+    defer manager.deinit();
+    var session = try manager.create(cwd, .{ .id = "e" ** session_id_len });
+
+    // Force the legacy state: project_key null, host recorded.
+    try manager.backend.exec(std.testing.io, "update sessions set project_key = null where id = ?", &.{.{ .text = session.id.slice() }});
+
+    var resolution = try manager.resolveProjectCwd(
+        gpa,
+        session.id.slice(),
+        cwd,
+        "laptop",
+        null,
+        ".",
+    );
+    defer resolution.deinit(gpa);
+    try std.testing.expect(resolution == .ready);
+    try std.testing.expect(paths.pathsEqual(cwd, resolution.ready.cwd));
+
+    // The lazy bind stamped the row and created the host binding.
+    var summary = try session.summary(gpa);
+    defer summary.deinit(gpa);
+    try std.testing.expect(summary.project_key != null);
+    const key_opt = try manager.projectKeyForCwd(gpa, cwd);
+    defer if (key_opt) |k| gpa.free(k);
+    try std.testing.expect(key_opt != null);
+    try std.testing.expectEqualStrings(summary.project_key.?, key_opt.?);
+}
+
+test "resolveProjectCwd prefers the current root, then the newest existing location" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Real directories: resolution's existence check is cwd-relative, so the
+    // bind paths must exist relative to the process cwd (the tmpDir layout).
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const dir_a = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "checkout-a" });
+    defer gpa.free(dir_a);
+    const dir_b = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "checkout-b" });
+    defer gpa.free(dir_b);
+    try std.Io.Dir.createDirPath(tmp.dir, std.testing.io, "checkout-a");
+    try std.Io.Dir.createDirPath(tmp.dir, std.testing.io, "checkout-b");
+
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop");
+    defer manager.deinit();
+    var session = try manager.create("/elsewhere", .{ .id = "f" ** session_id_len });
+
+    // Two checkouts of one project.
+    const key = try manager.bindProjectCwd(gpa, session.id.slice(), null, dir_a);
+    defer gpa.free(key);
+    const key2 = try manager.bindProjectCwd(gpa, session.id.slice(), key, dir_b);
+    defer gpa.free(key2);
+    try std.testing.expectEqualStrings(key, key2);
+    // Make the tie on updated_at_ms deterministic: checkout-b is newer.
+    const b_key = try paths.cwdKeyForHost(gpa, dir_b);
+    defer gpa.free(b_key);
+    try manager.backend.exec(std.testing.io, "update project_locations set updated_at_ms = 9999999999999 where cwd_key = ?", &.{.{ .text = b_key }});
+
+    // Current root bound → returned as-is.
+    {
+        var resolution = try manager.resolveProjectCwd(gpa, session.id.slice(), "/elsewhere", "laptop", key, dir_b);
+        defer resolution.deinit(gpa);
+        try std.testing.expect(resolution == .ready);
+        try std.testing.expect(paths.pathsEqual(dir_b, resolution.ready.cwd));
+    }
+    // Current root unbound but stale-free locations exist → newest wins.
+    {
+        var resolution = try manager.resolveProjectCwd(gpa, session.id.slice(), "/elsewhere", "laptop", key, "not-a-root");
+        defer resolution.deinit(gpa);
+        try std.testing.expect(resolution == .ready);
+        try std.testing.expect(paths.pathsEqual(dir_b, resolution.ready.cwd));
+    }
+}
+
+test "resolveProjectCwd skips stale locations and asks for a project root" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.initWithHost(gpa, std.testing.io, ":memory:", "laptop");
+    defer manager.deinit();
+    var session = try manager.create("/elsewhere", .{ .id = "7" ** session_id_len });
+
+    // The only binding points at a directory that no longer exists here.
+    const key = try manager.bindProjectCwd(gpa, session.id.slice(), null, "/gone/checkout");
+    defer gpa.free(key);
+
+    var resolution = try manager.resolveProjectCwd(
+        gpa,
+        session.id.slice(),
+        "/elsewhere",
+        "laptop",
+        key,
+        "/also-not-a-root",
+    );
+    defer resolution.deinit(gpa);
+    // A stale mapping is never executed as a runtime root — ask instead.
+    try std.testing.expect(resolution == .needs_project_root);
+    try std.testing.expectEqualStrings(session.id.slice(), resolution.needs_project_root.session_id);
+    try std.testing.expectEqualStrings(key, resolution.needs_project_root.project_key.?);
+}
+
+test "projectKeyForCwd is host-scoped: another host sees no binding" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions.db" });
+    defer gpa.free(db_path);
+
+    // Host "laptop" creates a session and its local binding.
+    {
+        var manager = try SessionManager.initWithHost(gpa, std.testing.io, db_path, "laptop");
+        defer manager.deinit();
+        _ = try manager.create("/work/repo", .{ .id = "9" ** session_id_len });
+        const key = try manager.projectKeyForCwd(gpa, "/work/repo");
+        defer if (key) |k| gpa.free(k);
+        try std.testing.expect(key != null);
+    }
+    // Host "desktop" opens the SAME store: no binding for it exists — its own
+    // cwd mapping must come from its own verified bind (INV-RESUME-CWD).
+    {
+        var manager = try SessionManager.initWithHost(gpa, std.testing.io, db_path, "desktop");
+        defer manager.deinit();
+        const key = try manager.projectKeyForCwd(gpa, "/work/repo");
+        defer if (key) |k| gpa.free(k);
+        try std.testing.expect(key == null);
+    }
 }
 
 test {

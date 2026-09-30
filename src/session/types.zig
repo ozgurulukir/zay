@@ -79,6 +79,96 @@ pub const CreateOptions = struct {
     model_provider: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     host_id: ?[]const u8 = null,
+    /// Explicit logical-project association for the new session. When null,
+    /// creation reuses the most recent current-host binding for the cwd, or
+    /// mints a fresh key when none exists.
+    project_key: ?[]const u8 = null,
+};
+
+/// Opaque logical-project identity (INV-PROJECT-ID). A project key names a
+/// project across hosts; it is NEVER interpreted as a filesystem path (the
+/// lane manifest's `repo_key` keeps its local-path semantics). Values are
+/// minted by the session layer (`pk-` + hex) and validated at the API
+/// boundary so a stray path or free-form string cannot masquerade as a key.
+pub const project_key_prefix = "pk-";
+pub const project_key_len = project_key_prefix.len + 32;
+
+pub const ProjectKey = struct {
+    value: []const u8,
+
+    /// Validate a borrowed key. Accepts exactly the minted shape; anything
+    /// else (paths, whitespace, uppercase, wrong length) is rejected.
+    pub fn validate(value: []const u8) Error!ProjectKey {
+        if (value.len != project_key_len) return error.BadProjectKey;
+        if (!std.mem.startsWith(u8, value, project_key_prefix)) return error.BadProjectKey;
+        for (value[project_key_prefix.len..]) |c| {
+            const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+            if (!ok) return error.BadProjectKey;
+        }
+        return .{ .value = value };
+    }
+};
+
+/// One host-local mapping of a logical project onto a real directory. Rows
+/// live in `project_locations` and are scoped by `host_id` — a foreign host's
+/// cwd is never executed as a runtime root (INV-RESUME-CWD).
+pub const ProjectLocation = struct {
+    project_key: []u8,
+    host_id: []u8,
+    /// Native/display path as stored on this host.
+    cwd: []u8,
+    /// Normalized lookup spelling (paths.cwdKey semantics).
+    cwd_key: []u8,
+    updated_at_ms: i64,
+
+    pub fn deinit(self: *ProjectLocation, gpa: std.mem.Allocator) void {
+        gpa.free(self.project_key);
+        gpa.free(self.host_id);
+        gpa.free(self.cwd);
+        gpa.free(self.cwd_key);
+        self.* = undefined;
+    }
+};
+
+/// A verified current-host project root — the only shape `switchToSession`
+/// may be called with (INV-RESUME-CWD).
+pub const ProjectRoot = struct {
+    cwd: []u8,
+};
+
+/// The payload of a `.needs_project_root` resolution: the selected session
+/// could not be bound to a local directory on this host. All strings are
+/// owned; `project_key` is null for legacy (unbound) rows and is minted on
+/// the user's successful bind.
+pub const PendingProjectBinding = struct {
+    session_id: []u8,
+    project_key: ?[]u8,
+    origin_cwd: []u8,
+    origin_host_id: ?[]u8,
+
+    pub fn deinit(self: *PendingProjectBinding, gpa: std.mem.Allocator) void {
+        gpa.free(self.session_id);
+        if (self.project_key) |key| gpa.free(key);
+        gpa.free(self.origin_cwd);
+        if (self.origin_host_id) |host| gpa.free(host);
+        self.* = undefined;
+    }
+};
+
+/// Resume resolution: either a verified local root, or an explicit request
+/// for the user to bind one inside the TUI (never a silent fallback to a
+/// foreign path).
+pub const ResumeResolution = union(enum) {
+    ready: ProjectRoot,
+    needs_project_root: PendingProjectBinding,
+
+    pub fn deinit(self: *ResumeResolution, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .ready => |root| gpa.free(root.cwd),
+            .needs_project_root => |*pending| pending.deinit(gpa),
+        }
+        self.* = undefined;
+    }
 };
 
 pub const SessionSummary = struct {
@@ -102,6 +192,13 @@ pub const SessionSummary = struct {
     reasoning_effort: ?[]u8,
     /// Machine or host identifier where the session originated.
     host_id: ?[]u8 = null,
+    /// Logical project this session belongs to (schema v9). null for legacy
+    /// rows — an unbound row stays representable until a verified lazy bind.
+    project_key: ?[]u8 = null,
+    /// The current host's mapped directory for this session's project, when
+    /// one exists (filled by `list`). null for unbound or foreign-only
+    /// sessions — the resume picker shows "project root required" for those.
+    local_cwd: ?[]u8 = null,
 
     pub fn deinit(self: *SessionSummary, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -111,6 +208,8 @@ pub const SessionSummary = struct {
         if (self.model_id) |mid| gpa.free(mid);
         if (self.reasoning_effort) |effort| gpa.free(effort);
         if (self.host_id) |hid| gpa.free(hid);
+        if (self.project_key) |key| gpa.free(key);
+        if (self.local_cwd) |cwd| gpa.free(cwd);
         self.* = undefined;
     }
 };

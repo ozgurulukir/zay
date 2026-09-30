@@ -300,6 +300,11 @@ pub fn submitMode(app: *App) !bool {
                     try app.confirmRenameSelectedSession();
                     return true;
                 },
+                // Project-root bind: validate + persist + resume.
+                .locating_project => {
+                    try app.confirmProjectRootBinding();
+                    return true;
+                },
                 // Delete requires 'y' (handled in handleCommandKey); Enter is
                 // a no-op so accidental Enter doesn't delete.
                 .deleting => return true,
@@ -310,20 +315,14 @@ pub fn submitMode(app: *App) !bool {
                 },
                 .browsing => {},
             }
-            const summary = try app.selectedResumeSummary() orelse return true;
-            app.switchToSession(summary.id, summary.cwd) catch |err| {
-                // A lane delivery turn may have started from the tick while the
-                // picker was open. Report it but KEEP the picker (and selection)
-                // open so the user can retry once it finishes — the generic
-                // reporter resets the mode and would silently discard the
-                // user's open picker.
-                if (err == error.InFlightTurn) {
-                    _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
-                    return true;
-                }
-                try app.reportSessionSwitchError(err);
-                return true;
-            };
+            // The resume front door: resolves the selection onto this host
+            // first (verified local root, or the .locating_project bind form)
+            // — NEVER a direct switch onto the row's origin cwd, which may
+            // belong to another machine (INV-RESUME-CWD). InFlightTurn keeps
+            // the picker (and selection) open so the user can retry once the
+            // delivery turn finishes; everything else reports through the
+            // generic switch-error path.
+            try app.beginResumeSelectedSession();
             return true;
         },
         .tree_picker => {

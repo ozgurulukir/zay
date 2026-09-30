@@ -65,6 +65,7 @@ fn overlayLabel(app: *const App) []const u8 {
             .renaming => "Rename Session",
             .deleting => "Delete Session",
             .blocked => "Cannot Delete Active Session",
+            .locating_project => "Set Local Project Root",
         },
         .provider_picker => "Connect to Provider",
         .model_picker => "Select Model",
@@ -382,6 +383,8 @@ const OverlayInner = struct {
             .group_by = app.nav.resume_group_by,
             .action = app.nav.session_action,
             .rename_text = app.input_buffers.session_rename_text.items,
+            .project_root_text = app.input_buffers.project_root_text.items,
+            .project_root_error = app.project_root_error,
             .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
             .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         };

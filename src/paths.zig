@@ -104,6 +104,86 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
     try std.testing.expect(!pathsEqualInternal("/home/user/repo", "/Home/user/repo", false));
 }
 
+/// Persistent normalized lookup spelling of a directory path: separator- and
+/// case-normalized the same way `pathsEqual` compares, so two spellings of the
+/// same directory collapse to one `cwd_key` in the session store. Separator
+/// runs collapse to `/`; TRAILING separators are dropped (matching
+/// `pathsEqual`'s tail skip). A path made only of separators — a bare root —
+/// normalizes to `/` so it stays distinct from the empty path. Caller owns
+/// the result. The host platform selects case folding — keys are only ever
+/// compared on the host that wrote them.
+pub fn cwdKey(gpa: std.mem.Allocator, path: []const u8, is_windows: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < path.len) {
+        const c = path[i];
+        if (c == '/' or c == '\\') {
+            var j = i;
+            while (j < path.len and (path[j] == '/' or path[j] == '\\')) j += 1;
+            // Emit one '/' only when a non-separator follows — trailing
+            // separator runs vanish, exactly like pathsEqual's tail skip.
+            if (j < path.len) try out.append(gpa, '/');
+            i = j;
+            continue;
+        }
+        const folded = if (is_windows) std.ascii.toLower(c) else c;
+        try out.append(gpa, folded);
+        i += 1;
+    }
+    if (out.items.len == 0 and path.len > 0) try out.append(gpa, '/');
+    return out.toOwnedSlice(gpa);
+}
+
+/// Platform-selected convenience wrapper for `cwdKey`.
+pub fn cwdKeyForHost(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    return cwdKey(gpa, path, os.is_windows);
+}
+
+test "cwdKey: separator, case, and trailing-separator normalization" {
+    const gpa = std.testing.allocator;
+    {
+        const key = try cwdKey(gpa, "C:\\Users\\zay\\Repo\\", true);
+        defer gpa.free(key);
+        try std.testing.expectEqualStrings("c:/users/zay/repo", key);
+    }
+    {
+        const key = try cwdKey(gpa, "C:/Users//zay/REPO", true);
+        defer gpa.free(key);
+        try std.testing.expectEqualStrings("c:/users/zay/repo", key);
+    }
+    {
+        // POSIX keeps case: /Repo and /repo are different directories.
+        const key = try cwdKey(gpa, "/home/zay/Repo/", false);
+        defer gpa.free(key);
+        try std.testing.expectEqualStrings("/home/zay/Repo", key);
+        const key2 = try cwdKey(gpa, "/home/zay/repo", false);
+        defer gpa.free(key2);
+        try std.testing.expect(!std.mem.eql(u8, key, key2));
+    }
+    {
+        // A bare root stays distinct from the empty path; trailing
+        // separators vanish (pathsEqual("C:", "C:/") is true).
+        const key = try cwdKey(gpa, "C:\\", true);
+        defer gpa.free(key);
+        try std.testing.expectEqualStrings("c:", key);
+        const key2 = try cwdKey(gpa, "/", false);
+        defer gpa.free(key2);
+        try std.testing.expectEqualStrings("/", key2);
+        const key3 = try cwdKey(gpa, "", false);
+        defer gpa.free(key3);
+        try std.testing.expectEqualStrings("", key3);
+    }
+    {
+        // Keys of pathsEqual-equal spellings are byte-equal.
+        const a = try cwdKey(gpa, "/foo/bar/", false);
+        defer gpa.free(a);
+        const b = try cwdKey(gpa, "/foo//bar", false);
+        defer gpa.free(b);
+        try std.testing.expectEqualStrings(a, b);
+    }
+}
+
 /// Platform-aware global config directory — the single base from which every
 /// global Zay path (config.json, worktrees, zay.log, sessions.sqlite) is
 /// derived.
