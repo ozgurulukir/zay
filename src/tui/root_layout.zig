@@ -187,6 +187,27 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
     };
 }
 
+/// Turn vxfw's logical blank cells into physical spaces before vaxis renders
+/// the frame. Vaxis deliberately skips `Cell.default` cells, so leaving them
+/// in a reused terminal row preserves characters from the previous frame.
+fn materializeBlankCells(arena: std.mem.Allocator, root: *vxfw.Surface) !void {
+    var pending: std.ArrayList(*vxfw.Surface) = .empty;
+    defer pending.deinit(arena);
+    try pending.append(arena, root);
+
+    while (pending.pop()) |surface| {
+        for (surface.buffer) |*cell| {
+            if (cell.default) {
+                cell.char = .{};
+                cell.default = false;
+            }
+        }
+        for (surface.children) |*child| {
+            try pending.append(arena, &child.surface);
+        }
+    }
+}
+
 pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     // The diff viewer replaces the whole screen (transcript + input + overlay),
     // so it short-circuits the normal layout entirely. Zero the split-rect
@@ -195,7 +216,9 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     // viewer is up.
     if (app.mode == .diff_viewer) {
         app.split_rect_count = 0;
-        return diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
+        var surface = try diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
+        try materializeBlankCells(ctx.arena, &surface);
+        return surface;
     }
     const max_width = ctx.max.width orelse ctx.min.width;
     const max_height = ctx.max.height orelse ctx.min.height;
@@ -481,10 +504,47 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
 
-    return .{
+    var surface: vxfw.Surface = .{
         .size = .{ .width = max_width, .height = max_height },
         .widget = root_widget,
         .buffer = &.{},
         .children = children,
     };
+    try materializeBlankCells(ctx.arena, &surface);
+    return surface;
+}
+
+test "materializeBlankCells makes nested blank cells drawable" {
+    var child_buffer = [_]vaxis.Cell{.{
+        .char = .{ .grapheme = "" },
+        .default = true,
+    }};
+    const child: vxfw.Surface = .{
+        .size = .{ .width = 1, .height = 1 },
+        .widget = undefined,
+        .buffer = &child_buffer,
+        .children = &.{},
+    };
+    var child_subsurface = [_]vxfw.SubSurface{.{
+        .origin = .{ .row = 0, .col = 0 },
+        .surface = child,
+        .z_index = 0,
+    }};
+    var root_buffer = [_]vaxis.Cell{.{
+        .char = .{ .grapheme = "stale" },
+        .default = true,
+    }};
+    var root: vxfw.Surface = .{
+        .size = .{ .width = 1, .height = 1 },
+        .widget = undefined,
+        .buffer = &root_buffer,
+        .children = &child_subsurface,
+    };
+
+    try materializeBlankCells(std.testing.allocator, &root);
+
+    try std.testing.expect(!root.buffer[0].default);
+    try std.testing.expectEqualStrings(" ", root.buffer[0].char.grapheme);
+    try std.testing.expect(!root.children[0].surface.buffer[0].default);
+    try std.testing.expectEqualStrings(" ", root.children[0].surface.buffer[0].char.grapheme);
 }
