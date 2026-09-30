@@ -395,12 +395,10 @@ fn appendRestoredNotice(app: *App, restored: u32) void {
 // Driver session pin (startup auto-resume)
 // ---------------------------------------------------------------------------
 
-/// The session id startup should resume: the driver pin when it still
-/// resolves, else the pre-existing `findLatest` behavior. The pin exists
-/// because lane sessions share the driver's cwd — the most recently updated
-/// row is often a lane's, which silently hijacked auto-resume. Honored on
-/// every startup, crash or not. Caller owns the returned id.
-pub fn resolveStartupResumeId(gpa: std.mem.Allocator, manager: *session_mod.SessionManager, repo_key: []const u8) !?[]u8 {
+/// Resolve only the validated driver pin. Keeping the pin lookup separate lets
+/// roaming startup choose a bound project's newest session before falling back
+/// to the legacy exact-cwd query.
+pub fn resolveStartupDriverPin(gpa: std.mem.Allocator, manager: *session_mod.SessionManager, repo_key: []const u8) !?[]u8 {
     if (lane_manifest.loadDriverPin(gpa, &manager.connection, repo_key) catch null) |pin| {
         defer gpa.free(pin);
         // Belt-and-braces: the FK set-null normally keeps pins valid, but a
@@ -410,6 +408,15 @@ pub fn resolveStartupResumeId(gpa: std.mem.Allocator, manager: *session_mod.Sess
             return try gpa.dupe(u8, pin);
         } else |_| {}
     }
+    return null;
+}
+
+/// The legacy startup selection: the driver pin when it still resolves, else
+/// the most recently updated session for this exact cwd. New roaming startup
+/// uses `resolveStartupDriverPin` directly so it can prefer a project binding.
+/// Caller owns the returned id.
+pub fn resolveStartupResumeId(gpa: std.mem.Allocator, manager: *session_mod.SessionManager, repo_key: []const u8) !?[]u8 {
+    if (try resolveStartupDriverPin(gpa, manager, repo_key)) |pin| return pin;
     return manager.findLatest(gpa, repo_key);
 }
 

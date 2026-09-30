@@ -10,6 +10,7 @@ const tui_style = @import("../style.zig");
 const tui_status = @import("../status.zig");
 const tree_art = @import("tree_art.zig");
 const config_mod = @import("../../config/config.zig");
+const paths = @import("../../paths.zig");
 
 pub const Content = struct {
     io: std.Io,
@@ -594,11 +595,7 @@ pub fn groupKeyOf(summary: *const session_mod.SessionSummary) []const u8 {
 }
 
 fn baseName(path: []const u8) []const u8 {
-    if (path.len == 0) return path;
-    var end = path.len;
-    while (end > 1 and path[end - 1] == '/') end -= 1;
-    if (std.mem.lastIndexOfScalar(u8, path[0..end], '/')) |index| return path[index + 1 .. end];
-    return path[0..end];
+    return paths.lastPathSegment(path);
 }
 
 fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) usize {

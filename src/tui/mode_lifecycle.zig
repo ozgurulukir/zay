@@ -83,10 +83,16 @@ pub fn cancelMode(app: *App) !bool {
         app.pickers.models.restore();
     }
     if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker) {
-        // Session picker sub-states (rename/delete) capture Esc to cancel
-        // the sub-state, not the entire picker.
+        // Session picker sub-states capture Esc to cancel the sub-state, not
+        // the entire picker. Project-root binding owns a separate pending
+        // identity, so it needs its full cleanup path rather than the
+        // rename/delete-only helper.
         if (app.mode == .session_picker and app.nav.session_action != .browsing) {
-            app.cancelSessionAction();
+            if (app.nav.session_action == .locating_project) {
+                app.cancelProjectRootBinding();
+            } else {
+                app.cancelSessionAction();
+            }
             return true;
         }
         try openCommandMenu(app);
@@ -845,6 +851,30 @@ test "cancelMode on theme_picker reverts the preview and resets mode" {
     try std.testing.expectEqual(App.Mode.normal, app.mode);
     try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
     try std.testing.expect(app.theme_preview_original == null);
+}
+
+test "cancelMode frees a pending project-root bind" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .session_picker;
+    app.nav.session_action = .locating_project;
+    app.pending_resume = .{
+        .session_id = try gpa.dupe(u8, "a" ** 32),
+        .project_key = try gpa.dupe(u8, "pk-" ++ "b" ** 32),
+        .origin_cwd = try gpa.dupe(u8, "/foreign/repo"),
+        .origin_host_id = null,
+    };
+    try app.input_buffers.project_root_text.appendSlice(gpa, "C:/repo");
+
+    try std.testing.expect(try app.cancelMode());
+    try std.testing.expectEqual(App.Mode.session_picker, app.mode);
+    try std.testing.expect(app.nav.session_action == .browsing);
+    try std.testing.expect(app.pending_resume == null);
+    try std.testing.expectEqual(@as(usize, 0), app.input_buffers.project_root_text.items.len);
 }
 
 test "syncModeWithInput leading slash from theme_picker reverts before entering command" {

@@ -211,10 +211,10 @@ pub const App = struct {
     /// session resume can reload config (`.zay/config.json`) from the
     /// target project's cwd without re-reading the OS environment.
     environ_map: ?*std.process.Environ.Map = null,
-    /// Host identity, resolved once at App init from the environment
-    /// (INV-HOST-ID) and propagated through every new/resumed/lane runtime.
-    /// Empty in test harnesses — callers fall back to the session layer's
-    /// "default-host" sentinel.
+    /// Host identity, resolved once at the process boundary and copied into
+    /// App (INV-HOST-ID), then propagated through every new/resumed/lane
+    /// runtime. Empty in test harnesses — callers fall back to the session
+    /// layer's "default-host" sentinel.
     host_id: []const u8 = "",
     retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
     /// Visual feedback state (loading spinner, black-hole intro, diff
@@ -349,11 +349,13 @@ pub const App = struct {
         runtime: *runtime_mod.AgentRuntime,
         config: config_mod.Config,
         environ_map: ?*std.process.Environ.Map,
+        host_id: []const u8,
     ) !App {
+        std.debug.assert(host_id.len > 0);
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
         app.environ_map = environ_map;
-        app.host_id = session_mod.resolveHostId(gpa, environ_map) catch "";
+        app.host_id = try gpa.dupe(u8, host_id);
         // Size the shared request limiter from the config knob (default 2 —
         // single lane is unaffected; 2 bounds the multi-lane burst).
         if (app.request_limiter) |limiter| {
@@ -1302,6 +1304,7 @@ pub fn run(
     runtime: *runtime_mod.AgentRuntime,
     config: config_mod.Config,
     gpa: std.mem.Allocator,
+    host_id: []const u8,
     recovery: ?[]lane_recovery.RecoveredLane,
 ) !void {
     // Allocator is provided by root.zig as `PageAllocator`. Thread-safe and
@@ -1328,7 +1331,7 @@ pub fn run(
     // Install the active color theme before the first frame is drawn.
     tui_style.setActive(tui_style.resolveTheme(config.theme));
 
-    var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map);
+    var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map, host_id);
     // Set the manager pointers now that `app` is in its final stack frame.
     // Inside initRuntime, &app.X would dangle after return-by-value.
     runtime.agent.mcp_manager = &app.mcp_manager;
