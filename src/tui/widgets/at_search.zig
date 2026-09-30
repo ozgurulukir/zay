@@ -12,13 +12,14 @@ const config_mod = @import("../../config/config.zig");
 pub const max_visible_rows = 8;
 pub const border_rows = 2;
 
-/// Total panel height, including the border, for the given result count.
-pub fn panelHeight(result_count: usize) u16 {
+/// Total panel height, including the border, for the given result count and
+/// optional notice row.
+pub fn panelHeight(result_count: usize, notice_visible: bool) u16 {
     const rows: u16 = if (result_count == 0)
         1
     else
         @intCast(@min(result_count, max_visible_rows));
-    return rows + border_rows;
+    return rows + @intFromBool(notice_visible) + border_rows;
 }
 
 /// Index of the first result to render so `selection` is within the `visible`
@@ -177,6 +178,13 @@ test "rendersNotice_whenResultsEmptyAndNoticePresent" {
         len += grapheme.len;
     }
     try std.testing.expectEqualStrings("! Search index building", buf[0..len]);
+}
+
+test "panelHeight reserves a row for the notice" {
+    try std.testing.expectEqual(@as(u16, 3), panelHeight(0, false));
+    try std.testing.expectEqual(@as(u16, 4), panelHeight(0, true));
+    try std.testing.expectEqual(@as(u16, 4), panelHeight(2, false));
+    try std.testing.expectEqual(@as(u16, 5), panelHeight(2, true));
 }
 
 test "rendersNotice_whenResultsPresentAndNoticePresent" {
