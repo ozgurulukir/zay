@@ -22,6 +22,7 @@ const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const lane_recovery = @import("lanes/recovery.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
+const background_delivery = @import("background_delivery.zig");
 const toast = @import("toast.zig");
 const git_label_job = @import("git_label_job.zig");
 const vcs = @import("../vcs.zig");
@@ -96,6 +97,10 @@ fn deinitSharedServices(self: *App) void {
     }
     for (self.background_modal_state.pending.items) |*delivery| self.freeDelivery(delivery);
     self.background_modal_state.pending.deinit(self.gpa);
+    // The cache holds owned copies (not manager memory), so freeing it after
+    // the manager teardown is order-independent.
+    if (self.background_modal_state.cache) |*c| c.deinit(self.gpa);
+    self.background_modal_state.cache = null;
 
     log.info("shutdown.jobs.begin", .{});
     cancelAllJobs(self);
@@ -305,9 +310,12 @@ fn drainDiffAndCompactions(root: *RootWidget) !bool {
 }
 
 /// Poll background jobs and deliver buffered completions to lanes / spawners.
+/// Also refreshes the background modal's cached display data (the draw path
+/// renders the cache verbatim — it never touches the manager or log files).
 fn drainBackgroundAndLanes(root: *RootWidget) !bool {
     var visible_change = false;
     if (try root.app.pollBackgroundJobs()) visible_change = true;
+    if (background_delivery.refreshBackgroundModalCache(root.app, false)) visible_change = true;
     if (try root.app.deliverPendingBackground()) visible_change = true;
     if (try lane_lifecycle.deliverPendingLaneCompletions(root.app)) visible_change = true;
     return visible_change;

@@ -3,7 +3,10 @@
 //! Renders background job snapshots with vxfw.Border labels, elapsed timers,
 //! focused cancel action buttons, and — when expanded with Space — a live
 //! log-tail panel for the selected job (#37). Scalarized per INV-WIDGET-1:
-//! the widget takes per-frame props built by `root_layout`, never an `App`.
+//! the widget takes per-frame props built by `root_layout`, never an `App`,
+//! and never touches the manager or the filesystem — the job views and the
+//! log tail are cached by `background_delivery.refreshBackgroundModalCache`
+//! (tick/key processing) and passed in as props.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -12,7 +15,6 @@ const vxfw = vaxis.vxfw;
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
 const background_mod = @import("../../background.zig");
-pub const background_tool = @import("../../tools/background.zig");
 
 /// Lines kept in the expanded log panel.
 pub const log_tail_max_lines: usize = 50;
@@ -26,14 +28,16 @@ pub const BackgroundJobsWidget = struct {
     props: Props = .{},
 
     pub const Props = struct {
-        manager: ?*background_mod.BackgroundManager = null,
+        /// Frozen job views cached by `refreshBackgroundModalCache` (empty
+        /// renders the "No background jobs running." placeholder).
+        views: []const background_mod.BackgroundManager.JobView = &.{},
         selection: usize = 0,
         cancel_focus: bool = false,
         /// Space-toggled log panel for the selected job (#37).
         log_expanded: bool = false,
-        /// Tail text for the selected job's log, read by `root_layout` each
-        /// frame via `background_tool.readLogTailBounded` (arena-owned, so
-        /// the widget only renders it). Empty when collapsed.
+        /// Tail text for the selected job's log, cached by
+        /// `refreshBackgroundModalCache` (owned by the modal state, so the
+        /// widget only renders it). Empty when collapsed.
         log_text: []const u8 = "",
         /// Log panel header: the log path.
         log_note: []const u8 = "",
@@ -46,16 +50,10 @@ pub const BackgroundJobsWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *BackgroundJobsWidget = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        const empty = vxfw.Surface.init(ctx.arena, self.widget(), .{
-            .width = ctx.max.width orelse 0,
-            .height = ctx.max.height orelse 0,
-        });
-        const manager = self.props.manager orelse return empty;
-        const views = manager.snapshot(ctx.arena) catch return empty;
         const inner = try ctx.arena.create(BackgroundJobsInner);
         inner.* = .{
-            .views = views,
-            .selection = if (views.len == 0) 0 else @min(self.props.selection, views.len - 1),
+            .views = self.props.views,
+            .selection = if (self.props.views.len == 0) 0 else @min(self.props.selection, self.props.views.len - 1),
             .cancel_focus = self.props.cancel_focus,
             .log_expanded = self.props.log_expanded,
             .log_text = self.props.log_text,
@@ -74,7 +72,7 @@ pub const BackgroundJobsWidget = struct {
 /// snapshot of `JobView`s and the current selection/cancel-focus so the
 /// outer widget doesn't have to re-fetch state each draw.
 const BackgroundJobsInner = struct {
-    views: []background_mod.BackgroundManager.JobView,
+    views: []const background_mod.BackgroundManager.JobView,
     selection: usize,
     cancel_focus: bool,
     log_expanded: bool = false,

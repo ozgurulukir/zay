@@ -425,7 +425,7 @@ fn handleEscapeSequence(
     ctx: *vxfw.EventContext,
 ) !void {
     if (app.getBackgroundModal()) {
-        app.setBackgroundModal(false);
+        app.closeBackgroundModal();
         ctx.consumeAndRedraw();
         return;
     }

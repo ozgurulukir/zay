@@ -31,14 +31,11 @@ const background_jobs = @import("widgets/background_jobs.zig");
 const at_search = @import("widgets/at_search.zig");
 const overlay = @import("widgets/overlay.zig");
 const toast = @import("toast.zig");
-const at_search_mod = @import("at_search.zig");
-const search_mod = @import("../search.zig");
 const permission_mod = @import("permission.zig");
 const lanes_util = @import("lanes.zig");
+const tui_message = @import("widgets/message.zig");
 
 const App = tui.App;
-
-const log = std.log.scoped(.root_layout);
 
 /// Build the input widget's per-frame view model (INV-WIDGET-1): every fact
 /// the widget renders, computed HERE from the App, so the widget stays a pure
@@ -126,6 +123,70 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
     };
 }
 
+/// The driver's workspace borrow, if any — the lane whose worktree path the
+/// driver (threads[0]) entered. Only the driver enters lanes, so its agent is
+/// the only one that can hold a workspace.
+fn driverWorkspacePath(app: *const App) ?[]const u8 {
+    if (app.threads.len() == 0) return null;
+    const agent = app.threads.at(0).agent orelse return null;
+    return agent.workspaceBorrow();
+}
+
+/// Build a lane column's per-frame view model (INV-WIDGET-1): every fact
+/// `LaneColumnWidget` renders, computed HERE from the App, so the widget
+/// stays a pure function of its props.
+pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u16, active: bool, focused: bool) lane_column.LaneColumnProps {
+    // The model flag mirrors the pre-scalarization behavior: always the
+    // ACTIVE lane's runtime, never the rendered lane's.
+    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+    const title: []const u8 = if (lane.title) |t| t else "untitled";
+    // Turn-state marker (S14): a spinner frame while the lane's turn is
+    // running, a stop glyph while interrupting, a quiet dot when idle. A
+    // manual /compact on this lane spins the same frame — the "lane is
+    // busy" signal the model watches for.
+    const compacting = if (lane.agent) |agent| agent.manualCompactPending() else false;
+    const state_glyph: []const u8 = if (compacting)
+        tui_message.loading_frames[app.metrics.loading_frame % tui_message.loading_frames.len]
+    else switch (lane.turn.state) {
+        .active => tui_message.loading_frames[app.metrics.loading_frame % tui_message.loading_frames.len],
+        .interrupting => "■",
+        .idle => "·",
+    };
+    // Distinct marker on the lane the driver's workspace currently points at —
+    // the "active lane tracking" the model needs to see at a glance.
+    const ws_marker: []const u8 = if (driverWorkspacePath(app)) |ws| blk: {
+        if (lanes_util.workingLaneOf(lane)) |w| {
+            if (lanes_util.pathsEqual(ws, w.path)) break :blk " ⇄";
+        }
+        break :blk "";
+    } else "";
+    // `active` and `focused` are distinct: `active` marks the ●/dim state,
+    // `focused` is the single column whose border is highlighted (when the
+    // knob is enabled).
+    var border_style: vaxis.Style = if (active) .{} else .{ .dim = true };
+    if (focused and app.cached_config.tui.highlight_focused_border) {
+        border_style = tui_style.activePalette().border_label;
+    }
+    return .{
+        .lane = lane,
+        .width = width,
+        .height = height,
+        .active = active,
+        .gpa = app.gpa,
+        .has_model_configured = has_model,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+        // Only the pane whose lane owns the shared input yields its splash;
+        // sibling lanes keep theirs until their own first prompt.
+        .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
+        .title = title,
+        .state_glyph = state_glyph,
+        .ws_marker = ws_marker,
+        .border_style = border_style,
+    };
+}
+
 pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     // The diff viewer replaces the whole screen (transcript + input + overlay),
     // so it short-circuits the normal layout entirely. Zero the split-rect
@@ -210,12 +271,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
                 const active = (col.lane_index == 0) or (col.lane_index == worker_focus);
                 const focused = (col.lane_index == worker_focus);
                 dual_lane_widgets[i] = .{
-                    .app = app,
-                    .lane = lane,
-                    .width = col.width,
-                    .height = col.height,
-                    .active = active,
-                    .focused = focused,
+                    .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused),
                 };
                 dual_lane_boxes[i] = .{
                     .child = dual_lane_widgets[i].widget(),
@@ -237,12 +293,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
                 const active = (col.lane_index == @as(usize, app.activeIndex()));
                 const focused = (col.lane_index == @as(usize, app.activeIndex()));
                 grid_lane_widgets[i] = .{
-                    .app = app,
-                    .lane = lane,
-                    .width = col.width,
-                    .height = col.height,
-                    .active = active,
-                    .focused = focused,
+                    .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused),
                 };
                 grid_lane_boxes[i] = .{
                     .child = grid_lane_widgets[i].widget(),
@@ -364,44 +415,26 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (background_visible) {
-        // Live log-tail panel (#37): re-read the selected job's log each
-        // frame while expanded — one bounded 64 KiB tail read via the shared
-        // `readLogTailBounded` (the same helper the `background` tool uses),
-        // so following an active job costs nothing measurable and the panel
-        // auto-scrolls (the newest lines always fit the visible window).
-        var log_text: []const u8 = "";
-        var log_note: []const u8 = "";
-        if (app.background_modal_state.log_expanded) {
-            if (app.background) |manager| {
-                if (manager.snapshot(app.gpa) catch null) |views| {
-                    defer tui.background_mod.BackgroundManager.freeViews(app.gpa, views);
-                    if (views.len > 0) {
-                        const sel = @min(app.background_modal_state.selection, views.len - 1);
-                        // The note outlives `views` — dupe into the frame arena.
-                        log_note = std.fmt.allocPrint(ctx.arena, "{s}", .{views[sel].log_path}) catch views[sel].log_path;
-                        log_text = background_jobs.background_tool.readLogTailBounded(
-                            app.io,
-                            ctx.arena,
-                            views[sel].log_path,
-                            @intCast(background_jobs.log_tail_max_lines),
-                        ) catch "";
-                    }
-                }
-            }
-        }
+        // The modal renders the display cache built by lifecycle processing
+        // (`background_delivery.refreshBackgroundModalCache` — tick and key
+        // handling). Draw performs no manager snapshot and no file read; a
+        // missing cache (transient snapshot error at open) renders the
+        // empty-state placeholder.
+        const cache = app.background_modal_state.cache;
+        const views: []const tui.background_mod.BackgroundManager.JobView = if (cache) |c| c.views else &.{};
         var jobs_view: background_jobs.BackgroundJobsWidget = .{ .props = .{
-            .manager = app.background,
+            .views = views,
             .selection = app.background_modal_state.selection,
             .cancel_focus = app.background_modal_state.cancel_focus,
             .log_expanded = app.background_modal_state.log_expanded,
-            .log_text = log_text,
-            .log_note = log_note,
+            .log_text = if (cache) |c| c.log_text else "",
+            .log_note = if (cache) |c| c.log_note else "",
         } };
-        const rows: usize = @min(@as(usize, 8), app.runningBackgroundCount());
+        const rows: usize = @min(@as(usize, 8), views.len);
         const panel_height = background_jobs.panelHeight(
             rows,
             app.background_modal_state.log_expanded,
-            log_text,
+            if (cache) |c| c.log_text else "",
             layout.input_row,
         );
         children[idx] = .{
@@ -415,26 +448,11 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (at_visible) {
-        // Poll async search results before drawing, so the popup reflects
-        // any completed background fuzzy search immediately.
-        at_search_mod.pollAtSearch(app) catch |err| {
-            // Surface the failure in the popup footer so the user isn't
-            // staring at stale/empty results with no hint.
-            log.warn("at-search poll failed: {s}", .{@errorName(err)});
-
-            at_search_mod.setSearchNotice(app, @errorName(err));
-        };
-        // Display any backend failure message when the index is in the failed
-        // state but the popup is still open.
-        if (app.at_search == .open and app.at_search.open.kind == .file) {
-            if (search_mod.backend.lastFailure(app.gpa)) |msg| {
-                defer app.gpa.free(msg);
-                if (app.at_search.open.notice == null or app.at_search.open.notice.?.len == 0) {
-                    at_search_mod.setSearchNotice(app, msg);
-                }
-            }
-        }
-        var at_view: tui.AtSearchWidget = .{ .app = app };
+        // The popup renders state prepared by lifecycle processing
+        // (`at_search.drainAtSearch` polls the async backend and promotes
+        // failures into the notice on the tick). Draw builds the view from
+        // prepared state only — no polling, no backend reads.
+        var at_view: tui.AtSearchWidget = .{ .content = tui.buildAtSearchContent(app) };
         const panel_height = at_search.panelHeight(app.at_search.results().len);
         const panel_width = @min(@as(u16, 72), max_width);
         children[idx] = .{

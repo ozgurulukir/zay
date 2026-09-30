@@ -10,6 +10,8 @@ const skill_mod = @import("../skill.zig");
 
 const App = tui.App;
 
+const log = std.log.scoped(.at_search);
+
 pub const MentionSearchKind = enum { file, skill };
 
 fn isSearchFooter(line: []const u8) bool {
@@ -95,8 +97,11 @@ fn refreshAtResults(app: *App) !void {
     }
 }
 
-/// Drains pending at-search events on the UI tick. Returns true if results or
-/// presentation changed and a redraw is needed.
+/// Drains pending at-search events on the UI tick: polls the async search,
+/// starts the debounced query, and promotes poll/backend failures into the
+/// popup notice. The ONE place search state advances (AD-3 of the
+/// draw-purity plan) — draw only reads prepared state. Returns true if
+/// results or presentation changed and a redraw is needed.
 pub fn drainAtSearch(app: *App) !bool {
     if (app.at_search == .closed) return false;
 
@@ -109,23 +114,50 @@ pub fn drainAtSearch(app: *App) !bool {
     }
 
     if (app.at_search == .open and app.at_search.open.kind == .file) {
-        var changed = false;
-        if (try pollFileResults(app)) {
-            changed = true;
-        }
-        if (try startDeferredFileSearch(app)) {
-            // New async search in-flight
-        }
+        // Poll the backend; a failed poll lands in the popup footer instead
+        // of surfacing as an error (the user isn't left staring at stale or
+        // empty results with no hint). A repeated identical failure neither
+        // resets the notice nor demands another redraw.
+        var changed = pollFileResults(app) catch |err| blk: {
+            break :blk noticeFailure(app, @errorName(err));
+        };
+        // Start the debounced query (or transition to the indexing state).
+        _ = startDeferredFileSearch(app) catch |err| blk: {
+            if (noticeFailure(app, @errorName(err))) changed = true;
+            break :blk false;
+        };
+        if (backendFailureNotice(app)) changed = true;
         return changed;
     }
 
     return false;
 }
 
-/// Poll the async search backend and update the popup's results when a
-/// search completes. Safe to call every frame; no-op when no search is running.
-pub fn pollAtSearch(app: *App) !void {
-    _ = try drainAtSearch(app);
+/// Set the popup notice to `text` unless that exact notice is already
+/// showing. Returns true when the visible notice changed, so a persistent
+/// failure neither spams the redraw path nor re-allocates the same message
+/// every tick.
+fn noticeFailure(app: *App, text: []const u8) bool {
+    if (app.at_search != .open) return false;
+    if (app.at_search.open.notice) |n| {
+        if (std.mem.eql(u8, n, text)) return false;
+    }
+    log.warn("at-search failure: {s}", .{text});
+    setSearchNotice(app, text);
+    return true;
+}
+
+/// Display the search backend's failure message in the popup footer while
+/// the index is in the failed state and no notice is showing yet. Returns
+/// true when a notice was newly set.
+fn backendFailureNotice(app: *App) bool {
+    if (app.at_search != .open or app.at_search.open.kind != .file) return false;
+    const o = &app.at_search.open;
+    if (o.notice != null and o.notice.?.len > 0) return false;
+    const msg = search_mod.backend.lastFailure(app.gpa) orelse return false;
+    defer app.gpa.free(msg);
+    setSearchNotice(app, msg);
+    return true;
 }
 
 fn pollFileResults(app: *App) !bool {
