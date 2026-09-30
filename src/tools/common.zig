@@ -24,6 +24,9 @@ pub const Output = struct {
     code: u8,
     display: Display = .none,
     observation: ?Observation = null,
+    /// End the current model turn after this result is persisted. Used by
+    /// detached operations whose completion will arrive asynchronously.
+    end_turn: bool = false,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);

@@ -9,24 +9,21 @@ Every call takes `command` (always required) naming the operation.
 | `list` | — | — | List all currently active/running background jobs (id, label, elapsed duration, command, log path) |
 | `status` | `id` | — | Query detailed status, elapsed duration, and recent log output of a currently running background job |
 | `cancel` | `id` | — | Request process-tree termination of a running background job |
-| `tail` | `id` | `lines` (default 50, max 200) | Read bounded tail lines from a running background job's log file |
+| `tail` | `id` | `lines` | Read the last output lines from a running job's log file (default 50, capped at 200) |
 
-The job id is an integer (e.g. `1` for job `bg_1`).
+## Important lifecycle
 
-## Examples
+A successful shell call with `run_in_background: true` is a detached launch, not a request to wait. Zay ends the current model turn immediately after the launch result is recorded. When the process exits, Zay automatically injects one completion message containing the exit status and bounded output (plus the full-log path) into the owning lane's context and starts the next turn.
 
-- List active running jobs:
-  `{"command":"list"}`
-- Check status of job 1:
-  `{"command":"status","id":1}`
-- Inspect the last 100 lines of job 2's log:
-  `{"command":"tail","id":2,"lines":100}`
-- Request termination for job 3:
-  `{"command":"cancel","id":3}`
+**Do not call `background` with `status`, `list`, or `tail` to wait for a detached job in the same turn.** Do not build a polling loop. The completion message is the source of truth and will arrive automatically. Use `status` or `tail` only for an explicit interim inspection requested by the user, or when diagnosing a job before its completion arrives. Use `cancel` when the user asks to stop the job.
 
-## Rules & Best Practices
+## Operational notes
 
-- **Active-Only Inspection:** `list`, `status`, and `tail` inspect active jobs currently managed by the runtime. Once a job completes, its exit notification is delivered to the lane transcript and it is cleared from active tracking.
-- **Do not poll in a tight loop:** Background job completion is automatically delivered to you as a message when the process exits. Use `status` or `tail` only when you need an interim progress check before proceeding with other work.
-- **Bounded Inspection:** The `tail` operation returns up to the requested number of lines (capped at 200 lines / 64 KB scan) to keep context concise.
-- **Clean Termination:** When a background build, server, or watcher is no longer needed, request termination with `{"command":"cancel","id":<id>}` to free system resources. Cancelled jobs are logged to the transcript and do not start a model follow-up turn.
+- Completed jobs are removed from the active-job list after their completion message is queued; a later `status` call may correctly report that no running job exists.
+- `tail` is bounded to 200 lines and 64 KiB, and is for interim inspection only; the completion message already includes the bounded final tail.
+- Cancelled jobs are also reported through the automatic completion message.
+
+## Best practices
+
+- **Active-only inspection:** `list`, `status`, and `tail` inspect only active jobs. They are not synchronization primitives.
+- **Clean termination:** When a background build, server, or watcher is no longer needed, use `cancel` rather than repeatedly checking `status`.

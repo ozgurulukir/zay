@@ -65,6 +65,9 @@ pub const ToolResult = struct {
     stderr: ?[]u8,
     /// Human channel — overrides body styling to red at draw time.
     failed: bool,
+    /// The tool completed an asynchronous handoff; do not ask the model for
+    /// another response in this turn.
+    end_turn: bool = false,
 
     pub fn deinit(self: *ToolResult, gpa: std.mem.Allocator) void {
         gpa.free(self.call_id.value);
@@ -94,6 +97,7 @@ pub const ToolResult = struct {
         /// Copied by value.
         display_kind: tools.DisplayKind = .text,
         failed: bool = false,
+        end_turn: bool = false,
     };
 
     /// Centralized constructor. Dupes `call_id`/`name`/`stderr` and assembles
@@ -120,6 +124,7 @@ pub const ToolResult = struct {
             .display_kind = spec.display_kind,
             .stderr = stderr,
             .failed = spec.failed,
+            .end_turn = spec.end_turn,
         };
     }
 };
@@ -378,6 +383,7 @@ pub const ExecutorService = struct {
                 .text, .none => .text,
             },
             .failed = output.code != 0,
+            .end_turn = output.end_turn,
         });
     }
 

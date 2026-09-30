@@ -336,11 +336,16 @@ pub fn Impl(comptime B: type) type {
                 gpa,
                 "Started in the background as {s} (id {d}, pid {d}).\n" ++
                     "Output is streaming to {s}.\n" ++
-                    "To inspect status/logs or cancel, use the `background` tool (`command`: \"status\"/\"tail\"/\"cancel\", `id`: {d}).\n" ++
-                    "Do not wait on it: its exit will be delivered to you as a message when it finishes.",
+                    "Use the `background` tool (`command`: \"status\"/\"tail\"/\"cancel\", `id`: {d}) only for an explicit interim inspection or cancellation.\n" ++
+                    "Do not poll it in this turn: Zay ends the turn now and delivers the exit and output as a message when it finishes.",
                 .{ started.label, started.id, started.pid, started.log_path, started.id },
             );
-            return common.ok(gpa, text);
+            var output = try common.ok(gpa, text);
+            // A successful detached launch must end this model turn. Otherwise
+            // the model sees an active job id and can start a status-poll loop
+            // before the manager has a chance to deliver the completion message.
+            output.end_turn = true;
+            return output;
         }
 
         fn mapBackgroundError(gpa: std.mem.Allocator, err: anyerror) common.Error!common.Output {
