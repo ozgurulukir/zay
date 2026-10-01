@@ -1,79 +1,89 @@
 ---
 name: architect
-description: "Sketch types, signatures, and module structure before code, then stay in the loop while implementation fills in. Use for /architect, 'architect this', 'design this', or non-trivial work where jumping to code would lock in the wrong shape."
+description: Sketch types, signatures, and module structure before code, then stay in the loop while implementation fills in. Use for /architect, design-this requests, or non-trivial changes where the wrong shape would be expensive.
 disable-model-invocation: true
 ---
 
 # Architect
 
-Design before implementing. Sketch types, function signatures, class shapes, and module boundaries with `not implemented` bodies and pseudocode. Synthesize across multiple model perspectives, then fill in code against the chosen sketch. If implementation proves the sketch wrong, throw it out and redesign.
+Design before implementing when the change crosses modules, introduces a new
+state machine, or changes an ownership boundary. The output is a small,
+reviewable contract: caller usage first, then types, signatures, module
+ownership, invariants, and a decision record. Do not design ceremony for a
+one-function fix.
 
 ## Start
 
-Open a todolist with one entry per phase before starting. Autonomous mode without checkpoints needs the list to show phase position and keep phases from silently disappearing.
+Keep an explicit phase checklist:
 
 1. Ground
-2. Sketch
-3. Agree
+2. Sketch alternatives
+3. Choose
 4. Implement
-5. Scrap
+5. Re-ground if the shape fails
 
-## Phase A: Ground the problem
+## Ground
 
-Build a real mental model of every system the new code touches. Run the **how** skill over the relevant subsystems. Critique mode if existing structure is the constraint or the design must push back on it.
+Build a traced model of every system the change touches. Use the how skill and
+the repository's own discovery instructions. Use any configured index or search
+helper when available, but keep the design understandable and executable with
+ordinary source reads, tests, and version-control history. Use why only when
+existing rationale or a historical constraint matters.
 
-Naming a file isn't grounding. Produce the traced model `how` prescribes. If the design redefines ownership or layering, also run the **why** skill on the existing shape so the rationale becomes a constraint, not a guess.
+Record the current caller usage, ownership, lifecycle, error paths, persistence
+boundaries, and platform differences. Read the relevant docs/PATTERNS.md section
+before proposing a new seam.
 
-Skip Phase A only when the work is genuinely greenfield with no surrounding system to integrate.
+## Sketch alternatives
 
-## Phase B: Sketch
+Write two or three genuinely different shapes, not cosmetic variations. For
+each, derive the type/signature sketch from the caller's usage and show:
 
-Run the **arena** skill with the design-sketch task and the Phase A grounding artifacts. Pass `references/runner-prompt.md` as each runner's prompt. Each candidate produces a design package shaped per `references/rationale-template.md`: the caller's usage written first, then the type sketch, function signatures, module map, and prose rationale derived from it.
+- state and ownership;
+- module boundaries and imports;
+- success, failure, cancellation, and teardown paths;
+- how tests reach the new logic;
+- which existing invariant it preserves or changes.
 
-Use these runner slugs: `claude-opus-4-8-thinking-xhigh`, `gpt-5.3-codex-high-fast`, `gpt-5.5-high-fast`, and `composer-2.5-fast`.
+Use the principle-exhaust-the-design-space guidance, but compare the alternatives
+locally in one decision table. Do not require a particular runner, model, or
+external orchestration service.
 
-This is the **exhaust-the-design-space** principle skill made concrete. Whole-shape alternatives, not point fixes inside one shape.
+## Choose
 
-Arena returns one synthesized design package. The synthesis decision populates the rationale's "Synthesis decision" section.
+Pick the smallest shape that makes invalid states difficult to represent and
+keeps the reader's path short. State the rejected alternatives and why they
+lose: wrong owner, extra mutable state, cross-layer dependency, blocked render
+path, unsafe retry, or unnecessary compatibility code.
 
-## Phase C: Agree (opt-in)
+Proceed without a human checkpoint by default. Pause only when the user
+explicitly asks to see the design before implementation or when a choice would
+cause an irreversible external change.
 
-Default: proceed directly to implementation with the synthesized design. No human checkpoint.
+## Implement
 
-Opt in to a checkpoint when the invoker explicitly asks: "/architect with checkpoint," "stop and show me before implementing," or similar. Then surface the synthesized design and pause for sign-off.
+Treat the chosen sketch as a contract, not a prison. If implementation needs a
+new parameter or escape hatch, stop and decide whether the sketch missed a
+requirement or the implementation is overreaching. Update the design before
+stacking workarounds.
 
-The synthesis can ship as its own commit either way. That's the "scaffold first" mode of the **foundational-thinking** principle skill; subsequent commits read as filling in bodies against a stable contract. Planned and scoped breakage during fill-in is fine, per the **outcome-oriented-execution** principle skill. For adversarial pressure on the design before implementing, run the **interrogate** skill on the synthesized sketch.
+For Zay, preserve the relevant invariants: lib/ does not import src/; TUI leaf
+widgets use props/view models; Job(T) owns App-level async families; remote
+multi-statement session writes are atomic batches; persistence precedes cache
+updates; worktree paths use pathsEqual; and heavy provisioning never blocks the
+render loop.
 
-If the human pushes back on the shape (in a checkpoint or after the fact), treat that as Phase A evidence. Re-ground and re-run Phase B before writing more code.
+## Re-ground when the shape fails
 
-## Phase D: Implement against the sketch
+Scrap and redesign when the same workaround appears twice, callers understand
+the abstraction's internals, optional fields are always populated in practice,
+or a new lock is compensating for shared ownership that could be removed. First
+re-run how over the implementation, subtract dead weight, then repeat the
+alternative comparison with the new evidence.
 
-Replace `not implemented` bodies with code, pseudocode with logic. The synthesized sketch is the contract.
+## Output
 
-Deviations from the sketch are signal worth surfacing, not friction to absorb silently. If a function needs a parameter the sketch didn't anticipate, ask whether the sketch was wrong, the requirement was missed, or the implementation is overreaching. Surface it; don't bolt it on.
-
-## Phase E: Scrap when the architecture is wrong
-
-If implementation keeps producing friction the sketch can't absorb, throw the sketch out. Don't bolt fixes onto a wrong design, per the **redesign-from-first-principles** and **fix-root-causes** principle skills.
-
-The signal is a _pattern_, not single instances. Tells:
-
-- The same shape of workaround appearing repeatedly across unrelated code.
-- Multiple unrelated edge cases that all need special-case branches.
-- Types that need escape hatches (`any`, casts, optional fields always set in practice) to compile.
-- The "we need a lock" reflex when the sketch said the state wasn't shared.
-- Callers having to know the abstraction's internal rules to use it.
-- Two or more independent Phase D deviations of the same shape across the implementation. Surfacing deviations is Phase D's job; a repeated pattern of them is Phase E's trigger.
-
-Use judgment. A few edge cases don't condemn an architecture. Some problems are legitimately complex; complexity in the data is not complexity in the design. The rewrite signal is repeated friction of the same shape, not single hard cases.
-
-When you scrap:
-
-1. Re-run the **how** skill over what's been built. The implementation lessons enter the new design as inputs, not vibes.
-2. Redesign as if the new constraints had been day-one assumptions, per redesign-from-first-principles.
-3. Subtract before adding, per the **subtract-before-you-add** principle skill. The new sketch should be smaller than the old one before it grows.
-4. Return to Phase B and re-run arena.
-
-## Outputs
-
-The caller's usage is written first and the type sketch derived from it. One file with new types and signatures for small changes; module map plus type definitions for larger work. The rationale ships alongside, shaped per `references/rationale-template.md`, including the usage sketch and the synthesis decision.
+For a small change, one page is enough: caller usage, type/signature sketch,
+module map, invariants, chosen shape, and rejected alternative. For a larger
+change, keep that package in the planning artifact or design document used by
+the implementation.
