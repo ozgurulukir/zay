@@ -119,10 +119,10 @@ pub const ModelCatalogue = struct {
     /// Remove every entry sourced from `provider`. Model, source, and reasoning
     /// leave together — nothing can drift out of alignment.
     ///
-    /// Enum-bazlıdır ve her builtin katalog provider'ı ayrı bir enum değerine
-    /// sahip olduğu için onlar için doğru çalışır. Çoklu `.openai_compatible`
-    /// provider'lar aynı enum değerini paylaştığından onları birleştirir —
-    /// dynamic/config provider'lar için `dropConn` kullanın.
+    /// Enum-based; correct for builtin catalogue providers because each owns
+    /// a distinct enum value. Multiple `.openai_compatible` providers share
+    /// the same enum value, so this merges them — use `dropConn` for
+    /// dynamic/config providers.
     pub fn dropProvider(self: *ModelCatalogue, gpa: std.mem.Allocator, provider: config_mod.Provider) void {
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -140,14 +140,14 @@ pub const ModelCatalogue = struct {
         }
     }
 
-    /// Remove every entry sourced from `conn`. Conn-bazlıdır: provider enum'u
-    /// + `base_url` + `auth_key_id` üçlüsü eşleşmelidir. Çoklu
-    /// `.openai_compatible` provider'lar aynı enum değerini paylaştığından,
-    /// enum-bazlı `dropProvider` onları ayıramazdı — bu versiyon yalnızca
-    /// verilen bağlantıya ait entry'leri düşürür, böylece "bir dynamic
-    /// provider refresh edildiğinde diğerlerinin modelleri kaybolmaz"
-    /// (illegal state temsil edilemez: `Compatible` üç bilgiyi birlikte taşır,
-    /// karşılaştırma da üçünü birlikte yapar).
+    /// Remove every entry sourced from `conn`. Conn-based: the provider enum
+    /// + `base_url` + `auth_key_id` triple must match. Because multiple
+    /// `.openai_compatible` providers share the same enum value, the
+    /// enum-based `dropProvider` could not distinguish them — this version
+    /// drops only the entries belonging to the given connection, so
+    /// "refreshing one dynamic provider never loses the others' models"
+    /// (the illegal state is unrepresentable: `Compatible` carries all three
+    /// pieces together, and the comparison uses all three together).
     pub fn dropConn(self: *ModelCatalogue, gpa: std.mem.Allocator, conn: model_loader.Compatible) void {
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -206,7 +206,7 @@ fn testModel(gpa: std.mem.Allocator, id: []const u8) !codex.Model {
 }
 
 /// Test helper: gpa-owned `Compatible` source. `catalogue.deinit`/`dropProvider`
-/// string'leri serbest bırakır.
+/// free the strings.
 fn testCompatibleSource(gpa: std.mem.Allocator, provider: config_mod.Provider, base_url: []const u8, auth_key_id: []const u8) !model_loader.Compatible {
     return .{
         .provider = provider,
@@ -236,10 +236,11 @@ test "dropProvider removes model, source, and reasoning together" {
 }
 
 test "dropConn drops only the matching dynamic provider, not sibling openai_compatible ones" {
-    // İki dynamic provider (StepFun + Kimi) aynı `.openai_compatible` enum
-    // değerini paylaşır. `dropConn` yalnızca (provider + base_url + auth_key_id)
-    // üçlüsü eşleşen entry'leri düşürmelidir — kardeşi korumalıdır. Enum-bazlı
-    // `dropProvider` bunu yapamazdı (her ikisini de düşürürdü).
+    // Two dynamic providers (StepFun + Kimi) share the same
+    // `.openai_compatible` enum value. `dropConn` must drop only the entries
+    // whose (provider + base_url + auth_key_id) triple matches — the sibling
+    // must survive. Enum-based `dropProvider` could not do this (it would
+    // drop both).
     const gpa = std.testing.allocator;
     var catalogue: ModelCatalogue = .{};
     defer catalogue.deinit(gpa);
@@ -249,7 +250,7 @@ test "dropConn drops only the matching dynamic provider, not sibling openai_comp
     try catalogue.append(gpa, try testModel(gpa, "kimi"), .{ .openai_compatible = try testCompatibleSource(gpa, .openai_compatible, "https://api.moonshot.cn/v1", "moonshot") });
     try catalogue.append(gpa, try testModel(gpa, "gpt"), .openai_codex);
 
-    // Refresh StepFun: sadece onun entry'leri düşürülmeli, Kimi ve Codex kalır.
+    // Refresh StepFun: only its entries must be dropped; Kimi and Codex stay.
     catalogue.dropConn(gpa, .{
         .provider = .openai_compatible,
         .base_url = "https://api.stepfun.com/v1",
@@ -262,7 +263,7 @@ test "dropConn drops only the matching dynamic provider, not sibling openai_comp
     try std.testing.expectEqualStrings("gpt", catalogue.entries.items[1].model.id);
     try std.testing.expectEqual(model_loader.ModelSource.openai_codex, catalogue.entries.items[1].source);
 
-    // Kimi'yi de drop et — geriye yalnızca Codex kalmalı.
+    // Drop Kimi too — only Codex should remain.
     catalogue.dropConn(gpa, .{
         .provider = .openai_compatible,
         .base_url = "https://api.moonshot.cn/v1",

@@ -7,13 +7,13 @@ const config_mod = @import("../config/config.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const symbols = @import("../symbols.zig");
 
-/// Bir modelin provenance'ı + bağlantı bilgisi. Entry ile birlikte dolaşır;
-/// `applySelectedModel` cached_config'in global tek değerine bakmadan bunu
-/// kullanır. Önceki `openai_compatible: Provider` armı dynamic/config
-/// provider'larını `.openai_compatible` enum'ına çöktürdüğü için çoklu
-/// provider kataloğunda yanlış provider'a bağlanmaya yol açıyordu —
-/// `base_url` + `auth_key_id` artık modelle birlikte taşındığından
-/// uyuşmazlık temsil edilemez.
+/// A model's provenance + connection info. Travels with the entry;
+/// `applySelectedModel` uses this without consulting the single global value
+/// in cached_config. The previous `openai_compatible: Provider` arm collapsed
+/// dynamic/config providers into the `.openai_compatible` enum, which led the
+/// multi-provider catalogue to connect to the wrong provider — now that
+/// `base_url` + `auth_key_id` travel with the model, the mismatch is
+/// unrepresentable.
 pub const ModelSource = union(enum) {
     openai_codex,
     openai_compatible: Compatible,
@@ -29,10 +29,11 @@ pub const ModelSource = union(enum) {
     }
 };
 
-/// Bir OpenAI-uyumlu provider'a bağlanmak için gereken üç bilgi: provider enum
-/// (display/default-URL fallback için), tam `base_url` (bağlantı için), ve
-/// auth.json anahtar kimliği (API key çözümlemesi için). Bir modelden
-/// ayrılamazlar — entry ile construction sırasında bağlanırlar.
+/// The three pieces of information needed to connect to an OpenAI-compatible
+/// provider: the provider enum (for display/default-URL fallback), the full
+/// `base_url` (for connecting), and the auth.json key id (for resolving the
+/// API key). They cannot be separated from a model — they are bound to the
+/// entry at construction time.
 pub const Compatible = struct {
     provider: config_mod.Provider,
     base_url: []const u8,
@@ -91,9 +92,9 @@ pub const Configured = struct {
     base_url: []u8, // gpa-owned
     api_key: []u8, // gpa-owned
     display_name: ?[]u8 = null, // gpa-owned
-    /// auth.json anahtar kimliği. Katalog provider'ları için `provider.label()`,
-    /// dynamic/config provider'ları için provider id'si (ör. "stepfun-ai").
-    /// null → `provider.label()`'a düşer (katalog provider'ları için).
+    /// auth.json key id. `provider.label()` for catalogue providers, the
+    /// provider id for dynamic/config providers (e.g. "stepfun-ai").
+    /// null → falls back to `provider.label()` (for catalogue providers).
     auth_key_id: ?[]u8 = null, // gpa-owned
     /// User-configured headers for this provider, `{env:VAR}` already
     /// expanded at job construction. Owned by the job; freed in `deinit`.
@@ -156,7 +157,7 @@ fn buildCatalog(job: *Job, result: *Result) !void {
             // the others — but don't swallow the reason silently: log it, and
             // record a per-provider outcome so the picker's [CONNECTED] badge can
             // tell a provider that contributes no models (e.g. Ollama Cloud) from
-            // one that d
+            // one that failed outright (`ok = false`).
             try loadConnectedParallel(job, result);
         },
         .single_provider => {
@@ -385,10 +386,10 @@ fn loadLocalCtx(gpa: std.mem.Allocator, io: std.Io, provider: config_mod.Provide
     }
 }
 
-/// Bir `Compatible` source'u gpa-owned `base_url` + `auth_key_id` ile kurar.
-/// `auth_key_id` null ise `provider.label()`'a düşer (katalog provider'ları
-/// auth.json'a label'larıyla kaydolur). Caller (Entry/Record) `source.deinit`
-/// ile string'leri serbest bırakır.
+/// Builds a `Compatible` source with gpa-owned `base_url` + `auth_key_id`.
+/// A null `auth_key_id` falls back to `provider.label()` (catalogue
+/// providers register in auth.json under their label). The caller
+/// (Entry/Record) frees the strings via `source.deinit`.
 pub fn compatibleSource(
     gpa: std.mem.Allocator,
     provider: config_mod.Provider,
