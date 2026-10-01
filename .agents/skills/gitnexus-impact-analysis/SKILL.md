@@ -1,6 +1,6 @@
 ---
 name: gitnexus-impact-analysis
-description: "Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: \"Is it safe to change X?\", \"What depends on this?\", \"What will break?\""
+description: "Use only when the user explicitly asks for GitNexus impact analysis. For ordinary Zay change-safety questions, use the repository's current invariants and change workflow."
 ---
 
 # Impact Analysis with GitNexus

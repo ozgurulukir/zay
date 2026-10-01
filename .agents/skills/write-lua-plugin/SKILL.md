@@ -1,6 +1,6 @@
 ---
 name: write-lua-plugin
-description: Guide to writing Zay Lua plugins for the Zay Agent. Learn how to create tools, access filesystem/shell/git, handle permissions, debug, and structure Lua plugin projects.
+description: Guide to writing Zay Lua 5.4 plugins for Zay. Covers the current manifest, sandboxed bridge API, lane/session-aware cwd, tool schemas, events, state, and plugin tests.
 ---
 
 # Write Zay Lua Plugin
@@ -13,6 +13,8 @@ Write a Lua plugin that extends Zay's capabilities. Plugins run in a sandboxed L
 ~/.config/zay/plugins/<plugin-name>/
   plugin.lua    -- manifest (required)
   init.lua      -- entry point (required)
+  prompt.md     -- optional model instructions
+  test.lua      -- optional plugin tests
 ```
 
 ## Manifest (`plugin.lua`)
@@ -68,7 +70,10 @@ descriptive names in `register_tool`.
 into a Lua table before the handler is called. You can access `params.param_name`
 directly — no manual JSON parsing needed.
 
-## Available Bridge Functions (28 total)
+## Available Bridge Functions
+
+The bridge surface is maintained in docs/plugins/api-reference.md and
+src/lua/sandbox.zig; do not copy a hard-coded function count into new docs.
 
 ### Filesystem (no permission needed)
 - `zay.read_file(path, opts?)` → `{path, content, size, lines, language, mime_type}`
@@ -153,14 +158,30 @@ round-trip cleanly for data tables: `json_decode(json_encode(t))` recovers `t`.
   (in-memory only, lost on restart). For durable state, write a file sidecar
   (`.zay/<plugin>/state.json`) — the `todo` example plugin's pattern.
 
+## Lane and session cwd
+
+Filesystem, git, and shell bridges resolve against the effective cwd. During a
+lane dispatch this is the lane worktree; after a cross-project resume it is the
+resumed session root; while init.lua is loading it is the process cwd. Use the
+cwd/project-root bridges instead of git -C workarounds. Keep paths relative or
+use forward slashes in Lua strings; native backslashes can introduce escapes
+and control bytes.
+
+Paths are confined to the effective project root by the sanitizePath boundary,
+including the symlink re-check where supported. Dedicated path operations are
+safer than shelling out for file changes.
+
 ## Parameter Schema
 
 ```lua
 parameters = {
   name = {
-    type = "string",       -- "string" | "number" | "boolean"
+    type = "string",       -- string, number, integer, boolean, object, array
     description = "...",   -- for the AI model
     optional = true,       -- if true, model may omit
+    nullable = true,       -- JSON null is accepted
+    enum = { "low", "high" },
+    default = "10",        -- JSON fragment recorded in the schema
   },
 }
 ```
@@ -186,6 +207,12 @@ parameters = {
     human-editable. A corrupt file should yield `{}` from your loader (guard
     `json_decode` returning `nil`) so a bad sidecar never blocks the plugin.
     The todo plugin's `.zay/todos/plans.json` sidecar is the reference pattern.
+
+11. **Treat budgets as per-dispatch.** Instruction and timeout limits are reset
+    before each tool call or event dispatch; keep handlers bounded and fast.
+12. **Ship prompt.md when the model needs usage guidance.** It is injected at
+    session start, capped per plugin and in aggregate, and changes take effect
+    on the next session or lane.
 
 ## Example: Read + Git Status Tool
 

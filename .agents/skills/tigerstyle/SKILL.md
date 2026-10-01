@@ -1,6 +1,6 @@
 ---
 name: tigerstyle
-description: Use when writing any code. It describes how to write beautiful, maintainable and performant code.
+description: Use when writing or reviewing Zig code in Zay. Apply the repository's Zig 0.16 style, ownership, boundary, concurrency, and test conventions.
 ---
 
 ## Goals when writing code
@@ -11,14 +11,15 @@ description: Use when writing any code. It describes how to write beautiful, mai
 
 ### Rules
 
-- Use only very simple, explicit control flow
-- Do not use recursion
+- Prefer simple, explicit control flow
+- Avoid recursion unless the data structure requires it and the depth is bounded
 - Minimise abstractions to a few excellent ones, increasing abstractions creates risk of a leaky abstraction
-- Bound everything, all loops and queues must have a fixed upper bound
-- Use explicitly-sized types like `u32` for everything, avoid architecture-specific `usize`.
-- Assert all function arguments and return values, pre/postconditions and invariants. A
-  function must not operate blindly on data it has not checked. We expect on average a minimum of two
-  assertions per function.
+- Bound queues, buffers, retries, and external work. Do not impose an artificial
+  bound where the protocol or file format is legitimately streaming.
+- Use semantic integer types: `usize` for indexes and lengths, fixed-width types
+  for wire formats, persisted values, and platform-independent limits.
+- Assert meaningful API/state-transition invariants. Do not add assertions for
+  facts already guaranteed by the type system or ordinary loop bounds.
 - For every property you want to enforce, try to find at least two different code paths where an assertion can be added. For example, assert validity of data right before writing it to disk, and also immediately after reading from disk.
 - Split compound assertions: prefer `assert(a); assert(b);` over `assert(a and b);`.
   The former is simpler to read, and provides more precise information if the condition fails.
@@ -28,13 +29,13 @@ description: Use when writing any code. It describes how to write beautiful, mai
   valid/invalid boundary between these spaces is where interesting bugs are often found. This is
   also why tests must test exhaustively, not only with valid data but also with invalid data,
   and as valid data becomes invalid.
-- All memory must be statically allocated at startup. No memory may be dynamically allocated (or
-  freed and reallocated) after initialization. This avoids unpredictable behavior that can
-  significantly affect performance, and avoids use-after-free.
+- Zay deliberately allocates after startup for sessions, prompts, plugins, and
+  UI state. Make those allocations explicit, scoped, and paired with `defer`
+  or `errdefer`; do not pretend the program is static-memory-only.
 - Declare variables at the smallest possible scope, and minimize the number of variables in
   scope, to reduce the probability that variables are misused.
-- Functions must be at most 70 lines
-- Functions should take a few parameters, have a simple return type, with meaty logic inside.
+- Keep functions small enough to review, but do not enforce an arbitrary line
+  limit. Extract helpers when they reduce state or clarify ownership.
 - Centralize control flow. When splitting a large function, try to keep all switch/if statements in the "parent" function, and move non-branchy logic fragments to helper functions. Divide responsibility. All control flow should be handled by _one_ function, the rest shouldn't
   care about control flow at all. In other words,
   ("push `if`s up and `for`s down").
@@ -46,7 +47,8 @@ description: Use when writing any code. It describes how to write beautiful, mai
   this make your program safer by keeping the control flow of your program under your control, it
   also improves performance for the same reason (you get to batch, instead of context switching on
   every event). Additionally, this makes it easier to maintain bounds on work done per time period.
-- Compound conditions that evaluate multiple booleans make it difficult for the reader to verify
+- Avoid deeply nested or opaque compound conditions; use the shape that makes
+  all meaningful cases obvious. Do not mechanically expand every `else if`.
   that all cases are handled. Split compound conditions into simple conditions using nested
   `if/else` branches. Split complex `else if` chains into `else { if { } }` trees. This makes the
   branches and cases clear. Again, consider whether a single `if` does not also need a matching
@@ -239,9 +241,9 @@ description: Use when writing any code. It describes how to write beautiful, mai
   be viral, propagating through the call chain. For example, as a return type, `void` trumps `bool`,
   `bool` trumps `u64`, `u64` trumps `?u64`, and `?u64` trumps `!u64`.
 
-- Ensure that functions run to completion without suspending, so that precondition assertions are
-  true throughout the lifetime of the function. These assertions are useful documentation without a
-  suspend, but may be misleading otherwise.
+- Treat asynchronous workers and UI ticks as explicit state machines. Never
+  block the render path; use the repository's `Job(T)` and bridge conventions
+  for background work.
 
 - Be on your guard for **[buffer bleeds](https://en.wikipedia.org/wiki/Heartbleed)**. This is a
   buffer underflow, the opposite of a buffer overflow, where a buffer is not fully utilized, with

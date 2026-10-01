@@ -16,10 +16,11 @@ LM Studio, vLLM, Together, DeepSeek, Mistral, Cerebras, Gemini gateways, custom
 `/v1`-style servers, etc. Builtin native support exists for OpenAI / Codex OAuth
 (chat login, no API key).
 
-**Reference docs:** `docs/CONFIG.md` (configuration architecture and provider
-section), `docs/MCP.md` (model context protocol servers), `schema/config.schema.json`
-(authoritative field documentation). `[[CONFIG]]` in repo docs links the wiki
-version. For command-safety or transport internals, see `docs/PATTERNS.md`.
+**Reference docs:** `docs/CONFIG.md` (configuration architecture, provider,
+database, and environment sections), `schema/config.schema.json`
+(authoritative field names), `docs/MCP.md` (model context protocol servers),
+and `docs/PATTERNS.md` (transport and reasoning invariants). `[[CONFIG]]` in
+repo docs links the wiki version.
 
 ---
 
@@ -79,11 +80,11 @@ model ids may themselves contain slashes (e.g. Hugging Face org/model ids).
 }
 ```
 
-Both parts must be non-empty. The provider name is looked up in (in order):
-user-defined `providers`, then builtin provider labels, then the models.dev
-catalogue. `baseURL` (top-level, legacy) overrides the active provider's base
-URL but is not schema-valid; new configs scope per-provider base URLs inside
-`providers.<name>.baseURL`.
+Both parts must be non-empty. The provider name is resolved against custom
+providers, builtin provider labels, and the models.dev catalogue. Top-level
+`baseURL` is a valid override for the active provider; use
+`providers.<name>.baseURL` when the endpoint belongs to a named provider and
+must survive model switches.
 
 ---
 
@@ -122,16 +123,24 @@ Common per-model keys:
 - `reasoningEffort` — `"default"` (model decides) / `"none"` (no thinking) /
   `"low"`/`"medium"`/`"high"`/`"xhigh"` / `"max"` (OpenRouter-only top level;
   OpenAI-native ignores it; Qwen/DashScope clips to `"medium"`).
-- `reasoningEfforts` — array this model supports; the TUI picker filters its
+- `reasoningOptions` — array this model supports; the TUI picker filters its
   cycle to this list.
 - `contextWindow` — token context window; overrides catalogue lookup (needed
   for local Ollama/LM Studio models the catalogue misses).
 - `maxOutputTokens` — caps `max_tokens` per turn; falls back to
   `context.maxOutputTokens`.
-- `disablePromptCache` — strip prompt-caching fields (some `:free` /
-  gateway-fronted models 400 on them).
-- `autoContinueOnLengthCut` — continue once when a response ends at the output
-  token cap without tool calls.
+Global transport/UI settings use camelCase in new config files:
+`useResponsesEndpoint`, `strictOutputs`, `systemPrompt`, and
+`bashClassifierUrl`. Legacy snake_case spellings are parsed for migration but
+are not schema-valid and are rewritten on save. Strict outputs are opt-in and
+gateway-incompatible; do not enable them for OpenRouter, Ollama, vLLM, or
+similar gateways unless the provider is known to support OpenAI strict tools.
+
+Context-wide settings live under `context`, not under a provider model:
+`disablePromptCache` suppresses cache fields in both wire clients and
+`autoContinueOnLengthCut` retries once after a cap-terminated response with
+no tool calls. The context block also owns request timeouts, concurrent-request
+limits, tool-call limits, and compaction.
 
 Reasoning-effort application is two composed layers (dialect-level clipping +
 Qwen/QwQ model-level clipping) resolved at one named home; you don't need to care
@@ -171,7 +180,18 @@ Ways to set a key:
 
 ---
 
-## 5. Environment variables
+## 5. External database and roaming sessions
+
+Session storage can remain local or use a remote backend configured under
+database.backend: local/local_sqlite, turso_http, d1_http, or zay_service.
+Turso and D1 use atomic HTTP batches; zay_service is the companion REST
+service. Remote failures fall back to local sessions.sqlite, and roaming
+sessions bind records to the local host_id and project root. Keep auth tokens
+in config as required by the selected backend and use docs/CONFIG.md for the
+provider-specific URL forms. The database tool is activated when an external
+database backend or service URL is configured.
+
+## 6. Environment variables
 
 | Variable | Effect |
 | -------- | ------ |
@@ -181,6 +201,7 @@ Ways to set a key:
 | `ZAY_USE_RESPONSES_ENDPOINT` | Force Responses-endpoint routing (`true`/`1`). |
 | `ZAY_STRICT_OUTPUTS` | OpenAI strict structured-outputs — gateway-incompatible (`true`/`1`). |
 | `ZAY_BASH_CLASSIFIER_URL` | External safety classifier URL (optional). |
+| `ZAY_DATABASE_SERVER_URL` / `ZAY_DATABASE_AUTH_TOKEN` | External database service URL and token. |
 | `ZAY_LOG_FILE`, `ZAY_LOG_MAX_BYTES`, `ZAY_LOG_STDERR_LEVEL` | Logging knobs. |
 
 Env vars override every file layer and are the quickest way to point Zay at a
@@ -189,7 +210,7 @@ provider for a one-off run:
 
 ---
 
-## 6. TUI commands
+## 7. TUI commands
 
 From the command palette (`/`):
 
@@ -198,7 +219,7 @@ From the command palette (`/`):
   for an API key (stored via auth). Local providers (Ollama, LM Studio) need no
   key and probe `/v1/models` to list available models.
 - **`/model`** — switch the active model for the session; the picker reflects
-  `reasoningEfforts` constraints and shows the model's context window.
+  `reasoningOptions` constraints and shows the model's context window.
 - **`/parallel`**, `/diff`, `/timeline`, `/undo`, `/help` — misc, not provider.
 
 Editing config in the TUI and hitting **Ctrl+S** persists to the global config
@@ -206,7 +227,7 @@ file.
 
 ---
 
-## 7. Common setups (playbook)
+## 8. Common setups (playbook)
 
 ### a. OpenAI / Codex (native, no key)
 ```json
@@ -269,7 +290,7 @@ DashScope OpenAI-compat endpoint.
 
 ---
 
-## 8. models.dev catalogue
+## 9. models.dev catalogue
 
 Zay embeds a models.dev registry (`models.dev.Registry`) used by the provider/
 model pickers to autocomplete providers, base URLs (provider.PROVIDERS.ai), and
@@ -286,7 +307,7 @@ model definition.
 
 ---
 
-## 9. Debugging & gotchas
+## 10. Debugging & gotchas
 
 - **API key not sent / 401** — key label must match the provider part of
   `defaultModel`; check `auth.json` `apiKeys` for the right label, or use
@@ -311,7 +332,7 @@ model definition.
 
 ---
 
-## 10. Quick checklist — "point Zay at a new LLM"
+## 11. Quick checklist — "point Zay at a new LLM"
 
 1. Pick provider name and model id → set `defaultModel` (`"<provider>/<model>"`).
 2. Add `providers.<name>.baseURL` (unless it's a builtin with a default).
