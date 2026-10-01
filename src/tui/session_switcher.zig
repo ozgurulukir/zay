@@ -25,7 +25,10 @@ const App = tui.App;
 
 fn resumeFoldIndex(app: *const App, group_key: []const u8) ?usize {
     for (app.resume_folded_projects.items, 0..) |folded, index| {
-        if (std.mem.eql(u8, folded, group_key)) return index;
+        // Same compare as `resume_picker.projectFolded`: keys may be legacy
+        // cwds that differ in separator/case, and the toggle must see the
+        // same fold class the render path does.
+        if (paths.pathsEqual(folded, group_key)) return index;
     }
     return null;
 }

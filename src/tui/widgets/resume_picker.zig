@@ -579,9 +579,11 @@ fn projectEnd(summaries: []const session_mod.SessionSummary, start: usize) usize
     return index;
 }
 
-pub fn projectFolded(folded_projects: []const []const u8, cwd: []const u8) bool {
+pub fn projectFolded(folded_projects: []const []const u8, group_key: []const u8) bool {
     for (folded_projects) |folded| {
-        if (std.mem.eql(u8, folded, cwd)) return true;
+        // Keys are project ids or legacy origin cwds; the path SSOT keeps cwd
+        // keys folding across separator/case drift (`paths.pathsEqual`).
+        if (paths.pathsEqual(folded, group_key)) return true;
     }
     return false;
 }
