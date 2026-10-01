@@ -34,7 +34,10 @@ fn resumeFoldIndex(app: *const App, group_key: []const u8) ?usize {
 }
 
 /// Build a GROUP-key → max_updated_at_ms map for O(1) project-lookup in the
-/// sort comparator. Caller owns the map and its backing allocator.
+/// sort comparator. Caller owns the map and its backing allocator. Map keys
+/// borrow from `summaries` (no dupe): `map.deinit()` must run while the
+/// summaries' backing memory is still alive — never cache the map across a
+/// `resumeClear`.
 fn buildProjectMaxMap(gpa: std.mem.Allocator, summaries: []const session_mod.SessionSummary) !std.StringHashMap(i64) {
     var map = std.StringHashMap(i64).init(gpa);
     errdefer map.deinit();
@@ -1262,4 +1265,188 @@ test "project-root bind cancel frees the pending identity and never writes" {
     try std.testing.expect(app.nav.session_action == .browsing);
     try std.testing.expect(app.input_buffers.project_root_text.items.len == 0);
     try std.testing.expect(app.mode == App.Mode.normal);
+}
+
+// ---------------------------------------------------------------------------
+// Resume project-sort tests (map-based production path)
+// ---------------------------------------------------------------------------
+
+/// Fixture shape for resume-sort tests: compact literals, gpa-owned string
+/// fields materialized by `makeSortSummaryFixture` (and freed via
+/// `SessionSummary.deinit`, matching `session.list` ownership).
+const ResumeSortFixture = struct {
+    id: []const u8,
+    cwd: []const u8,
+    project_key: ?[]const u8,
+    updated_at_ms: i64,
+    title: ?[]const u8 = null,
+    created_at_ms: i64 = 0,
+};
+
+fn makeSortSummaryFixture(gpa: std.mem.Allocator, fixture: ResumeSortFixture) !session_mod.SessionSummary {
+    return .{
+        .id = try gpa.dupe(u8, fixture.id),
+        .title = if (fixture.title) |title| try gpa.dupe(u8, title) else null,
+        .cwd = try gpa.dupe(u8, fixture.cwd),
+        .created_at_ms = fixture.created_at_ms,
+        .updated_at_ms = fixture.updated_at_ms,
+        .leaf_entry_id = null,
+        .model_provider = null,
+        .model_id = null,
+        .reasoning_effort = null,
+        .project_key = if (fixture.project_key) |key| try gpa.dupe(u8, key) else null,
+    };
+}
+
+test "map-based resume sort orders groups by max updated_at and keeps drifted key spellings separate" {
+    const gpa = std.testing.allocator;
+    // Two byte-different spellings of one logical project (separator + case
+    // drift on the bound `project_key`, which `groupKeyOf` returns verbatim)
+    // plus a third distinct group. updated_at values are NOT in insertion
+    // order so the max-fold over the map actually reorders groups:
+    // drifted-alpha (0) < beta (200) < raw-alpha (300).
+    var summaries: [4]session_mod.SessionSummary = undefined;
+    summaries[0] = try makeSortSummaryFixture(gpa, .{
+        .id = "alpha-drift",
+        .cwd = "/repo/alpha",
+        .project_key = "c:/repo/alpha",
+        .updated_at_ms = 0,
+    });
+    summaries[1] = try makeSortSummaryFixture(gpa, .{
+        .id = "beta-new",
+        .cwd = "/repo/beta",
+        .project_key = "C:\\Repo\\Beta",
+        .updated_at_ms = 200,
+    });
+    summaries[2] = try makeSortSummaryFixture(gpa, .{
+        .id = "beta-old",
+        .cwd = "/repo/beta",
+        .project_key = "C:\\Repo\\Beta",
+        .updated_at_ms = 40,
+    });
+    summaries[3] = try makeSortSummaryFixture(gpa, .{
+        .id = "alpha-raw",
+        .cwd = "/repo/alpha",
+        .project_key = "C:\\Repo\\Alpha",
+        .updated_at_ms = 300,
+    });
+    defer {
+        for (&summaries) |*summary| summary.deinit(gpa);
+    }
+
+    var map = try buildProjectMaxMap(gpa, summaries[0..]);
+    defer map.deinit();
+    // Byte-different spellings fold to SEPARATE map entries here (the fold is
+    // keyed by `std.mem.eql`-style byte identity, not `paths.pathsEqual`):
+    // c:/repo/alpha → 0, C:\Repo\Beta → 200, C:\Repo\Alpha → 300.
+    try std.testing.expectEqual(@as(usize, 3), map.count());
+
+    std.mem.sort(session_mod.SessionSummary, summaries[0..], &map, resumeSummaryLessThanWithMap);
+    const order = [_][]const u8{ "alpha-raw", "beta-new", "beta-old", "alpha-drift" };
+    for (order, summaries[0..]) |want, *summary| {
+        try std.testing.expectEqualStrings(want, summary.id);
+    }
+    // Members of the beta group stay contiguous.
+    try std.testing.expectEqualStrings("beta-new", summaries[1].id);
+    try std.testing.expectEqualStrings("beta-old", summaries[2].id);
+    // Byte-equal keys take the same-key fast path: newest member first.
+    try std.testing.expect(resumeSummaryLessThanWithMap(&map, summaries[1], summaries[2]));
+    try std.testing.expect(!resumeSummaryLessThanWithMap(&map, summaries[2], summaries[1]));
+
+    // The comparator is descending-only by construction (`left_max >
+    // right_max`); ascending ordering is a caller-context concern, not part
+    // of these two functions.
+}
+
+test "map-based resume sort sends map misses to the end and breaks misses by raw key bytes" {
+    const gpa = std.testing.allocator;
+    // The map is built from ONE summary only, so the two orphan keys miss
+    // lookup and fall through `orelse std.math.minInt`. Their updated_at
+    // values (999 / 10) cannot rescue them; the minInt tie is broken by
+    // `std.mem.lessThan` on the raw keys ("pk-aaa-orphan" < "pk-zzz-orphan").
+    var summaries: [4]session_mod.SessionSummary = undefined;
+    summaries[0] = try makeSortSummaryFixture(gpa, .{
+        .id = "alpha",
+        .cwd = "/repo/alpha",
+        .project_key = "pk-alpha",
+        .updated_at_ms = 500,
+    });
+    summaries[1] = try makeSortSummaryFixture(gpa, .{
+        .id = "alpha-old",
+        .cwd = "/repo/alpha",
+        .project_key = "pk-alpha",
+        .updated_at_ms = 100,
+    });
+    summaries[2] = try makeSortSummaryFixture(gpa, .{
+        .id = "zzz-orphan",
+        .cwd = "/repo/orphan",
+        .project_key = "pk-zzz-orphan",
+        .updated_at_ms = 999,
+    });
+    summaries[3] = try makeSortSummaryFixture(gpa, .{
+        .id = "aaa-orphan",
+        .cwd = "/repo/orphan",
+        .project_key = "pk-aaa-orphan",
+        .updated_at_ms = 10,
+    });
+    defer {
+        for (&summaries) |*summary| summary.deinit(gpa);
+    }
+
+    var map = try buildProjectMaxMap(gpa, summaries[0..1]);
+    defer map.deinit();
+    try std.testing.expectEqual(@as(usize, 1), map.count());
+
+    std.mem.sort(session_mod.SessionSummary, summaries[0..], &map, resumeSummaryLessThanWithMap);
+    const order = [_][]const u8{ "alpha", "alpha-old", "aaa-orphan", "zzz-orphan" };
+    for (order, summaries[0..]) |want, *summary| {
+        try std.testing.expectEqualStrings(want, summary.id);
+    }
+    // Direct comparator probes of the miss branch: equal minInt fallbacks
+    // resolve via raw-key byte order, deterministically.
+    try std.testing.expect(resumeSummaryLessThanWithMap(&map, summaries[3], summaries[2]));
+    try std.testing.expect(!resumeSummaryLessThanWithMap(&map, summaries[2], summaries[3]));
+}
+
+test "map-based resume sort does not fold pathsEqual-equal group keys into one entry" {
+    const gpa = std.testing.allocator;
+    // `C:\Repo\Gamma` and `c:/repo/gamma` are pathsEqual-equal but
+    // byte-different. The production fold keys the map by raw bytes, so they
+    // stay two entries and two byte-key groups (the pathsEqual folding lives
+    // in the render/fold toggle, not in the sort). One key carries two
+    // members to prove the byte-equal group stays contiguous internally.
+    var summaries: [3]session_mod.SessionSummary = undefined;
+    summaries[0] = try makeSortSummaryFixture(gpa, .{
+        .id = "gamma-upper-new",
+        .cwd = "/repo/gamma",
+        .project_key = "C:\\Repo\\Gamma",
+        .updated_at_ms = 100,
+    });
+    summaries[1] = try makeSortSummaryFixture(gpa, .{
+        .id = "gamma-upper-old",
+        .cwd = "/repo/gamma",
+        .project_key = "C:\\Repo\\Gamma",
+        .updated_at_ms = 20,
+    });
+    summaries[2] = try makeSortSummaryFixture(gpa, .{
+        .id = "gamma-lower",
+        .cwd = "/repo/gamma",
+        .project_key = "c:/repo/gamma",
+        .updated_at_ms = 50,
+    });
+    defer {
+        for (&summaries) |*summary| summary.deinit(gpa);
+    }
+
+    var map = try buildProjectMaxMap(gpa, summaries[0..]);
+    defer map.deinit();
+    try std.testing.expectEqual(@as(usize, 2), map.count());
+    try std.testing.expect(!std.mem.eql(u8, resume_picker.groupKeyOf(&summaries[0]), resume_picker.groupKeyOf(&summaries[2])));
+    try std.testing.expect(paths.pathsEqual(resume_picker.groupKeyOf(&summaries[0]), resume_picker.groupKeyOf(&summaries[2])));
+
+    std.mem.sort(session_mod.SessionSummary, summaries[0..], &map, resumeSummaryLessThanWithMap);
+    const order = [_][]const u8{ "gamma-upper-new", "gamma-upper-old", "gamma-lower" };
+    for (order, summaries[0..]) |want, *summary| {
+        try std.testing.expectEqualStrings(want, summary.id);
+    }
 }
