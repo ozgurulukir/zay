@@ -85,28 +85,6 @@ fn overlayLabel(app: *const App) []const u8 {
     };
 }
 
-fn writeBorderLabel(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u8) void {
-    const p = tui_style.activePalette();
-    writeBorderLabelLeft(surface, ctx, 0, text, p.border_label);
-}
-
-fn writeBorderLabelLeft(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, text: []const u8, style: vaxis.Style) void {
-    if (text.len == 0 or row >= surface.size.height) return;
-    var col: u16 = 1;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const width: u16 = @intCast(ctx.stringWidth(bytes));
-        if (width == 0) continue;
-        if (col + width >= surface.size.width) break;
-        surface.writeCell(col, row, .{
-            .char = .{ .grapheme = bytes, .width = @intCast(width) },
-            .style = style,
-        });
-        col += width;
-    }
-}
-
 pub const OverlayWidget = struct {
     app: *App,
 

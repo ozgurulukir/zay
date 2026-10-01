@@ -6,11 +6,12 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 
-/// Layout policy shared with the floating-panel host (see `tui.zig`). The body
-/// shows one row for the empty/status message or up to `max_visible_rows`
-/// results, wrapped in a single-cell border on top and bottom.
-pub const max_visible_rows = 8;
-pub const border_rows = 2;
+/// Layout policy for the floating at-search panel: the body shows one row for
+/// the empty/status message or up to `max_visible_rows` results, wrapped in a
+/// single-cell border on top and bottom (`border_rows`). The host sizes the
+/// panel through `panelHeight`.
+const max_visible_rows = 8;
+const border_rows = 2;
 
 /// Total panel height, including the border, for the given result count and
 /// optional notice row.
@@ -20,15 +21,6 @@ pub fn panelHeight(result_count: usize, notice_visible: bool) u16 {
     else
         @intCast(@min(result_count, max_visible_rows));
     return rows + @intFromBool(notice_visible) + border_rows;
-}
-
-/// Index of the first result to render so `selection` is within the `visible`
-/// rows. Keeps the selection pinned to the bottom edge once it scrolls past
-/// the fold; snaps back to the top while it still fits without scrolling.
-fn firstVisible(selection: u32, count: u32, visible: u16) u32 {
-    if (visible == 0 or count <= visible) return 0;
-    if (selection < visible) return 0;
-    return @min(selection - visible + 1, count - visible);
 }
 
 pub const Content = struct {
@@ -95,10 +87,10 @@ const Body = struct {
         // Scroll the visible window so the selection stays on screen even when
         // there are more results than fit (height < results.len).
         const count: u32 = @intCast(content.results.len);
-        const first = firstVisible(content.selection, count, surface.size.height);
+        const viewport = panel.ViewportWindow.compute(content.selection, count, surface.size.height);
         var row: u16 = 0;
-        while (row < surface.size.height and first + row < count) : (row += 1) {
-            const index = first + row;
+        while (row < viewport.visible_height and viewport.start_index + row < count) : (row += 1) {
+            const index = viewport.start_index + row;
             const selected = index == content.selection;
             try panel.drawFuzzyListRow(&surface, row, ctx, .{
                 .prefix = "  ",
@@ -135,18 +127,9 @@ test "at_search draws a selected result without overrunning" {
     try std.testing.expectEqual(@as(u16, 40), surface.size.width);
 }
 
-test "firstVisible keeps the selection within the window" {
-    // Everything fits: no scrolling.
-    try std.testing.expectEqual(@as(u32, 0), firstVisible(0, 5, 8));
-    try std.testing.expectEqual(@as(u32, 0), firstVisible(4, 5, 8));
-    // Selection still above the fold.
-    try std.testing.expectEqual(@as(u32, 0), firstVisible(7, 50, 8));
-    // Selection past the fold pins to the bottom edge.
-    try std.testing.expectEqual(@as(u32, 1), firstVisible(8, 50, 8));
-    try std.testing.expectEqual(@as(u32, 12), firstVisible(19, 50, 8));
-    // Selection near the end keeps it pinned to the bottom edge / last window.
-    try std.testing.expectEqual(@as(u32, 38), firstVisible(45, 50, 8));
-    try std.testing.expectEqual(@as(u32, 42), firstVisible(49, 50, 8));
+test "ViewportWindow.compute keeps the selection within the window" {
+    // Full case table lives in panel.zig; this pins the at-search sizing.
+    try std.testing.expectEqual(@as(u32, 42), panel.ViewportWindow.compute(49, 50, max_visible_rows).start_index);
 }
 
 test "rendersNotice_whenResultsEmptyAndNoticePresent" {
@@ -167,17 +150,7 @@ test "rendersNotice_whenResultsEmptyAndNoticePresent" {
     const inner_surface = outer_surface.children[0].surface;
 
     var buf: [64]u8 = undefined;
-    var len: usize = 0;
-    var col: u16 = 0;
-    while (col < inner_surface.size.width) : (col += 1) {
-        const cell = inner_surface.readCell(col, 1);
-        if (cell.default) continue;
-        const grapheme = cell.char.grapheme;
-        if (len + grapheme.len > buf.len) break;
-        @memcpy(buf[len..][0..grapheme.len], grapheme);
-        len += grapheme.len;
-    }
-    try std.testing.expectEqualStrings("! Search index building", buf[0..len]);
+    try std.testing.expectEqualStrings("! Search index building", panel.readRow(&inner_surface, 1, &buf));
 }
 
 test "panelHeight reserves a row for the notice" {
@@ -206,15 +179,5 @@ test "rendersNotice_whenResultsPresentAndNoticePresent" {
 
     // Row 0 and 1 have results, row 2 has the notice.
     var buf: [64]u8 = undefined;
-    var len: usize = 0;
-    var col: u16 = 0;
-    while (col < inner_surface.size.width) : (col += 1) {
-        const cell = inner_surface.readCell(col, 2);
-        if (cell.default) continue;
-        const grapheme = cell.char.grapheme;
-        if (len + grapheme.len > buf.len) break;
-        @memcpy(buf[len..][0..grapheme.len], grapheme);
-        len += grapheme.len;
-    }
-    try std.testing.expectEqualStrings("! Search error: timeout", buf[0..len]);
+    try std.testing.expectEqualStrings("! Search error: timeout", panel.readRow(&inner_surface, 2, &buf));
 }

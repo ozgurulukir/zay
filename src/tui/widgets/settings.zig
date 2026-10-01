@@ -261,6 +261,11 @@ pub const Content = struct {
         const sel = self.state.selection[@intFromEnum(Tab.prompt)];
         const is_editing = self.state.edit_target == .system_prompt;
 
+        // Prompt text wraps inside the bordered box: `prompt_text_max_rows`
+        // rows starting one row below the box top.
+        const prompt_text_row: u16 = 6;
+        const prompt_text_max_rows: u16 = 5;
+
         // Row 2: section header.
         try panel.lineStyledAt(surface, 2, "SYSTEM PROMPT", ctx, left_col, p.panel_header);
         try panel.lineStyledAt(surface, 3, "Custom instructions prepended to every conversation.", ctx, left_col, p.thinking_body);
@@ -287,12 +292,15 @@ pub const Content = struct {
                 else
                     "");
 
-        try drawWrappedText(surface, ctx, 6, left_col + 1, surface.size.width -| left_col -| 4, text, 5, p.info);
+        try drawWrappedText(surface, ctx, prompt_text_row, left_col + 1, surface.size.width -| left_col -| 4, text, prompt_text_max_rows, p.info);
 
         if (is_editing) {
             const cursor_pos = input.wrappedPosition(text, text.len, surface.size.width -| left_col -| 4);
             surface.cursor = .{
-                .row = @min(6 + cursor_pos.row, 10), // start_row + max_rows - 1
+                .row = @min(
+                    prompt_text_row + cursor_pos.row,
+                    prompt_text_row + prompt_text_max_rows - 1,
+                ),
                 .col = left_col + 1 + cursor_pos.col,
             };
         }

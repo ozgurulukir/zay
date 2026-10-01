@@ -5,8 +5,8 @@
 const std = @import("std");
 
 const tui = @import("../tui.zig");
+const panel = @import("widgets/panel.zig");
 const search_widget = @import("widgets/search.zig");
-const command_panel = @import("widgets/command_panel.zig");
 
 const App = tui.App;
 
@@ -61,7 +61,7 @@ pub fn rebuildMatches(app: *App, filter: []const u8) !void {
     for (messages, 0..) |message, index| {
         const src = search_widget.searchable(message) orelse continue;
         const body_match = firstMatchingLine(src.body, filter);
-        if (command_panel.containsIgnoreCase(src.title, filter) or body_match != null) {
+        if (panel.containsIgnoreCase(src.title, filter) or body_match != null) {
             // Dup the snippet: the transcript keeps streaming while the overlay
             // is open, and a realloc of the source body would dangle a borrow.
             const snippet = try app.gpa.dupe(u8, body_match orelse src.title);
@@ -80,7 +80,7 @@ pub fn rebuildMatches(app: *App, filter: []const u8) !void {
 fn firstMatchingLine(text: []const u8, filter: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
-        if (command_panel.containsIgnoreCase(line, filter)) return line;
+        if (panel.containsIgnoreCase(line, filter)) return line;
     }
     return null;
 }

@@ -282,6 +282,14 @@ pub fn fuzzyMatchPositions(query: []const u8, text: []const u8, positions: []usi
     return matched;
 }
 
+/// Case-insensitive substring match shared by every picker filter (command
+/// palette, model/provider/theme pickers, tree selector, transcript search)
+/// so the filters never drift.
+pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
+}
+
 /// Compare two decoded runes (as byte slices) for the fuzzy matcher: single-byte
 /// (ASCII) runes compare case-insensitively; multi-byte runes compare exactly.
 fn runeMatches(query: []const u8, text: []const u8) bool {
@@ -677,4 +685,26 @@ test "drawFuzzyListRow preserves rune alignment for multi-byte text" {
     // The matched rune 語 (3 bytes wide, 2 cells) is at col 4 and styled accent.
     const p = tui_style.buildPalette(tui_style.default_theme);
     try std.testing.expectEqual(p.selected_item.fg.rgb, cellFgRgb(&surface, 0, 4).?);
+}
+
+test "ViewportWindow.compute keeps the selection within the window" {
+    // Pins the window once the selection scrolls past the fold.
+    try std.testing.expectEqual(@as(u32, 0), ViewportWindow.compute(0, 50, 8).start_index);
+    try std.testing.expectEqual(@as(u32, 0), ViewportWindow.compute(7, 50, 8).start_index);
+    try std.testing.expectEqual(@as(u32, 1), ViewportWindow.compute(8, 50, 8).start_index);
+    try std.testing.expectEqual(@as(u32, 12), ViewportWindow.compute(19, 50, 8).start_index);
+    try std.testing.expectEqual(@as(u32, 38), ViewportWindow.compute(45, 50, 8).start_index);
+    try std.testing.expectEqual(@as(u32, 42), ViewportWindow.compute(49, 50, 8).start_index);
+    // Snaps back to the top while everything still fits.
+    try std.testing.expectEqual(@as(u32, 0), ViewportWindow.compute(4, 5, 8).start_index);
+}
+
+test "ViewportWindow.compute degenerate sizes render nothing" {
+    const empty = ViewportWindow.compute(0, 0, 8);
+    try std.testing.expectEqual(@as(u32, 0), empty.end_index);
+    try std.testing.expectEqual(@as(u32, 0), ViewportWindow.compute(0, 10, 0).visible_height);
+    // A short list leaves start/end clamped to the content.
+    const short = ViewportWindow.compute(2, 3, 8);
+    try std.testing.expectEqual(@as(u32, 0), short.start_index);
+    try std.testing.expectEqual(@as(u32, 3), short.end_index);
 }

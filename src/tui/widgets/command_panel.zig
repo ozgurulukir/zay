@@ -92,22 +92,14 @@ pub const Content = struct {
 pub fn matchesCommandFilter(name: []const u8, description: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;
     if (startsWithIgnoreCase(name, filter)) return true;
-    if (containsIgnoreCase(name, filter)) return true;
-    if (containsIgnoreCase(description, filter)) return true;
+    if (panel.containsIgnoreCase(name, filter)) return true;
+    if (panel.containsIgnoreCase(description, filter)) return true;
     return false;
 }
 
 fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     return std.ascii.startsWithIgnoreCase(haystack, needle);
-}
-
-/// Case-insensitive substring match, shared by the command-palette filter,
-/// the tree-selector filter (`widgets/tree_selector.zig`) and the transcript
-/// search path so the filters never drift.
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
 test "matchesCommandFilter matches slash prefix and descriptions" {
