@@ -135,6 +135,7 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 
 - 🏛️ **[System Architecture](docs/ARCHITECTURE.md):** Event pipeline, client layers, and memory model.
 - 🛡️ **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md):** Multi-tier safety architecture and model presets.
+- 🗄️ **[Database & Sessions](docs/DATABASE.md):** Local SQLite, Turso / LibSQL, Cloudflare D1, PostgreSQL, and roaming session backends.
 - ⚙️ **[Configuration Reference](docs/CONFIG.md):** Providers, API keys, compaction, and themes.
 - 🧠 **[Engineering Patterns](docs/PATTERNS.md):** Invariants, background slots, and thread safety.
 - 🔌 **[MCP Guide](docs/MCP.md):** stdio and Streamable HTTP MCP integration.
