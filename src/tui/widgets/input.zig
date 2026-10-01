@@ -19,7 +19,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui_style = @import("../style.zig");
-const telemetry = @import("../telemetry.zig");
 const status_bar = @import("status_bar.zig");
 const symbols = @import("../../symbols.zig");
 const app_state = @import("../app_state.zig");

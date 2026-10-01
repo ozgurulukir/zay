@@ -52,14 +52,14 @@ pub const Content = struct {
 
         if (self.plugins.len == 0) {
             try panel.lineStyledAt(&surface, 4, "No plugins loaded. Add plugins to ~/.config/zay/plugins/ or .zay/plugins/.", ctx, 2, p.notice);
-            try panel.lineStyledAt(&surface, height - 2, "[Esc] Close", ctx, 2, p.thinking_body);
+            try panel.lineStyledAt(&surface, height -| 2, "[Esc] Close", ctx, 2, p.thinking_body);
             return surface;
         }
 
         var row: u16 = 4;
         var line_buf: [256]u8 = undefined;
         for (self.plugins, 0..) |plugin, i| {
-            if (row >= height - 2) break;
+            if (row >= height -| 2) break;
             const is_selected = i == self.state.selection;
             const style = if (is_selected) p.selected_item else p.thinking_body;
             const status_icon = if (plugin.active) "●" else "○";
@@ -72,7 +72,7 @@ pub const Content = struct {
             row += 1;
         }
 
-        try panel.lineStyledAt(&surface, height - 2, "[Esc] Close", ctx, 2, p.thinking_body);
+        try panel.lineStyledAt(&surface, height -| 2, "[Esc] Close", ctx, 2, p.thinking_body);
         return surface;
     }
 };

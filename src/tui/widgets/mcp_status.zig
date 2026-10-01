@@ -65,19 +65,19 @@ pub const Content = struct {
             try panel.lineStyledAt(&surface, 4, "Add remote MCP server (Streamable HTTP):", ctx, 2, p.panel_header);
             const prompt = try std.fmt.allocPrint(ctx.arena, "  > {s}_", .{self.url_input});
             try panel.lineStyledAt(&surface, 6, prompt, ctx, 2, p.selected_item);
-            try panel.lineStyledAt(&surface, height - 2, "[Enter] Add Server  |  [Esc] Cancel", ctx, 2, p.thinking_body);
+            try panel.lineStyledAt(&surface, height -| 2, "[Enter] Add Server  |  [Esc] Cancel", ctx, 2, p.thinking_body);
             return surface;
         }
 
         var row: u16 = 4;
         if (self.manager.clients.items.len == 0) {
             try panel.lineStyledAt(&surface, row, "No MCP servers configured. Press [a] to add a remote server by URL.", ctx, 2, p.thinking_body);
-            try panel.lineStyledAt(&surface, height - 2, "[a] Add Server  |  [Esc] Close", ctx, 2, p.thinking_body);
+            try panel.lineStyledAt(&surface, height -| 2, "[a] Add Server  |  [Esc] Close", ctx, 2, p.thinking_body);
             return surface;
         }
 
         for (self.manager.clients.items, 0..) |client, i| {
-            if (row >= height - 2) break;
+            if (row >= height -| 2) break;
             const is_selected = i == self.state.selection;
             if (is_selected) panel.fillRow(&surface, row, p.selected);
 
@@ -104,8 +104,33 @@ pub const Content = struct {
             row += 2;
         }
 
-        try panel.lineStyledAt(&surface, height - 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, p.thinking_body);
+        try panel.lineStyledAt(&surface, height -| 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, p.thinking_body);
 
         return surface;
     }
 };
+
+test "State cursor clamps to the server count" {
+    var state: State = .{};
+    try std.testing.expectEqual(@as(usize, 0), state.selection);
+
+    // Moving down in an empty list stays put.
+    state.moveDown(0);
+    try std.testing.expectEqual(@as(usize, 0), state.selection);
+
+    state.moveDown(3);
+    state.moveDown(3);
+    try std.testing.expectEqual(@as(usize, 2), state.selection);
+    // The last row is a hard stop.
+    state.moveDown(3);
+    try std.testing.expectEqual(@as(usize, 2), state.selection);
+
+    state.moveUp();
+    state.moveUp();
+    state.moveUp();
+    try std.testing.expectEqual(@as(usize, 0), state.selection);
+
+    state.reset();
+    try std.testing.expectEqual(@as(usize, 0), state.selection);
+    try std.testing.expect(!state.adding);
+}

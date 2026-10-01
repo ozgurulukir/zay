@@ -13,7 +13,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
-const command_panel = @import("command_panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 
@@ -96,7 +95,7 @@ pub const Content = struct {
 fn matchesTheme(theme: tui_style.Theme, filter: []const u8) bool {
     if (filter.len == 0) return true;
     if (std.ascii.startsWithIgnoreCase(theme.name, filter)) return true;
-    return command_panel.containsIgnoreCase(theme.name, filter);
+    return panel.containsIgnoreCase(theme.name, filter);
 }
 
 /// Count the themes that the picker filter selects. Pure and shared — the

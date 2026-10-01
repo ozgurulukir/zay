@@ -382,24 +382,25 @@ const DiffSearchInner = struct {
             return surface;
         }
         const count: u32 = @intCast(matches.len);
-        const first = firstVisibleWindow(state.search_sel, count, visible);
+        const viewport = panel.ViewportWindow.compute(state.search_sel, count, visible);
         var r: u16 = 0;
-        while (r < visible and first + r < count) : (r += 1) {
-            const index = first + r;
+        while (r < viewport.visible_height and viewport.start_index + r < count) : (r += 1) {
+            const index = viewport.start_index + r;
             const selected = index == state.search_sel;
-            const prefix = if (selected) "  " else "  ";
-            const text = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, files[matches[index]].path }) catch files[matches[index]].path;
+            const text = std.fmt.allocPrint(ctx.arena, "  {s}", .{files[matches[index]].path}) catch files[matches[index]].path;
             panel.lineAt(&surface, 2 + r, text, ctx, selected, 0) catch {};
         }
         return surface;
     }
 };
 
-/// First visible index so `selection` stays on screen, pinned to the bottom edge
-/// once it scrolls past the fold.
-fn firstVisibleWindow(selection: u32, count: u32, visible: u16) u32 {
-    const v: u32 = visible;
-    if (v == 0 or count <= v) return 0;
-    if (selection < v) return 0;
-    return @min(selection - v + 1, count - v);
+test "expandTabs expands tabs to four spaces and passes plain text through" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const plain = "no tabs here";
+    try std.testing.expectEqualStrings(plain, try expandTabs(arena.allocator(), plain));
+
+    const expanded = try expandTabs(arena.allocator(), "\tindented\ttail");
+    try std.testing.expectEqualStrings("    indented    tail", expanded);
 }

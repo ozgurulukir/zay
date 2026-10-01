@@ -125,20 +125,6 @@ pub const Content = struct {
 // ---------------------------------------------------------------------------
 // Tests
 
-fn readRow(surface: *const vxfw.Surface, row: u16, out: []u8) []const u8 {
-    var len: usize = 0;
-    var col: u16 = 0;
-    while (col < surface.size.width) : (col += 1) {
-        const cell = surface.readCell(col, row);
-        if (cell.default) continue;
-        const grapheme = cell.char.grapheme;
-        if (len + grapheme.len > out.len) break;
-        @memcpy(out[len..][0..grapheme.len], grapheme);
-        len += grapheme.len;
-    }
-    return out[0..len];
-}
-
 test "search content shows a no-matches row for a non-empty query" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -152,7 +138,7 @@ test "search content shows a no-matches row for a non-empty query" {
     };
     const surface = try content.widget().draw(ctx);
     var buf: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, readRow(&surface, 0, &buf), "No matching messages") != null);
+    try std.testing.expect(std.mem.indexOf(u8, panel.readRow(&surface, 0, &buf), "No matching messages") != null);
 }
 
 test "search content shows a usage hint when the filter is empty" {
@@ -168,5 +154,5 @@ test "search content shows a usage hint when the filter is empty" {
     };
     const surface = try content.widget().draw(ctx);
     var buf: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, readRow(&surface, 0, &buf), "Type to search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, panel.readRow(&surface, 0, &buf), "Type to search") != null);
 }

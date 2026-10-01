@@ -8,7 +8,6 @@ const tui_style = @import("../style.zig");
 const auth = @import("../../auth/store.zig");
 const config_mod = @import("../../config/config.zig");
 const modelsdev = @import("../../models/registry.zig");
-const command_panel = @import("command_panel.zig");
 
 const assert = std.debug.assert;
 pub const Status = enum { unknown, connected, failed };
@@ -99,14 +98,14 @@ pub const ProviderHandle = union(enum) {
 pub fn matchesRow(handle_opt: ?ProviderHandle, filter: []const u8) bool {
     if (filter.len == 0) return true;
     if (handle_opt) |handle| {
-        return command_panel.containsIgnoreCase(handle.displayName(), filter) or
-            command_panel.containsIgnoreCase(handle.id(), filter) or
-            command_panel.containsIgnoreCase(handle.description(), filter);
+        return panel.containsIgnoreCase(handle.displayName(), filter) or
+            panel.containsIgnoreCase(handle.id(), filter) or
+            panel.containsIgnoreCase(handle.description(), filter);
     } else {
-        return command_panel.containsIgnoreCase("OpenAI Codex", filter) or
-            command_panel.containsIgnoreCase("codex", filter) or
-            command_panel.containsIgnoreCase("chatgpt", filter) or
-            command_panel.containsIgnoreCase("OpenAI ChatGPT & Codex OAuth authentication", filter);
+        return panel.containsIgnoreCase("OpenAI Codex", filter) or
+            panel.containsIgnoreCase("codex", filter) or
+            panel.containsIgnoreCase("chatgpt", filter) or
+            panel.containsIgnoreCase("OpenAI ChatGPT & Codex OAuth authentication", filter);
     }
 }
 

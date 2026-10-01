@@ -8,7 +8,6 @@ const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
-const command_panel = @import("command_panel.zig");
 const model_loader = @import("../model_loader.zig");
 
 fn columnStyle(focused: bool, selected: bool) vaxis.Style {
@@ -40,7 +39,7 @@ pub const ReasoningOption = struct { label: []const u8, effort: ai.ReasoningEffo
 
 pub fn matches(model: codex.Model, filter: []const u8) bool {
     if (filter.len == 0) return true;
-    return command_panel.containsIgnoreCase(model.label, filter) or command_panel.containsIgnoreCase(model.id, filter);
+    return panel.containsIgnoreCase(model.label, filter) or panel.containsIgnoreCase(model.id, filter);
 }
 
 pub fn findActiveStorageIdx(models: []const codex.Model, active_id: ?[]const u8) ?u32 {
