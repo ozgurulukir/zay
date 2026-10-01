@@ -9,9 +9,9 @@ const paths = @import("../paths.zig");
 
 const assert = std.debug.assert;
 const file_bytes_max: u32 = 2 * 1024 * 1024;
-/// v2: provider blokları artık `authKeyId` taşıyor (dynamic provider'ları
-/// ayırt etmek için). v1 cache `authKeyId` olmadan gelir; parse configured
-/// lookup'tan geri çözer.
+/// v2: provider blocks now carry `authKeyId` (to distinguish dynamic
+/// providers). A v1 cache arrives without `authKeyId`; parse falls back to
+/// resolving it from the configured lookup.
 const version_current: u32 = 2;
 
 pub const AuthMode = enum {
@@ -32,8 +32,8 @@ pub const Configured = struct {
     provider: config_mod.Provider,
     base_url: []const u8,
     auth_mode: AuthMode,
-    /// auth.json anahtar kimliği (katalog → label, dynamic → id). dynamic
-    /// provider'ları birbirinden ayırt etmek için serialize edilir.
+    /// auth.json key id (catalogue → label, dynamic → id). Serialized so
+    /// dynamic providers can be told apart from one another.
     auth_key_id: ?[]const u8 = null,
 };
 
@@ -114,8 +114,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, configured: []const Conf
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidCache;
     const version = intField(parsed.value, "version") orelse return error.InvalidCache;
-    // v1 (authKeyId yok) geriye dönük uyumlu: parse authKeyId alanı yoksa
-    // configured lookup'tan çözer. Daha eski/bilinmeyen sürümler reddedilir.
+    // Backward compatible with v1 (no authKeyId): parse resolves it from the
+    // configured lookup when the field is absent. Older/unknown versions are
+    // rejected.
     if (version != 1 and version != version_current) return .{};
 
     var out: Records = .{};
@@ -189,9 +190,10 @@ fn writeProvider(writer: *std.Io.Writer, records: []const Record, configured: Co
     try std.json.Stringify.value(configured.base_url, .{}, writer);
     try writeKey(writer, "authMode", &wrote_key);
     try std.json.Stringify.value(configured.auth_mode.label(), .{}, writer);
-    // auth_key_id dynamic provider'ları (aynı .openai_compatible enum'ını
-    // paylaşan StepFun, Kimi, vb.) birbirinden ayırır. Katalog provider'ları
-    // için label'a eşittir; yine de yazılır ki restart'ta birebir eşleşsin.
+    // auth_key_id distinguishes dynamic providers (StepFun, Kimi, etc.) that
+    // share the same .openai_compatible enum. For catalogue providers it
+    // equals the label; it is written anyway so the restart-time match is
+    // exact.
     if (configured.auth_key_id) |id| {
         try writeKey(writer, "authKeyId", &wrote_key);
         try std.json.Stringify.value(id, .{}, writer);
@@ -222,10 +224,10 @@ fn hasRecordsForConfigured(records: []const Record, configured: Configured) bool
     return false;
 }
 
-/// Bir record configured'a provider + base_url + auth_key_id üçlüsüyle
-/// eşleşiyorsa true. Dynamic provider'lar `.openai_compatible` enum'ını
-/// paylaştığından, yalnızca provider enum karşılaştırmak onları birleştirirdi;
-/// base_url + auth_key_id ayırt eder.
+/// True when a record matches the configured entry by the provider +
+/// base_url + auth_key_id triple. Because dynamic providers share the
+/// `.openai_compatible` enum, comparing the provider enum alone would merge
+/// them; base_url + auth_key_id distinguish them.
 fn recordMatchesConfigured(record: Record, configured: Configured) bool {
     return switch (record.source) {
         .openai_compatible => |conn| blk: {
@@ -238,9 +240,9 @@ fn recordMatchesConfigured(record: Record, configured: Configured) bool {
     };
 }
 
-/// Eşleşen configured kaydını döndürür (auth_key_id çözümlemek için), yoksa
-/// null. `auth_key_id` null (eski v1 cache) ise provider+base_url+auth_mode
-/// eşleşmesi yeterli; `auth_key_id` dolu ise (v2 cache) o da eşleşmeli.
+/// Returns the matching configured entry (to resolve auth_key_id), or null.
+/// When `auth_key_id` is null (old v1 cache), a provider+base_url+auth_mode
+/// match suffices; when `auth_key_id` is set (v2 cache), it must match too.
 fn containsConfigured(configured: []const Configured, provider: config_mod.Provider, base_url: []const u8, auth_mode: AuthMode, auth_key_id: ?[]const u8) ?Configured {
     for (configured) |entry| {
         if (entry.provider != provider) continue;
@@ -326,10 +328,10 @@ test "parse keeps only currently configured provider models" {
 }
 
 test "parse distinguishes dynamic providers sharing the openai_compatible enum" {
-    // İki dynamic provider (StepFun + Kimi) aynı .openai_compatible enum'ını
-    // paylaşır. authKeyId olmadan birleştirilirlerdi; v2 şema auth_key_id ile
-    // ayırt eder. Bu, multi-provider kataloğundaki eşleşme hatasının cache
-    // tarafındaki tezahürüdür.
+    // Two dynamic providers (StepFun + Kimi) share the same .openai_compatible
+    // enum. Without authKeyId they would be merged; the v2 schema distinguishes
+    // them via auth_key_id. This is the cache-side manifestation of the
+    // matching bug in the multi-provider catalogue.
     const gpa = std.testing.allocator;
     const configured = [_]Configured{
         .{ .provider = .openai_compatible, .base_url = "https://api.stepfun.com/v1", .auth_mode = .keyed, .auth_key_id = "stepfun-ai" },
@@ -344,8 +346,8 @@ test "parse distinguishes dynamic providers sharing the openai_compatible enum" 
     defer records.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 2), records.items.items.len);
-    // Her iki record da kendi base_url + auth_key_id'sini taşır — cache
-    // restore edildikten sonra applySelectedModel yanlış provider'a gitmez.
+    // Both records carry their own base_url + auth_key_id — after the cache
+    // is restored, applySelectedModel cannot route to the wrong provider.
     const ids = [_][]const u8{ records.items.items[0].source.openai_compatible.auth_key_id, records.items.items[1].source.openai_compatible.auth_key_id };
     try std.testing.expect(
         std.mem.eql(u8, ids[0], "stepfun-ai") or std.mem.eql(u8, ids[0], "moonshot"),
@@ -354,7 +356,8 @@ test "parse distinguishes dynamic providers sharing the openai_compatible enum" 
 }
 
 test "parse v1 cache (no authKeyId) resolves auth_key_id from configured label" {
-    // Eski v1 cache geriye dönük uyumlu: authKeyId yok, configured.label'a düşer.
+    // Old v1 cache is backward compatible: no authKeyId, falls back to
+    // configured.label.
     const gpa = std.testing.allocator;
     const configured = [_]Configured{.{ .provider = .openrouter, .base_url = "https://openrouter.ai/api", .auth_mode = .keyed }};
     var records = try parse(gpa,
@@ -367,11 +370,12 @@ test "parse v1 cache (no authKeyId) resolves auth_key_id from configured label" 
 }
 
 test "save+load round-trips two dynamic providers without collapsing them" {
-    // Düzeltme 1'in sonucu: `collectModelCacheConfigured` artık bağlı tüm
-    // dynamic provider'ları toplar; `save` her birini ayrı blok yazar ve
-    // restart'ta `parse` her ikisini de doğru `Compatible`'a geri çözer.
-    // Önceki kod yalnızca `model_selection`'daki tek provider'ı topladığı için
-    // ikinci dynamic provider cache'e yazılmaz, restart'ta kaybolurdu.
+    // Outcome of fix 1: `collectModelCacheConfigured` now collects every
+    // connected dynamic provider; `save` writes each one as its own block and
+    // on restart `parse` resolves both back to the correct `Compatible`.
+    // The previous code collected only the single provider in
+    // `model_selection`, so the second dynamic provider was never written to
+    // the cache and was lost across restart.
     const gpa = std.testing.allocator;
     const configured = [_]Configured{
         .{ .provider = .openai_compatible, .base_url = "https://api.stepfun.com/v1", .auth_mode = .keyed, .auth_key_id = "stepfun-ai" },
@@ -397,9 +401,9 @@ test "save+load round-trips two dynamic providers without collapsing them" {
     var loaded = try parse(gpa, payload.written(), &configured);
     defer loaded.deinit(gpa);
 
-    // İki record da geri gelmeli — "kayıp dynamic provider" belirtisi yok.
+    // Both records must come back — no "missing dynamic provider" symptom.
     try std.testing.expectEqual(@as(usize, 2), loaded.items.items.len);
-    // Her biri kendi auth_key_id'sini korumalı (uyuşmazlık temsil edilemez).
+    // Each must keep its own auth_key_id (the mismatch must be unrepresentable).
     var found_stepfun = false;
     var found_moonshot = false;
     for (loaded.items.items) |r| {
@@ -413,7 +417,7 @@ test "save+load round-trips two dynamic providers without collapsing them" {
             try std.testing.expectEqualStrings("kimi", r.model.id);
             found_moonshot = true;
         } else {
-            try std.testing.expect(false); // beklenmeyen auth_key_id
+            try std.testing.expect(false); // unexpected auth_key_id
         }
     }
     try std.testing.expect(found_stepfun);

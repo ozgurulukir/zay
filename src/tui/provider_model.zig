@@ -228,27 +228,24 @@ pub fn openModelPicker(self: *App) !void {
     tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
-    self.pickers.models.model_scope = defaultModelScope(
-        self,
-    );
+    self.pickers.models.model_scope = defaultModelScope(self);
     self.clearInput();
 
-    // Disk cache restore, bağlı dynamic (models.dev) provider'ları görmek için
-    // registry'ye ihtiyaç duyar (`collectModelCacheConfigured` onu tarar). Şu
-    // ana kadar yalnızca `openProviderPicker` yükleyordu; model picker'ı açarken
-    // de yükle ki restart sonrası dynamic provider modelleri restore edilsin.
-    // Idempotent ve network-first → cache → vendored → builtins fallback'ine
-    // sahip olduğundan asla bloke olmaz; hatayı sessizce yutuyoruz (registry
-    // yoksa dynamic provider kolu atlanır, katalog provider'ları yine gelir).
+    // Restoring the disk cache needs the models.dev registry so dynamic
+    // providers with stored keys are visible (`collectModelCacheConfigured`
+    // scans it). Until now only `openProviderPicker` loaded it; load it when
+    // the model picker opens too, so dynamic-provider models survive a
+    // restart. The loader is idempotent and network-first → cache → vendored
+    // → builtins, so this never blocks; failures are swallowed (without a
+    // registry the dynamic-provider branch is skipped and catalogue
+    // providers still appear).
     ensureModelsDevRegistry(self) catch {};
 
     // Always refresh connected-provider catalogue so all configured providers
     // appear, not just whatever was cached last. Cache/configured changes (new
     // provider added, key removed) otherwise leave stale state visible until
     // something else triggers a reload.
-    if (try restoreModelCache(
-        self,
-    )) {
+    if (try restoreModelCache(self)) {
         // Stale-while-revalidate (same pattern as the diff cache): the disk
         // cache shows instantly, but it can predate a provider connected
         // since it was written — e.g. an Ollama Cloud key added or renewed
@@ -262,9 +259,7 @@ pub fn openModelPicker(self: *App) !void {
     }
 
     // Cold path — clear stale state, kick off the async load.
-    codexModelsClear(
-        self,
-    );
+    codexModelsClear(self);
     self.pickers.models.entries.clearRetainingCapacity();
     self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
     self.pickers.models.model_selection_snapshot = 0;
@@ -349,8 +344,8 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             const key = self.provider_state.api_keys.get(provider.label()) orelse anon: {
                 break :anon provider.anonymousApiKey() orelse continue;
             };
-            // Katalog provider'ları auth.json'a label'larıyla kaydolur; null
-            // bırakmak compatibleSource'a label'a düşürür.
+            // Catalogue providers register in auth.json under their labels;
+            // null makes compatibleSource fall back to the label.
             try appendConfigured(self, &list, provider, base_url, key, null, null);
         }
         if (self.provider_state.modelsdev_registry) |*reg| {
@@ -359,8 +354,8 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
                 const id = entry.key_ptr.*;
                 if (catalogueIndexById(id) != null) continue;
                 if (reg.lookup(id)) |dyn_p| {
-                    // auth_key_id = registry id (auth.json anahtarı). entry.key_ptr.*
-                    // zaten bu id'ye eşittir.
+                    // auth_key_id = registry id (the auth.json key);
+                    // entry.key_ptr.* already equals that id.
                     try appendConfiguredDynamic(self, &list, dyn_p.base_url, entry.value_ptr.*, dyn_p.name, id);
                 }
             }
@@ -634,12 +629,8 @@ fn codexLoginTargetMatches(self: *const App, login: *const codex_login_job.Codex
 fn finishCodexConnection(self: *App, credentials: codex.Credentials) !void {
     self.pickers.models.models_cached = false;
     try reloadModelCatalog(self, .openai_codex);
-    const model = selectedCodexModel(
-        self,
-    ) orelse return error.NoModels;
-    const effort = selectedReasoningEffort(
-        self,
-    );
+    const model = selectedCodexModel(self) orelse return error.NoModels;
+    const effort = selectedReasoningEffort(self);
     try connectCodexClient(self, credentials, model.id, effort);
     self.codex_signed_in = true;
     const runtime = self.liveRuntime() orelse return error.NoActiveRuntime;
@@ -659,9 +650,7 @@ pub fn signOutCodex(self: *App) !void {
     self.codex_signed_in = false;
     self.liveRuntime().?.codex_connection_expired = false;
     self.thread.agent.?.client = self.liveRuntime().?.client;
-    codexModelsClear(
-        self,
-    );
+    codexModelsClear(self);
     self.pickers.models.models_cached = false;
     self.mode = .normal;
     self.clearInput();
@@ -708,9 +697,7 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
         // Anonymous free tier: drop any stale key so we connect without one.
         auth.removeProviderApiKey(self.gpa, self.io, home, provider.label()) catch {};
     }
-    try refreshProviderApiKeys(
-        self,
-    );
+    try refreshProviderApiKeys(self);
 
     // Clear stale connection state when switching to a builtin. Without
     // this, legacy fields from a previous dynamic/config provider linger
@@ -743,9 +730,7 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
     tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
-    self.pickers.models.model_scope = defaultModelScope(
-        self,
-    );
+    self.pickers.models.model_scope = defaultModelScope(self);
     self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
     self.pickers.models.model_selection_snapshot = 0;
     self.clearInput();
@@ -772,11 +757,11 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     try refreshProviderApiKeys(self);
 
     // Stash the dynamic provider's base_url and api_key into cached_config.
-    // applySelectedModel artık doğrudan seçili entry'nin conn'undan çözüm
-    // yaptığı için bunlara güvenmez; stash session resume
-    // (tryAttachOpenAiCompatibleFromConfig) ve hasOpenAICompatibleCredentials
-    // için tutulur. Seçim anında updateCachedModelSelection bunları entry'den
-    // gelen değerlerle tutarlı kılar.
+    // applySelectedModel no longer trusts these — it resolves directly from
+    // the selected entry's conn; the stash exists for session resume
+    // (tryAttachOpenAiCompatibleFromConfig) and hasOpenAICompatibleCredentials.
+    // updateCachedModelSelection keeps them consistent with the entry values
+    // at selection time.
     if (self.cached_config_owned) {
         const owned_url = try self.gpa.dupe(u8, provider.base_url);
         if (self.cached_config.base_url) |prev| self.gpa.free(prev);
@@ -954,13 +939,13 @@ pub fn startOpenAiCompatibleModelLoad(
     self.pickers.models.load = .{
         .loading = .{
             .job = .{},
-            // `merge = true`: mevcut kataloğu korur ve yeni provider'ın
-            // modellerini ekler (sadece aynı conn'a ait eski entry'ler drop edilip
-            // yenilenir — bkz. `installModelLoadResult`). Önceki `merge = false`
-            // tüm kataloğu silip yalnızca bu provider'ın modellerini yüklerdi;
-            // kullanıcı bir provider eklediğinde mevcut olanlar kaybolurdu.
-            // `startProviderModelLoad` (builtin yolu) zaten `merge = true`
-            // kullanır — bu onunla tutarlılık sağlar.
+            // `merge = true`: keep the existing catalogue and append the new
+            // provider's models (only stale entries for the same conn are
+            // dropped and refreshed — see `installModelLoadResult`). The
+            // earlier `merge = false` wiped the whole catalogue and loaded
+            // only this provider's models, so adding a provider lost the
+            // ones already present. `startProviderModelLoad` (the builtin
+            // path) already uses `merge = true` — this matches it.
             .merge = true,
         },
     };
@@ -1021,16 +1006,10 @@ pub fn applySelectedModel(self: *App) !void {
     if (self.thread.cancel_job != null) return error.InFlightTurn;
     if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
     if (self.thread.turn.isActive()) return error.InFlightTurn;
-    const model = selectedCodexModel(
-        self,
-    ) orelse return error.NoModels;
-    const effort = selectedReasoningEffort(
-        self,
-    );
+    const model = selectedCodexModel(self) orelse return error.NoModels;
+    const effort = selectedReasoningEffort(self);
 
-    const source = selectedModelSource(
-        self,
-    ) orelse return error.NoModels;
+    const source = selectedModelSource(self) orelse return error.NoModels;
     // Resolve the auth/config provider identity to persist into the session DB
     // so initResume restores the last-used model on restart. This mirrors what
     // runtime.applyFromConfig writes (selection.providerName()). Without it the
@@ -1060,10 +1039,10 @@ pub fn applySelectedModel(self: *App) !void {
             }
         },
         .openai_compatible => |conn| {
-            // Entry kendi tam bağlantı bilgisini taşır (base_url + auth_key_id).
-            // cached_config'in global tek değerine bakmak yerine doğrudan entry'den
-            // çözümle — çoklu provider kataloğunda yanlış provider'a bağlanmayı
-            // önler.
+            // The entry carries its own full connection (base_url +
+            // auth_key_id); resolve from the entry instead of cached_config's
+            // single global value so a multi-provider catalogue never
+            // connects to the wrong provider.
             const api_key = compatibleApiKeyForConn(self, conn);
             if (api_key.len == 0 and conn.provider.requiresApiKey()) return error.NotConnected;
             try attachOpenAiCompatibleClient(self, &conn, api_key, model.id, effort);
@@ -1171,10 +1150,10 @@ pub fn updateCachedModelSelection(
     }
 }
 
-/// Bir seçim için çözümlenmiş bağlantı: provider default URL/key (builtin'ler
-/// için) ya da entry'nin kendi `conn` değerleri (compatible yolu). `conn` null
-/// olduğunda (codex, veya güvenli olmayan eski çağrılar) cached_config'in
-/// dynamic_provider_id/base_url stash'ine düşer.
+/// A resolved connection for one selection: the provider default URL/key
+/// (builtins) or the entry's own `conn` values (compatible path). A null
+/// `conn` (codex, or unsafe legacy call sites) falls back to cached_config's
+/// dynamic_provider_id/base_url stash.
 const ResolvedConn = struct {
     base_url: []const u8,
     auth_key_id: []const u8,
@@ -1182,8 +1161,8 @@ const ResolvedConn = struct {
 
 fn resolveConn(provider: config_mod.Provider, conn: ?model_loader.Compatible) ResolvedConn {
     if (conn) |c| return .{ .base_url = c.base_url, .auth_key_id = c.auth_key_id };
-    // conn null yalnızca codex (.openai) yolunda olabilir; builtin/custom
-    // seçimleri daima conn ile gelir. Provider default'una düş.
+    // A null conn only happens on the codex (.openai) path; builtin/custom
+    // selections always carry a conn. Fall back to the provider defaults.
     return .{
         .base_url = provider.defaultBaseUrl() orelse "",
         .auth_key_id = provider.label(),
@@ -1192,10 +1171,10 @@ fn resolveConn(provider: config_mod.Provider, conn: ?model_loader.Compatible) Re
 
 pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider, resolved: ResolvedConn) !void {
     if (provider == .openai_compatible) {
-        // Compatible providers: entry'nin tam bağlantısını cached_config
-        // legacy alanlarına ve model_selection'a aynala, böylece session resume
-        // (tryAttachOpenAiCompatibleFromConfig) doğru endpoint + auth.json
-        // anahtarını çözümler.
+        // Compatible providers: mirror the entry's full connection into
+        // cached_config's legacy fields and model_selection so session resume
+        // (tryAttachOpenAiCompatibleFromConfig) resolves the right endpoint
+        // and auth.json key.
         if (resolved.base_url.len > 0) {
             try stashCachedBaseUrl(self, resolved.base_url);
             try replaceCachedBaseUrl(self, resolved.base_url);
@@ -1211,9 +1190,7 @@ pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider,
     if (self.cached_config.dynamic_provider_id) |previous| self.gpa.free(previous);
     self.cached_config.dynamic_provider_id = null;
     if (provider.defaultBaseUrl()) |base_url| try replaceCachedBaseUrl(self, base_url);
-    clearCachedApiKey(
-        self,
-    );
+    clearCachedApiKey(self);
 }
 
 pub fn replaceCachedBaseUrl(self: *App, base_url: []const u8) !void {
@@ -1268,17 +1245,17 @@ pub fn clearCachedApiKey(self: *App) void {
     }
 }
 
-/// `cached_config.base_url` legacy alanını (runtime-only, serialize edilmez)
-/// yenisiyle değiştir. Session resume ve hasOpenAICompatibleCredentials hâlâ
-/// bu alanı okur.
+/// Replace the legacy `cached_config.base_url` field (runtime-only, never
+/// serialized) with the new value. Session resume and
+/// hasOpenAICompatibleCredentials still read it.
 pub fn stashCachedBaseUrl(self: *App, base_url: []const u8) !void {
     const owned = try self.gpa.dupe(u8, base_url);
     if (self.cached_config.base_url) |prev| self.gpa.free(prev);
     self.cached_config.base_url = owned;
 }
 
-/// `cached_config.dynamic_provider_id` legacy alanını (runtime-only) yenisiyle
-/// değiştir. compatibleApiKey ve status bar bu alanı okur.
+/// Replace the legacy `cached_config.dynamic_provider_id` field (runtime-only)
+/// with the new value. compatibleApiKey and the status bar read it.
 pub fn stashCachedDynamicId(self: *App, id: []const u8) !void {
     const owned = try self.gpa.dupe(u8, id);
     if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
@@ -1309,7 +1286,7 @@ pub fn modelSelectionUpdates(
     }
     // For dynamic/custom providers the config-map key and auth.json key is
     // the provider id (e.g. "stepfun-ai"), carried by the selected entry's
-    // conn.auth_key_id. Codex (.openai) için provider.label() kullanılır.
+    // conn.auth_key_id. Codex (.openai) uses provider.label() instead.
     const resolved = resolveConn(provider, conn);
 
     providers[0] = .{ .name = try self.gpa.dupe(u8, resolved.auth_key_id), .provider = provider, .models = models };
@@ -1358,35 +1335,21 @@ pub fn modelSelectionUpdates(
 }
 
 pub fn reloadModelCatalog(self: *App, catalog: ModelCatalog) !void {
-    codexModelsClear(
-        self,
-    );
+    codexModelsClear(self);
     switch (catalog) {
         .connected_provider => {
-            if (shouldLoadConfiguredCompatibleCatalog(
-                self,
-            )) {
-                loadCompatibleCatalog(
-                    self,
-                ) catch |err| {
+            if (shouldLoadConfiguredCompatibleCatalog(self)) {
+                loadCompatibleCatalog(self) catch |err| {
                     if (!self.isCodexSignedIn()) return err;
                     log.warn("compatible.models.failed err={s}", .{@errorName(err)});
                 };
             }
-            try loadLocalCompatibleCatalogs(
-                self,
-            );
-            if (self.isCodexSignedIn()) try loadCodexStaticCatalog(
-                self,
-            );
+            try loadLocalCompatibleCatalogs(self);
+            if (self.isCodexSignedIn()) try loadCodexStaticCatalog(self);
         },
-        .openai_codex => try loadCodexStaticCatalog(
-            self,
-        ),
+        .openai_codex => try loadCodexStaticCatalog(self),
     }
-    try finishModelCatalogReload(
-        self,
-    );
+    try finishModelCatalogReload(self);
 }
 
 pub fn finishModelCatalogReload(self: *App) !void {
@@ -1412,14 +1375,12 @@ pub fn loadCodexStaticCatalog(self: *App) !void {
 }
 
 pub fn loadCompatibleCatalog(self: *App) !void {
-    if (!self.pickers.models.compatible_models_fetched) try fetchCompatibleCatalog(
-        self,
-    );
+    if (!self.pickers.models.compatible_models_fetched) try fetchCompatibleCatalog(self);
     const base_url = self.cached_config.base_url.?;
     const provider = tui_provider.compatibleProviderFromBaseUrl(base_url);
-    // Bu yol yalnızca cached_config.base_url'den gelen tek bir (env/config)
-    // provider için geçerlidir; auth_key_id olarak provider label'ını kullan
-    // (catalogue dışı config provider'ları auth.json'a isimle kaydolur).
+    // This path only applies to the single (env/config) provider derived
+    // from cached_config.base_url; use the provider label as the auth_key_id
+    // (off-catalogue config providers register in auth.json by name).
     for (self.pickers.models.compatible_models.items) |model| {
         const id = try self.gpa.dupe(u8, model.id);
         errdefer self.gpa.free(id);
@@ -1486,9 +1447,7 @@ pub fn fetchCompatibleCatalog(self: *App) !void {
         for (fetched) |*entry| entry.deinit(self.gpa);
         self.gpa.free(fetched);
     }
-    errdefer compatibleModelsCacheClear(
-        self,
-    );
+    errdefer compatibleModelsCacheClear(self);
     for (fetched) |entry| {
         if (!includeLocalModel(provider, entry.id)) continue;
         const id = try self.gpa.dupe(u8, entry.id);
@@ -1511,9 +1470,7 @@ pub fn hasOpenAICompatibleCredentials(self: *const App) bool {
 }
 
 pub fn shouldLoadConfiguredCompatibleCatalog(self: *const App) bool {
-    if (!hasOpenAICompatibleCredentials(
-        self,
-    )) return false;
+    if (!hasOpenAICompatibleCredentials(self)) return false;
     const provider = cachedProvider(self) orelse .openai_compatible;
     if (provider == .ollama) return false;
     if (provider == .llama_cpp) return false;
@@ -1552,10 +1509,10 @@ pub fn compatibleApiKey(self: *const App, provider: config_mod.Provider) []const
     return providerLocalApiKey(provider);
 }
 
-/// `compatibleApiKey`'ın conn-bazlı versiyonu: seçilen entry'nin kendi
-/// `auth_key_id`'sini birincil çözüm olarak kullanır (cached_config'in global
-/// stash'ine bağımlı olmadan). Bu, çoklu provider kataloğunda yanlış
-/// provider'ın anahtarını çözümlemeyi önler.
+/// Conn-based variant of `compatibleApiKey`: uses the selected entry's own
+/// `auth_key_id` as the primary lookup (no dependency on cached_config's
+/// global stash). Prevents resolving the wrong provider's key in a
+/// multi-provider catalogue.
 pub fn compatibleApiKeyForConn(self: *const App, conn: model_loader.Compatible) []const u8 {
     if (self.provider_state.api_keys.get(conn.auth_key_id)) |key| return key;
     if (self.cached_config.api_key) |key| {
@@ -1625,9 +1582,7 @@ pub fn cycleSelectedReasoning(self: *App) !void {
 
 pub fn selectedCodexModel(self: *App) ?codex.Model {
     if (self.pickers.models.model_selection >= self.pickers.models.len()) return null;
-    const active_storage_idx = self.pickers.models.activeStorageIdx(activeModelId(
-        self,
-    ));
+    const active_storage_idx = self.pickers.models.activeStorageIdx(activeModelId(self));
     const idx = model_picker.displayToStorage(active_storage_idx, self.pickers.models.model_selection);
     return self.pickers.models.entries.items[idx].model;
 }
@@ -1635,9 +1590,7 @@ pub fn selectedCodexModel(self: *App) ?codex.Model {
 pub fn modelDisplayMatches(self: *const App, display_pos: u32, filter: []const u8) bool {
     const count: u32 = self.pickers.models.len();
     if (display_pos >= count) return false;
-    const active = self.pickers.models.activeStorageIdx(activeModelId(
-        self,
-    ));
+    const active = self.pickers.models.activeStorageIdx(activeModelId(self));
     const storage = model_picker.displayToStorage(active, display_pos);
     if (storage >= count) return false;
     return model_picker.matches(self.pickers.models.entries.items[storage].model, filter);
@@ -1670,9 +1623,7 @@ pub fn stepModelSelection(self: *App, forward: bool) !void {
 
 pub fn selectedModelSource(self: *const App) ?ModelSource {
     if (self.pickers.models.model_selection >= self.pickers.models.len()) return null;
-    const active_storage_idx = self.pickers.models.activeStorageIdx(activeModelId(
-        self,
-    ));
+    const active_storage_idx = self.pickers.models.activeStorageIdx(activeModelId(self));
     const idx = model_picker.displayToStorage(active_storage_idx, self.pickers.models.model_selection);
     if (idx >= self.pickers.models.len()) return null;
     return self.pickers.models.entries.items[idx].source;

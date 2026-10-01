@@ -69,10 +69,10 @@ pub fn drainModelLoad(self: *App) !bool {
 pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
     if (self.pickers.models.load == .loading and self.pickers.models.load.loading.merge) {
         // Incremental load: replace only the freshly-fetched providers'
-        // models, leaving previously-cached providers untouched. Conn-bazlı
-        // dedup: çoklu `.openai_compatible` provider'lar aynı enum değerini
-        // paylaştığından `EnumSet` onları birleştirirdi — `auth_key_id` her
-        // bağlantıyı benzersiz tanımlar.
+        // models, leaving previously-cached providers untouched. Conn-based
+        // dedup: multiple `.openai_compatible` providers share the same enum
+        // value, so an `EnumSet` would merge them — `auth_key_id` uniquely
+        // identifies each connection.
         var refreshed = std.StringHashMap(void).init(self.gpa);
         defer refreshed.deinit();
         for (result.sources.items) |source| switch (source) {
@@ -116,16 +116,16 @@ pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
     saveModelCache(self) catch |err| log.warn("models.cache.save.failed err={s}", .{@errorName(err)});
 }
 
-/// Remove every cached model that came from `provider`. Builtin katalog
-/// provider'ları için uygundur (her biri ayrı bir enum değeridir).
+/// Remove every cached model that came from `provider`. Correct for builtin
+/// catalogue providers (each is a distinct enum value).
 pub fn dropModelsForProvider(self: *App, provider: config_mod.Provider) void {
     self.pickers.models.dropProvider(self.gpa, provider);
 }
 
-/// Remove every cached model sourced from `conn`. Çoklu `.openai_compatible`
-/// provider'lar aynı enum değerini paylaştığından, bunlar için enum-bazlı
-/// `dropModelsForProvider` tüm provider'ları birleştirir — conn-bazlı bu
-/// versiyon yalnızca verilen bağlantıya ait entry'leri düşürür.
+/// Remove every cached model sourced from `conn`. Because multiple
+/// `.openai_compatible` providers share the same enum value, the enum-based
+/// `dropModelsForProvider` merges them all — this conn-based version drops
+/// only the entries belonging to the given connection.
 pub fn dropModelsForConn(self: *App, conn: model_loader.Compatible) void {
     self.pickers.models.dropConn(self.gpa, conn);
 }
@@ -143,9 +143,9 @@ pub fn restoreModelCache(self: *App) !bool {
     provider_model.codexModelsClear(self);
     for (cached.items.items) |*record| {
         try self.pickers.models.append(self.gpa, record.model, record.source);
-        // Model ve source artık entry'ye taşındı (struct field'ları alias
-        // ediyor); sahipliği devret ve cached.deinit'in onları tekrar free
-        // etmesini önle.
+        // The model and source have now moved into the entry (the struct
+        // fields alias them); transfer ownership and prevent cached.deinit
+        // from freeing them again.
         record.model = .{ .id = &.{}, .label = &.{} };
         record.source = .openai_codex;
     }
