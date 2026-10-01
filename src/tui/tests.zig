@@ -67,6 +67,7 @@ const provider_picker = @import("widgets/provider_picker.zig");
 const tx_widget = @import("widgets/transcript.zig");
 const tui_message = @import("widgets/message.zig");
 const tui_metrics = @import("metrics.zig");
+const parts_mod = @import("../tools/parts.zig");
 
 const ConversationLayout = tui_message.ConversationLayout;
 const MessageWidget = tui_message.MessageWidget;
@@ -396,9 +397,89 @@ fn renderRootFrame(app: *App, ar: *std.heap.ArenaAllocator, width: u16, height: 
 fn frameHasExactLine(frame: []const u8, line: []const u8) bool {
     var it = std.mem.splitScalar(u8, frame, '\n');
     while (it.next()) |row| {
-        if (std.mem.eql(u8, row, line)) return true;
+        if (std.mem.eql(u8, std.mem.trim(u8, row, " "), line)) return true;
     }
     return false;
+}
+
+fn countDefaultCells(surface: vxfw.Surface) usize {
+    var count: usize = 0;
+    for (surface.buffer) |cell| {
+        if (cell.default) count += 1;
+    }
+    for (surface.children) |child| count += countDefaultCells(child.surface);
+    return count;
+}
+
+fn replaceToolBodyForRenderTest(gpa: std.mem.Allocator, message: *transcript_mod.Message, body: []const u8) !void {
+    const new_body = try gpa.dupe(u8, body);
+    errdefer gpa.free(new_body);
+    const new_parts = try parts_mod.buildParts(gpa, new_body, .text);
+    errdefer {
+        for (new_parts) |*part| part.deinit(gpa);
+        if (new_parts.len > 0) gpa.free(new_parts);
+    }
+
+    const tool = &message.tool;
+    const old_body = tool.body;
+    const old_parts = tool.parts;
+    tool.body = new_body;
+    tool.parts = new_parts;
+    message.invalidateRowCache();
+
+    gpa.free(old_body);
+    for (old_parts) |*part| part.deinit(gpa);
+    if (old_parts.len > 0) gpa.free(old_parts);
+}
+
+test "drawRoot shrinks an expanded tool body without stale cells" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(gpa, .user, "user", "show the index");
+    const tool_index = try app.thread.transcript.appendTool(gpa, "analyze", "{\n" ++
+        "  \"nodes\": 50422,\n" ++
+        "  \"edges\": 162412,\n" ++
+        "  \"hint\": \"⚠️ Index is 22 commits behind HEAD.\",\n" ++
+        "  \"previousPayload\": \"THIS QUOTE SHOULD DISAPPEAR\",\n" ++
+        "  \"sourceAvailable\": true\n" ++
+        "}", false);
+    app.thread.transcript.setExpanded(tool_index, true);
+
+    var long_arena = std.heap.ArenaAllocator.init(gpa);
+    defer long_arena.deinit();
+    var long_root: RootWidget = .{ .app = &app };
+    const long_ctx: vxfw.DrawContext = .{
+        .arena = long_arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const long_surface = try draw_root_layout.drawRoot(&app, long_root.widget(), long_ctx);
+    var long_text: std.ArrayList(u8) = .empty;
+    try collectSurfaceText(long_arena.allocator(), long_surface, &long_text);
+    try std.testing.expect(std.mem.indexOf(u8, long_text.items, "THIS QUOTE SHOULD DISAPPEAR") != null);
+
+    try replaceToolBodyForRenderTest(gpa, &app.thread.transcript.messages.items[tool_index], "{\n  \"nodes\": 42,\n  \"sourceAvailable\": true\n}");
+
+    var short_arena = std.heap.ArenaAllocator.init(gpa);
+    defer short_arena.deinit();
+    var short_root: RootWidget = .{ .app = &app };
+    const short_ctx: vxfw.DrawContext = .{
+        .arena = short_arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const short_surface = try draw_root_layout.drawRoot(&app, short_root.widget(), short_ctx);
+    var short_text: std.ArrayList(u8) = .empty;
+    try collectSurfaceText(short_arena.allocator(), short_surface, &short_text);
+
+    try std.testing.expect(std.mem.indexOf(u8, short_text.items, "THIS QUOTE SHOULD DISAPPEAR") == null);
+    try std.testing.expectEqual(@as(usize, 0), countDefaultCells(short_surface));
 }
 
 test "scripted smoke: background modal opens, follows the live log, swaps it on selection, and closes" {

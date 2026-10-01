@@ -353,6 +353,20 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
 
+    const vaxis_render_repro = b.addExecutable(.{
+        .name = "vaxis-render-repro",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/vaxis_render_repro.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+            },
+        }),
+    });
+    const vaxis_render_repro_step = b.step("vaxis-render-repro", "Run the vaxis clear/render and width reproduction");
+    vaxis_render_repro_step.dependOn(&b.addRunArtifact(vaxis_render_repro).step);
+
     // By making the run step depend on the default step, it will be run from the
     // installation directory rather than directly from within the cache directory.
     run_cmd.step.dependOn(b.getInstallStep());
