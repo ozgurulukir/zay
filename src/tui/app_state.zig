@@ -363,6 +363,9 @@ pub const InputBuffers = struct {
     /// Inline edit buffer for the MCP overlay's "add server by URL" form.
     /// Owned; freed in `deinit`.
     mcp_url: std.ArrayList(u8) = .empty,
+    /// Inline edit buffer for the plugin-store "add catalog URL" form.
+    /// Owned; freed in `deinit`.
+    plugin_store_url: std.ArrayList(u8) = .empty,
     /// Inline edit buffer for the resume picker's rename-session form.
     /// Owned; freed in `deinit`.
     session_rename_text: std.ArrayList(u8) = .empty,

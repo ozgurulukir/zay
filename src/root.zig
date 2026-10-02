@@ -21,6 +21,7 @@ pub const executor = @import("executor.zig");
 pub const image_resize = @import("image_resize.zig");
 pub const os = @import("os.zig");
 pub const paths = @import("paths.zig");
+pub const plugin_store = @import("plugin_store.zig");
 pub const result_cache = @import("tools/result_cache.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
@@ -550,6 +551,7 @@ fn handleStrictScanFlag(init: std.process.Init, gpa: std.mem.Allocator, home_dir
 
 test {
     _ = @import("mcp/mock_server.zig");
+    _ = @import("plugin_store.zig");
     _ = @import("tui/widgets/plugins_status.zig");
     std.testing.refAllDecls(@This());
     // The TUI tests moved out of `tui.zig` into `src/tui/tests.zig`; reference

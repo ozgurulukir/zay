@@ -46,9 +46,9 @@ pub const PluginPrompt = struct {
 /// Discover and load every plugin's `prompt.md` across both plugin roots.
 ///
 /// Scans `<home_dir>/.config/zay/plugins/<plugin>/prompt.md` first, then
-/// `<cwd>/.zay/plugins/<plugin>/prompt.md`. A project entry with the same
-/// directory name overrides the global one (matching `PluginManager`'s
-/// load order). Plugins without a `prompt.md`, or whose body is empty after
+/// `<cwd>/plugins/<plugin>/prompt.md`. The former `.zay/plugins/` root is also
+/// scanned as a legacy fallback; the visible root wins when both contain the
+/// same plugin. Plugins without a `prompt.md`, or whose body is empty after
 /// frontmatter stripping, are silently skipped — a missing or blank prompt
 /// is not an error.
 pub fn loadAll(
@@ -61,12 +61,14 @@ pub fn loadAll(
     errdefer deinitAll(gpa, prompts.items);
 
     const global_parts = [_][]const u8{ ".config", "zay", "plugins" };
-    const project_parts = [_][]const u8{ ".zay", "plugins" };
+    const legacy_project_parts = [_][]const u8{ ".zay", "plugins" };
+    const project_parts = [_][]const u8{"plugins"};
     if (os.is_windows and home_dir.len > 0) {
         const appdata_parts = [_][]const u8{ "AppData", "Roaming", "zay", "plugins" };
         try scanRoot(gpa, io, home_dir, &appdata_parts, &prompts);
     }
     try scanRoot(gpa, io, home_dir, &global_parts, &prompts);
+    try scanRoot(gpa, io, cwd, &legacy_project_parts, &prompts);
     try scanRoot(gpa, io, cwd, &project_parts, &prompts);
 
     return prompts.toOwnedSlice(gpa);
@@ -251,7 +253,7 @@ test "loadAll finds prompt.md and strips frontmatter" {
     defer gpa.free(root);
 
     const rel_dir = ".zig-cache/plugin-prompt-test";
-    const plugins_dir = rel_dir ++ "/.zay/plugins/write-tool";
+    const plugins_dir = rel_dir ++ "/plugins/write-tool";
     try std.Io.Dir.createDirPath(.cwd(), io, plugins_dir);
 
     var file = try std.Io.Dir.createFile(.cwd(), io, plugins_dir ++ "/prompt.md", .{ .truncate = true });

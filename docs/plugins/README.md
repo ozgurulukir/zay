@@ -6,13 +6,17 @@ interact with git, and store persistent state.
 
 ## Quick Start
 
-Create a plugin directory with two files:
+For a user-wide plugin, create a plugin directory with two files:
 
 ```
 ~/.config/zay/plugins/my-plugin/
   plugin.lua    -- manifest (required)
   init.lua      -- entry point (required)
 ```
+
+Project-local plugins remain available under `.zay/plugins/`; the checked-in
+repository `plugins/` directory contains the distribution catalog and is not
+the TUI install destination.
 
 ### plugin.lua (manifest)
 
@@ -81,9 +85,10 @@ When the user asks to create a new file, use `write` with the full path.
 ```
 
 **How it works:** Zay scans `<home>/.config/zay/plugins/*/prompt.md` and
-`.zay/plugins/*/prompt.md` at session start (a pure text scan — no Lua state
-is created). Each non-empty body is wrapped in a `<plugin_prompts>` block in
-the system prompt:
+`plugins/*/prompt.md` at session start (a pure text scan — no Lua state is
+created). The former `.zay/plugins/*/prompt.md` root is scanned as a legacy
+fallback, before the visible project root. Each non-empty body is wrapped in a
+`<plugin_prompts>` block in the system prompt:
 
 ```
 <plugin_prompts>
@@ -112,9 +117,27 @@ Zay discovers plugins from two directories:
 | Directory | Scope |
 |-----------|-------|
 | `~/.config/zay/plugins/` | Global — available in all projects (on Windows, `%APPDATA%\zay\plugins` is probed first, falling back to `.config\zay\plugins`) |
-| `.zay/plugins/` | Project — overrides global plugins with the same manifest `name` |
+| `plugins/` | Checked-in distribution/catalog content; not the TUI install destination |
+| `.zay/plugins/` | Project-local plugins — read as a fallback for existing projects |
 
 Each subdirectory containing a `plugin.lua` file is treated as a plugin.
+
+## Plugin Store
+
+Open `/plugins` in the TUI. The Store tab always includes the Zay GitHub
+catalog; when running from a Zay checkout it uses `plugins/store.json`, and
+otherwise it fetches the same catalog from the repository. That catalog points
+at demo sources in `examples/plugins/`. Press `a`, enter another HTTP(S)
+catalog URL, and press Enter to save it and refresh the catalog list. Select a
+plugin and press Enter to stage it into the user's global plugin directory.
+Store URLs are persisted globally in `plugin-stores.json` under Zay's platform
+config directory; installing from a checkout does not make the checkout dirty.
+
+Remote catalogs use explicit file URLs and must include `plugin.lua` and
+`init.lua` for each plugin. Catalogs and files have bounded sizes, relative
+package paths, and safe plugin IDs; installs are published only after all
+files are validated. A newly installed plugin is loaded by the next runtime
+or session so a live Lua state is never torn down while a turn can dispatch.
 
 ## Plugin API — `zay` Bridge Functions
 

@@ -45,6 +45,7 @@ const tui_layout = @import("tui/layout.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
 const git_label_job_mod = @import("tui/git_label_job.zig");
+const plugin_store_job_mod = @import("tui/plugin_store_job.zig");
 const codex_login_job_mod = @import("tui/codex_login_job.zig");
 pub const DiffCounts = app_state.DiffCounts;
 pub const DiffRefreshOutcome = diff_lifecycle.DiffRefreshOutcome;
@@ -245,6 +246,10 @@ pub const App = struct {
     /// from registry + tools_json until an unrelated injection event.
     mcp_sync_pending: bool = false,
     plugin_manager: lua_mod.PluginManager = undefined,
+    /// Background catalog refresh/install state. The catalog snapshot is
+    /// separate from PluginManager so installing a plugin never unloads Lua
+    /// states or rewrites the live tool registry mid-turn.
+    plugin_store: plugin_store_job_mod.State = .{},
     /// The `lane` tool's request/response bridge. Heap-allocated so its
     /// address stays stable while worker threads block on it; owned here,
     /// destroyed in `deinitApp` (after every lane's turn future is cancelled,
@@ -550,6 +555,14 @@ pub const App = struct {
         var cut = items.len - 1;
         while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
         self.input_buffers.mcp_url.shrinkRetainingCapacity(cut);
+    }
+
+    pub fn popPluginStoreUrlInput(self: *App) void {
+        const items = self.input_buffers.plugin_store_url.items;
+        if (items.len == 0) return;
+        var cut = items.len - 1;
+        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+        self.input_buffers.plugin_store_url.shrinkRetainingCapacity(cut);
     }
 
     pub fn popSessionRenameInput(self: *App) void {
@@ -1051,6 +1064,18 @@ pub const App = struct {
         input_lifecycle.clearPaletteInput(self);
     }
 
+    pub fn refreshPluginStore(self: *App) !void {
+        return plugin_store_job_mod.startRefresh(self);
+    }
+
+    pub fn installSelectedPlugin(self: *App) !void {
+        return plugin_store_job_mod.startInstall(self);
+    }
+
+    pub fn addPluginStore(self: *App, url: []const u8) !void {
+        return plugin_store_job_mod.addStore(self, url);
+    }
+
     pub fn peekCommentInput(self: *App) ![]u8 {
         return input_lifecycle.peekCommentInput(self);
     }
@@ -1523,6 +1548,12 @@ pub fn closeMcp(app: *App) void {
 pub fn openPlugins(app: *App) void {
     app.mode = .plugins;
     app.pickers.plugins.reset();
+    app.pickers.plugins.view = .installed;
+    app.pickers.plugins.adding = false;
+    app.input_buffers.plugin_store_url.clearRetainingCapacity();
+    app.refreshPluginStore() catch |err| {
+        log.warn("plugin_store.refresh.start_failed err={s}", .{@errorName(err)});
+    };
     if (app.liveRuntime() != null) {
         // Push the current tool set into the live AI client. Deliberately NO
         // `registerPluginTools` here: the loaded-plugin set is now known to
@@ -1541,6 +1572,8 @@ pub fn openPlugins(app: *App) void {
 
 pub fn closePlugins(app: *App) void {
     app.mode = .normal;
+    app.pickers.plugins.adding = false;
+    app.input_buffers.plugin_store_url.clearRetainingCapacity();
     app.clearInput();
     app.clearPaletteInput();
 }

@@ -3,12 +3,14 @@
 //! Discovers, loads, reloads, and unloads Lua plugins.
 //! Plugins are discovered from two directories:
 //!   - `~/.config/zay/plugins/` — global plugins
-//!   - `.zay/plugins/` — project plugins (override globals with same name)
+//!   - `plugins/` — project plugins (override globals with same name)
+//! The former `.zay/plugins/` root remains a legacy fallback so existing
+//! projects migrate without losing their installed plugins.
 
 const std = @import("std");
 const log = std.log.scoped(.lua);
 const c = @import("c");
-const os = @import("../os.zig");
+const paths = @import("../paths.zig");
 const State = @import("state.zig").State;
 const sandbox = @import("sandbox.zig");
 const plugin_api = @import("plugin_api.zig");
@@ -75,8 +77,11 @@ pub const PluginManager = struct {
     io: std.Io,
     /// Global plugin directory (~/.config/zay/plugins/)
     global_dir: []const u8,
-    /// Project plugin directory (.zay/plugins/)
+    /// Project plugin directory (plugins/)
     project_dir: []const u8,
+    /// Legacy project plugin directory (.zay/plugins/), loaded before the
+    /// visible project root so the new location wins on duplicate names.
+    legacy_project_dir: []const u8,
     /// Loaded plugins, indexed by name
     plugins: std.StringHashMapUnmanaged(*PluginInstance),
     /// Whether the manager has been initialized
@@ -91,28 +96,17 @@ pub const PluginManager = struct {
 
     /// Initialize the plugin manager.
     /// `home_dir` is the user's home directory (for `~/.config/zay/plugins/`).
-    /// `cwd` is the current working directory (for `.zay/plugins/`).
+    /// `cwd` is the current working directory (for `plugins/`).
     pub fn init(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, cwd: []const u8) Self {
-        var global_dir: []const u8 = "";
-        if (home_dir.len > 0) {
-            if (os.is_windows) {
-                const appdata_dir = std.fs.path.join(allocator, &.{ home_dir, "AppData", "Roaming", "zay", "plugins" }) catch "";
-                if (appdata_dir.len > 0) {
-                    if (std.Io.Dir.openDirAbsolute(io, appdata_dir, .{})) |*d| {
-                        d.close(io);
-                        global_dir = appdata_dir;
-                    } else |_| {
-                        allocator.free(appdata_dir);
-                        global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "zay", "plugins" }) catch "";
-                    }
-                } else {
-                    global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "zay", "plugins" }) catch "";
-                }
-            } else {
-                global_dir = std.fs.path.join(allocator, &.{ home_dir, ".config", "zay", "plugins" }) catch "";
-            }
-        }
+        const global_dir: []const u8 = if (home_dir.len > 0)
+            paths.globalPluginsDir(allocator, io, home_dir) catch ""
+        else
+            "";
         const project_dir = if (cwd.len > 0)
+            std.fs.path.join(allocator, &.{ cwd, "plugins" }) catch ""
+        else
+            "";
+        const legacy_project_dir = if (cwd.len > 0)
             std.fs.path.join(allocator, &.{ cwd, ".zay", "plugins" }) catch ""
         else
             "";
@@ -121,6 +115,7 @@ pub const PluginManager = struct {
             .io = io,
             .global_dir = global_dir,
             .project_dir = project_dir,
+            .legacy_project_dir = legacy_project_dir,
             .plugins = .empty,
             .initialized = false,
         };
@@ -139,6 +134,7 @@ pub const PluginManager = struct {
         self.plugin_configs.deinit(self.allocator);
         if (self.global_dir.len > 0) self.allocator.free(self.global_dir);
         if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
+        if (self.legacy_project_dir.len > 0) self.allocator.free(self.legacy_project_dir);
     }
 
     /// Clone the per-plugin config entries (enabled/settings) into the manager.
@@ -189,7 +185,11 @@ pub const PluginManager = struct {
         // Load global plugins first
         try self.loadFromDir(self.global_dir, false);
 
-        // Load project plugins (override globals)
+        // Load the legacy root first so the visible project root is the
+        // authoritative override during the migration window.
+        try self.loadFromDir(self.legacy_project_dir, false);
+
+        // Load project plugins (override globals and legacy project plugins)
         try self.loadFromDir(self.project_dir, false);
 
         const loaded = self.plugins.count();
@@ -364,14 +364,16 @@ pub const PluginManager = struct {
     }
 
     /// Repoint project-scoped discovery from the old project to `new_cwd`:
-    /// unload plugins loaded from the old project dir, free + replace
-    /// `project_dir`, load from the new one. Global plugins are untouched
+    /// unload plugins loaded from either project root, free + replace both
+    /// project paths, and load the legacy root before the visible root.
+    /// Global plugins are untouched
     /// (states, event subscriptions, require caches survive). Caller owns the
     /// all-lanes-idle guarantee — unloading frees Lua states mid-dispatch
     /// would be fatal.
     pub fn repointProjectDir(self: *Self, new_cwd: []const u8) !void {
-        // Step 1: snapshot old project_dir, compute new one — both BEFORE any
-        // mutation, so an allocation failure here leaves the manager intact.
+        // Step 1: snapshot both old roots and compute both new roots — all
+        // BEFORE any mutation, so an allocation failure leaves the manager
+        // intact.
         const old_project_dir = if (self.project_dir.len > 0)
             try self.allocator.dupe(u8, self.project_dir)
         else
@@ -380,22 +382,34 @@ pub const PluginManager = struct {
         // error and explicitly at the end of the happy path.
         errdefer if (old_project_dir.len > 0) self.allocator.free(old_project_dir);
 
+        const old_legacy_project_dir = if (self.legacy_project_dir.len > 0)
+            try self.allocator.dupe(u8, self.legacy_project_dir)
+        else
+            "";
+        errdefer if (old_legacy_project_dir.len > 0) self.allocator.free(old_legacy_project_dir);
+
         // `try`, not `catch ""`: an OOM here must fail the repoint, not
         // silently empty discovery after old plugins were unloaded.
         var new_project_dir: []u8 = if (new_cwd.len > 0)
-            try std.fs.path.join(self.allocator, &.{ new_cwd, ".zay", "plugins" })
+            try std.fs.path.join(self.allocator, &.{ new_cwd, "plugins" })
         else
             "";
         // Ownership transfers to self.project_dir at step 4; the assignment
         // of "" below disarms the errdefer.
         errdefer if (new_project_dir.len > 0) self.allocator.free(new_project_dir);
 
-        // Step 2: unload every plugin whose dir_path is under the old
-        // project dir. Two-pass: collect survivors and unload victims FIRST
+        var new_legacy_project_dir: []u8 = if (new_cwd.len > 0)
+            try std.fs.path.join(self.allocator, &.{ new_cwd, ".zay", "plugins" })
+        else
+            "";
+        errdefer if (new_legacy_project_dir.len > 0) self.allocator.free(new_legacy_project_dir);
+
+        // Step 2: unload every plugin whose dir_path is under either old
+        // project root. Two-pass: collect survivors and unload victims FIRST
         // (both fallible), swap the map, and only then destroy the victims.
         // Destroying during iteration would leave self.plugins referencing
         // freed instances if a later `put`/`append` failed with OOM.
-        if (old_project_dir.len > 0) {
+        if (old_project_dir.len > 0 or old_legacy_project_dir.len > 0) {
             var surviving: std.StringHashMapUnmanaged(*PluginInstance) = .empty;
             // On error the original map still owns every instance; only the
             // scratch buckets are freed.
@@ -405,7 +419,9 @@ pub const PluginManager = struct {
 
             var it = self.plugins.iterator();
             while (it.next()) |entry| {
-                if (pluginDirUnderProjectDir(entry.value_ptr.*.dir_path, old_project_dir)) {
+                if (pluginDirUnderProjectDir(entry.value_ptr.*.dir_path, old_project_dir) or
+                    pluginDirUnderProjectDir(entry.value_ptr.*.dir_path, old_legacy_project_dir))
+                {
                     try unloaded.append(self.allocator, entry.value_ptr.*);
                 } else {
                     try surviving.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
@@ -460,13 +476,25 @@ pub const PluginManager = struct {
             }
         }
 
-        // Step 4: free old project_dir, store new. Transferring ownership of
-        // new_project_dir (even when it's the "" literal) disarms its errdefer.
+        // Step 4: free old project roots, store both new roots. Transferring
+        // ownership disarms the corresponding errdefers.
         if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
         self.project_dir = new_project_dir;
         new_project_dir = "";
+        if (self.legacy_project_dir.len > 0) self.allocator.free(self.legacy_project_dir);
+        self.legacy_project_dir = new_legacy_project_dir;
+        new_legacy_project_dir = "";
 
-        // Step 5: load from new project dir. Missing dir → warn + no-op
+        // Step 5: load the legacy root, then the visible root. Missing dirs →
+        // warn + no-op. Non-FileNotFound failures are soft-degraded —
+        // aborting the switch would leave a half-swapped manager.
+        if (self.legacy_project_dir.len > 0) {
+            self.loadFromDir(self.legacy_project_dir, false) catch |err| {
+                log.warn("plugin.repoint.load_legacy_dir_failed dir={s} reason={s}", .{ self.legacy_project_dir, @errorName(err) });
+            };
+        }
+
+        // Load from new project dir. Missing dir → warn + no-op
         // (existing loadFromDir behavior). Non-FileNotFound failures are
         // soft-degraded — aborting the switch would leave a half-swapped
         // manager.
@@ -478,6 +506,7 @@ pub const PluginManager = struct {
 
         // Free the snapshot from step 1.
         if (old_project_dir.len > 0) self.allocator.free(old_project_dir);
+        if (old_legacy_project_dir.len > 0) self.allocator.free(old_legacy_project_dir);
     }
 
     // ── private helpers ─────────────────────────────────────────────
@@ -704,6 +733,26 @@ test "plugin manager: loadAll with no plugins" {
     defer manager.deinit();
     const count = try manager.loadAll();
     try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "plugin manager discovers visible project plugins root" {
+    const gpa = std.testing.allocator;
+    const root = "/tmp/zay_test_visible_project_plugins";
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const project_plugins = try std.fs.path.join(gpa, &.{ root, "project", "plugins" });
+    defer gpa.free(project_plugins);
+    try std.Io.Dir.createDirPath(std.testing.io, project_plugins);
+    try writeFixturePlugin(project_plugins, "visible_plugin", "return true");
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, "project" });
+    defer gpa.free(cwd);
+    var manager = PluginManager.init(gpa, std.testing.io, "", cwd);
+    defer manager.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), try manager.loadAll());
+    try std.testing.expect(manager.get("visible_plugin") != null);
+    try std.testing.expectEqualStrings(project_plugins, manager.project_dir);
 }
 
 test "plugin manager: end-to-end loadOne with register_tool" {
@@ -1149,8 +1198,8 @@ test "repointProjectDir swaps project plugins, keeps globals" {
     try testing.expect(manager.get("old_proj_plugin") == null);
     try testing.expect(manager.get("new_proj_plugin") != null);
 
-    // Verify project_dir updated to new_project's .zay/plugins
-    const expected_new_dir = try std.fs.path.join(gpa, &.{ new_cwd, ".zay", "plugins" });
+    // Verify project_dir updated to new_project's visible plugins root.
+    const expected_new_dir = try std.fs.path.join(gpa, &.{ new_cwd, "plugins" });
     defer gpa.free(expected_new_dir);
     try testing.expectEqualStrings(expected_new_dir, manager.project_dir);
 }
@@ -1187,10 +1236,10 @@ test "repointProjectDir to a project without plugins is a no-op" {
     try testing.expect(manager.get("global_plugin") != null);
     try testing.expect(manager.get("old_proj_plugin") != null);
 
-    // Repoint to a directory with no .zay/plugins
+    // Repoint to a directory with no project plugins root.
     const no_project_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "no_project" });
     defer gpa.free(no_project_cwd);
-    // Ensure the target directory exists (but no .zay/plugins subdir)
+    // Ensure the target directory exists (but no plugins subdir)
     std.Io.Dir.cwd().createDirPath(testing.io, no_project_cwd) catch {};
     try manager.repointProjectDir(no_project_cwd);
 
@@ -1200,7 +1249,7 @@ test "repointProjectDir to a project without plugins is a no-op" {
     try testing.expectEqual(@as(usize, 1), manager.count());
 
     // Verify project_dir updated
-    const expected_new_dir = try std.fs.path.join(gpa, &.{ no_project_cwd, ".zay", "plugins" });
+    const expected_new_dir = try std.fs.path.join(gpa, &.{ no_project_cwd, "plugins" });
     defer gpa.free(expected_new_dir);
     try testing.expectEqualStrings(expected_new_dir, manager.project_dir);
 }

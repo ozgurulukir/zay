@@ -719,8 +719,14 @@ const McpMode = struct {
 
 const PluginsMode = struct {
     fn handle(app: *App, key: vaxis.Key) !bool {
+        if (app.pickers.plugins.adding) return handleAddInput(app, key);
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
             tui.closePlugins(app);
+            return true;
+        }
+        if (key.matches(vaxis.Key.tab, .{})) {
+            app.pickers.plugins.view = if (app.pickers.plugins.view == .installed) .store else .installed;
+            app.pickers.plugins.reset();
             return true;
         }
         if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
@@ -728,10 +734,62 @@ const PluginsMode = struct {
             return true;
         }
         if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            app.pickers.plugins.moveDown(0); // count comes from plugin manager
+            const count = if (app.pickers.plugins.view == .installed)
+                app.plugin_manager.count()
+            else if (app.plugin_store.catalogs) |*catalogs|
+                catalogs.entryCount()
+            else
+                0;
+            app.pickers.plugins.moveDown(count);
+            return true;
+        }
+        if (app.pickers.plugins.view == .store and
+            app.plugin_store.operation == .idle and
+            key.matches('a', .{}))
+        {
+            app.pickers.plugins.adding = true;
+            app.input_buffers.plugin_store_url.clearRetainingCapacity();
+            return true;
+        }
+        if (app.pickers.plugins.view == .store and key.matches('r', .{})) {
+            try app.refreshPluginStore();
+            return true;
+        }
+        if (app.pickers.plugins.view == .store and isEnterKey(key)) {
+            try app.installSelectedPlugin();
             return true;
         }
         return false;
+    }
+
+    fn handleAddInput(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            app.pickers.plugins.adding = false;
+            app.input_buffers.plugin_store_url.clearRetainingCapacity();
+            return true;
+        }
+        if (isEnterKey(key)) {
+            const url = std.mem.trim(u8, app.input_buffers.plugin_store_url.items, " \t\r\n");
+            if (url.len > 0) app.addPluginStore(url) catch {};
+            app.pickers.plugins.adding = false;
+            app.input_buffers.plugin_store_url.clearRetainingCapacity();
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            app.popPluginStoreUrlInput();
+            return true;
+        }
+        if (key.text) |text| {
+            const trimmed = std.mem.trim(u8, text, "\r\n");
+            if (trimmed.len > 0) {
+                try app.input_buffers.plugin_store_url.appendSlice(app.gpa, trimmed);
+                return true;
+            }
+        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            try app.input_buffers.plugin_store_url.append(app.gpa, @intCast(key.codepoint));
+            return true;
+        }
+        return true;
     }
 };
 

@@ -260,7 +260,8 @@ const OverlayInner = struct {
     }
 
     fn drawPluginsContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        // Build plugin entries from the plugin manager
+        // Build both render snapshots from already-owned UI state. The draw
+        // path never refreshes a catalog or mutates the live plugin manager.
         var entries: std.ArrayList(plugins_status.PluginEntry) = .empty;
         defer entries.deinit(app.gpa);
 
@@ -272,9 +273,28 @@ const OverlayInner = struct {
             });
         }
 
+        var available: std.ArrayList(plugins_status.StoreEntry) = .empty;
+        defer available.deinit(ctx.arena);
+        if (app.plugin_store.catalogs) |*catalogs| {
+            var i: usize = 0;
+            while (i < catalogs.entryCount()) : (i += 1) {
+                const entry = catalogs.entryAt(i) orelse continue;
+                try available.append(ctx.arena, .{
+                    .name = entry.plugin.name,
+                    .version = entry.plugin.version,
+                    .store = entry.store_name,
+                    .installed = app.plugin_manager.get(entry.plugin.id) != null,
+                });
+            }
+        }
+
         var content: plugins_status.Content = .{
             .state = &app.pickers.plugins,
             .plugins = entries.items,
+            .available = available.items,
+            .store_url_input = app.input_buffers.plugin_store_url.items,
+            .notice = app.plugin_store.notice,
+            .installing = app.plugin_store.operation == .installing,
         };
         return content.widget().draw(ctx);
     }

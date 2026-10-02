@@ -34,7 +34,7 @@ Use `run_in_background: true` for continuous processes and commands expected to 
 
 ## Lua plugins
 
-Zay has a Lua plugin system that lets you extend your capabilities. Global plugins live in `~/.config/zay/plugins/<name>/` (`%APPDATA%\zay\plugins\<name>\` on Windows) and project plugins in `.zay/plugins/<name>/`.
+Zay has a Lua plugin system that lets you extend your capabilities. Global plugins live in `~/.config/zay/plugins/<name>/` (`%APPDATA%\zay\plugins\<name>\` on Windows) and project-local plugins in `.zay/plugins/<name>/`. The repository's `plugins/` directory contains the distributed store catalog; TUI installs go to the global directory instead of modifying the current checkout.
 
 Plugins register tools using `zay.register_tool()`. Registered tools appear in your tool list with the prefix `lua__<plugin>__<tool>` and can be called like any other tool.
 
