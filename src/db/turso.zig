@@ -16,7 +16,7 @@
 const std = @import("std");
 const http = @import("../http.zig");
 const db = @import("../db.zig");
-const os = @import("../os.zig");
+const remote_http = @import("http_transport.zig");
 const service = @import("service.zig");
 const mock_http_server = @import("../ai/mock_http_server.zig");
 
@@ -99,7 +99,10 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     endpoint: []const u8,
     auth_token: ?[]const u8 = null,
-    timeout_seconds: u32 = 15,
+    /// Windows bounds the whole pipeline by this deadline; POSIX applies it
+    /// to socket sends and reads. Multi-megabyte roaming resumes can exceed
+    /// 15 seconds on a cold Turso read even when the indexed query is healthy.
+    timeout_seconds: u32 = remote_http.timeout_seconds_default,
     /// Response-body ceiling; over-cap responses fail with
     /// `error.ResponseTooLarge`. Field (not constant) so tests can shrink it.
     response_max_bytes: usize = service.response_max_bytes,
@@ -381,161 +384,30 @@ pub const Client = struct {
         io: std.Io,
         payload: []const u8,
     ) ![]const u8 {
-        // Windows has no socket-level timeout through the std Io backend (the
-        // AFD driver's handles are not ws2_32 SOCKETs), so the whole exchange
-        // is raced against a deadline instead — the same approach as the MCP
-        // HTTP transport. POSIX applies SO_RCVTIMEO inside the unbounded path.
-        if (os.is_windows) {
-            return self.fetchPipelineBounded(allocator, io, payload);
-        }
-        return self.fetchPipelineUnbounded(allocator, io, payload);
-    }
-
-    const FetchOutcome = union(enum) {
-        body: []const u8,
-        failure: anyerror,
-    };
-
-    const FetchEvent = union(enum) {
-        fetch: FetchOutcome,
-        timeout: void,
-    };
-
-    fn fetchPipelineBounded(
-        self: *const Client,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        payload: []const u8,
-    ) ![]const u8 {
-        var events: [2]FetchEvent = undefined;
-        var select = std.Io.Select(FetchEvent).init(io, &events);
-        defer select.cancelDiscard();
-
-        try select.concurrent(.fetch, fetchPipelineTask, .{ self, allocator, io, payload });
-        try select.concurrent(.timeout, fetchDeadlineTask, .{ io, self.timeout_seconds });
-
-        const event = select.await() catch |err| return err;
-        return switch (event) {
-            .fetch => |outcome| switch (outcome) {
-                .body => |body| body,
-                .failure => |err| err,
-            },
-            // A late-completing fetch's body is arena-backed and freed by the
-            // caller's teardown; cancelDiscard reaps the task safely.
-            .timeout => error.ServerTimeout,
-        };
-    }
-
-    fn fetchPipelineTask(
-        self: *const Client,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        payload: []const u8,
-    ) FetchOutcome {
-        const body = self.fetchPipelineUnbounded(allocator, io, payload) catch |err| {
-            return .{ .failure = err };
-        };
-        return .{ .body = body };
-    }
-
-    fn fetchDeadlineTask(io: std.Io, timeout_seconds: u32) void {
-        io.sleep(std.Io.Duration.fromMilliseconds(@as(i64, timeout_seconds) * 1000), .awake) catch {};
-    }
-
-    fn fetchPipelineUnbounded(
-        self: *const Client,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        payload: []const u8,
-    ) ![]const u8 {
         const url = try pipelineUrl(allocator, self.endpoint);
         defer allocator.free(url);
 
-        // `timeoutAwareIo` translates the EAGAIN of an expired SO_RCVTIMEO
-        // into `error.Timeout` (Io.Threaded treats it as a programmer bug
-        // otherwise); `setSocketTimeout` below applies the timeout itself.
-        var http_client: std.http.Client = .{ .allocator = allocator, .io = http.timeoutAwareIo(io) };
-        defer http_client.deinit();
-
-        const auth_header: ?[]u8 = if (self.auth_token) |t|
-            try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
-        else
-            null;
-        defer if (auth_header) |a| allocator.free(a);
-
-        var req = http_client.request(.POST, std.Uri.parse(url) catch return error.InvalidEndpoint, .{
-            .headers = .{
-                .content_type = .{ .override = http.content_type_json },
-                .authorization = if (auth_header) |a| .{ .override = a } else .omit,
-            },
-        }) catch |err| return mapTransportError(err);
-        defer req.deinit();
-
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var send_buffer: [http.body_buffer_bytes]u8 = undefined;
-        var body_writer = req.sendBodyUnflushed(&send_buffer) catch |err| return mapTransportError(err);
-        body_writer.writer.writeAll(payload) catch |err| return mapTransportError(err);
-        body_writer.end() catch |err| return mapTransportError(err);
-        req.connection.?.flush() catch |err| return mapTransportError(err);
-
-        var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
-        var http_response = req.receiveHead(&redirect_buffer) catch |err| return mapTransportError(err);
-
-        const code: u16 = @intFromEnum(http_response.head.status);
-        if (code == 401 or code == 403) return error.Unauthorized;
-
-        // Socket-level read timeout: a stalled response body fails with
-        // `error.ServerTimeout` instead of blocking the caller forever.
-        // Applied after the head so the (fast) head exchange is unaffected.
-        if (req.connection) |conn| http.setSocketTimeout(conn, self.timeout_seconds);
-
-        var transfer_buffer: [http.transfer_buffer_bytes]u8 = undefined;
-        var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = http_response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
-
-        // Bounded accumulation (#159): over-cap bodies fail with
-        // `error.ResponseTooLarge` rather than exhausting memory.
-        const body = reader.allocRemaining(allocator, .limited(self.response_max_bytes)) catch |err| switch (err) {
-            error.StreamTooLong => return error.ResponseTooLarge,
-            else => {
-                // Prefer the recorded socket error: a read failure wraps the
-                // SO_RCVTIMEO timeout as its reason.
-                if (err == error.ReadFailed) {
-                    if (req.connection) |conn| {
-                        if (conn.stream_reader.err) |reason| return mapTransportError(reason);
-                    }
-                }
-                return mapTransportError(err);
-            },
+        const options: remote_http.Options = .{
+            .method = .POST,
+            .url = url,
+            .payload = payload,
+            .auth_token = self.auth_token,
+            .timeout_seconds = self.timeout_seconds,
+            .response_max_bytes = self.response_max_bytes,
         };
+        const response = try remote_http.fetch(allocator, io, &options);
+        errdefer allocator.free(response.body);
 
-        if (!http.isSuccess(code)) {
+        if (response.status == 401 or response.status == 403) return error.Unauthorized;
+        if (!http.isSuccess(response.status)) {
             // Head-cut the body: warn lines route into the toast bus when the
             // TUI is up, and a misconfigured host can return a huge HTML page.
-            log.warn("turso HTTP {d} error response: {s}", .{ code, http.logBytesHead(body) });
-            allocator.free(body);
+            log.warn("turso HTTP {d} error response: {s}", .{ response.status, http.logBytesHead(response.body) });
             return error.HttpError;
         }
-        return body;
+        return response.body;
     }
 };
-
-/// Collapse connection-level transport failures onto the backend's coarse
-/// connection error, and the SO_RCVTIMEO timeout onto `ServerTimeout`;
-/// anything more specific propagates unchanged.
-fn mapTransportError(err: anyerror) anyerror {
-    return switch (err) {
-        error.ConnectionRefused,
-        error.ConnectionResetByPeer,
-        error.ConnectionTimedOut,
-        error.BrokenPipe,
-        error.ConnectionFailed,
-        => error.ConnectionRefused,
-        error.Timeout => error.ServerTimeout,
-        else => err,
-    };
-}
 
 fn requireOkResponse(item: std.json.Value, expected_type: []const u8, operation: []const u8) !std.json.Value {
     if (item != .object) return error.InvalidResponse;
@@ -1065,9 +937,9 @@ test "oversized pipeline responses fail with ResponseTooLarge" {
 }
 
 // #159: a server that sends the head then stalls the body must hit the
-// configured deadline. POSIX applies SO_RCVTIMEO after the head; Windows
-// races the whole exchange against a timer (same mechanism as the MCP HTTP
-// transport), so the same timeout holds on both platforms.
+// configured deadline. POSIX applies socket timeouts before the first byte;
+// Windows races the whole exchange against a timer, so the same timeout holds
+// on both platforms.
 test "stalled pipeline body times out" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

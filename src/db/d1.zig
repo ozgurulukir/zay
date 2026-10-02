@@ -8,15 +8,18 @@
 //! - URL normalization: supports full REST URL or `d1://{account_id}/{database_id}`.
 //! - Atomic batch execution: batches multiple statements in a single HTTP roundtrip.
 //! - Schema introspection (`sqlite_master` and `PRAGMA table_info`).
+//! - Shared request deadline and bounded response bodies.
 //! - TigerStyle safety: bounded allocations, explicit allocators, error handling.
 
 const std = @import("std");
 const http = @import("../http.zig");
 const db = @import("../db.zig");
+const mock_http_server = @import("../ai/mock_http_server.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.d1);
 
+const remote_http = @import("http_transport.zig");
 const service = @import("service.zig");
 
 pub const Error = service.Error;
@@ -34,7 +37,8 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     endpoint: []const u8,
     auth_token: ?[]const u8 = null,
-    timeout_seconds: u32 = 15,
+    timeout_seconds: u32 = remote_http.timeout_seconds_default,
+    response_max_bytes: usize = service.response_max_bytes,
 
     pub fn init(allocator: std.mem.Allocator, endpoint: []const u8, auth_token: ?[]const u8) Client {
         assert(endpoint.len > 0);
@@ -296,46 +300,27 @@ pub const Client = struct {
         io: std.Io,
         payload: []const u8,
     ) ![]const u8 {
-        var response_body: std.Io.Writer.Allocating = .init(allocator);
-        errdefer response_body.deinit();
-        var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
-
-        var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
-        defer http_client.deinit();
-
         const url = try normalizeD1Url(allocator, self.endpoint);
         defer allocator.free(url);
 
-        const auth_header: ?[]u8 = if (self.auth_token) |t|
-            try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
-        else
-            null;
-        defer if (auth_header) |a| allocator.free(a);
-
-        const status = http_client.fetch(.{
+        const options: remote_http.Options = .{
             .method = .POST,
-            .location = .{ .url = url },
+            .url = url,
             .payload = payload,
-            .response_writer = &response_body.writer,
-            .redirect_buffer = &redirect_buffer,
-            .keep_alive = true,
-            .headers = .{
-                .content_type = .{ .override = http.content_type_json },
-                .authorization = if (auth_header) |a| .{ .override = a } else .omit,
-            },
-        }) catch |err| switch (err) {
-            error.ConnectionRefused, error.ConnectionResetByPeer => return error.ConnectionRefused,
-            else => return err,
+            .auth_token = self.auth_token,
+            .timeout_seconds = self.timeout_seconds,
+            .response_max_bytes = self.response_max_bytes,
         };
+        const response = try remote_http.fetch(allocator, io, &options);
+        errdefer allocator.free(response.body);
 
-        const code: u16 = @intFromEnum(status.status);
-        if (code == 401 or code == 403) return error.Unauthorized;
-        if (!http.isSuccess(code)) {
-            log.warn("d1 HTTP {d} error response: {s}", .{ code, response_body.written() });
+        if (response.status == 401 or response.status == 403) return error.Unauthorized;
+        if (!http.isSuccess(response.status)) {
+            log.warn("d1 HTTP {d} error response: {s}", .{ response.status, http.logBytesHead(response.body) });
             return error.HttpError;
         }
 
-        return response_body.toOwnedSlice();
+        return response.body;
     }
 };
 
@@ -592,4 +577,64 @@ test "parseD1JsonValue correctly converts booleans, integers, strings and nulls"
     const v_str = try parseD1JsonValue(gpa, .{ .string = "test-session" });
     defer gpa.free(v_str.text);
     try std.testing.expectEqualStrings("test-session", v_str.text);
+}
+
+test "D1 responses use the shared body cap" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "0123456789abcdefghij" },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/query", .{server.port()});
+    defer gpa.free(endpoint);
+    var client = Client.init(gpa, endpoint, null);
+    client.response_max_bytes = 16;
+
+    try std.testing.expectError(error.ResponseTooLarge, client.query(io, "SELECT 1", &.{}));
+}
+
+test "D1 responses use the shared deadline" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "{}", .body_delay_ms = 3000 },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/query", .{server.port()});
+    defer gpa.free(endpoint);
+    var client = Client.init(gpa, endpoint, null);
+    client.timeout_seconds = 1;
+
+    try std.testing.expectError(error.ServerTimeout, client.query(io, "SELECT 1", &.{}));
+}
+
+test "D1 response-head stalls use the shared deadline" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "{}", .head_delay_ms = 3000 },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/query", .{server.port()});
+    defer gpa.free(endpoint);
+    var client = Client.init(gpa, endpoint, null);
+    client.timeout_seconds = 1;
+
+    try std.testing.expectError(error.ServerTimeout, client.query(io, "SELECT 1", &.{}));
 }

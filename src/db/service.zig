@@ -9,6 +9,7 @@
 const std = @import("std");
 const http = @import("../http.zig");
 const db = @import("../db.zig");
+const remote_http = @import("http_transport.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.db_service);
@@ -33,7 +34,7 @@ pub const Error = error{
 /// Shared maximum database response body accepted from a remote backend
 /// (#159). An unexpectedly large query/error response fails with
 /// `error.ResponseTooLarge` instead of accumulating unbounded memory.
-pub const response_max_bytes: usize = 16 * 1024 * 1024;
+pub const response_max_bytes: usize = remote_http.response_max_bytes_default;
 
 pub const HealthStatus = struct {
     status: []const u8,
@@ -143,7 +144,8 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     endpoint: []const u8,
     auth_token: ?[]const u8 = null,
-    timeout_seconds: u32 = 10,
+    timeout_seconds: u32 = remote_http.timeout_seconds_default,
+    response_max_bytes: usize = response_max_bytes,
 
     pub fn init(allocator: std.mem.Allocator, endpoint: []const u8, auth_token: ?[]const u8) Client {
         assert(endpoint.len > 0);
@@ -382,39 +384,21 @@ pub const Client = struct {
         url: []const u8,
         payload: ?[]const u8,
     ) ![]const u8 {
-        var response_body: std.Io.Writer.Allocating = .init(allocator);
-        errdefer response_body.deinit();
-        var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
-
-        var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
-        defer http_client.deinit();
-
-        var auth_buf: [512]u8 = undefined;
-        const auth_header: ?[]const u8 = if (self.auth_token) |t| blk: {
-            break :blk std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch null;
-        } else null;
-
-        const status = http_client.fetch(.{
+        const options: remote_http.Options = .{
             .method = method,
-            .location = .{ .url = url },
+            .url = url,
             .payload = payload,
-            .response_writer = &response_body.writer,
-            .redirect_buffer = &redirect_buffer,
-            .keep_alive = true,
-            .headers = .{
-                .content_type = if (payload != null) .{ .override = http.content_type_json } else .default,
-                .authorization = if (auth_header) |a| .{ .override = a } else .omit,
-            },
-        }) catch |err| switch (err) {
-            error.ConnectionRefused, error.ConnectionResetByPeer => return error.ConnectionRefused,
-            else => return err,
+            .auth_token = self.auth_token,
+            .timeout_seconds = self.timeout_seconds,
+            .response_max_bytes = self.response_max_bytes,
         };
+        const response = try remote_http.fetch(allocator, io, &options);
+        errdefer allocator.free(response.body);
 
-        const code: u16 = @intFromEnum(status.status);
-        if (code == 401 or code == 403) return error.Unauthorized;
-        if (!http.isSuccess(code)) return error.HttpError;
+        if (response.status == 401 or response.status == 403) return error.Unauthorized;
+        if (!http.isSuccess(response.status)) return error.HttpError;
 
-        return response_body.toOwnedSlice();
+        return response.body;
     }
 };
 

@@ -1246,12 +1246,13 @@ pub const Session = struct {
         const leaf_id = self.leaf_entry_id orelse return try gpa.alloc(EntryRecord, 0);
 
         const sql =
-            \\with recursive branch(id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid) as (
-            \\  select id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid
+            \\with recursive branch(session_id, id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid) as (
+            \\  select session_id, id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid
             \\    from session_entries where session_id = ? and id = ?
             \\  union all
-            \\  select e.id, e.parent_id, e.kind, e.role, e.payload_json, e.created_at_ms, e.snapshot, e.rowid
-            \\    from session_entries e join branch on e.id = branch.parent_id
+            \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.payload_json, e.created_at_ms, e.snapshot, e.rowid
+            \\    from session_entries e join branch
+            \\      on e.session_id = branch.session_id and e.id = branch.parent_id
             \\    where branch.parent_id is not null
             \\)
             \\select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from branch order by created_at_ms, rowid
@@ -1771,6 +1772,41 @@ fn appendTextEntry(session: *Session, gpa: std.mem.Allocator, role: ai.Role, tex
         .tool => return error.InvalidRole,
     };
     try session.append(message, id_out);
+}
+
+test "session branch remains scoped when entry ids collide across sessions" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = try SessionManager.init(gpa, io, ":memory:");
+    defer manager.deinit();
+
+    var session = try manager.create("/tmp/zay", .{ .id = "0123456789abcdef0123456789abcdef" });
+    var root_id: [entry_id_len]u8 = undefined;
+    var leaf_id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "root", &root_id);
+    try appendTextEntry(&session, gpa, .assistant, "leaf", &leaf_id);
+
+    var other = try manager.create("/tmp/zay", .{ .id = "fedcba9876543210fedcba9876543210" });
+    var other_id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&other, gpa, .user, "foreign", &other_id);
+    try manager.backend.exec(io,
+        \\insert into session_entries(id, session_id, parent_id, kind, role, payload_json, created_at_ms, snapshot)
+        \\select ?, session_id, parent_id, kind, role, payload_json, created_at_ms, snapshot
+        \\from session_entries where session_id = ? and id = ?
+    , &.{
+        .{ .text = root_id[0..] },
+        .{ .text = other.id.slice() },
+        .{ .text = other_id[0..] },
+    });
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("root", messages[0].text());
+    try std.testing.expectEqualStrings("leaf", messages[1].text());
 }
 
 test "session compaction boundary replaces summarized prefix" {
