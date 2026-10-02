@@ -25,6 +25,7 @@ const turn_lifecycle = @import("turn_lifecycle.zig");
 const background_delivery = @import("background_delivery.zig");
 const toast = @import("toast.zig");
 const git_label_job = @import("git_label_job.zig");
+const plugin_store_job = @import("plugin_store_job.zig");
 const vcs = @import("../vcs.zig");
 const at_search_mod = @import("at_search.zig");
 const search_mod = @import("../search.zig");
@@ -122,6 +123,7 @@ fn deinitSharedServices(self: *App) void {
     log.info("shutdown.mcp.begin", .{});
     self.mcp_manager.deinit(self.io);
     log.info("shutdown.mcp.done", .{});
+    self.plugin_store.deinit(self.gpa);
     self.plugin_manager.deinit();
     self.tool_registry.deinit(self.gpa);
     self.gpa.destroy(self.tool_registry);
@@ -184,6 +186,7 @@ fn deinitOwnedState(self: *App) void {
     self.input_buffers.provider_key.deinit(self.gpa);
     self.input_buffers.settings_text.deinit(self.gpa);
     self.input_buffers.mcp_url.deinit(self.gpa);
+    self.input_buffers.plugin_store_url.deinit(self.gpa);
     self.input_buffers.session_rename_text.deinit(self.gpa);
     self.input_buffers.project_root_text.deinit(self.gpa);
     if (self.host_id.len > 0) self.gpa.free(self.host_id);
@@ -292,6 +295,7 @@ fn drainModelsAndMcp(root: *RootWidget) !bool {
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
     if (try provider_model.drainCodexLogin(root.app)) visible_change = true;
     if (try registry_job.drain(root.app)) visible_change = true;
+    if (try plugin_store_job.drain(root.app)) visible_change = true;
     if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
     if (provider_model.drainMcpConnects(root.app)) visible_change = true;
     // A registry sync refused mid-turn (connect/disconnect landing while a
@@ -374,7 +378,7 @@ fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
 /// (src/tui/job.zig). Adding a family arm without wiring its checks into the
 /// switches below fails to compile — tick exhaustiveness is enforced, not
 /// remembered.
-pub const JobFamily = enum { diff_refresh, registry_refresh, model_load, codex_login, git_label };
+pub const JobFamily = enum { diff_refresh, registry_refresh, model_load, codex_login, git_label, plugin_store };
 
 /// Any of the Job(T) families needs a tick to start or drain.
 pub fn anyJobActive(app: *const App) bool {
@@ -392,6 +396,7 @@ fn jobFamilyActive(app: *const App, comptime family: JobFamily) bool {
         .model_load => app.pickers.models.load == .loading,
         .codex_login => provider_model.codexLoginActive(app),
         .git_label => gitLabelRefreshActive(app),
+        .plugin_store => plugin_store_job.active(app),
     };
 }
 
@@ -407,6 +412,7 @@ pub fn cancelAllJobs(app: *App) void {
             .model_load => provider_model.cancelModelLoad(app),
             .codex_login => provider_model.cancelCodexLogin(app),
             .git_label => cancelGitLabelJob(app),
+            .plugin_store => plugin_store_job.cancel(app),
         }
         log.info("shutdown.job.done family={s}", .{field.name});
     }

@@ -93,7 +93,7 @@ The remote safety-classifier call (`classifyOverSocket`) is a hand-rolled, deadl
 
 ### Lua Plugin System pattern
 
-`src/lua/` implements a full Lua 5.4 plugin SDK. `PluginManager` (manager.zig) discovers plugins from `~/.config/zay/plugins/` (global) and `.zay/plugins/` (project), loads manifests (`plugin.lua`), and creates sandboxed Lua states. The `App` struct holds `plugin_manager: lua_mod.PluginManager` and `tool_registry: *tools.ToolRegistry`; the `/plugins` TUI overlay lists loaded plugins with active/inactive status. The development guide, `zay.*` bridge-function reference, and examples live in [Plugins](plugins/README.md) / [API reference](plugins/api-reference.md).
+`src/lua/` implements a full Lua 5.4 plugin SDK. `PluginManager` (manager.zig) discovers plugins from `~/.config/zay/plugins/` (global) and project-local roots, loads manifests (`plugin.lua`), and creates sandboxed Lua states. The repository's `plugins/` directory contains the checked-in distribution catalog; TUI installs go to the global directory, not the current checkout. The `App` struct holds `plugin_manager: lua_mod.PluginManager` and `tool_registry: *tools.ToolRegistry`; the `/plugins` TUI overlay lists loaded plugins with active/inactive status and browses bounded JSON store catalogs. The development guide, `zay.*` bridge-function reference, and examples live in [Plugins](plugins/README.md) / [API reference](plugins/api-reference.md).
 
 ### Plugin event wiring pattern
 
@@ -111,7 +111,7 @@ The remote safety-classifier call (`classifyOverSocket`) is a hand-rolled, deadl
 
 ### Plugin prompt injection pattern (`prompt.md`)
 
-Each plugin directory MAY ship an optional `prompt.md` describing how the model should use that plugin's tools. `src/plugin_prompt.zig` scans `<home>/.config/zay/plugins/*/prompt.md` and `<cwd>/.zay/plugins/*/prompt.md` (project overrides global on directory-name collision) and strips YAML frontmatter via `skill_mod.stripFrontmatter` (reused from `src/skill.zig`). The markdown bodies are injected into the system prompt as a `<plugin_prompts>` block by `plugin_prompt.formatForPrompt`, appended in `context/assembly.zig` `assembleSystemPrompt` step 5 — parallel to the `SKILL.md` → `<available_skills>` flow. This is a **pure text scan, no Lua state** — it runs early in `runtime.zig` `initSession` (alongside skill loading), before `PluginManager`/`App.initRuntime` create any Lua states. Because `assembleSystemPrompt` bakes the prompt once, plugin prompts reach the model via `system_prompt` only; a freshly-added `prompt.md` takes effect on the next session/lane. The scan mirrors `PluginManager`'s directory conventions (same `global_dir`/`project_dir` roots) but is intentionally decoupled — a plugin with `prompt.md` but no `plugin.lua` still contributes prompt text, and a plugin with `plugin.lua` but no `prompt.md` contributes none. Plugins whose body is empty after frontmatter stripping are skipped (uniform `error.FileNotFound` path).
+Each plugin directory MAY ship an optional `prompt.md` describing how the model should use that plugin's tools. `src/plugin_prompt.zig` scans `<home>/.config/zay/plugins/*/prompt.md`, project-local `<cwd>/.zay/plugins/*/prompt.md`, and the checked-in `<cwd>/plugins/*/prompt.md` catalog root when it contains plugin prompt directories. The markdown bodies are injected into the system prompt as a `<plugin_prompts>` block by `plugin_prompt.formatForPrompt`, appended in `context/assembly.zig` `assembleSystemPrompt` step 5 — parallel to the `SKILL.md` → `<available_skills>` flow. This is a **pure text scan, no Lua state** — it runs early in `runtime.zig` `initSession` (alongside skill loading), before `PluginManager`/`App.initRuntime` create any Lua states. Because `assembleSystemPrompt` bakes the prompt once, plugin prompts reach the model via `system_prompt` only; a freshly-added `prompt.md` takes effect on the next session/lane. The scan mirrors `PluginManager`'s directory conventions but is intentionally decoupled — a plugin with `prompt.md` but no `plugin.lua` still contributes prompt text, and a plugin with `plugin.lua` but no `prompt.md` contributes none. Plugins whose body is empty after frontmatter stripping are skipped (uniform `error.FileNotFound` path).
 
 ### Plugin tool dispatch via ToolRegistry pattern
 
@@ -401,7 +401,7 @@ One private `spawnTurn` spine (reset → model → `turn.submit` → stale-free/
 
 ### Plugin Discovery Lifecycle
 
-Project-scoped Lua plugins (`.zay/plugins/*`) are discovered **once** at App startup via `PluginManager.init` → `syncPluginConfig` → `loadAll`. The loaded set is immutable mid-session to avoid two free hazards:
+Project-scoped Lua plugins are discovered **once** at App startup via `PluginManager.init` → `syncPluginConfig` → `loadAll`; `.zay/plugins/*` remains supported for project-local plugins, while the checked-in `plugins/` root is distribution/catalog content. The loaded set is immutable mid-session to avoid two free hazards:
 
 - **Lua state frees:** unloading a plugin calls `PluginInstance.deinit`, which destroys its sandboxed Lua state. Any lane worker mid-dispatch through a plugin handler would be killed.
 - **Registry tool-record frees:** `registerPluginTools` (`src/tui/provider_model.zig`) strips all `lua__`-prefixed tools from the shared `ToolRegistry` before re-adding. A worker dispatching through a tool record that `removePluginToolsWithPrefix` just freed is a use-after-free.
@@ -410,7 +410,7 @@ There is exactly **one** mid-session exception: a guarded cross-project `/resume
 
 1. `anyLaneTurnActive` guard — iterates every lane; if any has a turn in `.active` or `.interrupting` state, the switch is refused with `error.InFlightTurn`. The guard runs synchronously on the UI thread with zero yield points, so no idle→active transition can interleave.
 2. `syncPluginConfig` — applies the reloaded project's enable/disable + settings (build-then-swap: error leaves the previous set intact).
-3. `repointProjectDir` — unloads old project plugins by directory prefix (with separator-boundary check), frees the old `project_dir`, loads from the new project's `.zay/plugins/`. Re-scans the global dir for plugins that were shadowed by the old project and are now absent.
+3. `repointProjectDir` — unloads old project plugins by directory prefix (with separator-boundary check), frees both project roots, and loads the new project's project-local roots. Re-scans the global dir for plugins that were shadowed by the old project and are now absent.
 4. `registerPluginTools` — strips the previous `lua__` generation and re-adds from the live manager (idempotent; descriptor-build failure leaves the stale-but-valid set).
 
 Global plugins (loaded from `~/.config/zay/plugins/` or `%APPDATA%/zay/plugins/`) are never touched during a repoint — their Lua states, event subscriptions, and `require` caches survive the switch. New-project plugins that share a name with a global override the global (mirroring `loadAll` semantics).

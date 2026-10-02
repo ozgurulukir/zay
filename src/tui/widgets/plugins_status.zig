@@ -8,7 +8,11 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
 pub const State = struct {
+    pub const View = enum { installed, store };
+
     selection: usize = 0,
+    view: View = .installed,
+    adding: bool = false,
 
     pub fn reset(self: *State) void {
         self.selection = 0;
@@ -29,6 +33,12 @@ pub const Content = struct {
     state: *State,
     /// Plugin names and their active state, borrowed from the plugin manager.
     plugins: []const PluginEntry = &.{},
+    /// Catalog entries are a borrowed render snapshot owned by the TUI job
+    /// state. Drawing never performs catalog I/O or touches PluginManager.
+    available: []const StoreEntry = &.{},
+    store_url_input: []const u8 = "",
+    notice: ?[]const u8 = null,
+    installing: bool = false,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -47,32 +57,65 @@ pub const Content = struct {
         );
 
         try panel.lineStyledAt(&surface, 0, "LUA PLUGINS", ctx, 2, p.panel_header);
-        const summary = try std.fmt.allocPrint(ctx.arena, "Loaded: {d}", .{self.plugins.len});
+        const tabs = if (self.state.view == .installed) "[Installed]  Store" else "Installed  [Store]";
+        try panel.lineStyledAt(&surface, 1, tabs, ctx, 2, p.info);
+        const summary = if (self.state.view == .installed)
+            try std.fmt.allocPrint(ctx.arena, "Loaded: {d}", .{self.plugins.len})
+        else
+            try std.fmt.allocPrint(ctx.arena, "Available: {d}", .{self.available.len});
         try panel.lineStyledAt(&surface, 2, summary, ctx, 2, p.info);
 
-        if (self.plugins.len == 0) {
-            try panel.lineStyledAt(&surface, 4, "No plugins loaded. Add plugins to ~/.config/zay/plugins/ or .zay/plugins/.", ctx, 2, p.notice);
-            try panel.lineStyledAt(&surface, height -| 2, "[Esc] Close", ctx, 2, p.thinking_body);
+        if (self.state.adding) {
+            try panel.lineStyledAt(&surface, 4, "Store URL:", ctx, 2, p.notice);
+            const input = try std.fmt.allocPrint(ctx.arena, "  {s}", .{self.store_url_input});
+            try panel.lineStyledAt(&surface, 5, input, ctx, 2, p.selected_item);
+            try panel.lineStyledAt(&surface, height -| 2, "[Enter] Add  [Esc] Cancel", ctx, 2, p.thinking_body);
             return surface;
         }
 
         var row: u16 = 4;
         var line_buf: [256]u8 = undefined;
-        for (self.plugins, 0..) |plugin, i| {
-            if (row >= height -| 2) break;
-            const is_selected = i == self.state.selection;
-            const style = if (is_selected) p.selected_item else p.thinking_body;
-            const status_icon = if (plugin.active) "●" else "○";
-            // A name longer than line_buf falls back to a per-frame
-            // allocation so the entry is never dropped from the list; the
-            // common path stays allocation-free.
-            const line = std.fmt.bufPrint(&line_buf, "  {s} {s}", .{ status_icon, plugin.name }) catch
-                try std.fmt.allocPrint(ctx.arena, "  {s} {s}", .{ status_icon, plugin.name });
-            try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
-            row += 1;
+        if (self.state.view == .installed) {
+            for (self.plugins, 0..) |plugin, i| {
+                if (row >= height -| 3) break;
+                const is_selected = i == self.state.selection;
+                const style = if (is_selected) p.selected_item else p.thinking_body;
+                const status_icon = if (plugin.active) "●" else "○";
+                // A name longer than line_buf falls back to a per-frame
+                // allocation so the entry is never dropped from the list;
+                // the common path stays allocation-free.
+                const line = std.fmt.bufPrint(&line_buf, "  {s} {s}", .{ status_icon, plugin.name }) catch
+                    try std.fmt.allocPrint(ctx.arena, "  {s} {s}", .{ status_icon, plugin.name });
+                try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
+                row += 1;
+            }
+            if (self.plugins.len == 0) {
+                try panel.lineStyledAt(&surface, 4, "No plugins loaded. Install one into <project>/plugins.", ctx, 2, p.notice);
+            }
+        } else {
+            for (self.available, 0..) |plugin, i| {
+                if (row >= height -| 3) break;
+                const is_selected = i == self.state.selection;
+                const style = if (is_selected) p.selected_item else p.thinking_body;
+                const marker = if (plugin.installed) "●" else "+";
+                const line = std.fmt.bufPrint(&line_buf, "  {s} {s} v{s} — {s}", .{ marker, plugin.name, plugin.version, plugin.store }) catch
+                    try std.fmt.allocPrint(ctx.arena, "  {s} {s} v{s} — {s}", .{ marker, plugin.name, plugin.version, plugin.store });
+                try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
+                row += 1;
+            }
+            if (self.available.len == 0) {
+                try panel.lineStyledAt(&surface, 4, "No catalogs loaded. Press [a] to add a store.", ctx, 2, p.notice);
+            }
         }
 
-        try panel.lineStyledAt(&surface, height -| 2, "[Esc] Close", ctx, 2, p.thinking_body);
+        if (self.notice) |notice| try panel.lineStyledAt(&surface, height -| 3, notice, ctx, 2, p.notice);
+        const footer = if (self.state.view == .installed)
+            "[Tab] Store  [Esc] Close"
+        else if (self.installing)
+            "Installing..."
+        else
+            "[Enter] Install  [a] Add store  [r] Refresh  [Tab] Installed";
+        try panel.lineStyledAt(&surface, height -| 2, footer, ctx, 2, p.thinking_body);
         return surface;
     }
 };
@@ -80,6 +123,13 @@ pub const Content = struct {
 pub const PluginEntry = struct {
     name: []const u8,
     active: bool,
+};
+
+pub const StoreEntry = struct {
+    name: []const u8,
+    version: []const u8,
+    store: []const u8,
+    installed: bool,
 };
 
 test "plugins_status Content.draw renders plugins list correctly" {

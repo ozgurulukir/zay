@@ -207,6 +207,23 @@ pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay" });
 }
 
+/// Return the global plugin directory used by PluginManager. Windows keeps
+/// the historical AppData-first probe so installation and discovery select
+/// the same location; POSIX uses the XDG-style config tree.
+pub fn globalPluginsDir(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
+    if (home_dir.len == 0) return error.InvalidPath;
+    if (os.is_windows) {
+        const appdata_dir = try std.fs.path.join(gpa, &.{ home_dir, "AppData", "Roaming", "zay", "plugins" });
+        if (std.Io.Dir.openDirAbsolute(io, appdata_dir, .{})) |*dir| {
+            dir.close(io);
+            return appdata_dir;
+        } else |_| {
+            gpa.free(appdata_dir);
+        }
+    }
+    return std.fs.path.join(gpa, &.{ home_dir, ".config", "zay", "plugins" });
+}
+
 /// Semantic alias for `platformConfigDir`: the platform config root doubles
 /// as the base for all application data (db path, history dir). See #158.
 pub const getBaseDataDir = platformConfigDir;

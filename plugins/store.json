@@ -1,0 +1,53 @@
+{
+  "name": "Zay Examples",
+  "plugins": [
+    {
+      "id": "hello-world",
+      "name": "Hello World",
+      "version": "1.0.0",
+      "description": "A minimal Lua plugin for learning the Zay bridge API.",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/test.lua" }
+      ]
+    },
+    {
+      "id": "todo",
+      "name": "Todo",
+      "version": "1.0.0",
+      "description": "A small persistent todo-list example.",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/test.lua" }
+      ]
+    },
+    {
+      "id": "file-tools",
+      "name": "File Tools",
+      "version": "1.0.0",
+      "description": "Safe file inspection and editing examples.",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/test.lua" }
+      ]
+    },
+    {
+      "id": "search-tools",
+      "name": "Search Tools",
+      "version": "1.0.0",
+      "description": "Project search helpers implemented as a Lua plugin.",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/test.lua" }
+      ]
+    }
+  ]
+}
