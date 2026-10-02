@@ -95,7 +95,7 @@ pub fn runPluginTool(
     const key: *PluginToolKey = @ptrCast(@alignCast(env.userdata));
     const manager = env.ctx.plugin_manager orelse
         return tools_common.fail(gpa, "plugin dispatcher: no live plugin manager"[0..], 1);
-    const result_text = manager.callTool(
+    var result = manager.callTool(
         key.plugin_name[0..],
         key.tool_name[0..],
         args,
@@ -107,9 +107,11 @@ pub fn runPluginTool(
             .{ key.plugin_name, key.tool_name, @errorName(err) },
         );
     };
-    errdefer gpa.free(result_text);
+    errdefer result.deinit(gpa);
     const stderr = try gpa.alloc(u8, 0);
-    return .{ .stdout = result_text, .stderr = stderr, .code = 0 };
+    const stdout = result.text;
+    result.text = undefined;
+    return .{ .stdout = stdout, .stderr = stderr, .code = result.code };
 }
 
 /// Human display metadata for a plugin tool. The `Env.userdata` carries the

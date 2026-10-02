@@ -58,7 +58,7 @@ local git_commit = registered.git_commit
 test.describe("git_status not-a-repo handling", function()
   test.it("reports not-a-repo when the bridge returns nil", function()
     status_reply = nil
-    local out = git_status.handler({})
+    local _, out = git_status.handler({})
     test.assert.contains("not a git repository", out)
   end)
 
@@ -72,7 +72,7 @@ test.describe("git_status not-a-repo handling", function()
   test.it("reports detached HEAD when branch is empty", function()
     status_reply = ""
     branch_reply = ""
-    local out = git_status.handler({})
+    local _, out = git_status.handler({})
     test.assert.contains("detached HEAD", out)
   end)
 end)
@@ -88,7 +88,7 @@ test.describe("git_diff and git_branch", function()
 
   test.it("git_branch reports an error on nil", function()
     branch_reply = nil
-    local out = git_branch.handler({})
+    local _, out = git_branch.handler({})
     test.assert.contains("could not determine branch", out)
   end)
 end)
@@ -122,7 +122,7 @@ end)
 -- ── git_add staging ──────────────────────────────────────────────────
 test.describe("git_add staging", function()
   test.it("requires files parameter", function()
-    local out = git_add.handler({})
+    local _, out = git_add.handler({})
     test.assert.contains("files parameter is required", out)
   end)
 
@@ -135,7 +135,7 @@ test.describe("git_add staging", function()
 
   test.it("surfaces error on add failure", function()
     add_reply = { success = false, output = "pathspec 'foo.zig' did not match any files" }
-    local out = git_add.handler({ files = "foo.zig" })
+    local _, out = git_add.handler({ files = "foo.zig" })
     test.assert.contains("pathspec 'foo.zig' did not match any files", out)
   end)
 end)
@@ -144,13 +144,13 @@ end)
 
 test.describe("git_commit failure surfacing", function()
   test.it("requires a message", function()
-    local out = git_commit.handler({})
+    local _, out = git_commit.handler({})
     test.assert.contains("commit message is required", out)
   end)
 
   test.it("surfaces result.output on a failed commit", function()
     commit_reply = { success = false, output = "pre-commit hook failed" }
-    local out = git_commit.handler({ message = "wip" })
+    local _, out = git_commit.handler({ message = "wip" })
     test.assert.contains("pre-commit hook failed", out)
   end)
 

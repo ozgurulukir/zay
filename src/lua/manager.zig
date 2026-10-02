@@ -321,8 +321,13 @@ pub const PluginManager = struct {
 
     /// Dispatch a tool call to a loaded plugin by name.
     /// `params_json` is forwarded to the Lua handler as a JSON string.
-    /// Returns the handler's output string (owned by caller).
-    pub fn callTool(self: *Self, plugin_name: []const u8, tool_name: []const u8, params_json: []const u8) ![]u8 {
+    /// Returns the handler's owned text and status.
+    pub fn callTool(
+        self: *Self,
+        plugin_name: []const u8,
+        tool_name: []const u8,
+        params_json: []const u8,
+    ) !plugin_api.ToolHandlerResult {
         const plugin = self.plugins.get(plugin_name) orelse return error.PluginNotFound;
         if (!plugin.active) return error.PluginDisabled;
         const tool_index = plugin_api.findToolIndex(plugin.state.handle, tool_name) orelse
@@ -876,9 +881,74 @@ test "plugin manager: settings reach init.lua and tool handlers via get_config (
     c.lua_pop(instance.state.handle, 1);
 
     // And the per-call read inside a tool handler returns the same value.
-    const out = try manager.callTool("cfg_plugin", "theme_tool", "{}");
-    defer gpa.free(out);
-    try testing.expectEqualStrings("dark", out);
+    var out = try manager.callTool("cfg_plugin", "theme_tool", "{}");
+    defer out.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), out.code);
+    try testing.expectEqualStrings("dark", out.text);
+}
+
+test "plugin manager: handler result contract preserves status and stack balance" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(testing.io, gpa);
+    defer gpa.free(cwd);
+    const root = try std.fs.path.join(gpa, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "plugin-result-contract",
+    });
+    defer gpa.free(root);
+    std.Io.Dir.cwd().createDirPath(testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+
+    try writeFixturePlugin(root, "result_plugin",
+        \\local function register(name, handler)
+        \\  zay.register_tool({ name = name, description = name, parameters = {}, handler = handler })
+        \\end
+        \\register("success", function() return "Error: this is valid output text" end)
+        \\register("failure", function() return nil, "diagnostic from handler" end)
+        \\register("exception", function() error("boom") end)
+        \\register("malformed", function() return {} end)
+    );
+
+    var manager = PluginManager.init(gpa, testing.io, "", "");
+    defer manager.deinit();
+    const plugin_dir = try std.fs.path.join(gpa, &.{ root, "result_plugin" });
+    defer gpa.free(plugin_dir);
+    const instance = try manager.loadOne(plugin_dir, false);
+    const stack_depth = c.lua_gettop(instance.state.handle);
+
+    var success = try manager.callTool("result_plugin", "success", "{}");
+    defer success.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), success.code);
+    try testing.expectEqualStrings("Error: this is valid output text", success.text);
+    try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
+
+    var failure = try manager.callTool("result_plugin", "failure", "{}");
+    defer failure.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), failure.code);
+    try testing.expectEqualStrings("diagnostic from handler", failure.text);
+    try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
+
+    var exception = try manager.callTool("result_plugin", "exception", "{}");
+    defer exception.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), exception.code);
+    try testing.expect(std.mem.startsWith(u8, exception.text, "Lua tool error:"));
+    try testing.expect(std.mem.indexOf(u8, exception.text, "boom") != null);
+    try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
+
+    var malformed = try manager.callTool("result_plugin", "malformed", "{}");
+    defer malformed.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), malformed.code);
+    try testing.expectEqualStrings(
+        "Lua tool handler must return a string, or nil and an error message",
+        malformed.text,
+    );
+    try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
 }
 
 // Load every shipped example plugin and confirm each registered at least one
@@ -1002,6 +1072,27 @@ test "plugin manager: emitEvent delivers to plugin callbacks" {
     } else {
         return error.CallbackDidNotFire;
     }
+}
+
+test "plugin manager: file-watcher counts a real failed/successful completion event" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var manager = PluginManager.init(gpa, testing.io, "", "");
+    defer manager.deinit();
+
+    const instance = try manager.loadOne("examples/plugins/file-watcher", false);
+    try testing.expect(instance.active);
+    manager.emitEvent(.{
+        .tool_call_finished = .{ .name = "lua__file-tools__write", .call_id = "call-ok", .success = true },
+    });
+    manager.emitEvent(.{
+        .tool_call_finished = .{ .name = "lua__file-tools__write", .call_id = "call-failed", .success = false },
+    });
+
+    var result = try manager.callTool("file-watcher", "file_stats", "{}");
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), result.code);
+    try testing.expect(std.mem.indexOf(u8, result.text, "write=1") != null);
 }
 
 // ── repointProjectDir tests ──────────────────────────────────────

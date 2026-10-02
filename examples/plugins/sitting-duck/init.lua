@@ -9,18 +9,18 @@
 --     command line; quoting is what keeps the classified command equal to
 --     the executed command.
 --
--- Architecture: SQL travels in a FILE, never on the shell command line —
--- `.zay/sitting-duck/query.sql` is staged via zay.write_file (atomic) and
--- fed to duckdb with `<` redirection. The file doubles as a debug artifact:
--- every query error message points at it. The extension bootstraps lazily
+-- Architecture: SQL travels through zay.run_bash stdin, never on the shell
+-- command line. A `.zay/sitting-duck/query.sql` copy is written only when
+-- debug_query_artifact=true, and error messages mention it only in that mode.
+-- The extension bootstraps lazily
 -- on the first tool call (INSTALL before LOAD — a cold machine has nothing
 -- to LOAD yet); success is cached in `.zay/sitting-duck/state.json` and
 -- re-verified against `duckdb --version` once per session so a duckdb
 -- upgrade triggers a re-install. Zero I/O happens at load time: any
 -- init.lua error disables the whole plugin.
 --
--- Handlers never raise; every failure path returns an "Error: ..." string
--- so the model can self-correct on the next call.
+-- Handlers return `nil, message` for operational failures so the executor can
+-- mark the tool call failed while preserving the diagnostic for the model.
 
 -- ── constants ───────────────────────────────────────────────────────
 
@@ -48,10 +48,28 @@ local COLS = "node_id, type, file_path, name, start_line, end_line"
 -- succeeds in this Lua state.
 local sd_ready = false
 
+local function fail(message)
+  return nil, message
+end
+
 -- ── small helpers ───────────────────────────────────────────────────
 
 local function q(s)
   return zay.shell_quote(s)
+end
+
+local function debug_query_artifact_enabled()
+  local cfg = plugin and plugin.get_config and plugin.get_config()
+  return type(cfg) == "table" and cfg.debug_query_artifact == true
+end
+
+local function query_artifact_note()
+  if not debug_query_artifact_enabled() then return "" end
+  return " Debug artifact: " .. QUERY_PATH .. " (it may contain sensitive SQL literals)."
+end
+
+local function null_device()
+  return zay.get_env and zay.get_env("OS") == "Windows_NT" and "NUL" or "/dev/null"
 end
 
 -- SQL single-quoted literal. DuckDB standard literals do not process
@@ -82,72 +100,137 @@ local function safe_rel_path(s)
   return true
 end
 
--- Enforce ONE statement with no dot-command lines. The CLI executes
--- everything in the staged file — dot commands included — so a chained
--- `COPY ... TO` after a `;`, or a `.shell`/`.output` line, would run even
--- when the first word is SELECT. The scan tracks string literals,
--- quoted identifiers, dollar-quoted strings, and comments so a `;`
--- inside quoted text does not split statements; anything the scan
--- misreads as quoted text that DuckDB treats as code fails later as a
--- DuckDB parse error (never as an executed second statement).
-local function single_statement_no_dot_commands(sql)
+-- Tokenize outside SQL literals/comments. Quoted identifiers are skipped as
+-- opaque text too: a column named "delete" is data/schema, not a statement.
+-- The scanner is deliberately conservative; it is a gate, not a SQL parser.
+local function scan_sql(sql)
+  local tokens = {}
   local i, n = 1, #sql
-  local statements = 0
-  local seen_content = false
+  local statement_count = 0
+  local after_statement = false
+  local line_start = true
+
+  local function add_token(token)
+    table.insert(tokens, token:upper())
+    after_statement = false
+  end
+
   while i <= n do
     local c = sql:sub(i, i)
-    if c == "'" then
+    if c == "\n" then
+      line_start = true
+      i = i + 1
+    elseif c == " " or c == "\t" or c == "\r" then
+      i = i + 1
+    elseif line_start and c == "." then
+      return nil, "dot-command lines are not allowed"
+    elseif c == "-" and sql:sub(i + 1, i + 1) == "-" then
+      local newline = sql:find("\n", i + 2, true)
+      i = newline or (n + 1)
+    elseif c == "/" and sql:sub(i + 1, i + 1) == "*" then
+      local close = sql:find("*/", i + 2, true)
+      if close == nil then return nil, "unterminated SQL comment" end
+      line_start = sql:sub(i, close + 1):find("\n", 1, true) ~= nil
+      i = close + 2
+    elseif c == "'" or c == '"' then
+      if after_statement then return nil, "chained SQL statements are not allowed" end
+      local quote = c
+      local closed = false
       i = i + 1
       while i <= n do
-        if sql:sub(i, i) == "'" then
-          if sql:sub(i + 1, i + 1) == "'" then
+        if sql:sub(i, i) == quote then
+          if sql:sub(i + 1, i + 1) == quote then
             i = i + 2
           else
             i = i + 1
+            closed = true
             break
           end
         else
+          if sql:sub(i, i) == "\n" then line_start = true end
           i = i + 1
         end
       end
-      seen_content = true
-    elseif c == '"' then
-      i = i + 1
-      while i <= n and sql:sub(i, i) ~= '"' do i = i + 1 end
-      i = i + 1
-      seen_content = true
-    elseif c == "$" and sql:sub(i + 1, i + 1) == "$" then
-      local close = sql:find("$$", i + 2, true)
-      i = (close == nil) and (n + 1) or (close + 2)
-      seen_content = true
-    elseif c == "-" and sql:sub(i + 1, i + 1) == "-" then
-      while i <= n and sql:sub(i, i) ~= "\n" do i = i + 1 end
-    elseif c == "/" and sql:sub(i + 1, i + 1) == "*" then
-      local close = sql:find("*/", i + 2, true)
-      i = (close == nil) and (n + 1) or (close + 2)
+      if not closed then return nil, "unterminated SQL quote" end
+      after_statement = false
+      line_start = false
+    elseif c == "$" then
+      if after_statement then return nil, "chained SQL statements are not allowed" end
+      local tag_end = sql:find("%$", i + 1)
+      if tag_end == nil then return nil, "unterminated dollar-quoted SQL string" end
+      local tag = sql:sub(i, tag_end)
+      local close = sql:find(tag, tag_end + 1, true)
+      if close == nil then return nil, "unterminated dollar-quoted SQL string" end
+      i = close + #tag
+      after_statement = false
+      line_start = false
     elseif c == ";" then
-      if seen_content then statements = statements + 1 end
-      if statements > 1 then return false end
-      seen_content = false
-      i = i + 1
-    elseif c == "\n" then
-      local j = i + 1
-      while j <= n and (sql:sub(j, j) == " " or sql:sub(j, j) == "\t") do j = j + 1 end
-      if sql:sub(j, j) == "." then return false end
+      if #tokens == 0 or after_statement then
+        return nil, "empty or chained SQL statement"
+      end
+      statement_count = statement_count + 1
+      if statement_count > 1 then return nil, "chained SQL statements are not allowed" end
+      after_statement = true
+      line_start = false
       i = i + 1
     else
-      if c ~= " " and c ~= "\t" and c ~= "\r" then seen_content = true end
-      i = i + 1
+      if after_statement then return nil, "chained SQL statements are not allowed" end
+      local start = i
+      while i <= n and sql:sub(i, i):match("[%w_]") do i = i + 1 end
+      if i == start then
+        after_statement = false
+        line_start = false
+        i = i + 1
+      else
+        if after_statement then
+          return nil, "chained SQL statements are not allowed"
+        end
+        add_token(sql:sub(start, i - 1))
+        line_start = false
+      end
     end
   end
-  -- A single trailing `;` is fine; content after a completed statement is
-  -- a second (possibly unterminated) statement.
-  if statements >= 1 and seen_content then return false end
+
+  if #tokens == 0 then return nil, "SQL statement is empty" end
+  if after_statement == false and statement_count > 0 then
+    return nil, "SQL text continues after the statement terminator"
+  end
+  return tokens
+end
+
+local SIDE_EFFECT_KEYWORDS = {
+  INSERT = true, UPDATE = true, DELETE = true, MERGE = true,
+  COPY = true, INSTALL = true, LOAD = true, ATTACH = true, DETACH = true,
+  EXPORT = true, IMPORT = true, CREATE = true, ALTER = true, DROP = true,
+  TRUNCATE = true, PRAGMA = true, VACUUM = true, CALL = true, SET = true,
+  RESET = true, CHECKPOINT = true, BEGIN = true, COMMIT = true,
+  ROLLBACK = true, GRANT = true, REVOKE = true, COMMENT = true,
+}
+
+local function validate_read_only_sql(sql)
+  local tokens, scan_error = scan_sql(sql)
+  if tokens == nil then
+    return false, scan_error
+  end
+  local first = tokens[1]
+  if first ~= "SELECT" and first ~= "WITH" then
+    return false, "statement must start with SELECT or WITH"
+  end
+  local saw_select = false
+  for _, token in ipairs(tokens) do
+    if token == "SELECT" then saw_select = true end
+    if SIDE_EFFECT_KEYWORDS[token] then
+      return false, "side-effecting SQL keyword rejected: " .. token
+    end
+  end
+  if first == "WITH" and not saw_select then
+    return false, "WITH statement must contain a read-only SELECT"
+  end
   return true
 end
 
 local function path_error(what)
-  return "Error: " .. what .. " must be a relative path inside the project"
+  return "Error: " .. what .. " must be a relative path inside the active workspace"
     .. " (absolute paths and '..' components are not allowed)."
 end
 
@@ -267,7 +350,7 @@ local function e1_duckdb()
 end
 
 local function e1_bash()
-  return "Error: a POSIX shell is required to run duckdb (input redirection)"
+  return "Error: a POSIX shell is required to run duckdb through Zay's shell bridge"
     .. " but is not available. On Windows install Git Bash or use WSL; on"
     .. " POSIX check that bash is installed."
 end
@@ -355,18 +438,26 @@ end
 
 -- ── runner ──────────────────────────────────────────────────────────
 
--- Stage `sql` into the query file and run it. The command line is a fixed
--- template: only the quoted binary path varies, and the SQL never touches
--- the shell — glob metacharacters and model-supplied SQL stay inert inside
--- the file duckdb itself parses.
+-- Send `sql` over stdin and run it. The command line is a fixed template:
+-- only the quoted binary path varies, and model-supplied SQL never touches
+-- the shell parser.
 local function run_script(bin, sql, timeout_s)
-  zay.mkdir(WORK_DIR)
-  local ok, werr = zay.write_file(QUERY_PATH, sql)
-  if ok == nil then
-    return nil, "could not stage query.sql: " .. tostring(werr or "?")
+  if debug_query_artifact_enabled() then
+    local made, make_err = zay.mkdir(WORK_DIR)
+    if made == nil then
+      return nil, "could not create debug artifact directory: " .. tostring(make_err or "?")
+    end
+    local ok, werr = zay.write_file(QUERY_PATH, sql)
+    if ok == nil then
+      return nil, "could not write debug query artifact: " .. tostring(werr or "?")
+    end
   end
-  local cmd = q(bin) .. " -json -init /dev/null < " .. q(QUERY_PATH)
-  return zay.run_bash(cmd, { timeout = timeout_s })
+  local quoted_bin, quote_err = q(bin)
+  if quoted_bin == nil then
+    return nil, "could not quote duckdb path: " .. tostring(quote_err or "?")
+  end
+  local cmd = quoted_bin .. " -json -init " .. null_device()
+  return zay.run_bash(cmd, { timeout = timeout_s, stdin = sql })
 end
 
 -- Cold → checking → ready. Returns nil when ready, else an error string.
@@ -377,7 +468,11 @@ local function ensure_ready()
 
   -- One cheap dispatch per session: detect missing duckdb/bash early and
   -- capture the version string for the drift check.
-  local res, rerr = zay.run_bash(q(bin) .. " --version", { timeout = VERSION_TIMEOUT_S })
+  local quoted_bin, quote_err = q(bin)
+  if quoted_bin == nil then
+    return "Error: could not quote duckdb path: " .. tostring(quote_err or "unknown error")
+  end
+  local res, rerr = zay.run_bash(quoted_bin .. " --version", { timeout = VERSION_TIMEOUT_S })
   if res == nil then
     local e = tostring(rerr)
     if e:find("ShellUnavailable", 1, true) then return e1_bash() end
@@ -387,7 +482,7 @@ local function ensure_ready()
   if res.code == 127 then return e1_duckdb() end
   if res.code ~= 0 then
     return "Error: duckdb --version failed (code " .. res.code .. "): "
-      .. stderr_tail(res.stderr, 2)
+      .. stderr_tail(res.stderr, 2) .. query_artifact_note()
   end
   local version = trim(res.stdout)
   if version == "" then version = "unknown" end
@@ -406,7 +501,7 @@ local function ensure_ready()
     local e = tostring(berr)
     if e:find("ShellUnavailable", 1, true) then return e1_bash() end
     if e:find("UnsafeShellBlocked", 1, true) then return "Error: " .. e end
-    return "Error: bootstrap failed: " .. e
+      return "Error: bootstrap failed: " .. e .. query_artifact_note()
   end
   if bres.code == 127 then return e1_duckdb() end
   if bres.code ~= 0 then
@@ -427,7 +522,7 @@ local function ensure_ready()
     return "Error: bootstrap completed but did not report ready."
       .. " stdout: " .. truncate_cell(bres.stdout, 200)
       .. " stderr: " .. stderr_tail(bres.stderr, 3)
-      .. " — the exact script sent is at " .. QUERY_PATH
+      .. query_artifact_note()
   end
 
   -- Best-effort: a failed marker write only costs a re-bootstrap next
@@ -449,11 +544,11 @@ local function run_query(sql)
     if e:find("StreamTooLong", 1, true) then
       return nil, "Error: query output exceeded the 512KB stream cap and was"
         .. " discarded. Rerun with a LIMIT (<= " .. MAX_LIMIT
-        .. "), fewer columns, or a narrower glob."
+        .. "), fewer columns, or a narrower glob." .. query_artifact_note()
     end
     if e:find("UnsafeShellBlocked", 1, true) then return nil, "Error: " .. e end
     if e:find("ShellUnavailable", 1, true) then return nil, e1_bash() end
-    return nil, "Error: could not run duckdb: " .. e
+    return nil, "Error: could not run duckdb: " .. e .. query_artifact_note()
   end
   if res.code == 127 then return nil, e1_duckdb() end
   if res.code ~= 0 then
@@ -473,13 +568,12 @@ local function run_query(sql)
         .. " 'src/**/*.zig' instead of 'src/**'). Detail:"
         .. " " .. stderr_tail(res.stderr, 2)
     end
-    return nil, "Error: duckdb query failed: " .. stderr_tail(res.stderr, 3)
-      .. " — the exact script sent is at " .. QUERY_PATH
+      return nil, "Error: duckdb query failed: " .. stderr_tail(res.stderr, 3)
+      .. query_artifact_note()
   end
   local rows = zay.json_decode(res.stdout or "")
   if type(rows) ~= "table" then
-    return nil, "Error: could not parse duckdb output — the exact script"
-      .. " sent is at " .. QUERY_PATH
+    return nil, "Error: could not parse duckdb output" .. query_artifact_note()
   end
   return rows
 end
@@ -653,12 +747,12 @@ zay.register_tool({
   handler = function(params)
     local glob = params.glob
     if type(glob) ~= "string" or trim(glob) == "" then
-      return "Error: glob is required (e.g. 'src/**/*.zig')."
+      return fail("Error: glob is required (e.g. 'src/**/*.zig').")
     end
-    if not safe_rel_path(glob) then return path_error("glob") end
+    if not safe_rel_path(glob) then return fail(path_error("glob")) end
     local limit = clamp_limit(params.limit)
     local rows, err = run_query(outline_sql(glob, params.kinds, limit))
-    if rows == nil then return err end
+    if rows == nil then return fail(err) end
     return shape_outline(rows, glob, limit)
   end,
 })
@@ -711,22 +805,24 @@ zay.register_tool({
   handler = function(params)
     local pattern = params.pattern
     if type(pattern) ~= "string" or trim(pattern) == "" then
-      return "Error: pattern is required (a code skeleton with __NAME__"
+      return fail("Error: pattern is required (a code skeleton with __NAME__"
         .. " wildcards, e.g. 'fn __FN__(__) void {}')."
+      )
     end
     local glob = params.glob or "**/*"
-    if not safe_rel_path(glob) then return path_error("glob") end
+    if not safe_rel_path(glob) then return fail(path_error("glob")) end
     local language = trim(tostring(params.language or ""))
     if language == "" then
       language = infer_language(glob) or ""
     end
     if language == "" then
-      return "Error: language is required for this glob (no recognizable"
+      return fail("Error: language is required for this glob (no recognizable"
         .. " file extension) — pass it explicitly, e.g. 'zig' or 'python'."
+      )
     end
     local limit = clamp_limit(params.limit)
     local rows, err = run_query(pattern_sql(pattern, glob, language, limit))
-    if rows == nil then return err end
+    if rows == nil then return fail(err) end
     return shape_pattern(rows, pattern)
   end,
 })
@@ -761,16 +857,16 @@ zay.register_tool({
   handler = function(params)
     local file = params.file
     if type(file) ~= "string" or trim(file) == "" then
-      return "Error: file is required."
+      return fail("Error: file is required.")
     end
-    if not safe_rel_path(file) then return path_error("file") end
+    if not safe_rel_path(file) then return fail(path_error("file")) end
     if params.node_id == nil or tostring(params.node_id) == "" then
-      return "Error: node_id is required."
+      return fail("Error: node_id is required.")
     end
     local ctx = math.max(0, math.min(math.floor(tonumber(params.context_lines) or 0), 20))
 
     local rows, err = run_query(span_sql(file, params.node_id))
-    if rows == nil then return err end
+    if rows == nil then return fail(err) end
     local node = rows[1]
     if node == nil then
       return "No node " .. tostring(params.node_id) .. " in " .. file
@@ -783,9 +879,9 @@ zay.register_tool({
     local el = tonumber(node.end_line) or sl
     local first = math.max(1, sl - ctx)
     local last = el + ctx
-    local read = zay.read_file(file, { start_line = first, end_line = last })
+    local read, read_err = zay.read_file(file, { start_line = first, end_line = last })
     if read == nil then
-      return "Error: could not read " .. file
+      return fail("Error: could not read " .. file .. ": " .. tostring(read_err or "unknown error"))
     end
     return shape_span(node, file, read.content, first)
   end,
@@ -815,8 +911,9 @@ zay.register_tool({
     .. " bounded only by DuckDB itself (e.g. read_csv can reach files"
     .. " outside the project) — prefer the dedicated tools' path"
     .. " parameters. Include a LIMIT (recommended <= 200); output above"
-    .. " 512KB fails with StreamTooLong. On errors the exact script is"
-    .. " kept at .zay/sitting-duck/query.sql for inspection. Requires the"
+    .. " 512KB fails with StreamTooLong. Query text is not persisted by default;"
+    .. " enable debug_query_artifact only when a sensitive SQL artifact is"
+    .. " acceptable. Requires the"
     .. " duckdb CLI (plugins.sitting-duck.settings.duckdb_path /"
     .. " ZAY_SITTING_DUCK_BIN / PATH).",
   parameters = {
@@ -830,29 +927,17 @@ zay.register_tool({
   handler = function(params)
     local sql = params.sql
     if type(sql) ~= "string" or trim(sql) == "" then
-      return "Error: sql is required (a single statement over read_ast(...)"
-        .. " with a LIMIT)."
+      return fail("Error: sql is required (a single statement over read_ast(...)"
+        .. " with a LIMIT).")
     end
-    -- The classifier only ever sees the fixed command template — the SQL
-    -- itself is the plugin's own gate. Two layers: the first-word check
-    -- (no COPY/INSTALL/ATTACH/EXPORT as the leading statement) and a
-    -- quote-aware statement scan (no chained statements, no dot-command
-    -- lines) — together they keep ast_query read-only even though the CLI
-    -- would happily execute a whole script.
-    local first_word = sql:match("^%s*(%a+)")
-    if first_word == nil or (first_word ~= "SELECT" and first_word ~= "select"
-      and first_word ~= "WITH" and first_word ~= "with") then
-      return "Error: ast_query accepts a single read-only statement starting"
-        .. " with SELECT or WITH (write statements such as COPY, INSTALL,"
-        .. " ATTACH, or EXPORT are rejected)."
-    end
-    if not single_statement_no_dot_commands(sql) then
-      return "Error: ast_query accepts ONE read-only statement: chained"
-        .. " statements after a ';' and dot-command lines (e.g. .shell,"
-        .. " .output) are rejected."
+    local valid, validation_error = validate_read_only_sql(sql)
+    if not valid then
+      return fail("Error: ast_query accepts ONE read-only statement: "
+        .. tostring(validation_error or "the SQL could not be proven safe")
+        .. ".")
     end
     local rows, err = run_query(wrap_query(sql))
-    if rows == nil then return err end
+    if rows == nil then return fail(err) end
     local out = shape_rows(rows, "ast_query result")
     -- Soft advisory, not a rewrite: remind about the stream cap when the
     -- model forgot the LIMIT the hard backstop would otherwise enforce.

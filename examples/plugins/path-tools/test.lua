@@ -44,7 +44,7 @@ test.describe("path-tools plugin", function()
     local res = registered["create_directory"].handler({ path = "src/nested/dir" })
     test.assert.contains("Created directory: src/nested/dir", res)
 
-    local err = registered["create_directory"].handler({ path = "fail_dir" })
+    local _, err = registered["create_directory"].handler({ path = "fail_dir" })
     test.assert.contains("Error: could not create", err)
   end)
 
@@ -52,7 +52,7 @@ test.describe("path-tools plugin", function()
     local res = registered["copy_path"].handler({ source_path = "a.txt", destination_path = "b.txt" })
     test.assert.contains("Copied a.txt to b.txt", res)
 
-    local err = registered["copy_path"].handler({ source_path = "fail_src", destination_path = "b.txt" })
+    local _, err = registered["copy_path"].handler({ source_path = "fail_src", destination_path = "b.txt" })
     test.assert.contains("Error: could not copy", err)
   end)
 
@@ -60,7 +60,7 @@ test.describe("path-tools plugin", function()
     local res = registered["move_path"].handler({ source_path = "a.txt", destination_path = "b.txt" })
     test.assert.contains("Moved a.txt to b.txt", res)
 
-    local err = registered["move_path"].handler({ source_path = "fail_src", destination_path = "b.txt" })
+    local _, err = registered["move_path"].handler({ source_path = "fail_src", destination_path = "b.txt" })
     test.assert.contains("Error: could not move", err)
   end)
 
@@ -71,7 +71,7 @@ test.describe("path-tools plugin", function()
     local res2 = registered["delete_path"].handler({ path = "dir", recursive = true })
     test.assert.contains("Deleted (recursive): dir", res2)
 
-    local err = registered["delete_path"].handler({ path = "fail_path" })
+    local _, err = registered["delete_path"].handler({ path = "fail_path" })
     test.assert.contains("Error: could not delete", err)
   end)
 end)

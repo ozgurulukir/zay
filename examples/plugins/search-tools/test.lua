@@ -190,7 +190,7 @@ test.describe("grep regex output handling", function()
   test.it("surfaces invalid regex (rg exit 2)", function()
     reset()
     bash_reply = { stdout = "", stderr = "regex parse error", code = 2 }
-    local out = grep.handler({ pattern = "(", regex = true })
+    local _, out = grep.handler({ pattern = "(", regex = true })
     test.assert.contains("invalid regex", out)
   end)
 
@@ -208,14 +208,14 @@ test.describe("grep regex output handling", function()
   test.it("reports regex needs rg when rg is missing (exit 127)", function()
     reset()
     bash_reply = { stdout = "", stderr = "rg: command not found", code = 127 }
-    local out = grep.handler({ pattern = "foo", regex = true })
+    local _, out = grep.handler({ pattern = "foo", regex = true })
     test.assert.contains("needs ripgrep", out)
   end)
 
   test.it("reports error when run_bash fails (nil) for regex", function()
     reset()
     bash_reply = nil
-    local out = grep.handler({ pattern = "foo", regex = true })
+    local _, out = grep.handler({ pattern = "foo", regex = true })
     test.assert.contains("regex search failed", out)
   end)
 end)
@@ -261,7 +261,7 @@ test.describe("grep substring output handling", function()
   test.it("reports an error when search_files fails (nil)", function()
     reset()
     search_reply = nil
-    local out = grep.handler({ pattern = "foo" })
+    local _, out = grep.handler({ pattern = "foo" })
     test.assert.contains("could not search", out)
   end)
 

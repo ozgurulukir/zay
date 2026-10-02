@@ -8,6 +8,7 @@ const background = @import("background.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
 const lane_tool = @import("tools/lane.zig");
 const lua_mod = @import("lua/root.zig");
+const lua_registry_bridge = @import("lua/registry_bridge.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const os = @import("os.zig");
@@ -798,6 +799,32 @@ const test_dummy_run: *const fn (
     }
 }.run;
 
+const test_failed_run: *const fn (
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    args: []const u8,
+    env: tools.Env,
+) tools.Error!tools.Output = struct {
+    fn run(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        args: []const u8,
+        env: tools.Env,
+    ) tools.Error!tools.Output {
+        _ = io;
+        _ = cwd;
+        _ = args;
+        _ = env;
+        return .{
+            .stdout = try gpa.dupe(u8, "handler diagnostic"),
+            .stderr = try gpa.alloc(u8, 0),
+            .code = 1,
+        };
+    }
+}.run;
+
 const test_dummy_display: *const fn (
     gpa: std.mem.Allocator,
     args: []const u8,
@@ -874,6 +901,129 @@ fn makeCall(gpa: std.mem.Allocator, id: []const u8, name: []const u8, args: []co
         .name = try gpa.dupe(u8, name),
         .arguments = try gpa.dupe(u8, args),
     };
+}
+
+test "executor marks a non-zero plugin output as failed" {
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    const name = try gpa.dupe(u8, "lua__p__failed");
+    errdefer gpa.free(name);
+    const description = try gpa.dupe(u8, "failed plugin test tool");
+    errdefer gpa.free(description);
+    try registry.addPluginTool(gpa, .{
+        .name = name,
+        .description = description,
+        .schema = .{ .properties = &.{} },
+        .run = test_failed_run,
+        .display = test_dummy_display,
+        .userdata = undefined,
+        .userdata_free = test_dummy_free,
+    });
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = cwd,
+        .tool_registry = &registry,
+    });
+    const call = try makeCall(gpa, "plugin_failed", "lua__p__failed", "{}");
+    defer freeCall(gpa, call);
+    var result = try executor.runOne(call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "handler diagnostic") != null);
+}
+
+test "executor propagates a real Lua plugin failure to completion observers" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    const plugin_root = try std.fs.path.join(gpa, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "executor-plugin-failure",
+    });
+    defer gpa.free(plugin_root);
+    std.Io.Dir.cwd().createDirPath(std.testing.io, plugin_root) catch {};
+    var plugin_dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, plugin_root, .{});
+    defer plugin_dir.close(std.testing.io);
+    try plugin_dir.writeFile(std.testing.io, .{
+        .sub_path = "plugin.lua",
+        .data =
+        \\return { name = "executor-failure", version = "1.0.0", description = "executor failure test" }
+        ,
+    });
+    try plugin_dir.writeFile(std.testing.io, .{
+        .sub_path = "init.lua",
+        .data =
+        \\zay.register_tool({
+        \\  name = "fail",
+        \\  description = "returns an explicit failure",
+        \\  parameters = {},
+        \\  handler = function() return nil, "nope" end,
+        \\})
+        ,
+    });
+
+    var manager = lua_mod.PluginManager.init(gpa, std.testing.io, "", "");
+    defer manager.deinit();
+    _ = try manager.loadOne(plugin_root, false);
+
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    const descriptors = try lua_registry_bridge.buildPluginToolDescriptors(gpa, &manager);
+    for (descriptors) |descriptor| try registry.addPluginTool(gpa, descriptor);
+    gpa.free(descriptors);
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = cwd,
+        .tool_registry = &registry,
+        .plugin_manager = &manager,
+    });
+    const call = try makeCall(
+        gpa,
+        "lua-failure",
+        "lua__executor-failure__fail",
+        "{}",
+    );
+    defer freeCall(gpa, call);
+
+    const Capture = struct {
+        failed: bool = false,
+        fn onStarted(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        fn onFinished(ctx: *@This(), result: *const ToolResult) anyerror!void {
+            ctx.failed = result.failed;
+        }
+        fn approve(_: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return false;
+        }
+    };
+    var capture = Capture{};
+    const observer = ToolCallObserver(Capture){
+        .ctx = &capture,
+        .on_started = Capture.onStarted,
+        .on_finished = Capture.onFinished,
+        .approve_unsafe_bash = Capture.approve,
+    };
+
+    const results = try executor.runAll(&.{call}, observer);
+    defer {
+        for (results) |*result| result.deinit(gpa);
+        gpa.free(results);
+    }
+    try std.testing.expect(results[0].failed);
+    try std.testing.expect(capture.failed);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "nope") != null);
 }
 
 test "valid bash call still dispatches after schema validation" {

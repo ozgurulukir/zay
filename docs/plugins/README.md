@@ -134,8 +134,9 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 | `zay.move_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Move/rename a file or directory |
 | `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory (recursive opt-in) |
 
-All filesystem functions validate paths through `sanitizePath`: paths are
-resolved against the project root and **rejected if they escape it**. This
+All filesystem functions validate paths through `sanitizePath`: relative paths
+resolve against the active workspace/effective cwd and are **rejected if they
+escape it**. This
 makes the dedicated path ops (`mkdir`/`copy_path`/`move_path`/`delete_path`)
 safer and more precise than shell-outs: `zay.run_bash` commands pass through
 the shell safety classifier (destructive forms are hard-blocked with
@@ -366,8 +367,9 @@ shapes models already know from Claude Code / OpenCode / Zed agents:
   search via code-skeleton patterns with `__NAME__` wildcards), `ast_get_source` (`node_id` → numbered source
   snippet), `ast_query` (read-only SQL over `read_ast()` — single
   SELECT/WITH statement; chained statements and dot-commands rejected).
-  State lives in `.zay/sitting-duck/` (bootstrap marker + the `query.sql`
-  debug artifact). First example consuming `plugin.get_config()` and
+  State lives in `.zay/sitting-duck/` (bootstrap marker + an opt-in
+  `query.sql` debug artifact). Query text is sent through stdin and is not
+  persisted by default. First example consuming `plugin.get_config()` and
   `zay.shell_quote`: binary resolution is
   `plugins.sitting-duck.settings.duckdb_path` →
   `ZAY_SITTING_DUCK_BIN` → `duckdb` on PATH. Linux-first.
@@ -382,9 +384,12 @@ the plugin's tools.
 2. **Prefer dedicated tools over bash** — `delete_path` over `run_bash("rm")`,
    `find_files` over `run_bash("find")`. The dedicated tools are sandboxed;
    `run_bash` runs unclassified.
-3. **Handle errors gracefully** — return descriptive error strings
+3. **Handle errors gracefully** — return `nil, descriptive_message` for
+   operational failures, not a successful string that merely starts with
+   `Error:`
 4. **Keep handlers fast** — events are dispatched synchronously
 5. **Test with `test_runner`** — create `test.lua` in your plugin directory
 6. **Ship a `prompt.md`** — teach the model when to use each tool
 7. **Name tools with underscores** — `my_tool`, not `myTool`
-8. **Return strings from handlers** — the model reads the return value
+8. **Return strings from handlers** — use `string` for success and
+   `nil, message` for failure

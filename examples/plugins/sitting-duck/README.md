@@ -38,15 +38,17 @@ They are exposed to the model as `lua__sitting-duck__<tool>`.
   `.zay/sitting-duck/state.json` and re-verified once per session, so a
   duckdb upgrade triggers a re-install (the extension is built per DuckDB
   release).
-- **Linux-first.** Windows runs the plugin through git-bash and is untested.
+- **Cross-platform shell note.** POSIX uses `/dev/null`; Windows uses the
+  `run_bash` Git Bash bridge and DuckDB's native `NUL` device. On Windows,
+  install Git Bash and keep DuckDB on `PATH` or configure its native executable
+  path explicitly.
 
 ## Install
 
-1. Copy the plugin into Zay's plugin directory (from your Zay checkout):
-
-   ```bash
-   cp -r examples/plugins/sitting-duck ~/.config/zay/plugins/
-   ```
+1. Install the plugin directory using your normal Zay plugin installation
+   workflow (from your Zay checkout). Do not use a recursive shell copy as a
+   general file-operation workaround; use the dedicated path/file tools when
+   operating from inside Zay.
 
    Project-local alternative: `.zay/plugins/sitting-duck/` inside a repo
    (overrides a global plugin with the same name). On Windows the global
@@ -65,7 +67,9 @@ They are exposed to the model as `lua__sitting-duck__<tool>`.
    }
    ```
 
-   (an escaped-JSON-string `settings` form also works — see
+   (on Windows, a native path such as `C:/tools/duckdb/duckdb.exe` is also
+   accepted; forward slashes avoid shell-quoting surprises.) An
+   escaped-JSON-string `settings` form also works — see
    `docs/CONFIG.md`), or via the environment:
 
    ```bash
@@ -82,11 +86,12 @@ ast_outline"*. The first call bootstraps the extension; later calls are fast.
 
 ## Notes
 
-- All plugin state lives under `.zay/sitting-duck/` in the project: the
-  bootstrap marker (`state.json`) and the `query.sql` debug artifact (every
-  query error message points at it). Deleting the directory is safe — the
-  plugin re-bootstraps on the next call.
+- All plugin state lives under `.zay/sitting-duck/` in the active workspace:
+  the bootstrap marker (`state.json`) and, only when
+  `debug_query_artifact=true`, the `query.sql` debug artifact. Query text is
+  sent through stdin and is not persisted by default. Deleting the directory
+  is safe — the plugin re-bootstraps on the next call.
 - `ast_query` accepts a single read-only statement; chained statements and
   dot-commands are rejected.
-- Paths are confined to the project (relative paths only, no `..`, no `~`,
+- Paths are confined to the active workspace (relative paths only, no `..`, no `~`,
   no absolute paths); see `prompt.md` for the full tool contracts.

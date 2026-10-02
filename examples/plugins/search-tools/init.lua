@@ -13,6 +13,10 @@
 -- value quoted via the supplied `quote` function (regex mode only). rg exit
 -- codes the handler relies on: 0 = matches, 1 = no matches, 2 = error (e.g.
 -- bad regex); shell returns 127 when rg itself is missing.
+local function fail(message)
+  return nil, "Error: " .. message
+end
+
 local function build_rg_command(pattern, root, include, case_sensitive, quote)
   local argv = { "rg", "--line-number", "--no-heading", "--color", "never" }
   if not case_sensitive then
@@ -20,11 +24,17 @@ local function build_rg_command(pattern, root, include, case_sensitive, quote)
   end
   if include and include ~= "" then
     table.insert(argv, "--glob")
-    table.insert(argv, quote(include))
+    local quoted, err = quote(include)
+    if quoted == nil then return nil, err end
+    table.insert(argv, quoted)
   end
   table.insert(argv, "-e")
-  table.insert(argv, quote(pattern))
-  table.insert(argv, quote(root))
+  local quoted_pattern, pattern_err = quote(pattern)
+  if quoted_pattern == nil then return nil, pattern_err end
+  table.insert(argv, quoted_pattern)
+  local quoted_root, root_err = quote(root)
+  if quoted_root == nil then return nil, root_err end
+  table.insert(argv, quoted_root)
   return table.concat(argv, " ")
 end
 
@@ -133,13 +143,16 @@ local function native_substring_search(params, root, case_sensitive, max_results
   if file_restriction and file_restriction ~= "" then
     file_pattern = file_restriction
   end
-  local result = zay.search_files(root, params.pattern, {
+  local result, err = zay.search_files(root, params.pattern, {
     file_pattern = file_pattern,
     case_sensitive = case_sensitive,
     max_results = max_results,
   })
   if result == nil then
-    return "Error: could not search " .. root
+    return fail("could not search " .. root .. ": " .. tostring(err or "unknown error"))
+  end
+  if result.error then
+    return fail("could not search " .. root .. ": " .. tostring(result.error))
   end
   if result.total_matches == 0 then
     return "No matches found for: " .. params.pattern
@@ -185,7 +198,7 @@ zay.register_tool({
     },
     path = {
       type = "string",
-      description = "Root directory to search in (default: project root)",
+      description = "Root directory to search in (default: active workspace)",
       optional = true,
     },
     include = {
@@ -232,21 +245,27 @@ zay.register_tool({
     local shell_runner = zay.run_shell or zay.run_bash
     local dialect = (shell_runner == zay.run_shell) and "native" or "posix"
     local quote = function(s) return zay.shell_quote(s, dialect) end
-    local cmd = build_rg_command(params.pattern, root, params.include, case_sensitive, quote)
+    local cmd, quote_err = build_rg_command(params.pattern, root, params.include, case_sensitive, quote)
+    if cmd == nil then
+      return fail("could not quote regex search arguments: " .. tostring(quote_err or "unknown error"))
+    end
     -- rg over large repos can exceed the 30 s default; give it a 60 s budget.
-    local bash_result = shell_runner(cmd, { cwd = root, timeout = 60 })
+    local bash_result, shell_err = shell_runner(cmd, { cwd = root, timeout = 60 })
 
     if bash_result == nil then
-      return "Error: regex search failed"
+      return fail("regex search failed: " .. tostring(shell_err or "unknown error"))
     end
     if bash_result.code == 127 then
-      return "Error: regex search needs ripgrep (rg), which is not installed"
+      return fail("regex search needs ripgrep (rg), which is not installed")
     end
     if bash_result.code == 2 then
-      return "Error: invalid regex pattern: " .. (bash_result.stderr or "")
+      return fail("invalid regex pattern: " .. (bash_result.stderr or ""))
     end
     if bash_result.code == 1 or bash_result.stdout == "" then
       return "No matches found for: " .. params.pattern
+    end
+    if bash_result.code ~= 0 then
+      return fail("regex search failed (exit " .. tostring(bash_result.code) .. "): " .. (bash_result.stderr or "unknown error"))
     end
     return group_rg_output(bash_result.stdout, params.pattern, max_results)
   end,
@@ -264,7 +283,7 @@ zay.register_tool({
     },
     path = {
       type = "string",
-      description = "Root directory to search in (default: project root)",
+      description = "Root directory to search in (default: active workspace)",
       optional = true,
     },
     max_results = {
@@ -278,9 +297,9 @@ zay.register_tool({
     local max_results = math.max(1, math.min(math.floor(params.max_results or 100), 200))
     local opts = { max_results = max_results }
 
-    local result = zay.find_files(root, params.pattern, opts)
+    local result, err = zay.find_files(root, params.pattern, opts)
     if result == nil then
-      return "Error: glob failed for " .. params.pattern
+      return fail("glob failed for " .. params.pattern .. ": " .. tostring(err or "unknown error"))
     end
 
     -- When `path` pointed at a single file, keep only that file (the walk

@@ -16,7 +16,26 @@ Register a tool that the AI model can invoke.
 | `name` | string | yes | Tool identifier (lowercase, underscores). Must be unique within the plugin. Exposed to the AI model as `lua__<plugin>__<name>`. |
 | `description` | string | yes | Natural language description of what the tool does. The model uses this to decide when to call the tool. |
 | `parameters` | table | no | JSON Schema-like parameter definitions. Each key is a parameter name, each value is a parameter-schema table (below). Omitted or empty → the tool takes no parameters. |
-| `handler` | function | yes | Called with `(params)` when the model invokes the tool. `params` is a Lua table — JSON arguments from the model are automatically parsed. Must return a string. |
+| `handler` | function | yes | Called with `(params)` when the model invokes the tool. `params` is a Lua table — JSON arguments from the model are automatically parsed. Return one string on success, or `nil, message` for an operational failure. |
+
+Handlers have a two-result contract:
+
+```lua
+handler = function(params)
+  local result, err = zay.read_file(params.path, {})
+  if result == nil then
+    return nil, "Error: could not read " .. tostring(err or "unknown error")
+  end
+  return result.content
+end
+```
+
+The first form (`return "..."`) is a successful model-facing result even if
+the text begins with `Error:`. The second form (`return nil, "..."`) marks the
+tool call failed while preserving the diagnostic for the model. Lua exceptions
+and any other return shape are also reported as failed calls. Do not encode
+failure only in a successful string; callers and `tool_call_finished` rely on
+the status bit.
 
 **Parameter schema:**
 
@@ -247,7 +266,7 @@ All filesystem bridges (`read_file`, `write_file`, `edit_file`, `search_files`,
 `git -C <path>` workarounds needed. The effective cwd is:
 
 - A **lane worktree root** when the call is made from a lane worker agent.
-- The **resumed session's project root** after a cross-project `/resume`.
+- The **resumed session's bound workspace** after a cross-project `/resume`.
 - The **process cwd** (Zay's launch directory) when called outside tool
   dispatch (e.g. during `init.lua` load).
 
