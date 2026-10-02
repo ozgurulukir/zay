@@ -742,7 +742,7 @@ test "plugin manager discovers visible project plugins root" {
 
     const project_plugins = try std.fs.path.join(gpa, &.{ root, "project", "plugins" });
     defer gpa.free(project_plugins);
-    try std.Io.Dir.createDirPath(std.testing.io, project_plugins);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, project_plugins);
     try writeFixturePlugin(project_plugins, "visible_plugin", "return true");
 
     const cwd = try std.fs.path.join(gpa, &.{ root, "project" });

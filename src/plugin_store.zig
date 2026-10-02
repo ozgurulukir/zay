@@ -58,6 +58,7 @@ pub const CatalogBundle = struct {
                 return .{
                     .catalog_index = catalog_index,
                     .plugin_index = plugin_index,
+                    .catalog_source = catalog.source,
                     .store_name = catalog.name,
                     .plugin = plugin,
                 };
@@ -71,6 +72,7 @@ pub const CatalogBundle = struct {
 pub const Entry = struct {
     catalog_index: usize,
     plugin_index: usize,
+    catalog_source: []const u8,
     store_name: []const u8,
     plugin: *const Plugin,
 };
@@ -232,14 +234,33 @@ pub fn installSelected(
     io: std.Io,
     home_dir: []const u8,
     project_root: []const u8,
-    selection: usize,
+    catalog_source: []const u8,
+    plugin_id: []const u8,
 ) !InstallReport {
     var bundle = try loadCatalogs(gpa, io, home_dir, project_root);
     defer bundle.deinit(gpa);
-    const selected = bundle.entryAt(selection) orelse return error.PluginNotFound;
+    const selected = findEntry(&bundle, catalog_source, plugin_id) orelse return error.PluginNotFound;
     const install_dir = try paths.globalPluginsDir(gpa, io, home_dir);
     defer gpa.free(install_dir);
     return installPlugin(gpa, io, install_dir, selected.plugin);
+}
+
+fn findEntry(bundle: *const CatalogBundle, catalog_source: []const u8, plugin_id: []const u8) ?Entry {
+    for (bundle.catalogs, 0..) |catalog, catalog_index| {
+        if (!std.mem.eql(u8, catalog.source, catalog_source)) continue;
+        for (catalog.plugins, 0..) |*plugin, plugin_index| {
+            if (std.mem.eql(u8, plugin.id, plugin_id)) {
+                return .{
+                    .catalog_index = catalog_index,
+                    .plugin_index = plugin_index,
+                    .catalog_source = catalog.source,
+                    .store_name = catalog.name,
+                    .plugin = plugin,
+                };
+            }
+        }
+    }
+    return null;
 }
 
 fn installPlugin(
@@ -367,8 +388,10 @@ fn parseCatalog(
         appended = true;
     }
 
+    const source_copy = try gpa.dupe(u8, source);
+    errdefer gpa.free(source_copy);
     return .{
-        .source = try gpa.dupe(u8, source),
+        .source = source_copy,
         .name = name,
         .plugins = try plugins.toOwnedSlice(gpa),
     };
@@ -628,6 +651,30 @@ test "parseCatalog validates explicit remote files" {
     try std.testing.expectEqualStrings("Test Store", catalog.name);
     try std.testing.expectEqual(@as(usize, 1), catalog.plugins.len);
     try std.testing.expect(catalog.plugins[0].source == .files);
+}
+
+test "findEntry selects by catalog source and plugin id" {
+    const gpa = std.testing.allocator;
+    const json =
+        "{\"name\":\"Test Store\",\"plugins\":[{" ++
+        "\"id\":\"hello-world\",\"name\":\"Hello\",\"version\":\"1\",\"files\":[" ++
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\"}," ++
+        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\"}]}]}";
+    var catalog = try parseCatalog(gpa, "https://example.com/store.json", json, ".", false);
+    var catalog_owned = true;
+    defer if (catalog_owned) catalog.deinit(gpa);
+    var catalogs = try gpa.alloc(Catalog, 1);
+    var catalogs_owned = true;
+    defer if (catalogs_owned) gpa.free(catalogs);
+    catalogs[0] = catalog;
+    catalog_owned = false;
+    var bundle: CatalogBundle = .{ .catalogs = catalogs };
+    catalogs_owned = false;
+    defer bundle.deinit(gpa);
+
+    const entry = findEntry(&bundle, "https://example.com/store.json", "hello-world") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello-world", entry.plugin.id);
+    try std.testing.expectEqualStrings("https://example.com/store.json", entry.catalog_source);
 }
 
 test "parseCatalog rejects traversal and invalid plugin ids" {
