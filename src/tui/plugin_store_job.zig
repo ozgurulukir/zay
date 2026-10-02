@@ -62,11 +62,14 @@ const Worker = struct {
     io: std.Io,
     home_dir: []u8,
     project_root: []u8,
-    selection: usize = 0,
+    catalog_source: []u8 = &.{},
+    plugin_id: []u8 = &.{},
 
     fn deinit(self: *Worker) void {
         self.gpa.free(self.home_dir);
         self.gpa.free(self.project_root);
+        if (self.catalog_source.len > 0) self.gpa.free(self.catalog_source);
+        if (self.plugin_id.len > 0) self.gpa.free(self.plugin_id);
         self.gpa.destroy(self);
     }
 };
@@ -88,7 +91,8 @@ fn runInstall(worker: *Worker) InstallResult {
         worker.io,
         worker.home_dir,
         worker.project_root,
-        worker.selection,
+        worker.catalog_source,
+        worker.plugin_id,
     ) catch |err| {
         return .{ .failed = failureMessage(gpa, "Plugin installation failed", err) };
     };
@@ -100,7 +104,7 @@ pub fn startRefresh(app: *App) !void {
     const runtime = app.liveRuntime() orelse app.templateRuntime() orelse return;
     if (runtime.home_dir.len == 0 or runtime.cwd.len == 0) return;
 
-    const worker = try makeWorker(app, runtime.home_dir, runtime.cwd, 0);
+    const worker = try makeWorker(app, runtime.home_dir, runtime.cwd, null);
     errdefer worker.deinit();
     app.plugin_store.operation = .{ .refreshing = .{ .job = .{} } };
     app.plugin_store.operation.refreshing.job.spawn(app.io, worker, runRefresh) catch |err| {
@@ -120,7 +124,8 @@ pub fn startInstall(app: *App) !void {
     const count = app.plugin_store.catalogs.?.entryCount();
     if (selection >= count) return;
 
-    const worker = try makeWorker(app, runtime.home_dir, runtime.cwd, selection);
+    const entry = app.plugin_store.catalogs.?.entryAt(selection) orelse return;
+    const worker = try makeWorker(app, runtime.home_dir, runtime.cwd, entry);
     errdefer worker.deinit();
     app.plugin_store.operation = .{ .installing = .{ .job = .{} } };
     app.plugin_store.operation.installing.job.spawn(app.io, worker, runInstall) catch |err| {
@@ -207,19 +212,24 @@ pub fn active(app: *const App) bool {
     return app.plugin_store.operation != .idle;
 }
 
-fn makeWorker(app: *App, home_dir: []const u8, project_root: []const u8, selection: usize) !*Worker {
+fn makeWorker(app: *App, home_dir: []const u8, project_root: []const u8, entry: ?plugin_store.Entry) !*Worker {
     const worker = try app.gpa.create(Worker);
     errdefer app.gpa.destroy(worker);
     const home_copy = try app.gpa.dupe(u8, home_dir);
     errdefer app.gpa.free(home_copy);
     const project_copy = try app.gpa.dupe(u8, project_root);
     errdefer app.gpa.free(project_copy);
+    const catalog_source: []u8 = if (entry) |selected| try app.gpa.dupe(u8, selected.catalog_source) else &.{};
+    errdefer if (catalog_source.len > 0) app.gpa.free(catalog_source);
+    const plugin_id: []u8 = if (entry) |selected| try app.gpa.dupe(u8, selected.plugin.id) else &.{};
+    errdefer if (plugin_id.len > 0) app.gpa.free(plugin_id);
     worker.* = .{
         .gpa = app.gpa,
         .io = app.io,
         .home_dir = home_copy,
         .project_root = project_copy,
-        .selection = selection,
+        .catalog_source = catalog_source,
+        .plugin_id = plugin_id,
     };
     return worker;
 }
