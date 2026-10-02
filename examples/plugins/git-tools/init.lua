@@ -3,6 +3,10 @@
 -- wrap Zay's git bridge functions. The behavioral guidance (when to commit,
 -- what to inspect first) lives in prompt.md, not in code.
 
+local function fail(message)
+  return nil, "Error: " .. message
+end
+
 -- ── git_status ──────────────────────────────────────────────────────
 
 zay.register_tool({
@@ -10,16 +14,16 @@ zay.register_tool({
   description = "Show the current branch and working tree status (porcelain format). Use this before proposing changes or a commit to see what is modified, staged, or untracked.",
   parameters = {},
   handler = function()
-    local branch = zay.git_branch()
-    local status = zay.git_status()
+    local branch, branch_err = zay.git_branch()
+    local status, status_err = zay.git_status()
     if status == nil then
-      return "Error: not a git repository (or git failed)"
+      return fail("not a git repository (or git failed): " .. tostring(status_err or "unknown error"))
     end
     -- git branch --show-current returns "" on a detached HEAD (and the bridge
     -- now returns nil + error outside a repo). Treat empty as a distinct case
     -- rather than printing a blank "Branch: ".
     if branch == nil or branch == "" then
-      return "Error: could not determine branch (detached HEAD or not a git repository)"
+      return fail("could not determine branch (detached HEAD or not a git repository): " .. tostring(branch_err or "unknown error"))
     end
     local out = string.format("Branch: %s\n", branch)
     if status and #status > 0 then
@@ -44,9 +48,9 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    local diff = zay.git_diff(params.path)
+    local diff, err = zay.git_diff(params.path)
     if diff == nil then
-      return "Error: git diff failed"
+      return fail("git diff failed: " .. tostring(err or "unknown error"))
     end
     if diff == "" then
       return "No uncommitted changes."
@@ -74,9 +78,9 @@ zay.register_tool({
     if type(n) ~= "number" or n < 1 or n > 1000 or math.floor(n) ~= n then
       n = 10
     end
-    local log = zay.git_log(n)
+    local log, err = zay.git_log(n)
     if log == nil then
-      return "Error: git log failed"
+      return fail("git log failed: " .. tostring(err or "unknown error"))
     end
     if log == "" then
       return "No commits found."
@@ -96,9 +100,9 @@ zay.register_tool({
   description = "Show the current branch name. Lightweight; use this when you only need the branch, not the full status.",
   parameters = {},
   handler = function()
-    local branch = zay.git_branch()
+    local branch, err = zay.git_branch()
     if branch == nil then
-      return "Error: could not determine branch (not a git repository?)"
+      return fail("could not determine branch (not a git repository?): " .. tostring(err or "unknown error"))
     end
     return "Current branch: " .. branch
   end,
@@ -117,16 +121,16 @@ zay.register_tool({
   },
   handler = function(params)
     if not params.files or params.files == "" then
-      return "Error: files parameter is required"
+      return fail("files parameter is required")
     end
-    local result = zay.git_add(params.files)
+    local result, err = zay.git_add(params.files)
     if result == nil then
-      return "Error: git add failed"
+      return fail("git add failed: " .. tostring(err or "unknown error"))
     end
     if result.success then
       return "Staged files: " .. params.files
     end
-    return "Error: git add failed — " .. (result.output or "unknown error")
+    return fail("git add failed — " .. (result.output or "unknown error"))
   end,
 })
 
@@ -153,7 +157,7 @@ zay.register_tool({
   },
   handler = function(params)
     if not params.message or params.message == "" then
-      return "Error: commit message is required"
+      return fail("commit message is required")
     end
     local opts = {}
     if params.files and params.files ~= "" then
@@ -164,14 +168,14 @@ zay.register_tool({
       opts.staged_only = true
     end
 
-    local result = zay.git_commit(params.message, opts)
+    local result, err = zay.git_commit(params.message, opts)
     if result == nil then
-      return "Error: git commit failed"
+      return fail("git commit failed: " .. tostring(err or "unknown error"))
     end
     if result.success then
       return "Committed: " .. (result.output or params.message)
     end
-    return "Error: commit failed — " .. (result.output or "unknown error") ..
-      "\n\nFix the issue and create a new commit; do not amend the failed commit."
+    return fail("commit failed — " .. (result.output or "unknown error") ..
+      "\n\nFix the issue and create a new commit; do not amend the failed commit.")
   end,
 })

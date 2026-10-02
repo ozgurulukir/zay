@@ -625,16 +625,35 @@ pub const pushJsonValue = json_bridge.pushJsonValue;
 pub const pushJsonToLua = json_bridge.pushJsonToLua;
 pub const luaValueToJsonString = json_bridge.luaValueToJsonString;
 
+/// The owned result of one Lua plugin tool handler call.
+///
+/// `code == 0` is a successful model-facing response. A non-zero code keeps
+/// the response text available to the model while marking the tool call as a
+/// failure in the shared executor pipeline.
+pub const ToolHandlerResult = struct {
+    text: []u8,
+    code: u8 = 0,
+
+    pub fn deinit(self: *ToolHandlerResult, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        self.* = undefined;
+    }
+};
+
 /// Call a registered tool handler by index. Pushes the params table onto
-/// the Lua stack, calls the handler, and returns the result string.
-/// The caller must keep the Lua state alive during the call.
-/// Returns the handler's return value as a string (owned by caller).
+/// the Lua stack, calls the handler, and returns an owned result.
+///
+/// A handler may return either `string` for success or `nil, string` for an
+/// operational failure. The latter keeps the diagnostic as model-facing text
+/// while setting a non-zero status. Lua exceptions and malformed return
+/// shapes are represented the same way as failed handler results; dispatcher
+/// lookup/state errors remain Zig errors.
 pub fn callToolHandler(
     L: *c.lua_State,
     gpa: std.mem.Allocator,
     tool_index: c_int,
     params_json: []const u8,
-) ![]u8 {
+) !ToolHandlerResult {
     // Get zay_tools[index].handler_ref
     _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
     if (c.lua_isnil(L, -1)) {
@@ -660,24 +679,56 @@ pub fn callToolHandler(
     // limits mean "per tool call", not "per session" (T1/T2).
     sandbox_mod.resetInstructionBudget(L);
 
-    // Call handler(params_json)
-    const rc = c.lua_pcallk(L, 1, 1, 0, 0, null);
+    // Call handler(params_json) and reserve both return slots. A one-value
+    // string return leaves the second slot as nil; an explicit failure is
+    // `nil, message`.
+    const rc = c.lua_pcallk(L, 1, 2, 0, 0, null);
     if (rc != c.LUA_OK) {
         const err_msg = c.lua_tolstring(L, -1, null);
         const msg = if (err_msg) |p| std.mem.sliceTo(p, 0) else "unknown error";
-        const result = try std.fmt.allocPrint(gpa, "Lua tool error: {s}", .{msg});
+        const result = std.fmt.allocPrint(gpa, "Lua tool error: {s}", .{msg}) catch |err| {
+            c.lua_pop(L, 2); // pop error and tools table
+            return err;
+        };
         c.lua_pop(L, 1); // pop error
         c.lua_pop(L, 1); // pop tools table
-        return result;
+        return .{ .text = result, .code = 1 };
     }
 
-    // Get result string
-    var len: usize = 0;
-    const result_ptr = c.lua_tolstring(L, -1, &len);
-    const result = if (result_ptr) |p| try gpa.dupe(u8, p[0..len]) else try gpa.dupe(u8, "");
+    // Stack layout: [ ... | tools_table | first_result | second_result ].
+    const first_is_string = c.lua_type(L, -2) == c.LUA_TSTRING;
+    const first_is_nil = c.lua_isnil(L, -2);
+    const second_is_string = c.lua_type(L, -1) == c.LUA_TSTRING;
+    const second_is_nil = c.lua_isnil(L, -1);
 
-    c.lua_pop(L, 2); // pop result and tools table
-    return result;
+    if (first_is_string and second_is_nil) {
+        var len: usize = 0;
+        const result_ptr = c.lua_tolstring(L, -2, &len).?;
+        const result = gpa.dupe(u8, result_ptr[0..len]) catch |err| {
+            c.lua_pop(L, 3);
+            return err;
+        };
+        c.lua_pop(L, 3);
+        return .{ .text = result };
+    }
+
+    if (first_is_nil and second_is_string) {
+        var len: usize = 0;
+        const result_ptr = c.lua_tolstring(L, -1, &len).?;
+        const result = gpa.dupe(u8, result_ptr[0..len]) catch |err| {
+            c.lua_pop(L, 3);
+            return err;
+        };
+        c.lua_pop(L, 3);
+        return .{ .text = result, .code = 1 };
+    }
+
+    const contract = gpa.dupe(u8, "Lua tool handler must return a string, or nil and an error message") catch |err| {
+        c.lua_pop(L, 3);
+        return err;
+    };
+    c.lua_pop(L, 3);
+    return .{ .text = contract, .code = 1 };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

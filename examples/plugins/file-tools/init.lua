@@ -5,6 +5,10 @@
 
 -- ── helpers ─────────────────────────────────────────────────────────
 
+local function fail(message)
+  return nil, "Error: " .. message
+end
+
 -- Binary file extensions we refuse to read as text.
 local BINARY_EXTS = {
   zip = true, gz = true, tar = true, tgz = true, bz2 = true, ["7z"] = true,
@@ -95,7 +99,7 @@ zay.register_tool({
   parameters = {
     path = {
       type = "string",
-      description = "File path to read (relative to project root or absolute)",
+      description = "File path to read (relative to the current active workspace or absolute)",
     },
     offset = {
       type = "integer",
@@ -112,15 +116,15 @@ zay.register_tool({
     local limit = math.max(1, math.floor(params.limit or 2000))
     local offset = math.max(1, math.floor(params.offset or 1))
 
-    local result = zay.read_file(params.path, {})
+    local result, err = zay.read_file(params.path, {})
     if result == nil then
-      return "Error: could not read " .. params.path
+      return fail("could not read " .. params.path .. ": " .. tostring(err or "unknown error"))
     end
 
     -- Binary guard.
     local ext = extension(result.path)
     if is_binary(ext, result.content:sub(1, 1024)) then
-      return "Error: cannot read binary file: " .. result.path
+      return fail("cannot read binary file: " .. result.path)
     end
 
     -- Split into numbered lines, applying offset/limit.
@@ -164,7 +168,7 @@ zay.register_tool({
   parameters = {
     path = {
       type = "string",
-      description = "File path to write (relative to project root or absolute)",
+      description = "File path to write (relative to the current active workspace or absolute)",
     },
     content = {
       type = "string",
@@ -172,11 +176,11 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    local ok = zay.write_file(params.path, params.content)
+    local ok, err = zay.write_file(params.path, params.content)
     if ok then
       return string.format("Wrote %d bytes to %s", #params.content, params.path)
     end
-    return "Error: could not write to " .. params.path
+    return fail("could not write to " .. params.path .. ": " .. tostring(err or "unknown error"))
   end,
 })
 
@@ -241,25 +245,25 @@ zay.register_tool({
 
     -- The description promises new_string must differ from old_string.
     if params.old_string == params.new_string then
-      return "Error: new_string must differ from old_string"
+      return fail("new_string must differ from old_string")
     end
 
     -- Read current content to validate before mutating.
-    local result = zay.read_file(params.path, {})
+    local result, read_err = zay.read_file(params.path, {})
     if result == nil then
-      return "Error: could not read " .. params.path .. " (read the file before editing)"
+      return fail("could not read " .. params.path .. " (read the file before editing): " .. tostring(read_err or "unknown error"))
     end
     local content = result.content
 
     local occurrences = count_occurrences(content, params.old_string)
     if occurrences == 0 then
-      return "Error: old_string not found in " .. params.path
+      return fail("old_string not found in " .. params.path)
     end
     if not replace_all_flag and occurrences > 1 then
-      return string.format(
-        "Error: old_string found %d times in %s. Provide more surrounding lines to make it unique, or set replace_all=true.",
+      return fail(string.format(
+        "old_string found %d times in %s. Provide more surrounding lines to make it unique, or set replace_all=true.",
         occurrences, params.path
-      )
+      ))
     end
 
     local new_content, n
@@ -267,20 +271,20 @@ zay.register_tool({
       new_content, n = replace_all(content, params.old_string, params.new_string)
     else
       -- Zay's edit_file replaces the first occurrence only.
-      local ok = zay.edit_file(params.path, params.old_string, params.new_string)
+      local ok, err = zay.edit_file(params.path, params.old_string, params.new_string)
       if not ok then
-        return "Error: edit failed on " .. params.path
+        return fail("edit failed on " .. params.path .. ": " .. tostring(err or "unknown error"))
       end
       n = 1
       return string.format("Edited %s (1 replacement)", params.path)
     end
 
     if n == 0 then
-      return "Error: old_string not found in " .. params.path
+      return fail("old_string not found in " .. params.path)
     end
-    local ok = zay.write_file(params.path, new_content)
+    local ok, err = zay.write_file(params.path, new_content)
     if not ok then
-      return "Error: could not write edited content to " .. params.path
+      return fail("could not write edited content to " .. params.path .. ": " .. tostring(err or "unknown error"))
     end
     return string.format("Edited %s (%d replacements)", params.path, n)
   end,
@@ -294,15 +298,15 @@ zay.register_tool({
   parameters = {
     path = {
       type = "string",
-      description = "Directory path to list (relative to project root or absolute, default: project root)",
+      description = "Directory path to list (relative to the current active workspace or absolute, default: active workspace)",
       optional = true,
     },
   },
   handler = function(params)
     local dir = params.path or "."
-    local result = zay.list_dir(dir)
+    local result, err = zay.list_dir(dir)
     if result == nil then
-      return "Error: could not list " .. dir
+      return fail("could not list " .. dir .. ": " .. tostring(err or "unknown error"))
     end
 
     -- Collect and sort folders and files separately (Zed format).

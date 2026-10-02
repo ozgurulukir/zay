@@ -209,22 +209,22 @@ zay.register_tool({
   parameters = {
     path = {
       type = "string",
-      description = "File path to read (relative to project root or absolute)",
+      description = "File path to read (relative to the active workspace or absolute)",
     },
     offset = { type = "integer", description = "Line number to start reading from (1-indexed, optional)", optional = true },
     limit = { type = "integer", description = "Maximum number of lines to read (default 2000)", optional = true },
   },
   handler = function(params)
     ...
-    local result = zay.read_file(params.path, {})
+    local result, err = zay.read_file(params.path, {})
     if result == nil then
-      return "Error: could not read " .. params.path
+      return nil, "Error: could not read " .. params.path .. ": " .. tostring(err or "unknown error")
     end
 
     -- Binary guard: extension blacklist + null-byte sniff on a sample.
     local ext = extension(result.path)
     if is_binary(ext, result.content:sub(1, 1024)) then
-      return "Error: cannot read binary file: " .. result.path
+      return nil, "Error: cannot read binary file: " .. result.path
     end
 
     -- Split into numbered lines, applying offset/limit.
@@ -251,15 +251,15 @@ Key points:
 Registers `create_directory`, `copy_path`, `move_path`, and `delete_path` —
 sandboxed alternatives to bash `cp`/`mv`/`rm`/`mkdir`. Every operation goes
 through Zay's path validator (`sanitizePath`), so traversal outside the
-project root is rejected. That is the point of the example: `zay.run_bash`
+active workspace is rejected. That is the point of the example: `zay.run_bash`
 commands do pass the shell-safety classifier, but that gate only blocks
 destructive patterns — it does not confine paths, so a plain `cp` could still
-write outside the project root. The dedicated bridges carry no shell-quoting
+write outside the active workspace. The dedicated bridges carry no shell-quoting
 or classification burden at all.
 
 Key points:
 - Prefer dedicated path bridges over shell-outs for file operations
-- Confinement is the project root of the **effective cwd** (lane-aware —
+- Confinement is the active workspace of the **effective cwd** (lane-aware —
   see the [API reference](api-reference.md))
 - `delete_path` is recursive only via explicit `opts.recursive`
 
@@ -281,7 +281,7 @@ zay.register_tool({
   description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). ...",
   parameters = {
     pattern = { type = "string", description = "Text pattern to search for" },
-    path = { type = "string", description = "Root directory to search in (default: project root)", optional = true },
+    path = { type = "string", description = "Root directory to search in (default: active workspace)", optional = true },
     include = { type = "string", description = "File glob filter (e.g. '*.zig', '*.lua')", optional = true },
     regex = { type = "boolean", description = "Treat pattern as a regex via ripgrep (default false = literal substring via built-in search)", optional = true },
     case_sensitive = { type = "boolean", description = "Case-sensitive search (default false)", optional = true },

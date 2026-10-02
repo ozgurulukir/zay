@@ -89,6 +89,11 @@ test.describe("manual track_file_op", function()
     test.assert.contains("Tracked read on a.txt", out)
     test.assert.contains("Manually tracked: 1", file_stats.handler({}))
   end)
+
+  test.it("returns a failed result for an invalid manual operation", function()
+    local _, err = track_file_op.handler({ operation = "chmod", path = "a.txt" })
+    test.assert.contains("invalid operation", err)
+  end)
 end)
 
 test.run()

@@ -20,6 +20,11 @@
 local TODOS_FILE = ".zay/todos.txt"
 local PLANS_FILE = ".zay/todos/plans.json"
 local PLANS_DIR = ".zay/todos"
+local META_FILE = ".zay/todos/metadata.json"
+
+local function fail(message)
+  return nil, "Error: " .. message
+end
 
 -- ── date helpers ────────────────────────────────────────────────────
 
@@ -49,6 +54,26 @@ end
 local function task_id(t, index)
   if t.id then return tostring(t.id) end
   return tostring(index)
+end
+
+local function clone_task(task)
+  local copy = {}
+  for key, value in pairs(task) do copy[key] = value end
+  return copy
+end
+
+local function clone_tasks(tasks)
+  local copy = {}
+  for i, task in ipairs(tasks) do copy[i] = clone_task(task) end
+  return copy
+end
+
+local function is_missing_error(err)
+  if err == nil then return true end
+  local message = tostring(err):lower()
+  return message:find("notfound", 1, true) ~= nil
+    or message:find("no such file", 1, true) ~= nil
+    or message:find("enoent", 1, true) ~= nil
 end
 
 -- ── todo.txt parser ─────────────────────────────────────────────────
@@ -198,60 +223,146 @@ end
 
 -- ── todo.txt file I/O ───────────────────────────────────────────────
 
--- Load todos from disk into _G.todos (a 1-indexed array of task records).
+-- Load todos from disk into a 1-indexed array of task records.
 -- Reads fresh on every call rather than caching across turns: todo.txt is small
 -- and a stale cache previously masked edits made in an external editor (the
 -- cache was only cleared by todo_write). This keeps the in-Lua view always
 -- consistent with disk.
-local function load_todos()
-  _G.todos = {}
-
-  local result = zay.read_file(TODOS_FILE, {})
-  if result == nil then
-    return true -- file doesn't exist yet; start with empty list
-  end
-
-  for line in result.content:gmatch("[^\r\n]+") do
-    local t = parse_line(line)
-    if t.text ~= "" or t.done then
-      table.insert(_G.todos, t)
-    end
-  end
-  return true
+local function set_task_id(task, id)
+  task.id = id
+  task.tags["id"] = tostring(id)
+  task.text = task.text:gsub("%s*id:%d+%s*$", "") .. " id:" .. id
 end
 
--- Persist _G.todos back to disk. Returns true on success, or nil + err so
+local function parse_tasks(content)
+  local tasks = {}
+  local ids = {}
+  local max_id = 0
+  for line in content:gmatch("[^\r\n]+") do
+    local t = parse_line(line)
+    if t.text ~= "" or t.done then
+      if t.tags.id ~= nil and t.id == nil then
+        return nil, "invalid numeric id tag in todo.txt"
+      end
+      if t.id ~= nil then
+        if t.id < 1 or math.floor(t.id) ~= t.id then
+          return nil, "invalid numeric id in todo.txt"
+        end
+        if ids[t.id] then
+          return nil, "duplicate task id:" .. t.id .. " in todo.txt"
+        end
+        ids[t.id] = true
+        if t.id > max_id then max_id = t.id end
+      end
+      table.insert(tasks, t)
+    end
+  end
+  return tasks, max_id, ids
+end
+
+local function read_next_id(max_id)
+  local result, err = zay.read_file(META_FILE, {})
+  if result == nil then
+    if not is_missing_error(err) then
+      return nil, "could not read todo metadata: " .. tostring(err or "unknown error")
+    end
+    return max_id + 1
+  end
+  local decoded, decode_err = zay.json_decode(result.content)
+  if type(decoded) ~= "table" or decoded.version ~= 1 or type(decoded.next_id) ~= "number"
+    or decoded.next_id < 1 or math.floor(decoded.next_id) ~= decoded.next_id then
+    return nil, "todo metadata is malformed; repair " .. META_FILE
+      .. " before adding tasks"
+  end
+  return math.max(decoded.next_id, max_id + 1)
+end
+
+local function load_todos()
+  local result, err = zay.read_file(TODOS_FILE, {})
+  local content = ""
+  if result == nil then
+    if not is_missing_error(err) then
+      return nil, "could not read todos: " .. tostring(err or "unknown error")
+    end
+  else
+    content = result.content
+  end
+
+  local tasks, max_id, ids = parse_tasks(content)
+  if tasks == nil then return nil, max_id end
+  local next_id, metadata_err = read_next_id(max_id)
+  if next_id == nil then return nil, metadata_err end
+  for _, task in ipairs(tasks) do
+    if task.id == nil then
+      while ids[next_id] do next_id = next_id + 1 end
+      set_task_id(task, next_id)
+      ids[next_id] = true
+      next_id = next_id + 1
+    end
+  end
+  return tasks, nil, next_id
+end
+
+-- Persist a candidate task list back to disk. Returns true on success, or nil + err so
 -- mutating handlers can surface a failed write instead of reporting success
 -- while nothing was persisted (persist-before-cache doctrine).
-local function save_todos()
+local function save_todos(tasks)
   local lines = {}
-  for _, t in ipairs(_G.todos) do
+  for _, t in ipairs(tasks) do
     local line = render_line(t)
     if line ~= "" then table.insert(lines, line) end
   end
   return zay.write_file(TODOS_FILE, table.concat(lines, "\n") .. "\n")
 end
 
+local function save_metadata(next_id)
+  local made, mkdir_err = zay.mkdir(PLANS_DIR)
+  if not made then return nil, "could not create metadata directory: " .. tostring(mkdir_err or "unknown error") end
+  local json, encode_err = zay.json_encode({ version = 1, next_id = next_id }, { pretty = true })
+  if json == nil then return nil, encode_err or "could not encode todo metadata" end
+  return zay.write_file(META_FILE, json)
+end
+
+local function persist_todos(tasks, next_id)
+  local ok, err = save_todos(tasks)
+  if not ok then return nil, "Error: could not save todos: " .. tostring(err or "unknown error") end
+  local meta_ok, meta_err = save_metadata(next_id)
+  if not meta_ok then
+    return nil, "Error: todos were saved, but metadata was not: " .. tostring(meta_err or "unknown error")
+  end
+  _G.todos = tasks
+  return true
+end
+
 -- ── plans.json file I/O ─────────────────────────────────────────────
 
--- Load the plan sidecar. Returns a table keyed by id-string. A missing or
--- corrupt file yields an empty table (plans are best-effort; we never let a
--- bad sidecar block the task list).
+-- Load the plan sidecar. A missing file is an empty map; malformed existing
+-- data is an error so plan mutations cannot overwrite user data with `{}`.
 local function load_plans()
-  local result = zay.read_file(PLANS_FILE, {})
+  local result, err = zay.read_file(PLANS_FILE, {})
   if result == nil then
-    return {}
+    if is_missing_error(err) then return {} end
+    return nil, "could not read plans: " .. tostring(err or "unknown error")
   end
-  local decoded = zay.json_decode(result.content)
+  local decoded, decode_err = zay.json_decode(result.content)
   if decoded == nil then
-    -- Corrupt JSON: start fresh rather than failing the whole plugin.
-    return {}
+    return nil, "plans sidecar is malformed: " .. tostring(decode_err or "invalid JSON")
   end
-  -- The sidecar is hand-editable; it may contain valid-but-scalar JSON (42,
-  -- "x", [1]). Callers index plans[key], which raises on a non-table. Guard
-  -- here so a bad sidecar degrades to an empty plan set, never a crash.
   if type(decoded) ~= "table" then
-    return {}
+    return nil, "plans sidecar is malformed: expected an object"
+  end
+  for key, plan in pairs(decoded) do
+    if type(key) ~= "string" or type(plan) ~= "table"
+      or type(plan.summary) ~= "string" or type(plan.steps) ~= "table"
+      or (plan.notes ~= nil and type(plan.notes) ~= "string") then
+      return nil, "plans sidecar is malformed: invalid plan shape for " .. tostring(key)
+    end
+    for index, step in ipairs(plan.steps) do
+      if type(step) ~= "table" or type(step.text) ~= "string"
+        or type(step.done) ~= "boolean" then
+        return nil, "plans sidecar is malformed: invalid step " .. tostring(index)
+      end
+    end
   end
   return decoded
 end
@@ -259,21 +370,25 @@ end
 -- Persist plans back to the sidecar with pretty indentation so a human can read
 -- or hand-edit it in a text editor. Returns true on success, or nil + err.
 local function save_plans(plans)
-  zay.mkdir(PLANS_DIR)
-  local json = zay.json_encode(plans, { pretty = true })
+  local made, mkdir_err = zay.mkdir(PLANS_DIR)
+  if not made then return nil, "could not create plans directory: " .. tostring(mkdir_err or "unknown error") end
+  local json, encode_err = zay.json_encode(plans, { pretty = true })
   if json == nil then
-    return nil, "could not encode plans"
+    return nil, encode_err or "could not encode plans"
   end
   return zay.write_file(PLANS_FILE, json)
 end
 
--- Surface a failed save as a clean error string (B5). Returns the error string
--- when `ok` is nil, else nil so the caller proceeds to report success.
-local function save_error(ok, err, what)
-  if ok == nil then
-    return string.format("Error: could not save %s: %s", what, err or "unknown error")
+local function clone_plans(plans)
+  local copy = {}
+  for key, plan in pairs(plans) do
+    local plan_copy = { summary = plan.summary, notes = plan.notes, steps = {} }
+    for index, step in ipairs(plan.steps or {}) do
+      plan_copy.steps[index] = { text = step.text, done = step.done }
+    end
+    copy[key] = plan_copy
   end
-  return nil
+  return copy
 end
 
 -- Count the steps in a plan, defensively (missing steps table -> 0).
@@ -291,11 +406,13 @@ end
 -- shows a compact plan marker (count only) so the list stays small; plan
 -- bodies are fetched separately via todo_get_plan.
 local function summarize(include_done)
-  load_todos()
-  local plans = load_plans()
+  local todos, todo_err = load_todos()
+  if todos == nil then return nil, todo_err end
+  local plans, plans_err = load_plans()
+  if plans == nil then return nil, plans_err end
   local open_count = 0
   local done_count = 0
-  for _, t in ipairs(_G.todos) do
+  for _, t in ipairs(todos) do
     if t.done then done_count = done_count + 1 else open_count = open_count + 1 end
   end
 
@@ -303,7 +420,7 @@ local function summarize(include_done)
   table.insert(out, string.format("Todo list (%d open, %d done):", open_count, done_count))
   table.insert(out, "")
 
-  if #_G.todos == 0 then
+  if #todos == 0 then
     table.insert(out, "(no tasks yet — use todo_add to create one)")
     return table.concat(out, "\n")
   end
@@ -316,7 +433,7 @@ local function summarize(include_done)
   end
 
   local indexed = {}
-  for i, t in ipairs(_G.todos) do
+  for i, t in ipairs(todos) do
     table.insert(indexed, { task = t, idx = i, key = sort_key(t, i) })
   end
   table.sort(indexed, function(a, b) return a.key < b.key end)
@@ -357,7 +474,9 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    return summarize(params.include_done == true)
+    local out, err = summarize(params.include_done == true)
+    if out == nil then return fail(err) end
+    return out
   end,
 })
 
@@ -378,18 +497,25 @@ zay.register_tool({
   },
   handler = function(params)
     if not params.text or params.text == "" then
-      return "Error: task text is required"
+      return fail("task text is required")
     end
-    load_todos()
-
-    -- Assign the next stable id: scan existing id: tags for the max, then +1.
-    -- This keeps ids monotonic and stable across delete/reorder (unlike array
-    -- indices, which shift on table.remove).
-    local max_id = 0
-    for _, t in ipairs(_G.todos) do
-      if t.id and t.id > max_id then max_id = t.id end
+    local priority = params.priority
+    if priority ~= nil and priority ~= "" then
+      if type(priority) ~= "string" or #priority ~= 1 then
+        return fail("priority must be a single letter A-Z or empty")
+      end
+      priority = priority:upper()
+      local priority_code = priority:byte()
+      if priority_code < string.byte("A") or priority_code > string.byte("Z") then
+        return fail("priority must be a single letter A-Z or empty")
+      end
+    elseif priority == "" then
+      priority = nil
     end
-    local new_id = max_id + 1
+    local current, load_err, next_id = load_todos()
+    if current == nil then return fail(load_err) end
+    local candidate = clone_tasks(current)
+    local new_id = next_id
 
     -- Append id:N to the text so it round-trips through todo.txt on disk.
     -- Strip only a TRAILING id tag, then append the new one — a mid-sentence
@@ -399,7 +525,7 @@ zay.register_tool({
 
     local t = {
       done = false,
-      priority = params.priority,
+      priority = priority,
       created = today(),
       completed = nil,
       text = text,
@@ -414,10 +540,12 @@ zay.register_tool({
     for key, val in text:gmatch("(%w+):(%S+)") do
       if key ~= "http" and key ~= "https" then t.tags[key] = val end
     end
-    table.insert(_G.todos, t)
-    local save_err = save_error(save_todos(), "todos")
-    if save_err then return save_err end
-    return "Added task #" .. #_G.todos .. " (id:" .. new_id .. "): " .. render_line(t) .. "\n\n" .. summarize(false)
+    table.insert(candidate, t)
+    local saved, save_err = persist_todos(candidate, new_id + 1)
+    if not saved then return nil, save_err end
+    local out, summary_err = summarize(false)
+    if out == nil then return fail(summary_err) end
+    return "Added task #" .. #candidate .. " (id:" .. new_id .. "): " .. render_line(t) .. "\n\n" .. out
   end,
 })
 
@@ -432,19 +560,23 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    load_todos()
-    if not is_index(params.id, #_G.todos) then
-      return "Error: invalid task id (use todo_list to see valid ids)"
+    local current, load_err, next_id = load_todos()
+    if current == nil then return fail(load_err) end
+    if not is_index(params.id, #current) then
+      return fail("invalid task id (use todo_list to see valid ids)")
     end
-    local t = _G.todos[params.id]
+    local candidate = clone_tasks(current)
+    local t = candidate[params.id]
     if t.done then
       return "Task #" .. params.id .. " is already done."
     end
     t.done = true
     t.completed = today()
-    local save_err = save_error(save_todos(), "todos")
-    if save_err then return save_err end
-    return "Completed task #" .. params.id .. ": " .. t.text .. "\n\n" .. summarize(false)
+    local saved, save_err = persist_todos(candidate, next_id)
+    if not saved then return nil, save_err end
+    local out, summary_err = summarize(false)
+    if out == nil then return fail(summary_err) end
+    return "Completed task #" .. params.id .. ": " .. t.text .. "\n\n" .. out
   end,
 })
 
@@ -459,14 +591,30 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    load_todos()
-    if not is_index(params.id, #_G.todos) then
-      return "Error: invalid task id (use todo_list to see valid ids)"
+    local current, load_err, next_id = load_todos()
+    if current == nil then return fail(load_err) end
+    if not is_index(params.id, #current) then
+      return fail("invalid task id (use todo_list to see valid ids)")
     end
-    local removed = table.remove(_G.todos, params.id)
-    local save_err = save_error(save_todos(), "todos")
-    if save_err then return save_err end
-    return "Deleted: " .. removed.text .. "\n\n" .. summarize(false)
+    local plans, plans_err = load_plans()
+    if plans == nil then return fail(plans_err) end
+    local candidate = clone_tasks(current)
+    local removed = table.remove(candidate, params.id)
+    local saved, save_err = persist_todos(candidate, next_id)
+    if not saved then return nil, save_err end
+    local key = task_id(removed, params.id)
+    if plans[key] ~= nil then
+      local pruned = clone_plans(plans)
+      pruned[key] = nil
+      local plans_ok, plan_err = save_plans(pruned)
+      if not plans_ok then
+        _G.todos = candidate
+        return nil, "Error: task deleted, but plan cleanup failed: " .. tostring(plan_err or "unknown error")
+      end
+    end
+    local out, summary_err = summarize(false)
+    if out == nil then return fail(summary_err) end
+    return "Deleted: " .. removed.text .. "\n\n" .. out
   end,
 })
 
@@ -486,27 +634,31 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    load_todos()
-    if not is_index(params.id, #_G.todos) then
-      return "Error: invalid task id (use todo_list to see valid ids)"
+    local current, load_err, next_id = load_todos()
+    if current == nil then return fail(load_err) end
+    if not is_index(params.id, #current) then
+      return fail("invalid task id (use todo_list to see valid ids)")
     end
-    local t = _G.todos[params.id]
+    local candidate = clone_tasks(current)
+    local t = candidate[params.id]
     local pri = params.priority
     if pri and #pri == 1 then
       pri = pri:upper()
       if pri:byte() >= 65 and pri:byte() <= 90 then
         t.priority = pri
       else
-        return "Error: priority must be a letter A-Z"
+        return fail("priority must be a letter A-Z")
       end
     elseif pri and #pri == 0 then
       t.priority = nil
     else
-      return "Error: priority must be a single letter A-Z or empty"
+      return fail("priority must be a single letter A-Z or empty")
     end
-    local save_err = save_error(save_todos(), "todos")
-    if save_err then return save_err end
-    return "Set priority " .. (t.priority or "(none)") .. " on task #" .. params.id .. "\n\n" .. summarize(false)
+    local saved, save_err = persist_todos(candidate, next_id)
+    if not saved then return nil, save_err end
+    local out, summary_err = summarize(false)
+    if out == nil then return fail(summary_err) end
+    return "Set priority " .. (t.priority or "(none)") .. " on task #" .. params.id .. "\n\n" .. out
   end,
 })
 
@@ -522,31 +674,65 @@ zay.register_tool({
   },
   handler = function(params)
     if not params.tasks then
-      return "Error: tasks string is required"
+      return fail("tasks string is required")
     end
-    _G.todos = {}
+    local current, load_err, next_id = load_todos()
+    if current == nil then return fail(load_err) end
+    local existing_plans, plans_err = load_plans()
+    if existing_plans == nil then return fail(plans_err) end
+    local candidate = {}
+    local ids = {}
     for line in params.tasks:gmatch("[^\r\n]+") do
       local t = parse_line(line)
       if t.text ~= "" or t.done then
-        table.insert(_G.todos, t)
+        if t.tags.id ~= nil and t.id == nil then
+          return fail("invalid numeric id tag in replacement")
+        end
+        if t.id ~= nil then
+          if t.id < 1 or math.floor(t.id) ~= t.id then
+            return fail("invalid numeric id in replacement")
+          end
+          if ids[t.id] then
+            return fail("duplicate task id:" .. t.id .. " in replacement")
+          end
+          ids[t.id] = true
+          if t.id >= next_id then next_id = t.id + 1 end
+        end
+        table.insert(candidate, t)
       end
     end
-    -- Backfill missing ids so every task remains plan-addressable after a rewrite.
-    local max_id = 0
-    for _, t in ipairs(_G.todos) do
-      if t.id and t.id > max_id then max_id = t.id end
-    end
-    for _, t in ipairs(_G.todos) do
+    -- Backfill missing ids without reusing retired ids.
+    for _, t in ipairs(candidate) do
       if t.id == nil then
-        max_id = max_id + 1
-        t.id = max_id
-        t.tags["id"] = tostring(max_id)
-        t.text = t.text .. " id:" .. max_id
+        while ids[next_id] do next_id = next_id + 1 end
+        set_task_id(t, next_id)
+        ids[next_id] = true
+        next_id = next_id + 1
       end
     end
-    local save_err = save_error(save_todos(), "todos")
-    if save_err then return save_err end
-    return "Replaced todo list with " .. #_G.todos .. " tasks.\n\n" .. summarize(false)
+    local saved, save_err = persist_todos(candidate, next_id)
+    if not saved then return nil, save_err end
+
+    local retained = {}
+    for _, task in ipairs(candidate) do retained[task_id(task, 0)] = true end
+    local pruned = clone_plans(existing_plans)
+    local removed_plan = false
+    for key in pairs(pruned) do
+      if not retained[key] then
+        pruned[key] = nil
+        removed_plan = true
+      end
+    end
+    if removed_plan then
+      local plans_ok, plan_err = save_plans(pruned)
+      if not plans_ok then
+        _G.todos = candidate
+        return nil, "Error: todo list replaced, but orphan-plan cleanup failed: " .. tostring(plan_err or "unknown error")
+      end
+    end
+    local out, summary_err = summarize(false)
+    if out == nil then return fail(summary_err) end
+    return "Replaced todo list with " .. #candidate .. " tasks.\n\n" .. out
   end,
 })
 
@@ -563,13 +749,15 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    load_todos()
-    if not is_index(params.id, #_G.todos) then
-      return "Error: invalid task id (use todo_list to see valid ids)"
+    local todos, load_err = load_todos()
+    if todos == nil then return fail(load_err) end
+    if not is_index(params.id, #todos) then
+      return fail("invalid task id (use todo_list to see valid ids)")
     end
-    local t = _G.todos[params.id]
+    local t = todos[params.id]
     local key = task_id(t, params.id)
-    local plans = load_plans()
+    local plans, plans_err = load_plans()
+    if plans == nil then return fail(plans_err) end
     local plan = plans[key]
     if not plan then
       return "No plan for task #" .. params.id .. " (id:" .. key .. "): " .. t.text
@@ -628,18 +816,19 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    load_todos()
-    if not is_index(params.id, #_G.todos) then
-      return "Error: invalid task id (use todo_list to see valid ids)"
+    local todos, load_err = load_todos()
+    if todos == nil then return fail(load_err) end
+    if not is_index(params.id, #todos) then
+      return fail("invalid task id (use todo_list to see valid ids)")
     end
     if not params.summary or params.summary == "" then
-      return "Error: summary is required"
+      return fail("summary is required")
     end
     if not params.steps or params.steps == "" then
-      return "Error: steps is required (use newline-separated checklist; pass a single line if just one step)"
+      return fail("steps is required (use newline-separated checklist; pass a single line if just one step)")
     end
 
-    local t = _G.todos[params.id]
+    local t = todos[params.id]
     local key = task_id(t, params.id)
 
     -- Parse the steps string into {text, done=false} records. Blank lines are
@@ -651,14 +840,16 @@ zay.register_tool({
       end
     end
 
-    local plans = load_plans()
+    local plans, plans_err = load_plans()
+    if plans == nil then return fail(plans_err) end
+    plans = clone_plans(plans)
     plans[key] = {
       summary = params.summary,
       steps = step_list,
       notes = params.notes or "",
     }
-    local save_err = save_error(save_plans(plans), "plans")
-    if save_err then return save_err end
+    local saved, save_err = save_plans(plans)
+    if not saved then return fail("could not save plans: " .. tostring(save_err or "unknown error")) end
 
     return string.format("Plan set for task #%d (id:%s): %s\n%d steps recorded.\n\nUse todo_get_plan to view it.",
       params.id, key, t.text, #step_list)
@@ -680,26 +871,30 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    load_todos()
-    if not is_index(params.id, #_G.todos) then
-      return "Error: invalid task id (use todo_list to see valid ids)"
+    local todos, load_err = load_todos()
+    if todos == nil then return fail(load_err) end
+    if not is_index(params.id, #todos) then
+      return fail("invalid task id (use todo_list to see valid ids)")
     end
-    local t = _G.todos[params.id]
+    local t = todos[params.id]
     local key = task_id(t, params.id)
-    local plans = load_plans()
+    local plans, plans_err = load_plans()
+    if plans == nil then return fail(plans_err) end
     local plan = plans[key]
     if not plan or not plan.steps or #plan.steps == 0 then
-      return "Error: no plan steps for task #" .. params.id
+      return fail("no plan steps for task #" .. params.id
         .. ". Use todo_set_plan to create one first."
+      )
     end
     if not is_index(params.step, #plan.steps) then
-      return string.format("Error: invalid step number (1-%d). Use todo_get_plan to see steps.", #plan.steps)
+      return fail(string.format("invalid step number (1-%d). Use todo_get_plan to see steps.", #plan.steps))
     end
 
-    local s = plan.steps[params.step]
+    plans = clone_plans(plans)
+    local s = plans[key].steps[params.step]
     s.done = not s.done
-    local save_err = save_error(save_plans(plans), "plans")
-    if save_err then return save_err end
+    local saved, save_err = save_plans(plans)
+    if not saved then return fail("could not save plans: " .. tostring(save_err or "unknown error")) end
 
     local state = s.done and "done" or "open"
     return string.format("Step %d marked %s for task #%d.\n\n", params.step, state, params.id)

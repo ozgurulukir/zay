@@ -18,6 +18,10 @@ local event_counts = {
 -- Manual records added via track_file_op.
 local file_ops = {}
 
+local function fail(message)
+  return nil, "Error: " .. message
+end
+
 -- Classify a fully-qualified tool name (`lua__<plugin>__<tool>`) into a
 -- file-operation kind, or nil if it isn't a file operation we track.
 local function classify(name)
@@ -75,6 +79,15 @@ zay.register_tool({
     },
   },
   handler = function(params)
+    if type(params.operation) ~= "string" or params.operation == "" then
+      return fail("operation is required")
+    end
+    if not ({ read = true, write = true, delete = true, rename = true })[params.operation] then
+      return fail("invalid operation: " .. params.operation)
+    end
+    if type(params.path) ~= "string" or params.path == "" then
+      return fail("path is required")
+    end
     table.insert(file_ops, {
       operation = params.operation,
       path = params.path,
