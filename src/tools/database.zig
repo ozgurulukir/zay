@@ -7,6 +7,7 @@ const std = @import("std");
 
 const common = @import("common.zig");
 const db = @import("../db.zig");
+const SessionBackend = @import("../session/backend.zig").SessionBackend;
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.db_tool);
@@ -87,14 +88,16 @@ pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args 
 
     var sql: ?[]u8 = null;
     if (parsed.value.sql) |s| {
-        const trimmed = std.mem.trim(u8, s, " \t\r\n");
+        const trimmed = std.mem.trim(u8, s, "
+");
         if (trimmed.len > 0) sql = try gpa.dupe(u8, trimmed);
     }
     errdefer if (sql) |s| gpa.free(s);
 
     var table: ?[]u8 = null;
     if (parsed.value.table) |t| {
-        const trimmed = std.mem.trim(u8, t, " \t\r\n");
+        const trimmed = std.mem.trim(u8, t, "
+");
         if (trimmed.len > 0) table = try gpa.dupe(u8, trimmed);
     }
 
@@ -106,7 +109,8 @@ pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args 
 }
 
 fn isSelectQuery(sql: []const u8) bool {
-    var words = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+    var words = std.mem.tokenizeAny(u8, sql, "
+");
     const first = words.next() orelse return false;
     return std.ascii.eqlIgnoreCase(first, "select") or std.ascii.eqlIgnoreCase(first, "with");
 }
@@ -124,18 +128,21 @@ fn renderQueryResult(gpa: std.mem.Allocator, res: *const db.service.QueryResult)
     defer out.deinit();
 
     if (res.columns.len == 0) {
-        try writeStr(&out, "Query returned empty result set (0 columns, 0 rows).\n");
+        try writeStr(&out, "Query returned empty result set (0 columns, 0 rows).
+");
     } else {
         // Render Markdown Table
         try writeStr(&out, "| ");
         for (res.columns) |col| {
             try writeFmt(&out, "{s} | ", .{col});
         }
-        try writeStr(&out, "\n| ");
+        try writeStr(&out, "
+| ");
         for (res.columns) |_| {
             try writeStr(&out, "--- | ");
         }
-        try writeStr(&out, "\n");
+        try writeStr(&out, "
+");
 
         for (res.rows) |row| {
             try writeStr(&out, "| ");
@@ -148,12 +155,354 @@ fn renderQueryResult(gpa: std.mem.Allocator, res: *const db.service.QueryResult)
                     .blob => |v| try writeFmt(&out, "[blob {d}B] | ", .{v.len}),
                 }
             }
-            try writeStr(&out, "\n");
+            try writeStr(&out, "
+");
         }
-        try writeFmt(&out, "({d} rows returned)\n", .{res.count});
+        try writeFmt(&out, "({d} rows returned)
+", .{res.count});
     }
 
     return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn renderSchemaResult(gpa: std.mem.Allocator, s: *const db.service.SchemaResult) common.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try writeStr(&out, "[Database Schema]
+");
+    if (s.tables.len == 0) {
+        try writeStr(&out, "No tables discovered.
+");
+    } else {
+        for (s.tables) |t| {
+            try writeFmt(&out, "Table: {s}
+", .{t.name});
+            for (t.columns) |c| {
+                try writeFmt(&out, "  - {s} ({s}{s}{s})
+", .{
+                    c.name,
+                    c.type_name,
+                    if (c.primary_key) ", PRIMARY KEY" else "",
+                    if (!c.nullable) ", NOT NULL" else "",
+                });
+            }
+            try writeStr(&out, "
+");
+        }
+    }
+
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+const ServiceTarget = struct {
+    client: db.Service,
+    endpoint: []const u8,
+};
+
+const BackendTarget = union(enum) {
+    service: ServiceTarget,
+    backend: *SessionBackend,
+};
+
+pub const PreparedBackend = struct {
+    backend: SessionBackend,
+    conn: ?db.Connection = null,
+
+    pub fn deinit(self: *PreparedBackend) void {
+        if (self.conn) |*conn| conn.close();
+        self.* = undefined;
+    }
+};
+
+fn prepareBackend(gpa: std.mem.Allocator, backend: *const SessionBackend) common.Error!PreparedBackend {
+    var prepared = PreparedBackend{
+        .backend = backend.*,
+    };
+    errdefer prepared.deinit();
+
+    if (backend.local_path) |path| {
+        if (!std.mem.eql(u8, path, ":memory:")) {
+            var conn = db.Connection.open(path, .{ .create = false, .full_mutex = true }) catch |err| {
+                return common.failFmt(gpa, 1, "Database connection failed: {s}
+", .{@errorName(err)});
+            };
+            conn.exec("pragma busy_timeout = 5000") catch |err| {
+                conn.close();
+                return common.failFmt(gpa, 1, "Database connection setup failed: {s}
+", .{@errorName(err)});
+            };
+            conn.exec("pragma foreign_keys = on") catch |err| {
+                conn.close();
+                return common.failFmt(gpa, 1, "Database connection setup failed: {s}
+", .{@errorName(err)});
+            };
+            prepared.conn = conn;
+            prepared.backend.local = conn;
+        }
+    }
+    return prepared;
+}
+
+fn runHealth(gpa: std.mem.Allocator, io: std.Io, target: BackendTarget) common.Error!common.Output {
+    switch (target) {
+        .service => |s| {
+            var h = s.client.health(io) catch |err| {
+                return common.failFmt(gpa, 1, "Failed to connect to database service at {s}: {s}
+", .{ s.endpoint, @errorName(err) });
+            };
+            defer h.deinit();
+
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            try writeFmt(&out, "[Database Service Health]
+Endpoint: {s}
+Status: {s}
+Backend: {s}
+Version: {s}
+Auth required: {}
+", .{
+                s.endpoint,
+                h.status,
+                h.backend,
+                h.version,
+                h.auth_required,
+            });
+
+            const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
+            return common.ok(gpa, stdout);
+        },
+        .backend => |backend| {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            switch (backend.kind) {
+                .local_sqlite => try writeStr(&out, "[Database Health]
+Backend: sqlite (local embedded session database)
+Status: ok
+Version: embedded
+Auth required: false
+"),
+                .remote_service => {
+                    const client = backend.remote orelse return common.failFmt(gpa, 1, "Database service is unavailable.
+", .{});
+                    var health = client.health(io) catch |err| {
+                        return common.failFmt(gpa, 1, "Database health check failed: {s}
+", .{@errorName(err)});
+                    };
+                    defer health.deinit();
+                    try writeFmt(&out, "[Database Health]
+Backend: {s}
+Status: {s}
+Version: {s}
+Auth required: {}
+", .{ health.backend, health.status, health.version, health.auth_required });
+                },
+                .turso_http => {
+                    const client = backend.turso orelse return common.failFmt(gpa, 1, "Turso database client is unavailable.
+", .{});
+                    var health = client.health(io) catch |err| {
+                        return common.failFmt(gpa, 1, "Database health check failed: {s}
+", .{@errorName(err)});
+                    };
+                    defer health.deinit();
+                    try writeFmt(&out, "[Database Health]
+Backend: {s}
+Status: {s}
+Version: {s}
+Auth required: {}
+", .{ health.backend, health.status, health.version, health.auth_required });
+                },
+                .d1_http => {
+                    const client = backend.d1 orelse return common.failFmt(gpa, 1, "Cloudflare D1 client is unavailable.
+", .{});
+                    var health = client.health(io) catch |err| {
+                        return common.failFmt(gpa, 1, "Database health check failed: {s}
+", .{@errorName(err)});
+                    };
+                    defer health.deinit();
+                    try writeFmt(&out, "[Database Health]
+Backend: {s}
+Status: {s}
+Version: {s}
+Auth required: {}
+", .{ health.backend, health.status, health.version, health.auth_required });
+                },
+                .postgres_native => try writeStr(&out, "[Database Health]
+Backend: postgres_native (native wire protocol)
+Status: not implemented
+"),
+            }
+            const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
+            return common.ok(gpa, stdout);
+        },
+    }
+}
+
+fn runQuery(gpa: std.mem.Allocator, io: std.Io, args: Args, target: BackendTarget) common.Error!common.Output {
+    const sql = args.sql orelse {
+        return common.failFmt(gpa, 2, "Invalid arguments: 'sql' query is required for 'query' action.
+", .{});
+    };
+
+    var res = switch (target) {
+        .service => |s| s.client.query(io, sql, &.{}) catch |err| {
+            return common.failFmt(gpa, 1, "Database query failed: {s}
+", .{@errorName(err)});
+        },
+        .backend => |backend| backend.query(io, sql, &.{}) catch |err| {
+            return common.failFmt(gpa, 1, "Database query failed: {s}
+", .{@errorName(err)});
+        },
+    };
+    defer res.deinit();
+
+    const stdout = try renderQueryResult(gpa, &res);
+    return common.ok(gpa, stdout);
+}
+
+fn runExec(gpa: std.mem.Allocator, io: std.Io, args: Args, target: BackendTarget) common.Error!common.Output {
+    const sql = args.sql orelse {
+        return common.failFmt(gpa, 2, "Invalid arguments: 'sql' statement is required for 'exec' action.
+", .{});
+    };
+
+    switch (target) {
+        .service => |s| {
+            const res = s.client.exec(io, sql, &.{}) catch |err| {
+                return common.failFmt(gpa, 1, "Database execute failed: {s}
+", .{@errorName(err)});
+            };
+
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+
+            try writeFmt(&out, "Statement executed successfully.
+Changes: {d}
+", .{res.changes});
+            if (res.last_insert_rowid) |rowid| {
+                try writeFmt(&out, "Last Insert RowID: {d}
+", .{rowid});
+            }
+
+            const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
+            return common.ok(gpa, stdout);
+        },
+        .backend => |backend| {
+            backend.exec(io, sql, &.{}) catch |err| {
+                return common.failFmt(gpa, 1, "Database execution failed: {s}
+", .{@errorName(err)});
+            };
+            const msg = try gpa.dupe(u8, "Statement executed successfully.
+");
+            return common.ok(gpa, msg);
+        },
+    }
+}
+
+fn runSchema(gpa: std.mem.Allocator, io: std.Io, args: Args, target: BackendTarget) common.Error!common.Output {
+    switch (target) {
+        .service => |s| {
+            var schema_res = s.client.schema(io, args.table) catch |err| {
+                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}
+", .{@errorName(err)});
+            };
+            defer schema_res.deinit();
+
+            const stdout = try renderSchemaResult(gpa, &schema_res);
+            return common.ok(gpa, stdout);
+        },
+        .backend => |backend| {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+
+            switch (backend.kind) {
+                .local_sqlite => {
+                    var res = if (args.table) |tbl| blk: {
+                        break :blk backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name = ? ORDER BY name", &.{.{ .text = tbl }}) catch |err| {
+                            return common.failFmt(gpa, 1, "Database schema inspection failed: {s}
+", .{@errorName(err)});
+                        };
+                    } else blk: {
+                        break :blk backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", &.{}) catch |err| {
+                            return common.failFmt(gpa, 1, "Database schema inspection failed: {s}
+", .{@errorName(err)});
+                        };
+                    };
+                    defer res.deinit();
+
+                    try writeStr(&out, "[Database Schema]
+
+");
+                    if (res.rows.len == 0) {
+                        try writeStr(&out, "No tables found.
+");
+                    } else {
+                        for (res.rows) |row| {
+                            if (row.len >= 2) {
+                                const name = switch (row[0]) {
+                                    .text => |t| t,
+                                    else => "unknown",
+                                };
+                                const table_sql = switch (row[1]) {
+                                    .text => |t| t,
+                                    else => "",
+                                };
+                                try writeFmt(&out, "Table: `{s}`
+```sql
+{s}
+```
+
+", .{ name, table_sql });
+                            }
+                        }
+                    }
+                },
+                .remote_service => {
+                    if (backend.remote) |*client| {
+                        var s = client.schema(io, args.table) catch |err| {
+                            return common.failFmt(gpa, 1, "Database schema inspection failed: {s}
+", .{@errorName(err)});
+                        };
+                        defer s.deinit();
+                        const text = try renderSchemaResult(gpa, &s);
+                        defer gpa.free(text);
+                        try writeStr(&out, text);
+                    }
+                },
+                .turso_http => {
+                    if (backend.turso) |*client| {
+                        var s = client.schema(io, args.table) catch |err| {
+                            return common.failFmt(gpa, 1, "Database schema inspection failed: {s}
+", .{@errorName(err)});
+                        };
+                        defer s.deinit();
+                        const text = try renderSchemaResult(gpa, &s);
+                        defer gpa.free(text);
+                        try writeStr(&out, text);
+                    }
+                },
+                .d1_http => {
+                    if (backend.d1) |*client| {
+                        var s = client.schema(io, args.table) catch |err| {
+                            return common.failFmt(gpa, 1, "Database schema inspection failed: {s}
+", .{@errorName(err)});
+                        };
+                        defer s.deinit();
+                        const text = try renderSchemaResult(gpa, &s);
+                        defer gpa.free(text);
+                        try writeStr(&out, text);
+                    }
+                },
+                .postgres_native => {
+                    return common.failFmt(gpa, 1, "Database schema inspection is not yet implemented for this backend.
+", .{});
+                },
+            }
+
+            const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
+            return common.ok(gpa, stdout);
+        },
+    }
 }
 
 pub fn runTool(
@@ -171,15 +520,18 @@ pub fn runTool(
         error.InvalidArguments => return common.failFmt(
             gpa,
             2,
-            "Invalid arguments: 'action' is required ('query', 'exec', 'schema', or 'health').\n",
+            "Invalid arguments: 'action' is required ('query', 'exec', 'schema', or 'health').
+",
             .{},
         ),
     };
     defer args.deinit(gpa);
+
     if (args.action == .query) {
         if (args.sql) |sql| {
             if (!isSelectQuery(sql)) {
-                return common.failFmt(gpa, 2, "Database query must be a SELECT statement.\n", .{});
+                return common.failFmt(gpa, 2, "Database query must be a SELECT statement.
+", .{});
             }
         }
     }
@@ -187,303 +539,36 @@ pub fn runTool(
     if (env.ctx.session_backend == null and env.ctx.database_server_url != null) {
         const endpoint = env.ctx.database_server_url.?;
         const client = db.Service.init(gpa, endpoint, env.ctx.database_auth_token);
-
-        switch (args.action) {
-            .health => {
-                var h = client.health(io) catch |err| {
-                    return common.failFmt(gpa, 1, "Failed to connect to database service at {s}: {s}\n", .{ endpoint, @errorName(err) });
-                };
-                defer h.deinit();
-
-                var out: std.Io.Writer.Allocating = .init(gpa);
-                defer out.deinit();
-                try writeFmt(&out, "[Database Service Health]\nEndpoint: {s}\nStatus: {s}\nBackend: {s}\nVersion: {s}\nAuth required: {}\n", .{
-                    endpoint,
-                    h.status,
-                    h.backend,
-                    h.version,
-                    h.auth_required,
-                });
-
-                const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
-                return common.ok(gpa, stdout);
-            },
-            .query => {
-                const sql = args.sql orelse {
-                    return common.failFmt(gpa, 2, "Invalid arguments: 'sql' query is required for 'query' action.\n", .{});
-                };
-
-                var res = client.query(io, sql, &.{}) catch |err| {
-                    return common.failFmt(gpa, 1, "Database query failed: {s}\n", .{@errorName(err)});
-                };
-                defer res.deinit();
-
-                const stdout = try renderQueryResult(gpa, &res);
-                return common.ok(gpa, stdout);
-            },
-            .exec => {
-                const sql = args.sql orelse {
-                    return common.failFmt(gpa, 2, "Invalid arguments: 'sql' statement is required for 'exec' action.\n", .{});
-                };
-
-                const res = client.exec(io, sql, &.{}) catch |err| {
-                    return common.failFmt(gpa, 1, "Database execute failed: {s}\n", .{@errorName(err)});
-                };
-
-                var out: std.Io.Writer.Allocating = .init(gpa);
-                defer out.deinit();
-
-                try writeFmt(&out, "Statement executed successfully.\nChanges: {d}\n", .{res.changes});
-                if (res.last_insert_rowid) |rowid| {
-                    try writeFmt(&out, "Last Insert RowID: {d}\n", .{rowid});
-                }
-
-                const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
-                return common.ok(gpa, stdout);
-            },
-            .schema => {
-                var s = client.schema(io, args.table) catch |err| {
-                    return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
-                };
-                defer s.deinit();
-
-                var out: std.Io.Writer.Allocating = .init(gpa);
-                defer out.deinit();
-
-                try writeStr(&out, "[Database Schema]\n");
-                if (s.tables.len == 0) {
-                    try writeStr(&out, "No tables discovered.\n");
-                } else {
-                    for (s.tables) |t| {
-                        try writeFmt(&out, "Table: {s}\n", .{t.name});
-                        for (t.columns) |c| {
-                            try writeFmt(&out, "  - {s} ({s}{s}{s})\n", .{
-                                c.name,
-                                c.type_name,
-                                if (c.primary_key) ", PRIMARY KEY" else "",
-                                if (!c.nullable) ", NOT NULL" else "",
-                            });
-                        }
-                        try writeStr(&out, "\n");
-                    }
-                }
-
-                const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
-                return common.ok(gpa, stdout);
-            },
-        }
+        const target: BackendTarget = .{ .service = .{ .client = client, .endpoint = endpoint } };
+        return switch (args.action) {
+            .health => runHealth(gpa, io, target),
+            .query => runQuery(gpa, io, args, target),
+            .exec => runExec(gpa, io, args, target),
+            .schema => runSchema(gpa, io, args, target),
+        };
     } else if (env.ctx.session_backend) |backend| {
-        var tool_backend = backend.*;
-        var tool_connection: ?db.Connection = null;
-        defer if (tool_connection) |*conn| conn.close();
-        if (backend.local_path) |path| {
-            if (!std.mem.eql(u8, path, ":memory:")) {
-                var conn = db.Connection.open(path, .{ .create = false, .full_mutex = true }) catch |err| {
-                    return common.failFmt(gpa, 1, "Database connection failed: {s}\n", .{@errorName(err)});
-                };
-                conn.exec("pragma busy_timeout = 5000") catch |err| {
-                    conn.close();
-                    return common.failFmt(gpa, 1, "Database connection setup failed: {s}\n", .{@errorName(err)});
-                };
-                conn.exec("pragma foreign_keys = on") catch |err| {
-                    conn.close();
-                    return common.failFmt(gpa, 1, "Database connection setup failed: {s}\n", .{@errorName(err)});
-                };
-                tool_connection = conn;
-                tool_backend.local = conn;
-            }
-        }
-        switch (args.action) {
-            .health => {
-                var out: std.Io.Writer.Allocating = .init(gpa);
-                defer out.deinit();
-                switch (backend.kind) {
-                    .local_sqlite => try writeStr(&out, "[Database Health]\nBackend: sqlite (local embedded session database)\nStatus: ok\nVersion: embedded\nAuth required: false\n"),
-                    .remote_service => {
-                        const client = backend.remote orelse return common.failFmt(gpa, 1, "Database service is unavailable.\n", .{});
-                        var health = client.health(io) catch |err| {
-                            return common.failFmt(gpa, 1, "Database health check failed: {s}\n", .{@errorName(err)});
-                        };
-                        defer health.deinit();
-                        try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
-                    },
-                    .turso_http => {
-                        const client = backend.turso orelse return common.failFmt(gpa, 1, "Turso database client is unavailable.\n", .{});
-                        var health = client.health(io) catch |err| {
-                            return common.failFmt(gpa, 1, "Database health check failed: {s}\n", .{@errorName(err)});
-                        };
-                        defer health.deinit();
-                        try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
-                    },
-                    .d1_http => {
-                        const client = backend.d1 orelse return common.failFmt(gpa, 1, "Cloudflare D1 client is unavailable.\n", .{});
-                        var health = client.health(io) catch |err| {
-                            return common.failFmt(gpa, 1, "Database health check failed: {s}\n", .{@errorName(err)});
-                        };
-                        defer health.deinit();
-                        try writeFmt(&out, "[Database Health]\nBackend: {s}\nStatus: {s}\nVersion: {s}\nAuth required: {}\n", .{ health.backend, health.status, health.version, health.auth_required });
-                    },
-                    .postgres_native => try writeStr(&out, "[Database Health]\nBackend: postgres_native (native wire protocol)\nStatus: not implemented\n"),
-                }
-                const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
-                return common.ok(gpa, stdout);
-            },
-            .query => {
-                const sql = args.sql orelse {
-                    return common.failFmt(gpa, 2, "Invalid arguments: 'sql' query is required for 'query' action.\n", .{});
-                };
-
-                var res = tool_backend.query(io, sql, &.{}) catch |err| {
-                    return common.failFmt(gpa, 1, "Database query failed: {s}\n", .{@errorName(err)});
-                };
-                defer res.deinit();
-
-                const stdout = try renderQueryResult(gpa, &res);
-                return common.ok(gpa, stdout);
-            },
-            .exec => {
-                const sql = args.sql orelse {
-                    return common.failFmt(gpa, 2, "Invalid arguments: 'sql' statement is required for 'exec' action.\n", .{});
-                };
-
-                tool_backend.exec(io, sql, &.{}) catch |err| {
-                    return common.failFmt(gpa, 1, "Database execution failed: {s}\n", .{@errorName(err)});
-                };
-                const msg = try gpa.dupe(u8, "Statement executed successfully.\n");
-                return common.ok(gpa, msg);
-            },
-            .schema => {
-                var out: std.Io.Writer.Allocating = .init(gpa);
-                defer out.deinit();
-
-                switch (backend.kind) {
-                    .local_sqlite => {
-                        var res = if (args.table) |tbl| blk: {
-                            break :blk tool_backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name = ? ORDER BY name", &.{.{ .text = tbl }}) catch |err| {
-                                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
-                            };
-                        } else blk: {
-                            break :blk tool_backend.query(io, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", &.{}) catch |err| {
-                                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
-                            };
-                        };
-                        defer res.deinit();
-
-                        try writeStr(&out, "[Database Schema]\n\n");
-                        if (res.rows.len == 0) {
-                            try writeStr(&out, "No tables found.\n");
-                        } else {
-                            for (res.rows) |row| {
-                                if (row.len >= 2) {
-                                    const name = switch (row[0]) {
-                                        .text => |t| t,
-                                        else => "unknown",
-                                    };
-                                    const table_sql = switch (row[1]) {
-                                        .text => |t| t,
-                                        else => "",
-                                    };
-                                    try writeFmt(&out, "Table: `{s}`\n```sql\n{s}\n```\n\n", .{ name, table_sql });
-                                }
-                            }
-                        }
-                    },
-                    .remote_service => {
-                        if (backend.remote) |*client| {
-                            var s = client.schema(io, args.table) catch |err| {
-                                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
-                            };
-                            defer s.deinit();
-
-                            try writeStr(&out, "[Database Schema]\n");
-                            if (s.tables.len == 0) {
-                                try writeStr(&out, "No tables discovered.\n");
-                            } else {
-                                for (s.tables) |t| {
-                                    try writeFmt(&out, "Table: {s}\n", .{t.name});
-                                    for (t.columns) |c| {
-                                        try writeFmt(&out, "  - {s} ({s}{s}{s})\n", .{
-                                            c.name,
-                                            c.type_name,
-                                            if (c.primary_key) ", PRIMARY KEY" else "",
-                                            if (!c.nullable) ", NOT NULL" else "",
-                                        });
-                                    }
-                                    try writeStr(&out, "\n");
-                                }
-                            }
-                        }
-                    },
-                    .turso_http => {
-                        if (backend.turso) |*client| {
-                            var s = client.schema(io, args.table) catch |err| {
-                                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
-                            };
-                            defer s.deinit();
-
-                            try writeStr(&out, "[Database Schema]\n");
-                            if (s.tables.len == 0) {
-                                try writeStr(&out, "No tables discovered.\n");
-                            } else {
-                                for (s.tables) |t| {
-                                    try writeFmt(&out, "Table: {s}\n", .{t.name});
-                                    for (t.columns) |c| {
-                                        try writeFmt(&out, "  - {s} ({s}{s}{s})\n", .{
-                                            c.name,
-                                            c.type_name,
-                                            if (c.primary_key) ", PRIMARY KEY" else "",
-                                            if (!c.nullable) ", NOT NULL" else "",
-                                        });
-                                    }
-                                    try writeStr(&out, "\n");
-                                }
-                            }
-                        }
-                    },
-                    .d1_http => {
-                        if (backend.d1) |*client| {
-                            var s = client.schema(io, args.table) catch |err| {
-                                return common.failFmt(gpa, 1, "Database schema inspection failed: {s}\n", .{@errorName(err)});
-                            };
-                            defer s.deinit();
-
-                            try writeStr(&out, "[Database Schema]\n");
-                            if (s.tables.len == 0) {
-                                try writeStr(&out, "No tables discovered.\n");
-                            } else {
-                                for (s.tables) |t| {
-                                    try writeFmt(&out, "Table: {s}\n", .{t.name});
-                                    for (t.columns) |c| {
-                                        try writeFmt(&out, "  - {s} ({s}{s}{s})\n", .{
-                                            c.name,
-                                            c.type_name,
-                                            if (c.primary_key) ", PRIMARY KEY" else "",
-                                            if (!c.nullable) ", NOT NULL" else "",
-                                        });
-                                    }
-                                    try writeStr(&out, "\n");
-                                }
-                            }
-                        }
-                    },
-                    .postgres_native => {
-                        return common.failFmt(gpa, 1, "Database schema inspection is not yet implemented for this backend.\n", .{});
-                    },
-                }
-
-                const stdout = out.toOwnedSlice() catch return error.OutOfMemory;
-                return common.ok(gpa, stdout);
-            },
-        }
+        var prepared = try prepareBackend(gpa, backend);
+        defer prepared.deinit();
+        const target: BackendTarget = .{ .backend = &prepared.backend };
+        return switch (args.action) {
+            .health => runHealth(gpa, io, target),
+            .query => runQuery(gpa, io, args, target),
+            .exec => runExec(gpa, io, args, target),
+            .schema => runSchema(gpa, io, args, target),
+        };
     } else {
         return common.failFmt(
             gpa,
             1,
-            "External database service is not configured.\n" ++
+            "External database service is not configured.
+" ++
                 "To connect Zay to an external database, configure 'databaseServerUrl' in config.json " ++
-                "or export ZAY_DATABASE_SERVER_URL='http://127.0.0.1:8766'.\n" ++
-                "To start the included local DB server:\n" ++
-                "  uv run -m tools.db_server.server --port 8766\n",
+                "or export ZAY_DATABASE_SERVER_URL='http://127.0.0.1:8766'.
+" ++
+                "To start the included local DB server:
+" ++
+                "  uv run -m tools.db_server.server --port 8766
+",
             .{},
         );
     }
@@ -523,16 +608,16 @@ pub fn display(
 test "database tool parseArgs validates actions" {
     const gpa = std.testing.allocator;
 
-    var args1 = try parseArgs(gpa, "{\"action\":\"health\"}");
+    var args1 = try parseArgs(gpa, "{"action":"health"}");
     defer args1.deinit(gpa);
     try std.testing.expectEqual(Action.health, args1.action);
 
-    var args2 = try parseArgs(gpa, "{\"action\":\"query\",\"sql\":\"SELECT 1\"}");
+    var args2 = try parseArgs(gpa, "{"action":"query","sql":"SELECT 1"}");
     defer args2.deinit(gpa);
     try std.testing.expectEqual(Action.query, args2.action);
     try std.testing.expectEqualStrings("SELECT 1", args2.sql.?);
 
-    try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{\"action\":\"unknown\"}"));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{"action":"unknown"}"));
     try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{}"));
 }
 
@@ -546,7 +631,7 @@ test "database tool operates on session_backend fallback" {
     try conn.exec("create table sessions (id text, title text, cwd text, created_at_ms bigint, host_id text)");
     try conn.exec("insert into sessions values ('s1', 'first session', '/proj', 1000, 'host-a')");
 
-    var backend: @import("../session/backend.zig").SessionBackend = .{
+    var backend: SessionBackend = .{
         .gpa = gpa,
         .kind = .local_sqlite,
         .local = conn,
@@ -559,31 +644,31 @@ test "database tool operates on session_backend fallback" {
     const env: common.Env = .{ .ctx = &ctx, .userdata = undefined };
 
     // 1. health
-    var health_out = try runTool(gpa, io, ".", "{\"action\":\"health\"}", env);
+    var health_out = try runTool(gpa, io, ".", "{"action":"health"}", env);
     defer health_out.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 0), health_out.code);
     try std.testing.expect(std.mem.indexOf(u8, health_out.stdout, "sqlite (local embedded session database)") != null);
 
     // 2. query
-    var query_out = try runTool(gpa, io, ".", "{\"action\":\"query\",\"sql\":\"SELECT id, title, host_id FROM sessions\"}", env);
+    var query_out = try runTool(gpa, io, ".", "{"action":"query","sql":"SELECT id, title, host_id FROM sessions"}", env);
     defer query_out.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 0), query_out.code);
     try std.testing.expect(std.mem.indexOf(u8, query_out.stdout, "first session") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_out.stdout, "host-a") != null);
 
     // 3. schema
-    var schema_out = try runTool(gpa, io, ".", "{\"action\":\"schema\"}", env);
+    var schema_out = try runTool(gpa, io, ".", "{"action":"schema"}", env);
     defer schema_out.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 0), schema_out.code);
     try std.testing.expect(std.mem.indexOf(u8, schema_out.stdout, "Table: `sessions`") != null);
 
     // 4. exec
-    var exec_out = try runTool(gpa, io, ".", "{\"action\":\"exec\",\"sql\":\"insert into sessions values ('s2', 'second session', '/proj', 2000, 'host-b')\"}", env);
+    var exec_out = try runTool(gpa, io, ".", "{"action":"exec","sql":"insert into sessions values ('s2', 'second session', '/proj', 2000, 'host-b')"}", env);
     defer exec_out.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 0), exec_out.code);
 
     // Verify row inserted
-    var verify_out = try runTool(gpa, io, ".", "{\"action\":\"query\",\"sql\":\"SELECT count(*) FROM sessions\"}", env);
+    var verify_out = try runTool(gpa, io, ".", "{"action":"query","sql":"SELECT count(*) FROM sessions"}", env);
     defer verify_out.deinit(gpa);
     try std.testing.expect(std.mem.indexOf(u8, verify_out.stdout, "2") != null);
 }
