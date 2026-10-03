@@ -622,6 +622,7 @@ test {
     // module; reference them directly so their test declarations are analyzed.
     _ = @import("at_mention_tests.zig");
     _ = @import("agent/compactor.zig");
+    _ = @import("agent/queue.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/provider.zig");
     _ = @import("db.zig");
