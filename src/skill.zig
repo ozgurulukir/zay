@@ -1311,3 +1311,137 @@ test "appendSkillBlock escapes XML special characters in attributes" {
     // All XML-special chars in the name must be escaped inside the opening tag.
     try std.testing.expect(std.mem.indexOf(u8, result, "a&quot;b&amp;c&lt;d&gt;") != null);
 }
+
+
+test "returnsEmptyList_whenNoSkillDirectoriesExist" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-loadproject-empty-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, full_dir);
+
+    // Act
+    const skills = try loadProject(gpa, io, null, full_dir);
+    defer deinitAll(gpa, skills);
+
+    // Assert
+    try std.testing.expectEqual(@as(usize, 0), skills.len);
+}
+
+test "ignoresGlobalRoot_whenHomeDirIsEmptyString" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-loadproject-empty-home-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+
+    const empty_home = "";
+    const project_agents = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(project_agents);
+    try std.Io.Dir.createDirPath(.cwd(), io, project_agents);
+
+    try writeSkillMd(io, gpa, project_agents, "proj-skill", "---
+name: proj-skill
+description: project skill
+---
+body
+");
+
+    // Act
+    const skills = try loadProject(gpa, io, empty_home, full_dir);
+    defer deinitAll(gpa, skills);
+
+    // Assert
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("proj-skill", skills[0].name);
+}
+
+test "combinesGlobalAndProjectSkills_whenBothExistWithUniqueNames" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-loadproject-combine-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+
+    const home_dir = try std.fs.path.join(gpa, &.{ full_dir, "home" });
+    defer gpa.free(home_dir);
+    const global_agents = try std.fs.path.join(gpa, &.{ home_dir, ".agents", "skills" });
+    defer gpa.free(global_agents);
+    try std.Io.Dir.createDirPath(.cwd(), io, global_agents);
+    try writeSkillMd(io, gpa, global_agents, "global-skill", "---
+name: global-skill
+description: global skill
+---
+global body
+");
+
+    const project_agents = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(project_agents);
+    try std.Io.Dir.createDirPath(.cwd(), io, project_agents);
+    try writeSkillMd(io, gpa, project_agents, "project-skill", "---
+name: project-skill
+description: project skill
+---
+project body
+");
+
+    // Act
+    const skills = try loadProject(gpa, io, home_dir, full_dir);
+    defer deinitAll(gpa, skills);
+
+    // Assert
+    try std.testing.expectEqual(@as(usize, 2), skills.len);
+    try std.testing.expect(find(skills, "global-skill") != null);
+    try std.testing.expect(find(skills, "project-skill") != null);
+}
+
+test "shadowsGlobalSkillCaseInsensitively_whenProjectSkillHasDifferentCaseName" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-loadproject-case-shadow-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+
+    const home_dir = try std.fs.path.join(gpa, &.{ full_dir, "home" });
+    defer gpa.free(home_dir);
+    const global_agents = try std.fs.path.join(gpa, &.{ home_dir, ".agents", "skills" });
+    defer gpa.free(global_agents);
+    try std.Io.Dir.createDirPath(.cwd(), io, global_agents);
+    try writeSkillMd(io, gpa, global_agents, "my-skill", "---
+name: my-skill
+description: global description
+---
+global body
+");
+
+    const project_agents = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
+    defer gpa.free(project_agents);
+    try std.Io.Dir.createDirPath(.cwd(), io, project_agents);
+    try writeSkillMd(io, gpa, project_agents, "MY-SKILL", "---
+name: MY-SKILL
+description: project description
+---
+project body
+");
+
+    // Act
+    const skills = try loadProject(gpa, io, home_dir, full_dir);
+    defer deinitAll(gpa, skills);
+
+    // Assert
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("project description", skills[0].description);
+}
