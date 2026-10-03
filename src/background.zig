@@ -14,7 +14,12 @@
 //!
 //! Lifecycle: a clean exit (and the modal's cancel) calls `terminateTree`, which
 //! kills the whole process tree — `taskkill /T` on Windows, `kill` on POSIX.
-//! TODO: Address orphaned processes when an unexpected exit happens.
+//! On Windows, child processes are assigned to a Win32 Job Object configured
+//! with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel terminates child
+//! processes automatically when the main process handle closes. On POSIX, active
+//! background process group PIDs are tracked in a global thread-safe registry
+//! so `emergencyCleanupAll()` can kill all orphaned process trees on unexpected
+//! exit or panic.
 
 const std = @import("std");
 
@@ -40,6 +45,53 @@ const test_poll_attempts_max: u32 = 100;
 
 /// Maximum log file size per background job before truncation kicks in (50 MB).
 pub const max_job_log_bytes: u64 = 50 * 1024 * 1024;
+
+/// Global registry tracking active background process group PIDs
+/// across all BackgroundManager instances to guarantee cleanup on unexpected process exit/panic.
+var global_active_mutex: std.Thread.Mutex = .{};
+var global_active_pids: [128]i64 = undefined;
+var global_active_pids_count: usize = 0;
+
+pub fn registerActivePid(pid: i64) void {
+    if (pid <= 1) return;
+    global_active_mutex.lock();
+    defer global_active_mutex.unlock();
+    if (global_active_pids_count < global_active_pids.len) {
+        global_active_pids[global_active_pids_count] = pid;
+        global_active_pids_count += 1;
+    }
+}
+
+pub fn unregisterActivePid(pid: i64) void {
+    if (pid <= 1) return;
+    global_active_mutex.lock();
+    defer global_active_mutex.unlock();
+    for (global_active_pids[0..global_active_pids_count], 0..) |p, i| {
+        if (p == pid) {
+            global_active_pids[i] = global_active_pids[global_active_pids_count - 1];
+            global_active_pids_count -= 1;
+            break;
+        }
+    }
+}
+
+/// Emergency cleanup called on unexpected exit, signal, or panic.
+/// Kills all registered active background process groups.
+pub fn emergencyCleanupAll() void {
+    global_active_mutex.lock();
+    defer global_active_mutex.unlock();
+    for (global_active_pids[0..global_active_pids_count]) |pid| {
+        if (!os.is_windows) {
+            if (pid > 1) {
+                const p: std.posix.pid_t = @intCast(pid);
+                if (std.posix.kill(-p, std.posix.SIG.KILL)) |_| {} else |_| {
+                    std.posix.kill(p, std.posix.SIG.KILL) catch {};
+                }
+            }
+        }
+    }
+    global_active_pids_count = 0;
+}
 
 pub const BackgroundManager = struct {
     io: std.Io,
@@ -257,6 +309,7 @@ pub const BackgroundManager = struct {
         };
 
         const pid = processId(child.?);
+        registerActivePid(pid);
 
         var win32_job_obj: ?windows.HANDLE = null;
         errdefer if (win32_job_obj) |h| {
@@ -664,6 +717,7 @@ pub const BackgroundManager = struct {
     }
 
     fn destroyJob(gpa: std.mem.Allocator, io: std.Io, job: *Job) void {
+        unregisterActivePid(job.pid);
         gpa.free(job.label);
         gpa.free(job.command);
         gpa.free(job.cwd);
@@ -1362,4 +1416,25 @@ test "writeLogChunk caps at quota and writes truncation notice" {
     // Subsequent writeLogChunk calls must be no-ops
     BackgroundManager.writeLogChunk(&job, io, "more data");
     try std.testing.expectEqual(max_job_log_bytes, job.bytes_written);
+}
+
+
+test "registerActivePid and unregisterActivePid track pids correctly" {
+    registerActivePid(12345);
+    registerActivePid(67890);
+    try std.testing.expectEqual(@as(usize, 2), global_active_pids_count);
+
+    unregisterActivePid(12345);
+    try std.testing.expectEqual(@as(usize, 1), global_active_pids_count);
+    try std.testing.expectEqual(@as(i64, 67890), global_active_pids[0]);
+
+    unregisterActivePid(67890);
+    try std.testing.expectEqual(@as(usize, 0), global_active_pids_count);
+}
+
+test "emergencyCleanupAll clears registered active pids" {
+    registerActivePid(99999);
+    try std.testing.expectEqual(@as(usize, 1), global_active_pids_count);
+    emergencyCleanupAll();
+    try std.testing.expectEqual(@as(usize, 0), global_active_pids_count);
 }

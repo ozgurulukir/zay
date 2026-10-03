@@ -20,6 +20,7 @@ fn zayLog(
 pub const panic = std.debug.FullPanic(zayPanic);
 
 fn zayPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    zay.background.emergencyCleanupAll();
     std.debug.print("\x1b[?1049l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[0m\r\n", .{});
     std.debug.defaultPanic(msg, first_trace_addr);
 }
