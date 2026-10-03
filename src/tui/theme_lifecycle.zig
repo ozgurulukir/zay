@@ -38,8 +38,7 @@ pub fn openThemePicker(app: *App) void {
 /// Recolor the live UI to `theme` without persisting or notifying. UI-thread
 /// only; the /theme picker calls this on every up/down navigation when
 /// `tui.theme_live_preview` is enabled.
-pub fn previewTheme(app: *App, theme: tui_style.Theme) void {
-    _ = app;
+pub fn previewTheme(_app: *App, theme: tui_style.Theme) void {
     tui_style.setActive(theme);
 }
 
