@@ -366,3 +366,91 @@ pub fn walkAndSearch(
         }
     }
 }
+
+
+// ── Unit Tests ───────────────────────────────────────────────────────
+
+test "matchGlob_returnsTrue_whenPatternIsEmpty" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("a.zig", ""));
+    try std.testing.expect(matchGlob("src/nested/file.txt", ""));
+    try std.testing.expect(matchGlob("", ""));
+}
+
+test "matchGlob_returnsTrue_whenLiteralMatchesExactPath" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("main.zig", "main.zig"));
+    try std.testing.expect(matchGlob("src/foo/bar.lua", "src/foo/bar.lua"));
+}
+
+test "matchGlob_returnsFalse_whenLiteralDiffers" {
+    // Arrange & Act & Assert
+    try std.testing.expect(!matchGlob("main.zig", "main.lua"));
+    try std.testing.expect(!matchGlob("src/foo.zig", "lib/foo.zig"));
+}
+
+test "matchGlob_returnsTrue_whenStarMatchesWithinSegment" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("main.zig", "*.zig"));
+    try std.testing.expect(matchGlob("test_search.zig", "test_*.zig"));
+    try std.testing.expect(matchGlob("file_v1_final.txt", "file_*_final.txt"));
+}
+
+test "matchGlob_returnsFalse_whenStarDoesNotCrossDirectorySeparator" {
+    // Arrange & Act & Assert
+    try std.testing.expect(!matchGlob("src/main.zig", "*.zig"));
+    try std.testing.expect(!matchGlob("a/b/c.txt", "a/*.txt"));
+}
+
+test "matchGlob_returnsTrue_whenQuestionMarkMatchesSingleChar" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("a.ts", "?.ts"));
+    try std.testing.expect(matchGlob("file1.json", "file?.json"));
+}
+
+test "matchGlob_returnsFalse_whenQuestionMarkCountMismatches" {
+    // Arrange & Act & Assert
+    try std.testing.expect(!matchGlob("file12.json", "file?.json"));
+    try std.testing.expect(!matchGlob("file.json", "file?.json"));
+}
+
+test "matchGlob_returnsTrue_whenDoubleStarMatchesMultipleDirectories" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("src/a/b/c.zig", "src/**/*.zig"));
+    try std.testing.expect(matchGlob("src/c.zig", "src/**/*.zig"));
+    try std.testing.expect(matchGlob("a/b/c/d/e.txt", "**/*.txt"));
+    try std.testing.expect(matchGlob("file.txt", "**/*.txt"));
+}
+
+test "matchGlob_returnsTrue_whenTrailingDoubleStarMatchesRemainder" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("src/components/button/index.tsx", "src/**"));
+    try std.testing.expect(matchGlob("src", "src/**"));
+    try std.testing.expect(!matchGlob("lib/a", "src/**"));
+}
+
+test "matchGlob_handlesMixedPathSeparators" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("src\\tools\\bash.zig", "src/**/*.zig"));
+    try std.testing.expect(matchGlob("src/tools/bash.zig", "src\\**\\*.zig"));
+    try std.testing.expect(matchGlob("a\\b\\c.txt", "a/b/*.txt"));
+}
+
+test "matchGlob_handlesMultipleWildcardsInSingleSegment" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("alpha_beta_gamma.test.js", "*_*_*.test.*"));
+    try std.testing.expect(matchGlob("a_b_c.d", "a*b*c*d"));
+    try std.testing.expect(matchGlob("abc", "a***b***c"));
+}
+
+test "matchGlob_returnsFalse_whenExtensionOrSuffixDiffers" {
+    // Arrange & Act & Assert
+    try std.testing.expect(!matchGlob("main.zig", "*.lua"));
+    try std.testing.expect(!matchGlob("src/a/b.js", "src/**/*.ts"));
+}
+
+test "matchGlob_returnsFalse_whenNameIsEmptyAndPatternIsNonEmpty" {
+    // Arrange & Act & Assert
+    try std.testing.expect(!matchGlob("", "*.zig"));
+    try std.testing.expect(matchGlob("", "**"));
+}

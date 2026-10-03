@@ -25,4 +25,6 @@ test {
     std.testing.refAllDecls(PluginManager);
     std.testing.refAllDecls(PluginInstance);
     std.testing.refAllDecls(Event);
+    std.testing.refAllDecls(plugin_api);
+    std.testing.refAllDecls(plugin_api.search_bridge);
 }
