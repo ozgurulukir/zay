@@ -588,6 +588,7 @@ test {
     // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
     _ = @import("ai/text_tool_call.zig");
     _ = @import("ai/model_compat.zig");
+    _ = @import("ai/provider_headers.zig");
     _ = @import("ai/json.zig");
     _ = @import("ai/openai_request.zig");
     _ = @import("ai/responses_request.zig");
@@ -622,8 +623,10 @@ test {
     // module; reference them directly so their test declarations are analyzed.
     _ = @import("at_mention_tests.zig");
     _ = @import("agent/compactor.zig");
+    _ = @import("agent/queue.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/provider.zig");
     _ = @import("db.zig");
+    _ = @import("models/registry.zig");
     _ = @import("tools/database.zig");
 }

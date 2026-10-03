@@ -6,8 +6,8 @@ Security updates and patches are actively provided for the following releases:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.9.x   | :white_check_mark: |
-| < 0.9   | :x:                |
+| 0.10.x  | :white_check_mark: |
+| < 0.10  | :x:                |
 
 ---
 

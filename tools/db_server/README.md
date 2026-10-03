@@ -25,9 +25,17 @@ uv run -m tools.db_server.server --port 8766
 # Start with an API key and custom DB path:
 uv run -m tools.db_server.server --port 8766 --api-key "secret-key" --db-path "/data/zay.db"
 
-# Start with PostgreSQL backend:
-uv run -m tools.db_server.server --port 8766 --backend postgres --postgres-url "postgresql://user:pass@localhost:5432/zay"
+# Start with PostgreSQL backend (the optional dependency is installed via the extra):
+uv run --project tools/db_server --extra postgres -m tools.db_server.server \
+  --port 8766 \
+  --backend postgres \
+  --postgres-url "postgresql://user:pass@localhost:5432/zay" \
+  --api-key "secret-key"
 ```
+
+The service reads its backend, PostgreSQL URL, and API key from these CLI flags;
+it does not read `ZAY_DB_*` environment variables. Omit `--api-key` only when
+an unauthenticated service is intentional.
 
 ### 2. Configure Zay Agent
 

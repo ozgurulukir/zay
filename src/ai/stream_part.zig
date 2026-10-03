@@ -115,13 +115,50 @@ fn readLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
     return try line_writer.toOwnedSlice();
 }
 
-test "classify distinguishes data, done, and skip lines" {
+test "classify returns .skip for non-data lines, comments, and empty payloads" {
+    // Non-data field names and comments
+    try std.testing.expectEqual(Line.skip, classify(""));
+    try std.testing.expectEqual(Line.skip, classify("   \r"));
     try std.testing.expectEqual(Line.skip, classify(": keep-alive comment"));
     try std.testing.expectEqual(Line.skip, classify("event: message"));
+    try std.testing.expectEqual(Line.skip, classify("id: 101"));
+    try std.testing.expectEqual(Line.skip, classify("retry: 3000"));
+    try std.testing.expectEqual(Line.skip, classify("data_other: value"));
+    try std.testing.expectEqual(Line.skip, classify("DATA: uppercase"));
+
+    // Empty data payloads with various whitespace
+    try std.testing.expectEqual(Line.skip, classify("data:"));
     try std.testing.expectEqual(Line.skip, classify("data: "));
+    try std.testing.expectEqual(Line.skip, classify("data:    "));
+    try std.testing.expectEqual(Line.skip, classify("data: \r"));
+    try std.testing.expectEqual(Line.skip, classify("  data:   \r"));
+}
+
+test "classify returns .done for [DONE] sentinel with surrounding whitespace" {
     try std.testing.expectEqual(Line.done, classify("data: [DONE]"));
-    switch (classify("data: {\"k\":1}\r")) {
+    try std.testing.expectEqual(Line.done, classify("data: [DONE]\r"));
+    try std.testing.expectEqual(Line.done, classify("data:   [DONE]  "));
+    try std.testing.expectEqual(Line.done, classify("  data:   [DONE]  \r"));
+}
+
+test "classify returns .data with correct slice borrowing for JSON and text payloads" {
+    switch (classify("data: {\"k\":1}")) {
         .data => |payload| try std.testing.expectEqualStrings("{\"k\":1}", payload),
+        else => try std.testing.expect(false),
+    }
+
+    switch (classify("data:   {\"k\":1}  \r")) {
+        .data => |payload| try std.testing.expectEqualStrings("{\"k\":1}", payload),
+        else => try std.testing.expect(false),
+    }
+
+    switch (classify("data:hello")) {
+        .data => |payload| try std.testing.expectEqualStrings("hello", payload),
+        else => try std.testing.expect(false),
+    }
+
+    switch (classify("  data:   hello world  \r")) {
+        .data => |payload| try std.testing.expectEqualStrings("hello world", payload),
         else => try std.testing.expect(false),
     }
 }

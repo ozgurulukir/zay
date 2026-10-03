@@ -419,6 +419,28 @@ test "scripted tool_calls step builds a complete turn and drives tool deltas" {
     try std.testing.expectEqualStrings("pwsh", seen.last_tool_name);
 }
 
+test "scripted truncated_tool_calls step returns turn with tool_calls_truncated and empty observer stream" {
+    const gpa = std.testing.allocator;
+    var client = try Client.init(gpa, std.testing.io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{step.truncatedToolCalls(3)});
+
+    const model = ai.LanguageModel{ .scripted = &client };
+    var seen: Seen = .{};
+    defer seen.deinit(gpa);
+
+    var turn = try model.prompt(&.{}, seenObserver(&seen));
+    defer turn.deinit(gpa);
+
+    try std.testing.expectEqual(ai.FinishReason.tool_calls, turn.finish_reason);
+    try std.testing.expectEqual(@as(u32, 3), turn.tool_calls_truncated);
+    try std.testing.expectEqual(@as(usize, 0), turn.assistant.assistant.content.len);
+    try std.testing.expectEqual(@as(usize, 0), seen.content.items.len);
+    try std.testing.expectEqual(@as(u32, 0), seen.tool_delta_count);
+    try std.testing.expectEqual(@as(u32, 0), seen.delta_end_count);
+    try std.testing.expectEqual(@as(u32, 1), client.prompts_answered);
+}
+
 test "scripted fail step returns the error and records error detail" {
     const gpa = std.testing.allocator;
     var client = try Client.init(gpa, std.testing.io, "scripted-model");
