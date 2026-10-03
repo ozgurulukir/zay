@@ -12,7 +12,7 @@ High-level architecture of Zay. For implementation patterns, engineering gotchas
 
 POSIX-only syscalls (`std.posix.kill`, `std.posix.poll`, `setsockopt`, `std.c.realpath`) are guarded behind `if (!os.is_windows)` at their call sites. This is what lets the app compile on Windows while leaving Linux behavior unchanged.
 
-This is distinct from `src/os.zig`, which is pure comptime OS identification (`builtin.os.tag`); `lib/platform.zig` is the runtime behavior layer built on top of that identification.
+This is distinct from `src/os.zig`, which resolves the host OS once at comptime (`tag`, `is_windows`, `label`) *and* owns the POSIX child-process-tree teardown helpers built on that identification (`terminateChildBounded`, `termCode`). `lib/platform.zig` is the narrower portable-syscall layer (fd writes, clocks, environment).
 
 ## LLM Gateway
 
@@ -22,18 +22,19 @@ We try to normalise the request to a shape that is most compatible with the targ
 
 ## Agent Tools
 
-Zay exposes four builtin tools:
+Zay exposes five builtin tools:
 
 - `bash` (on Linux/macOS) / `pwsh` (on Windows)
 - `lane`
 - `background`
 - `skill`
+- `database` — query and inspect the active session-database backend (always advertised; it reports "not configured" when no endpoint is set — see [DATABASE.md](DATABASE.md))
 
 When configured, Zay also exposes tools from Lua plugins as `lua__<plugin>__<tool>` and tools from connected MCP servers as `mcp__<server>__<tool>`. The canonical builtin registry lives in `src/tools/registry.zig`.
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Shell Safety & Auto-Review](#shell-safety--auto-review) below.
 
-`lane` gives the model first-class access to Zay's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `resume`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
+`lane` gives the model first-class access to Zay's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `resume`, `review`, `review_read`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
 
 The primary driver remains rooted in the repository and supervises independent
 worker agents. Workers run concurrently on their own threads; completion is
@@ -43,9 +44,11 @@ state (`Agent.workspace` and executor `effectiveCwd` re-rooting) remains for
 compatibility with lifecycle code and tests, but model commands cannot reach it.
 
 Only the primary driver may supervise workers or integrate their branches; a
-worker gets `list`/`read` only. The 4-lane cap applies; `validateCwd`'s
-containment guarantees are unchanged (lane roots are valid only because Zay
-owns them).
+worker gets `list`/`read` only. The cap is **4 threads total — the primary
+driver plus at most 3 worker lanes** (the legacy 2x2 grid), because that is the
+empirical limit for the mental load required to manage all agents effectively.
+`validateCwd`'s containment guarantees are unchanged (lane roots are valid only
+because Zay owns them).
 
 See [Parallel](#parallel) for the user-facing lane model.
 
@@ -70,7 +73,11 @@ User's can branch off at any point in their conversation to pursue different pat
 
 ## Session Persistence
 
-The session store (`sessions.sqlite`) records the active `model_provider`, `model_id`, and `reasoning_effort` on every turn and on every mid-session model switch, and resumes correctly across restarts — including cross-project resumes. The full lifecycle (schema, resume paths, custom-provider round-tripping, dynamic-provider auth resolution, restart catalog restore) is documented in the [Mid-session model persistence pattern](PATTERNS.md#mid-session-model-persistence-pattern), the [Cross-project session resume pattern](PATTERNS.md#cross-project-session-resume-pattern), and the related provider patterns in Patterns.
+The session store (`sessions.sqlite`) records the active `model_provider`, `model_id`, and `reasoning_effort` on every turn and on every mid-session model switch, and resumes correctly across restarts — including cross-project resumes. The store defaults to a local
+`sessions.sqlite`, but the backend is pluggable: `local`, `zay_service`,
+`turso_http` (LibSQL/Turso), `postgres_native`, and `d1_http` (Cloudflare D1)
+are selectable through the `database` config block — see
+[DATABASE.md](DATABASE.md). The full lifecycle (schema, resume paths, custom-provider round-tripping, dynamic-provider auth resolution, restart catalog restore) is documented in the [Mid-session model persistence pattern](PATTERNS.md#mid-session-model-persistence-pattern), the [Cross-project session resume pattern](PATTERNS.md#cross-project-session-resume-pattern), and the related provider patterns in Patterns.
 
 ## Parallel
 
@@ -81,8 +88,9 @@ each tile a `lane`. In `grid` or `tab` mode the selected lane receives user
 prompts; `dual` keeps the primary as the input target. `/close` parks the
 selected lane, while the user can open the UI merge flow from an idle lane or
 the primary driver can merge/delete it by lane id. The maximum number of lanes
-that can be active is currently 4, because that is the empirical limit for the
-mental load required to manage all agents effectively.
+that can be active is 3, because the cap is on **threads** — the driver occupies
+one of the 4 total slots — and 3 workers is the empirical limit for the mental
+load required to manage all agents effectively.
 
 A lane starts on a random `zay/<hex>` branch. On its first prompt, the session's own model is asked (in parallel with the turn) for a descriptive branch name based on that prompt and the last few messages of the parent lane. When the answer lands, the branch is renamed in place (`zay/<name>`) and becomes the lane's label. If the request fails or the name is unusable, the hex branch simply stays.
 

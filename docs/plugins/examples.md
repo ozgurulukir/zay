@@ -30,7 +30,7 @@ return {
 The manifest declares the plugin's identity and permissions. Since this plugin
 doesn't access the filesystem or network, all permissions are at their defaults.
 
-### init.lua
+### init.lua (excerpt — the `greet` tool)
 
 ```lua
 zay.register_tool({
@@ -49,9 +49,13 @@ zay.register_tool({
 })
 ```
 
+The real `init.lua` registers a second tool, `current_time`
+(`os.date("%H:%M:%S")`), the same way at the bottom of the file — see
+`plugins/packages/hello-world/init.lua` for the complete source.
+
 Key points:
 - `zay.register_tool()` is the primary API for exposing functionality to the AI model
-- The `name` must be unique within the plugin (the system prefixes it as `lua__<plugin>__<name>`)
+- The `name` must be unique within the plugin by convention (duplicates are not rejected — the first registration wins, and the system prefixes it as `lua__<plugin>__<name>`)
 - `parameters` follows JSON Schema conventions — each key is a parameter name
 - The `handler` receives a Lua table of parameter values (JSON parsed automatically) and returns a string
 - Parameters declared without `optional = true` are required

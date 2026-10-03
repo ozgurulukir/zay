@@ -164,16 +164,25 @@ uv run -m tools.db_server.server --port 8766
 ```
 
 #### Option B: Cloud PostgreSQL (Neon / Supabase / Render)
-```bash
-export ZAY_DB_TARGET="postgres"
-export ZAY_PG_DATABASE_URL="postgresql://user:password@ep-xyz.neon.tech/neondb?sslmode=require"
-export ZAY_DB_AUTH_TOKEN="your-chosen-secret"
 
-uv run -m tools.db_server.server --port 8766
+The service is configured **entirely through CLI flags** — it reads no `ZAY_DB_*`
+environment variables. `asyncpg` ships as the `postgres` extra, so install it or the
+Postgres pool is never created and `/health` reports `standby`.
+
+```bash
+uv run --project tools/db_server --extra postgres -m tools.db_server.server \
+  --port 8766 \
+  --backend postgres \
+  --postgres-url "postgresql://user:password@ep-xyz.neon.tech/neondb?sslmode=require" \
+  --api-key "your-chosen-secret"
 ```
 
+> [!NOTE]
+> Always pass `--api-key` when starting Postgres remotely. When it is omitted, the API
+> accepts unauthenticated requests.
+
 > [!IMPORTANT]
-> **Transaction Pooling Compatibility:** `tools/db_server/` is hardened for serverless PostgreSQL providers using transaction-mode poolers (such as PgBouncer or Supabase transaction pooling on port 6543). The server uses explicit connection checkouts, `statement_timeout = 15000`, and avoids session-level prepared statement leaks.
+> **Transaction Pooling Compatibility:** `tools/db_server/` is hardened for serverless PostgreSQL providers using transaction-mode poolers (such as PgBouncer or Supabase transaction pooling on port 6543). The server acquires an explicit connection per operation (`pool.acquire()`), disables the session-level prepared-statement cache (`statement_cache_size=0` — critical for PgBouncer/Supavisor/Neon), and caps the pool at `min_size=1, max_size=10`.
 
 ### Step 2: Configure Zay
 In `~/.config/zay/config.json`:
@@ -201,11 +210,11 @@ export ZAY_DATABASE_AUTH_TOKEN="your-chosen-secret"
 When using a remote backend (`turso_http`, `d1_http`, or `zay_service`), developers frequently connect from different computers (e.g., office desktop, home laptop, SSH dev container).
 
 To ensure conflict-free coexistence:
-1. Schema migration 8 adds a `host_id` column to both the `sessions` and `lanes` tables.
-2. At startup, Zay detects the machine hostname:
-   - Evaluates `ZAY_HOST_ID` (if set)
-   - On Windows: Reads `COMPUTERNAME`
-   - On POSIX: Reads `HOSTNAME`
+1. Schema migration 8 adds a `host_id` column to both the `sessions` and `lanes` tables; the current schema is **version 9** (v9 adds `project_key` and the `project_locations` table for cross-project roaming).
+2. At startup, Zay resolves the machine identity once, checking in this order on every platform:
+   - `ZAY_HOST_ID` (if set — pin this to control roaming identity explicitly)
+   - `COMPUTERNAME` (the Windows default)
+   - `HOSTNAME` (the POSIX default)
    - Fallback: `"default-host"`
 3. Sessions and lane reviews recorded from each machine retain their originating `host_id`.
 4. In the session picker (`/resume`), sessions can be inspected and filtered while preserving distinct lane recovery manifests across machines.
@@ -218,7 +227,7 @@ Network connections can drop, laptops can be opened on airplanes without Wi-Fi, 
 
 Zay adheres to a **zero-lockout resilience rule**:
 - At startup, `SessionManager` performs a health check against the configured remote backend.
-- If the endpoint returns a network error, HTTP error, or timeout, Zay logs a warning diagnostic (`session.external_db_fallback`, `session.turso_db_fallback`, or `session.d1_db_fallback`).
+- If the endpoint returns a network error, HTTP error, or timeout, Zay logs a single warning diagnostic — `session.external_db_fallback url=… err=…` — used for **every** remote backend kind (service, Turso, and D1 alike), not a per-backend variant.
 - Zay **automatically falls back to local embedded SQLite** (`sessions.sqlite`).
 - The developer can continue coding, querying models, and editing code locally without crash interruptions.
 
@@ -226,13 +235,17 @@ Zay adheres to a **zero-lockout resilience rule**:
 
 ## 7. Built-in Agent Database Tool
 
-When an external database backend or `databaseServerUrl` is active, the agent gains access to the built-in `database` tool to inspect schemas and run queries.
+The built-in `database` tool is **always advertised to the model**; it needs an endpoint to do
+work. It resolves one from `databaseServerUrl` or the active session backend — `zay_service`,
+`turso_http`, `d1_http`, or a local SQLite path (the local session store itself is queryable).
+With nothing configured the call simply returns `External database service is not configured.`
+rather than being absent from the tool list.
 
 ### Supported Actions:
-- **`health`**: Checks connectivity, reports backend engine (`turso (libsql)`, `postgres`, `sqlite`), and latency status.
+- **`health`**: Checks connectivity and reports the backend engine (`turso (libsql)`, `postgres`, or `sqlite`) and status.
 - **`schema`**: Discovers table structures, column types, nullable flags, and primary keys.
 - **`query`**: Runs read-only `SELECT` queries (formatted as Markdown tables).
-- **`exec`**: Runs DDL/DML statements (`INSERT`, `UPDATE`, `CREATE TABLE`) and reports row counts.
+- **`exec`**: Runs DDL/DML statements (`INSERT`, `UPDATE`, `CREATE TABLE`) and reports success; remote service responses also include change counts.
 
 ### Example User Prompts:
 ```text
