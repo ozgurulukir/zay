@@ -13,7 +13,7 @@ Register a tool that the AI model can invoke.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | yes | Tool identifier (lowercase, underscores). Must be unique within the plugin. Exposed to the AI model as `lua__<plugin>__<name>`. |
+| `name` | string | yes | Tool identifier. **Enforced:** ≤64 chars, first char a lowercase letter, remaining chars lowercase letters, digits, or `_` (hyphens are rejected). Duplicate names are **not** rejected — the first registration wins and later ones are unreachable, so keep names unique by convention. Exposed to the AI model as `lua__<plugin>__<name>`. |
 | `description` | string | yes | Natural language description of what the tool does. The model uses this to decide when to call the tool. |
 | `parameters` | table | no | JSON Schema-like parameter definitions. Each key is a parameter name, each value is a parameter-schema table (below). Omitted or empty → the tool takes no parameters. |
 | `handler` | function | yes | Called with `(params)` when the model invokes the tool. `params` is a Lua table — JSON arguments from the model are automatically parsed. Return one string on success, or `nil, message` for an operational failure. |
@@ -221,10 +221,11 @@ class, fork bombs, and their PowerShell spellings); plugin shell calls made
 outside tool dispatch (e.g. during `init.lua` load, where no executor context
 exists) are classified by that local backstop only. An empty command string
 returns `nil, "command argument must not be empty"` before anything spawns.
-If the shell binary itself is missing, the call returns one of
-`"ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider zay.run_shell"`
-or
-`"ShellUnavailable: pwsh not found (install PowerShell 7, or ensure powershell.exe is on PATH)"`.
+If the shell binary itself is missing, the call returns `nil, err` where `err` is
+the Zig error name for the failing backend — `"FileNotFound"` for `run_bash`, and
+`"pwsh executable not found in PATH; ensure PowerShell is installed"` for
+`run_shell` on Windows. Match on those strings, **not** on `ShellUnavailable`
+(that text survives only in an unreachable duplicate mapper in `plugin_api.zig`).
 
 **`zay.shell_quote(s, dialect?)`** quotes one argument so it reaches the
 shell as a single inert word — this is the injection defense on the plugin
@@ -252,7 +253,9 @@ local r = zay.run_bash("grep -c " .. q .. " src/*.zig")
 | `zay.git_log(n)` | `n` (default 10) | `string` | Recent commits |
 | `zay.git_branch()` | — | `string` | Current branch name |
 | `zay.git_add(files)` | `files` (string or array) | `{success, output}` | Stage specific files or patterns |
-| `zay.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only`, `opts.stage_all` | `{success, output}` | Create commit (selective or staged) |
+| `zay.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only` | `{success, output}` | Create commit. `opts.files` → `git add -- <files> && git commit -F -`; `opts.staged_only = true` → `git commit -F -` (no add); **neither → `git add -A && git commit -F -` (staging everything is the default).** There is no `stage_all` option. The message is passed over stdin, so it never reaches the shell. |
+
+**Result row shapes:** `search_files` rows are `{file, line, content}` (content truncated to 200 bytes per line); `find_files` rows are `{path, name}`; `list_dir`'s `files`/`directories` are **arrays of plain name strings**, not tables. On a mid-walk failure, `search_files`/`find_files` return partial data with an `error` string field and **no** `truncated` field — check `result.error` before trusting `results`.
 
 ### Lane & session awareness
 
@@ -302,8 +305,8 @@ below reflects the current state of the bridge.
 
 | Bridge | POSIX | Windows |
 |--------|-------|---------|
-| `zay.run_bash` | bash | git-bash candidates (`bash.exe` next to git, then `bash` on PATH); if none is found → `ShellUnavailable: bash not found …` |
-| `zay.run_shell` | bash | `pwsh.exe`, falling back to `powershell.exe`; stdin is delivered via `$input`; if neither is found → `ShellUnavailable: pwsh not found …` |
+| `zay.run_bash` | bash | git-bash candidates (`bash.exe` next to git, then `bash` on PATH); if none is found → `"FileNotFound"` |
+| `zay.run_shell` | bash | `pwsh.exe`, falling back to `powershell.exe`; stdin is delivered via `$input`; if neither is found → `"pwsh executable not found in PATH; ensure PowerShell is installed"` |
 | `zay.shell_quote` | `"posix"` and `"native"` behave identically | `"posix"` for `run_bash` (git-bash is POSIX); `"native"` applies the PowerShell `''` rule for `run_shell` |
 | Path confinement (`opts.cwd`, path bridges) | cwd-confinement + symlink realpath re-check | cwd-confinement (lexical verdict; the realpath re-check is POSIX-only) |
 | Shell safety gate | local matcher always armed; remote classifier when configured | same, and pwsh destructive patterns (`Remove-Item -Recurse -Force …`) are covered by the local matcher too |

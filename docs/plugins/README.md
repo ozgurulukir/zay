@@ -154,12 +154,14 @@ or session so a live Lua state is never torn down while a turn can dispatch.
 | `zay.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence) |
 | `zay.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content grep (substring) |
 | `zay.find_files(root, pattern, opts?)` | `root`, `pattern` (glob), `opts.max_results` | `{root, total_matches, truncated, results}` | Recursive filename glob match |
-| `zay.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing (single level) |
+| `zay.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing (single level). `files`/`directories` are **arrays of plain name strings**, not tables |
 | `zay.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
 | `zay.mkdir(path)` | `path` | `true` or `nil` | Create directory (recursive, with parents) |
 | `zay.copy_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Copy a single file |
 | `zay.move_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Move/rename a file or directory |
 | `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory (recursive opt-in) |
+
+Result rows: `search_files` → `{file, line, content}` (content truncated to 200 bytes per line); `find_files` → `{path, name}`. On a mid-walk failure the bridge returns partial data with an `error` string field and **no** `truncated` field — check `result.error` before trusting `results`.
 
 All filesystem functions validate paths through `sanitizePath`: relative paths
 resolve against the active workspace/effective cwd and are **rejected if they
@@ -195,7 +197,7 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 | `zay.git_log(n)` | `n` (default 10) | `string` | Recent commits |
 | `zay.git_branch()` | — | `string` | Current branch name |
 | `zay.git_add(files)` | one path `string` or array of paths | `{success, output}` | Stage files for commit |
-| `zay.git_commit(msg)` | `msg` | `{success, output}` | Create commit |
+| `zay.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only` | `{success, output}` | Create commit; with neither option it runs `git add -A` first (see the API reference) |
 
 ### Plugin System
 
@@ -301,9 +303,15 @@ Embedded plugins (shipped with Zay) always get full access.
 
 | Limit | Default | Description |
 |-------|---------|-------------|
-| `instruction_limit` | 100,000 | Max Lua instructions before abort |
+| `instruction_limit` | 100,000 | Max Lua instructions before abort (`0` = unlimited) |
 | `memory_limit_mb` | 16 | Max memory in MB |
 | `timeout_ms` | 5,000 | Approximate timeout in ms |
+
+These are **per-dispatch** budgets: the instruction count and timeout deadline are
+reset before every tool handler call and every event callback, so they cap one call,
+not the plugin's lifetime. The hook fires once per 1000 VM instructions, so a
+`timeout_ms` deadline can overshoot slightly. Set a limit to `0` for unlimited;
+negative values are clamped to `0`.
 
 Set these in the manifest's `permissions` table:
 

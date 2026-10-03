@@ -1659,3 +1659,66 @@ test "executor re-roots back on lane leave" {
     try std.testing.expect(std.mem.indexOf(u8, outcome.results[2].content, cwd_abs) != null);
     try std.testing.expect(agent.workspaceBorrow() == null);
 }
+
+test "freesAllAllocatedFields_whenDeinitedWithOptionalFields" {
+    const gpa = std.testing.allocator;
+
+    const content = try gpa.dupe(u8, "sample content");
+    errdefer gpa.free(content);
+
+    const label = try gpa.dupe(u8, "sample label");
+    errdefer gpa.free(label);
+
+    const expanded_label = try gpa.dupe(u8, "sample expanded label");
+    errdefer gpa.free(expanded_label);
+
+    const display_body = try gpa.dupe(u8, "sample display body");
+    errdefer gpa.free(display_body);
+
+    var res = try ToolResult.init(gpa, .{
+        .call_id = "call_123",
+        .name = "bash",
+        .stderr = "sample stderr",
+        .content = content,
+        .display = .{
+            .label = label,
+            .expanded_label = expanded_label,
+        },
+        .display_body = display_body,
+        .display_kind = .text,
+        .failed = false,
+        .end_turn = false,
+    });
+
+    res.deinit(gpa);
+}
+
+test "freesAllAllocatedFields_whenDeinitedWithoutOptionalFields" {
+    const gpa = std.testing.allocator;
+
+    const content = try gpa.dupe(u8, "sample content");
+    errdefer gpa.free(content);
+
+    const label = try gpa.dupe(u8, "sample label");
+    errdefer gpa.free(label);
+
+    const display_body = try gpa.dupe(u8, "sample display body");
+    errdefer gpa.free(display_body);
+
+    var res = try ToolResult.init(gpa, .{
+        .call_id = "call_123",
+        .name = "bash",
+        .stderr = null,
+        .content = content,
+        .display = .{
+            .label = label,
+            .expanded_label = null,
+        },
+        .display_body = display_body,
+        .display_kind = .text,
+        .failed = false,
+        .end_turn = false,
+    });
+
+    res.deinit(gpa);
+}

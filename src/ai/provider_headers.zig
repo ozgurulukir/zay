@@ -405,6 +405,45 @@ test "HeaderSet resolves account_id from the value context" {
     try std.testing.expectEqualStrings("acct-7", wire[0].value);
 }
 
+test "isValidHeaderValue_returnsTrue_forValidAsciiTabsObsTextAndUtf8" {
+    // Arrange
+    const empty_value = "";
+    const standard_ascii = "Bearer secret-token_12345!@#$%^&*()_+-=[]{}|;:'\",.<>/?";
+    const tab_and_spaces = "custom\tvalue with spaces";
+    const ascii_boundaries = "\t ~ \x80\xff";
+    const utf8_multibyte = "Header-Value-\xe2\x82\xac"; // Contains multi-byte UTF-8 bytes (>= 0x80)
+
+    // Act & Assert
+    try std.testing.expect(isValidHeaderValue(empty_value));
+    try std.testing.expect(isValidHeaderValue(standard_ascii));
+    try std.testing.expect(isValidHeaderValue(tab_and_spaces));
+    try std.testing.expect(isValidHeaderValue(ascii_boundaries));
+    try std.testing.expect(isValidHeaderValue(utf8_multibyte));
+}
+
+test "isValidHeaderValue_returnsFalse_forControlBytesAndDel" {
+    // Arrange & Act & Assert
+    // ASCII control character lower boundary (NUL .. 0x1F except '\t' 0x09)
+    try std.testing.expect(!isValidHeaderValue("\x00"));
+    try std.testing.expect(!isValidHeaderValue("\x01"));
+    try std.testing.expect(!isValidHeaderValue("\x08")); // BS
+    try std.testing.expect(!isValidHeaderValue("\x0a")); // LF
+    try std.testing.expect(!isValidHeaderValue("\x0b")); // VT
+    try std.testing.expect(!isValidHeaderValue("\x0c")); // FF
+    try std.testing.expect(!isValidHeaderValue("\x0d")); // CR
+    try std.testing.expect(!isValidHeaderValue("\x1e")); // RS
+    try std.testing.expect(!isValidHeaderValue("\x1f")); // US (last control char before space)
+
+    // DEL character (0x7F)
+    try std.testing.expect(!isValidHeaderValue("\x7f"));
+
+    // Control characters positioned at start, middle, and end of string
+    try std.testing.expect(!isValidHeaderValue("\x1fPrefix"));
+    try std.testing.expect(!isValidHeaderValue("In\x00Middle"));
+    try std.testing.expect(!isValidHeaderValue("AtEnd\x7f"));
+    try std.testing.expect(!isValidHeaderValue("Header\r\nInjection: True"));
+}
+
 test "isValidHeaderValue accepts wire-safe bytes and rejects control bytes" {
     try std.testing.expect(isValidHeaderValue("token abc~\t\x80"));
     try std.testing.expect(isValidHeaderValue(""));

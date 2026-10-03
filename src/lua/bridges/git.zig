@@ -483,3 +483,75 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_setfield(L_ptr, -2, "output");
     return 1;
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "quoteShellArg: POSIX rules (pwsh_rules = false)" {
+    const gpa = std.testing.allocator;
+
+    {
+        const q = try quoteShellArg(gpa, "", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("''", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "hello.txt", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'hello.txt'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "path with spaces/file.txt", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'path with spaces/file.txt'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "a'b", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a'\\''b'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "a'b'c", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a'\\''b'\\''c'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "x'; rm -rf ~; #", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'x'\\''; rm -rf ~; #'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "a $HOME `test` \"double\" \n", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a $HOME `test` \"double\" \n'", q);
+    }
+}
+
+test "quoteShellArg: PowerShell rules (pwsh_rules = true)" {
+    const gpa = std.testing.allocator;
+
+    {
+        const q = try quoteShellArg(gpa, "", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("''", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "hello.txt", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'hello.txt'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "a'b", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a''b'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "a'b'c", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a''b''c'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "x'; rm -rf ~; #", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'x''; rm -rf ~; #'", q);
+    }
+}

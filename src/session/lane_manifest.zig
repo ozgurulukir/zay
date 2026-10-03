@@ -600,3 +600,93 @@ test "driver pin round-trips: absent, set, re-pinned, and deleted-session nullin
     try manager.deleteSession("5" ** 32);
     try std.testing.expect((try loadDriverPin(gpa, conn, "/repo")) == null);
 }
+
+test "upsertLane inserts new row and updates existing row preserving created_at_ms and coalescing title" {
+    const gpa = std.testing.allocator;
+    var manager = try session_mod.SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    const conn = &manager.connection;
+
+    const sid = "7" ** 32;
+    _ = try manager.create("/tmp/zay", .{ .id = sid });
+
+    // 1. Initial insert with null title and null session_id.
+    try upsertLane(gpa, conn, .{
+        .worktree_path = "/repo/worktrees/lane1",
+        .repo_key = "/repo",
+        .session_id = null,
+        .title = null,
+        .state = state_open,
+        .now_ms = 1000,
+    });
+
+    {
+        var row = (try lookupLane(gpa, conn, "/repo/worktrees/lane1")) orelse return error.TestFailed;
+        defer row.deinit(gpa);
+        try std.testing.expectEqualStrings("/repo/worktrees/lane1", row.worktree_path);
+        try std.testing.expectEqualStrings("/repo", row.repo_key);
+        try std.testing.expect(row.session_id == null);
+        try std.testing.expect(row.title == null);
+        try std.testing.expectEqualStrings("open", row.state);
+        try std.testing.expectEqual(@as(i64, 1000), row.created_at_ms);
+        try std.testing.expectEqual(@as(i64, 1000), row.updated_at_ms);
+    }
+
+    // 2. Update to set non-null session_id and non-null title.
+    try upsertLane(gpa, conn, .{
+        .worktree_path = "/repo/worktrees/lane1",
+        .repo_key = "/repo",
+        .session_id = sid,
+        .title = "initial title",
+        .state = state_open,
+        .now_ms = 1500,
+    });
+
+    {
+        var row = (try lookupLane(gpa, conn, "/repo/worktrees/lane1")) orelse return error.TestFailed;
+        defer row.deinit(gpa);
+        try std.testing.expectEqualStrings(sid, row.session_id.?);
+        try std.testing.expectEqualStrings("initial title", row.title.?);
+        try std.testing.expectEqual(@as(i64, 1000), row.created_at_ms);
+        try std.testing.expectEqual(@as(i64, 1500), row.updated_at_ms);
+    }
+
+    // 3. Update with null title: existing title is preserved via coalesce.
+    try upsertLane(gpa, conn, .{
+        .worktree_path = "/repo/worktrees/lane1",
+        .repo_key = "/repo",
+        .session_id = sid,
+        .title = null,
+        .state = state_parked,
+        .now_ms = 2000,
+    });
+
+    {
+        var row = (try lookupLane(gpa, conn, "/repo/worktrees/lane1")) orelse return error.TestFailed;
+        defer row.deinit(gpa);
+        try std.testing.expectEqualStrings("initial title", row.title.?);
+        try std.testing.expectEqualStrings("parked", row.state);
+        try std.testing.expectEqual(@as(i64, 1000), row.created_at_ms);
+        try std.testing.expectEqual(@as(i64, 2000), row.updated_at_ms);
+    }
+
+    // 4. Update with a new non-null title: title is overwritten.
+    try upsertLane(gpa, conn, .{
+        .worktree_path = "/repo/worktrees/lane1",
+        .repo_key = "/repo",
+        .session_id = null,
+        .title = "updated title",
+        .state = state_open,
+        .now_ms = 2500,
+    });
+
+    {
+        var row = (try lookupLane(gpa, conn, "/repo/worktrees/lane1")) orelse return error.TestFailed;
+        defer row.deinit(gpa);
+        try std.testing.expectEqualStrings("updated title", row.title.?);
+        try std.testing.expect(row.session_id == null);
+        try std.testing.expectEqualStrings("open", row.state);
+        try std.testing.expectEqual(@as(i64, 1000), row.created_at_ms);
+        try std.testing.expectEqual(@as(i64, 2500), row.updated_at_ms);
+    }
+}

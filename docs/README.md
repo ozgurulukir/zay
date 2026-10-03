@@ -18,6 +18,9 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | [Database & Sessions](DATABASE.md) | Storage & Roaming | Local SQLite, Turso / LibSQL Cloud, PostgreSQL service, multi-host roaming, fail-safe fallback. |
 | [Building](BUILDING.md) | Source builds | Clone, fetch dependencies, build, test, and install. |
 | [Releasing](RELEASING.md) | Release process | Cutting a release — tag & push, what the GitHub Actions workflow builds and attaches, `zay --version`. |
+| [Command Safety & Classifier](wiki/SAFETY_CLASSIFIER.md) | Safety stack | Tier 1 deterministic matcher, optional Tier 2 ModernBERT classifier REST service, fallback semantics. |
+| [Plugins API Reference](plugins/api-reference.md) | Lua bridge reference | The `zay.*` bridge function surface — parameters, return shapes, errors. |
+| [Plugins Examples](plugins/examples.md) | Lua plugin walkthroughs | End-to-end example plugins. |
 
 ## Where does X live?
 

@@ -118,12 +118,13 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 
 | Shortcut | Action |
 |:---|:---|
-| `/` | Command palette (`/connect`, `/model`, `/parallel`, `/diff`, `/timeline`, `/undo`, `/help`) |
+| `/` or `Ctrl+K` | Command palette (`/connect`, `/model`, `/parallel`, `/diff`, `/timeline`, `/undo`, `/help`) |
 | `@file` | Attach file contents directly into prompt |
 | `$skill` | Invoke a specialized agent skill |
 | `Ctrl+O` | Background Jobs & Log Viewer |
 | `Shift+Tab` | Cycle between active parallel lanes |
-| `Ctrl+L` | Toggle fullscreen / split lane view |
+| `Ctrl+L` | Cycle the focused worker lane in split view (falls back to cycling the split layout) |
+| `Ctrl+W` | Cycle split layout (dual → grid → tab) |
 | `Ctrl+F` | Search transcript |
 | `Ctrl+↑ / Ctrl+↓` | Navigate prompt history |
 | `Alt+V` | Paste from clipboard (works in Windows Terminal) |
@@ -151,8 +152,9 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 - **Windows:** Daily-driver ready. Release CI builds `zay-windows-x86_64.exe` natively on Windows
   runners; PowerShell 7 (`pwsh`) is the shell tool, and the TUI, parallel worktree lanes,
   background jobs (Win32 Job Objects), SQLite persistence, and bounded MCP stdio/HTTP/SSE
-  deadlines all run natively. The deferred Windows test variants tracked in [#32](https://github.com/ozgurulukir/zay/issues/32)
-  are now enabled and covered by the Windows test suite.
+  deadlines all run natively. Windows test variants run via `zig build test` — the direct
+  test runner in `build.zig` works around Zig 0.16's Windows test-server hang — though no
+  CI job executes them today; CI is limited to the release workflow's build and smoke step.
 
 ---
 

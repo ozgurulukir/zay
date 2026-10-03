@@ -12,9 +12,13 @@
 //! jobs each tick (see `takeFinished`) and enqueues the notice itself, keeping
 //! all agent/history mutation on the UI/worker threads.
 //!
-//! Lifecycle: a clean exit (and the modal's cancel) calls `terminateTree`, which
-//! kills the whole process tree — `taskkill /T` on Windows, `kill` on POSIX.
-//! TODO: Address orphaned processes when an unexpected exit happens.
+//! Lifecycle: a clean exit (and the modal's cancel) calls `terminateTreeSync`,
+//! which kills the whole process tree — Win32 Job Objects (`KILL_ON_JOB_CLOSE`)
+//! and `taskkill /T` on Windows, process group `kill` (`.pgid = 0`) on POSIX.
+//! On unexpected process termination on Windows, OS handle cleanup automatically
+//! closes the Job Object handle and terminates all descendant processes. On POSIX,
+//! background processes run in dedicated process groups cleaned up during manager
+//! teardown (`shutdownAll`).
 
 const std = @import("std");
 
@@ -538,7 +542,7 @@ pub const BackgroundManager = struct {
         }
 
         if (target_job) |job| {
-            terminateTree(self.io, self.gpa, job.pid, job);
+            terminateTreeSync(self.io, self.gpa, job.pid, job);
             return true;
         }
         return false;
@@ -799,12 +803,6 @@ pub fn terminateTreeSync(io: std.Io, gpa: std.mem.Allocator, pid: i64, job_opt: 
             std.posix.kill(p, std.posix.SIG.KILL) catch {};
         }
     }
-}
-
-/// Kill a job's whole process tree. On Windows, if a Job Object is attached,
-/// it terminates immediately in the kernel; otherwise runs synchronous/fallback taskkill.
-fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64, job_opt: ?*BackgroundManager.Job) void {
-    terminateTreeSync(io, gpa, pid, job_opt);
 }
 
 fn processId(child: std.process.Child) i64 {
@@ -1362,4 +1360,40 @@ test "writeLogChunk caps at quota and writes truncation notice" {
     // Subsequent writeLogChunk calls must be no-ops
     BackgroundManager.writeLogChunk(&job, io, "more data");
     try std.testing.expectEqual(max_job_log_bytes, job.bytes_written);
+}
+
+test "BackgroundManager.shutdownAll terminates active jobs cleanly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.deinit();
+
+    const is_win = os.is_windows;
+    var started = try manager.start(.{
+        .command = if (is_win) "Start-Sleep -Seconds 60" else "sleep 60",
+        .cwd = cwd,
+        .env_map = &env_map,
+        .owner_generation = 1,
+        .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
+        .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
+        .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
+        .stderr_merge_suffix = if (is_win) "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }" else "",
+    });
+    defer started.deinit(gpa);
+    defer std.Io.Dir.deleteFile(.cwd(), io, started.log_path) catch {};
+    try std.testing.expect(started.pid > 0);
+
+    try std.testing.expectEqual(@as(usize, 1), manager.runningCount());
+
+    // shutdownAll terminates active jobs cleanly and reaps reader threads.
+    manager.shutdownAll();
+
+    try std.testing.expectEqual(@as(usize, 0), manager.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.runningCount());
 }
