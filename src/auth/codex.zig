@@ -697,13 +697,18 @@ test "parseTokenResponse rejects empty tokens or negative expires_in" {
     try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, std.testing.io, "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_in\":-1}"));
 }
 
-test "static models match openai codex catalog" {
+test "loadStaticModels_returnsExpectedCodexCatalogModels_whenCalledWithAllocator" {
+    // Arrange
     const gpa = std.testing.allocator;
+
+    // Act
     const loaded = try loadStaticModels(gpa);
     defer {
         for (loaded) |*model| model.deinit(gpa);
         gpa.free(loaded);
     }
+
+    // Assert
     try std.testing.expectEqual(@as(usize, 3), loaded.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", loaded[0].id);
     try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Sol", loaded[0].label);
@@ -713,9 +718,12 @@ test "static models match openai codex catalog" {
     try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Luna", loaded[2].label);
 }
 
-test "loadStaticModels handles allocation failures gracefully" {
+test "loadStaticModels_returnsOutOfMemory_whenAllocationFails" {
+    // Arrange
     const gpa = std.testing.allocator;
     var succeeded = false;
+
+    // Act & Assert
     var i: usize = 0;
     while (i < 30) : (i += 1) {
         var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = i });
@@ -729,6 +737,25 @@ test "loadStaticModels handles allocation failures gracefully" {
         }
     }
     try std.testing.expect(succeeded);
+}
+
+test "Model.deinit_freesAllocatedFields_withoutLeaks" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const id = try gpa.dupe(u8, "custom-id");
+    errdefer gpa.free(id);
+    const label = try gpa.dupe(u8, "custom-label");
+    errdefer gpa.free(label);
+
+    var model = Model{
+        .id = id,
+        .label = label,
+    };
+
+    // Act
+    model.deinit(gpa);
+
+    // Assert: std.testing.allocator verifies no leaked bytes on test completion
 }
 
 test "sign out removes missing auth file without error" {
