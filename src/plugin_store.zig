@@ -414,15 +414,17 @@ fn parsePlugin(
     errdefer gpa.free(description);
 
     if (object.get("sourceDir") orelse object.get("source_dir")) |source_value| {
-        if (!local_source or source_value != .string or !validRelativePath(source_value.string)) return error.InvalidSourceDir;
-        const source_dir = try std.fs.path.join(gpa, &.{ project_root, source_value.string });
-        return .{
-            .id = id,
-            .name = name,
-            .version = version,
-            .description = description,
-            .source = .{ .local_dir = source_dir },
-        };
+        if (local_source) {
+            if (source_value != .string or !validRelativePath(source_value.string)) return error.InvalidSourceDir;
+            const source_dir = try std.fs.path.join(gpa, &.{ project_root, source_value.string });
+            return .{
+                .id = id,
+                .name = name,
+                .version = version,
+                .description = description,
+                .source = .{ .local_dir = source_dir },
+            };
+        }
     }
 
     const files_value = object.get("files") orelse return error.MissingFiles;

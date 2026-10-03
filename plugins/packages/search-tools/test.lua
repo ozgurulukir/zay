@@ -65,7 +65,7 @@ zay = {
 -- Load the plugin source (registers grep + glob into `registered`). The test
 -- runner builds with cwd at the repo root; io + load are available because the
 -- runner uses a full-access sandbox.
-local f = assert(io.open("examples/plugins/search-tools/init.lua", "r"))
+local f = assert(io.open("plugins/packages/search-tools/init.lua", "r"))
 local src = f:read("*a")
 f:close()
 assert(load(src))()

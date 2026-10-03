@@ -446,7 +446,7 @@ pub fn build(b: *std.Build) void {
 
     // Lua plugin test runner: `zig build test-plugin` runs Lua test files
     // through the Zay Lua sandbox. Tests are standalone .lua files under
-    // examples/plugins/ that use the test_runner module.
+    // plugins/ that use the test_runner module.
     const lua_test_step = b.step("test-plugin", "Run Lua plugin tests");
     {
         const lua_test_exe = b.addExecutable(.{
@@ -462,15 +462,15 @@ pub fn build(b: *std.Build) void {
         });
         const run_lua_tests = b.addRunArtifact(lua_test_exe);
         // Pass test file paths as arguments
-        run_lua_tests.addArg("examples/plugins/hello-world/test.lua");
-        run_lua_tests.addArg("examples/plugins/search-tools/test.lua");
-        run_lua_tests.addArg("examples/plugins/todo/test.lua");
-        run_lua_tests.addArg("examples/plugins/file-tools/test.lua");
-        run_lua_tests.addArg("examples/plugins/git-tools/test.lua");
-        run_lua_tests.addArg("examples/plugins/file-watcher/test.lua");
-        run_lua_tests.addArg("examples/plugins/path-tools/test.lua");
-        run_lua_tests.addArg("examples/plugins/modular-demo/test.lua");
-        run_lua_tests.addArg("examples/plugins/sitting-duck/test.lua");
+        run_lua_tests.addArg("plugins/packages/hello-world/test.lua");
+        run_lua_tests.addArg("plugins/packages/search-tools/test.lua");
+        run_lua_tests.addArg("plugins/packages/todo/test.lua");
+        run_lua_tests.addArg("plugins/packages/file-tools/test.lua");
+        run_lua_tests.addArg("plugins/packages/git-tools/test.lua");
+        run_lua_tests.addArg("plugins/packages/file-watcher/test.lua");
+        run_lua_tests.addArg("plugins/packages/path-tools/test.lua");
+        run_lua_tests.addArg("plugins/packages/modular-demo/test.lua");
+        run_lua_tests.addArg("plugins/packages/sitting-duck/test.lua");
         lua_test_step.dependOn(&run_lua_tests.step);
     }
 

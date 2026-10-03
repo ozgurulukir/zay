@@ -1,8 +1,11 @@
-# Distributed plugin catalog
+# Plugin Store and Packages
 
-This checked-in directory contains the catalog distributed with the GitHub
-source tree. The `store.json` catalog exposes the demo plugins without moving
-their source: the demos remain under [`../examples/plugins`](../examples/plugins).
+This directory contains the checked-in store catalog and the plugin packages
+distributed with Zay. Each `plugins/packages/<id>/` directory is the canonical
+source for that package; the catalog points at these packages both locally and
+on GitHub. Keeping packages one level below the catalog also keeps their
+prompts out of the checkout's project-plugin prompt scan.
+
 When Zay runs outside this checkout, it fetches this catalog from
 `https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/store.json`.
 
@@ -34,8 +37,9 @@ Additional catalogs are JSON documents with this shape:
 }
 ```
 
-`plugin.lua` and `init.lua` are required. File paths are relative to the
-plugin package and URLs must be HTTP(S). Store URLs are saved globally in
-`plugin-stores.json` under Zay's platform config directory. The checked-in
-`plugins/` directory is catalog/distribution content; it is not the install
+`plugin.lua` and `init.lua` are required. Remote file paths are relative to the
+plugin package and URLs must be HTTP(S). The checked-in catalog also has a
+`sourceDir` for each package, used only when running from this checkout. Store
+URLs are saved globally in `plugin-stores.json` under Zay's platform config
+directory. The checked-in packages are store sources, not the install
 destination.

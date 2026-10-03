@@ -13,7 +13,7 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "zig build test failed" }
 }
 
-$documentationScopes = @("docs/plugins", "examples/plugins")
+$documentationScopes = @("docs/plugins", "plugins")
 foreach ($forbidden in @("cp -r", "in_progress")) {
     $matches = & rg --fixed-strings --line-number --glob "*.md" --glob "*.lua" $forbidden @documentationScopes 2>$null
     if ($LASTEXITCODE -eq 0) {

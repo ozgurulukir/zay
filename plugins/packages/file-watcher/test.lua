@@ -22,7 +22,7 @@ zay = {
   end,
 }
 
-local f = assert(io.open("examples/plugins/file-watcher/init.lua", "r"))
+local f = assert(io.open("plugins/packages/file-watcher/init.lua", "r"))
 local src = f:read("*a")
 f:close()
 assert(load(src, "@file-watcher/init.lua"))()

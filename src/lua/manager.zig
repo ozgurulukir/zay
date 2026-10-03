@@ -1000,17 +1000,17 @@ test "plugin manager: handler result contract preserves status and stack balance
     try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
 }
 
-// Load every shipped example plugin and confirm each registered at least one
+// Load every shipped plugin and confirm each registered at least one
 // tool. This catches syntax errors, missing bridge functions, and registration
 // regressions across the whole plugin set in one test.
 test "plugin manager: loads all shipped example plugins" {
     const testing = std.testing;
 
-    // examples/plugins is resolved from cwd. The test binary runs with cwd
+    // plugins is resolved from cwd. The test binary runs with cwd
     // set to the repo root (same convention as the other plugin tests), so a
-    // relative "examples/plugins" works without needing @src().
-    const examples_plugins = try std.fs.path.join(testing.allocator, &.{ "examples", "plugins" });
-    defer testing.allocator.free(examples_plugins);
+    // relative "plugins" works without needing @src().
+    const plugins_dir = try std.fs.path.join(testing.allocator, &.{ "plugins", "packages" });
+    defer testing.allocator.free(plugins_dir);
 
     // Each entry: directory name and the minimum number of tools expected.
     const expectations = [_]struct { dir: []const u8, min_tools: u32 }{
@@ -1030,7 +1030,7 @@ test "plugin manager: loads all shipped example plugins" {
     defer manager.deinit();
 
     for (expectations) |exp| {
-        const plugin_dir = try std.fs.path.join(testing.allocator, &.{ examples_plugins, exp.dir });
+        const plugin_dir = try std.fs.path.join(testing.allocator, &.{ plugins_dir, exp.dir });
         defer testing.allocator.free(plugin_dir);
 
         const instance = manager.loadOne(plugin_dir, false) catch |err| {
@@ -1129,7 +1129,7 @@ test "plugin manager: file-watcher counts a real failed/successful completion ev
     var manager = PluginManager.init(gpa, testing.io, "", "");
     defer manager.deinit();
 
-    const instance = try manager.loadOne("examples/plugins/file-watcher", false);
+    const instance = try manager.loadOne("plugins/packages/file-watcher", false);
     try testing.expect(instance.active);
     manager.emitEvent(.{
         .tool_call_finished = .{ .name = "lua__file-tools__write", .call_id = "call-ok", .success = true },
