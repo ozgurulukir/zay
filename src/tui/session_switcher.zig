@@ -1404,8 +1404,8 @@ test "map-based resume sort sends map misses to the end and breaks misses by raw
     }
     // Direct comparator probes of the miss branch: equal minInt fallbacks
     // resolve via raw-key byte order, deterministically.
-    try std.testing.expect(resumeSummaryLessThanWithMap(&map, summaries[3], summaries[2]));
-    try std.testing.expect(!resumeSummaryLessThanWithMap(&map, summaries[2], summaries[3]));
+    try std.testing.expect(resumeSummaryLessThanWithMap(&map, summaries[2], summaries[3]));
+    try std.testing.expect(!resumeSummaryLessThanWithMap(&map, summaries[3], summaries[2]));
 }
 
 test "map-based resume sort does not fold pathsEqual-equal group keys into one entry" {

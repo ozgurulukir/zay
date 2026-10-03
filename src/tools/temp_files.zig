@@ -32,23 +32,48 @@ pub fn isPrunable(name: []const u8) bool {
     return false;
 }
 
-test "prunable prefixes cover every writer name shape" {
+test "prunablePrefixes_matchExpectedValues" {
     // Pin the exact prefix values: files from older binaries carry them, so an
     // accidental value change would strand every pre-existing temp file past
     // the startup prune.
     try std.testing.expectEqualStrings("zay-bash-", bash_spill_prefix);
     try std.testing.expectEqualStrings("zay-pwsh-", pwsh_prefix);
     try std.testing.expectEqualStrings("zay-bg_", bg_log_prefix);
+}
 
-    // Every name shape the writers produce, composed the way the writers do.
+test "isPrunable_returnsTrue_whenNameHasValidPrefix" {
+    // Every name shape produced by writers
     try std.testing.expect(isPrunable(bash_spill_prefix ++ "a1b2c3.log"));
     try std.testing.expect(isPrunable(pwsh_prefix ++ "a1b2c3.log"));
     try std.testing.expect(isPrunable(pwsh_prefix ++ "script-a1b2c3.ps1"));
     try std.testing.expect(isPrunable(pwsh_prefix ++ "bg-a1b2c3.ps1"));
     try std.testing.expect(isPrunable(bg_log_prefix ++ "7.log"));
 
-    // Bare `zay-` must stay unprunable, and unrelated files untouched.
+    // Bare exact prefixes without trailing filenames/suffixes
+    try std.testing.expect(isPrunable(bash_spill_prefix));
+    try std.testing.expect(isPrunable(pwsh_prefix));
+    try std.testing.expect(isPrunable(bg_log_prefix));
+}
+
+test "isPrunable_returnsFalse_whenNameLacksValidPrefix" {
+    // Bare `zay-` must stay unprunable
     try std.testing.expect(!isPrunable("zay-other.txt"));
+    try std.testing.expect(!isPrunable("zay-"));
+
+    // Partial or misspelled prefixes
+    try std.testing.expect(!isPrunable("zay-bas"));
+    try std.testing.expect(!isPrunable("zay-pws"));
+    try std.testing.expect(!isPrunable("zay-b"));
+
+    // Uppercase / case variants (prefixes are strictly lower-case)
+    try std.testing.expect(!isPrunable("ZAY-BASH-123.log"));
+    try std.testing.expect(!isPrunable("ZAY-PWSH-123.log"));
+
+    // Prefixes in middle or end of string (must start with prefix)
+    try std.testing.expect(!isPrunable("tmp/zay-bash-123.log"));
+    try std.testing.expect(!isPrunable("prefix_zay-bg_1.log"));
+
+    // Unrelated files & empty string
     try std.testing.expect(!isPrunable("keep.txt"));
     try std.testing.expect(!isPrunable(""));
 }
