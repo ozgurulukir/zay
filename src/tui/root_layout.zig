@@ -208,106 +208,56 @@ fn materializeBlankCells(arena: std.mem.Allocator, root: *vxfw.Surface) !void {
     }
 }
 
-pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-    // The diff viewer replaces the whole screen (transcript + input + overlay),
-    // so it short-circuits the normal layout entirely. Zero the split-rect
-    // stash here too — the normal path that clears it is skipped, so otherwise
-    // `routeMouse` would keep hit-testing stale split geometry while the diff
-    // viewer is up.
-    if (app.mode == .diff_viewer) {
-        app.split_rect_count = 0;
-        var surface = try diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
-        try materializeBlankCells(ctx.arena, &surface);
-        return surface;
-    }
-    const max_width = ctx.max.width orelse ctx.min.width;
-    const max_height = ctx.max.height orelse ctx.min.height;
-    const loading_visible = app.thread.turn_view.awaitingOutput();
-    const split = app.split_mode != .tab and app.threads.len() > 1;
-    // In split view always reserve the loading row so each column keeps a
-    // fixed height across turns — the spinner appearing must not reflow.
-    // One arena concat feeds BOTH the layout row count and the input widget's
-    // props (was: two gpa peek allocations per frame).
-    const input_combined = try std.mem.concat(ctx.arena, u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() });
-    const layout = root_layout.rootLayout(max_height, false, input_mod.wrappedTextRows(ctx, input_combined, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
-    // Compute the split geometry once and stash it for mouse click-to-focus
-    // routing (event_router.routeMouse), so the render path and the mouse
-    // handler share one source of truth. `split_rect_count` is set
-    // unconditionally so leaving split mode (or the diff viewer early-return)
-    // leaves it 0 and the mouse handler stops hit-testing stale geometry.
-    var split_cols: []const root_layout.ColumnRect = &.{};
-    var split_rects: [4]root_layout.ColumnRect = undefined;
+/// Context container for constructing top widget storage buffers across split layout modes.
+const TopWidgetBuffers = struct {
+    transcript_box: vxfw.SizedBox = undefined,
+    dual_lane_widgets: [2]lane_column.LaneColumnWidget = undefined,
+    dual_lane_boxes: [2]vxfw.SizedBox = undefined,
+    dual_flex_items: [2]vxfw.FlexItem = undefined,
+    dual_row: vxfw.FlexRow = undefined,
+    grid_lane_widgets: [4]lane_column.LaneColumnWidget = undefined,
+    grid_lane_boxes: [4]vxfw.SizedBox = undefined,
+    grid_row0_buf: [2]vxfw.FlexItem = undefined,
+    grid_row1_buf: [2]vxfw.FlexItem = undefined,
+    grid_row0_flex: vxfw.FlexRow = undefined,
+    grid_row1_flex: vxfw.FlexRow = undefined,
+    grid_rows_buf: [2]vxfw.FlexItem = undefined,
+    grid_col: vxfw.FlexColumn = undefined,
+    split_box: vxfw.SizedBox = undefined,
+};
+
+/// Build top area widget (single transcript column or tiled grid/dual split columns).
+fn buildTopWidget(
+    app: *App,
+    split: bool,
+    split_cols: []const root_layout.ColumnRect,
+    max_width: u16,
+    transcript_height: u16,
+    transcript_view: *tx_widget.TranscriptWidget,
+    bufs: *TopWidgetBuffers,
+) vxfw.Widget {
     if (split) {
-        split_cols = root_layout.computeSplitLayout(max_width, layout.transcript_height, app.split_mode, app.threads.len(), app.focused_worker_index, app.cached_config.tui.min_split_width, &split_rects);
-        app.split_rects = split_rects;
-    }
-    app.split_rect_count = split_cols.len;
-    app.input_surface_row = layout.input_row;
-    app.nav.lanes_chip_rect = null;
-
-    // INV-WIDGET-1: leaf widgets take scalars, computed here per frame.
-    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
-    var transcript_view: tx_widget.TranscriptWidget = .{
-        .thread = app.thread,
-        .gpa = app.gpa,
-        .has_model_configured = has_model,
-        .loading_frame = app.metrics.loading_frame,
-        .blackhole_frame = app.metrics.blackhole_frame,
-        .blackhole_visible = &app.metrics.blackhole_visible,
-        .splash_suppressed = app.inputs.input.buf.realLength() > 0,
-    };
-    var loading_view: loading.LoadingWidget = .{
-        .awaiting_output = app.thread.turn_view.awaitingOutput(),
-        .word_index = app.thread.turn_view.loading_word_index,
-        .loading_frame = app.metrics.loading_frame,
-    };
-    var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
-    var overlay_view: overlay.OverlayWidget = .{ .app = app };
-
-    const overlay_visible = app.mode != .normal;
-    const permission_visible = app.permissionPending() and !overlay_visible;
-    const background_visible = app.background_modal_state.modal and !overlay_visible and !permission_visible;
-    const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
-    const toast_visible = toast.global.hasToasts();
-
-    // Top area: single transcript or split grid/dual columns.
-    var transcript_box: vxfw.SizedBox = undefined;
-    var dual_lane_widgets: [2]lane_column.LaneColumnWidget = undefined;
-    var dual_lane_boxes: [2]vxfw.SizedBox = undefined;
-    var dual_flex_items: [2]vxfw.FlexItem = undefined;
-    var dual_row: vxfw.FlexRow = undefined;
-    var grid_lane_widgets: [4]lane_column.LaneColumnWidget = undefined;
-    var grid_lane_boxes: [4]vxfw.SizedBox = undefined;
-    var grid_row0_buf: [2]vxfw.FlexItem = undefined;
-    var grid_row1_buf: [2]vxfw.FlexItem = undefined;
-    var grid_row0_flex: vxfw.FlexRow = undefined;
-    var grid_row1_flex: vxfw.FlexRow = undefined;
-    var grid_rows_buf: [2]vxfw.FlexItem = undefined;
-    var grid_col: vxfw.FlexColumn = undefined;
-    var split_box: vxfw.SizedBox = undefined;
-
-    const top_widget = if (split) blk: {
         if (app.split_mode == .dual) {
             for (split_cols, 0..) |col, i| {
                 const lane = app.threads.slice()[col.lane_index];
                 const worker_focus = @max(@min(app.focused_worker_index, app.threads.len() - 1), 1);
                 const active = (col.lane_index == 0) or (col.lane_index == worker_focus);
                 const focused = (col.lane_index == worker_focus);
-                dual_lane_widgets[i] = .{
+                bufs.dual_lane_widgets[i] = .{
                     .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused),
                 };
-                dual_lane_boxes[i] = .{
-                    .child = dual_lane_widgets[i].widget(),
+                bufs.dual_lane_boxes[i] = .{
+                    .child = bufs.dual_lane_widgets[i].widget(),
                     .size = .{ .width = col.width, .height = col.height },
                 };
-                dual_flex_items[i] = .{ .widget = dual_lane_boxes[i].widget(), .flex = 0 };
+                bufs.dual_flex_items[i] = .{ .widget = bufs.dual_lane_boxes[i].widget(), .flex = 0 };
             }
-            dual_row = .{ .children = dual_flex_items[0..split_cols.len] };
-            split_box = .{
-                .child = dual_row.widget(),
-                .size = .{ .width = max_width, .height = layout.transcript_height },
+            bufs.dual_row = .{ .children = bufs.dual_flex_items[0..split_cols.len] };
+            bufs.split_box = .{
+                .child = bufs.dual_row.widget(),
+                .size = .{ .width = max_width, .height = transcript_height },
             };
-            break :blk split_box.widget();
+            return bufs.split_box.widget();
         } else {
             var row0_count: usize = 0;
             var row1_count: usize = 0;
@@ -315,80 +265,73 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
                 const lane = app.threads.slice()[col.lane_index];
                 const active = (col.lane_index == @as(usize, app.activeIndex()));
                 const focused = (col.lane_index == @as(usize, app.activeIndex()));
-                grid_lane_widgets[i] = .{
+                bufs.grid_lane_widgets[i] = .{
                     .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused),
                 };
-                grid_lane_boxes[i] = .{
-                    .child = grid_lane_widgets[i].widget(),
+                bufs.grid_lane_boxes[i] = .{
+                    .child = bufs.grid_lane_widgets[i].widget(),
                     .size = .{ .width = col.width, .height = col.height },
                 };
                 if (col.row == 0) {
-                    grid_row0_buf[row0_count] = .{ .widget = grid_lane_boxes[i].widget(), .flex = 0 };
+                    bufs.grid_row0_buf[row0_count] = .{ .widget = bufs.grid_lane_boxes[i].widget(), .flex = 0 };
                     row0_count += 1;
                 } else {
-                    grid_row1_buf[row1_count] = .{ .widget = grid_lane_boxes[i].widget(), .flex = 0 };
+                    bufs.grid_row1_buf[row1_count] = .{ .widget = bufs.grid_lane_boxes[i].widget(), .flex = 0 };
                     row1_count += 1;
                 }
             }
-            grid_row0_flex = .{ .children = grid_row0_buf[0..row0_count] };
-            grid_rows_buf[0] = .{ .widget = grid_row0_flex.widget(), .flex = 0 };
+            bufs.grid_row0_flex = .{ .children = bufs.grid_row0_buf[0..row0_count] };
+            bufs.grid_rows_buf[0] = .{ .widget = bufs.grid_row0_flex.widget(), .flex = 0 };
             var grid_rows_count: usize = 1;
             if (row1_count > 0) {
-                grid_row1_flex = .{ .children = grid_row1_buf[0..row1_count] };
-                grid_rows_buf[1] = .{ .widget = grid_row1_flex.widget(), .flex = 0 };
+                bufs.grid_row1_flex = .{ .children = bufs.grid_row1_buf[0..row1_count] };
+                bufs.grid_rows_buf[1] = .{ .widget = bufs.grid_row1_flex.widget(), .flex = 0 };
                 grid_rows_count = 2;
             }
-            grid_col = .{ .children = grid_rows_buf[0..grid_rows_count] };
-            split_box = .{
-                .child = grid_col.widget(),
-                .size = .{ .width = max_width, .height = layout.transcript_height },
+            bufs.grid_col = .{ .children = bufs.grid_rows_buf[0..grid_rows_count] };
+            bufs.split_box = .{
+                .child = bufs.grid_col.widget(),
+                .size = .{ .width = max_width, .height = transcript_height },
             };
-            break :blk split_box.widget();
+            return bufs.split_box.widget();
         }
-    } else blk: {
-        transcript_box = .{
+    } else {
+        bufs.transcript_box = .{
             .child = transcript_view.widget(),
-            .size = .{ .width = max_width, .height = layout.transcript_height },
+            .size = .{ .width = max_width, .height = transcript_height },
         };
-        break :blk transcript_box.widget();
-    };
-
-    var main_flex_buf: [3]vxfw.FlexItem = undefined;
-    var main_flex_count: usize = 0;
-
-    main_flex_buf[main_flex_count] = .{ .widget = top_widget, .flex = 1 };
-    main_flex_count += 1;
-
-    const include_loading = split or loading_visible;
-    var loading_box: vxfw.SizedBox = undefined;
-    if (include_loading) {
-        loading_box = .{
-            .child = loading_view.widget(),
-            .size = .{ .width = max_width, .height = layout.loading_height },
-        };
-        main_flex_buf[main_flex_count] = .{ .widget = loading_box.widget(), .flex = 0 };
-        main_flex_count += 1;
+        return bufs.transcript_box.widget();
     }
+}
 
-    var input_box: vxfw.SizedBox = .{
-        .child = input_view.widget(),
-        .size = .{ .width = max_width, .height = layout.input_height },
-    };
-    main_flex_buf[main_flex_count] = .{ .widget = input_box.widget(), .flex = 0 };
-    main_flex_count += 1;
 
-    var main_col: vxfw.FlexColumn = .{ .children = main_flex_buf[0..main_flex_count] };
-    const main_surface = try main_col.widget().draw(ctx.withConstraints(
-        .{ .width = max_width, .height = max_height },
-        .{ .width = max_width, .height = max_height },
-    ));
+/// Context options for `buildOverlayChildren`.
+const OverlayFlags = struct {
+    overlay_visible: bool,
+    permission_visible: bool,
+    background_visible: bool,
+    at_visible: bool,
+    toast_visible: bool,
+};
 
+/// Construct subsurfaces for all visible modal overlays, prompts, popups, and toasts.
+fn buildOverlayChildren(
+    app: *App,
+    ctx: vxfw.DrawContext,
+    layout: root_layout.RootLayout,
+    max_width: u16,
+    max_height: u16,
+    main_surface: vxfw.Surface,
+    overlay_view: *overlay.OverlayWidget,
+    flags: OverlayFlags,
+) std.mem.Allocator.Error![]vxfw.SubSurface {
     var child_count: usize = 1;
-    if (overlay_visible) child_count += 1;
-    if (permission_visible) child_count += 1;
-    if (background_visible) child_count += 1;
-    if (at_visible) child_count += 1;
-    if (toast_visible) child_count += 1;
+    if (flags.overlay_visible) child_count += 1;
+    if (flags.permission_visible) child_count += 1;
+    if (flags.background_visible) child_count += 1;
+    if (flags.at_visible) child_count += 1;
+    if (flags.toast_visible) child_count += 1;
+
     const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
     children[0] = .{
         .origin = .{ .row = 0, .col = 0 },
@@ -396,7 +339,8 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .z_index = 0,
     };
     var idx: usize = 1;
-    if (overlay_visible) {
+
+    if (flags.overlay_visible) {
         var centered_overlay: vxfw.Center = .{ .child = overlay_view.widget() };
         children[idx] = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -408,7 +352,8 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         };
         idx += 1;
     }
-    if (permission_visible) {
+
+    if (flags.permission_visible) {
         const lane = permission_mod.approvalLane(app);
         const worker = if (lane) |l| if (l.worker_context) |*wc| wc else null else null;
         const snapshot = if (worker) |w| try w.approval.snapshot(w.io, ctx.arena, app.thread.permission_selection) else null;
@@ -437,7 +382,8 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         };
         idx += 1;
     }
-    if (background_visible) {
+
+    if (flags.background_visible) {
         // The modal renders the display cache built by lifecycle processing
         // (`background_delivery.refreshBackgroundModalCache` — tick and key
         // handling). Draw performs no manager snapshot and no file read; a
@@ -470,7 +416,8 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         };
         idx += 1;
     }
-    if (at_visible) {
+
+    if (flags.at_visible) {
         // The popup renders state prepared by lifecycle processing
         // (`at_search.drainAtSearch` polls the async backend and promotes
         // failures into the notice on the tick). Draw builds the view from
@@ -489,7 +436,8 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         };
         idx += 1;
     }
-    if (toast_visible) {
+
+    if (flags.toast_visible) {
         // Top-right toast stack, above every other child (z_index 4).
         const toast_w: u16 = @min(max_width, 60);
         var toast_view: toast.Widget = .{ .bus = &toast.global };
@@ -503,6 +451,100 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         };
         idx += 1;
     }
+
+    return children;
+}
+
+
+pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+    if (app.mode == .diff_viewer) {
+        app.split_rect_count = 0;
+        var surface = try diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
+        try materializeBlankCells(ctx.arena, &surface);
+        return surface;
+    }
+    const max_width = ctx.max.width orelse ctx.min.width;
+    const max_height = ctx.max.height orelse ctx.min.height;
+    const loading_visible = app.thread.turn_view.awaitingOutput();
+    const split = app.split_mode != .tab and app.threads.len() > 1;
+
+    const input_combined = try std.mem.concat(ctx.arena, u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() });
+    const layout = root_layout.rootLayout(max_height, false, input_mod.wrappedTextRows(ctx, input_combined, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
+
+    var split_cols: []const root_layout.ColumnRect = &.{};
+    var split_rects: [4]root_layout.ColumnRect = undefined;
+    if (split) {
+        split_cols = root_layout.computeSplitLayout(max_width, layout.transcript_height, app.split_mode, app.threads.len(), app.focused_worker_index, app.cached_config.tui.min_split_width, &split_rects);
+        app.split_rects = split_rects;
+    }
+    app.split_rect_count = split_cols.len;
+    app.input_surface_row = layout.input_row;
+    app.nav.lanes_chip_rect = null;
+
+    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+    var transcript_view: tx_widget.TranscriptWidget = .{
+        .thread = app.thread,
+        .gpa = app.gpa,
+        .has_model_configured = has_model,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+        .splash_suppressed = app.inputs.input.buf.realLength() > 0,
+    };
+    var loading_view: loading.LoadingWidget = .{
+        .awaiting_output = app.thread.turn_view.awaitingOutput(),
+        .word_index = app.thread.turn_view.loading_word_index,
+        .loading_frame = app.metrics.loading_frame,
+    };
+    var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
+    var overlay_view: overlay.OverlayWidget = .{ .app = app };
+
+    const overlay_visible = app.mode != .normal;
+    const permission_visible = app.permissionPending() and !overlay_visible;
+    const background_visible = app.background_modal_state.modal and !overlay_visible and !permission_visible;
+    const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
+    const toast_visible = toast.global.hasToasts();
+
+    var top_bufs: TopWidgetBuffers = .{};
+    const top_widget = buildTopWidget(app, split, split_cols, max_width, layout.transcript_height, &transcript_view, &top_bufs);
+
+    var main_flex_buf: [3]vxfw.FlexItem = undefined;
+    var main_flex_count: usize = 0;
+
+    main_flex_buf[main_flex_count] = .{ .widget = top_widget, .flex = 1 };
+    main_flex_count += 1;
+
+    const include_loading = split or loading_visible;
+    var loading_box: vxfw.SizedBox = undefined;
+    if (include_loading) {
+        loading_box = .{
+            .child = loading_view.widget(),
+            .size = .{ .width = max_width, .height = layout.loading_height },
+        };
+        main_flex_buf[main_flex_count] = .{ .widget = loading_box.widget(), .flex = 0 };
+        main_flex_count += 1;
+    }
+
+    var input_box: vxfw.SizedBox = .{
+        .child = input_view.widget(),
+        .size = .{ .width = max_width, .height = layout.input_height },
+    };
+    main_flex_buf[main_flex_count] = .{ .widget = input_box.widget(), .flex = 0 };
+    main_flex_count += 1;
+
+    var main_col: vxfw.FlexColumn = .{ .children = main_flex_buf[0..main_flex_count] };
+    const main_surface = try main_col.widget().draw(ctx.withConstraints(
+        .{ .width = max_width, .height = max_height },
+        .{ .width = max_width, .height = max_height },
+    ));
+
+    const children = try buildOverlayChildren(app, ctx, layout, max_width, max_height, main_surface, &overlay_view, .{
+        .overlay_visible = overlay_visible,
+        .permission_visible = permission_visible,
+        .background_visible = background_visible,
+        .at_visible = at_visible,
+        .toast_visible = toast_visible,
+    });
 
     var surface: vxfw.Surface = .{
         .size = .{ .width = max_width, .height = max_height },
