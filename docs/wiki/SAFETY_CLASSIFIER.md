@@ -25,7 +25,7 @@ flowchart TD
 The system operates across two complementary tiers:
 1. **Tier 1: Built-in Deterministic Safety Matcher (Always Active)**
    - Zero-dependency, microsecond-latency token pattern matcher built directly into the native Zig binary.
-   - Intercepts known destructive commands: `rm -rf /`, `mkfs.*`, `dd of=/dev/sd*`, PowerShell `Remove-Item -Recurse -Force` on system roots, `Clear-RecycleBin -Force`, fork bombs (`:(){ :|:& };:`), and critical system redirects (`> /etc/passwd`).
+   - Intercepts known destructive commands: `rm -rf /`, `mkfs.*`, `dd of=/dev/sd*`, PowerShell `Remove-Item -Recurse -Force` on system roots, `Clear-RecycleBin -Force`, fork bombs (`:(){ :|:& };:`), critical system redirects (`> /etc/passwd`), **and privileged package management** — a privilege escalator (`sudo`, `doas`, `runas`), a bare package-manager token (`apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `pacman`, `apk`, `brew`, `zypper`, `emerge`, `aptitude`, `nix-env`, `snap`), or an install verb (`pip install`, `npm install -g`, `cargo install`, `gem install`, `go install`, `conda install`, `flatpak install`). This last family is why `sudo apt install …` always surfaces for interactive approval.
 2. **Tier 2: External AI Safety Classifier (Optional & Pluggable)**
    - External REST endpoint powered by a fine-tuned Transformer model (such as ModernBERT) or an LLM proxy.
    - Evaluates natural language shell commands semantically for dangerous side effects beyond simple regex matching.

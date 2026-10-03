@@ -52,7 +52,6 @@ rewrites the config as `"mcpServers"`.
       "enabled": true
     },
     "context7": {
-      "type": "remote",
       "url": "https://mcp.context7.com/mcp",
       "headers": {
         "CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}"
@@ -64,7 +63,7 @@ rewrites the config as `"mcpServers"`.
 
 ### Server Configuration Options
 
-The `mcpServers` entry fields (`command`, `args`, `url`, `headers`, `type`, `enabled`) are part of the config schema — the authoritative field table lives in the [Configuration Guide](CONFIG.md#mcp-server-configuration). The two auth shapes and the `{env:VAR}` expansion behavior are specific to MCP and covered below.
+The `mcpServers` entry fields (`command`, `args`, `url`, `headers`, `enabled`, `requestTimeoutMs`) are part of the config schema — the authoritative field table lives in the [Configuration Guide](CONFIG.md#mcp-server-configuration). A `"type"` key may be present for compatibility with other MCP clients but is **ignored**: Zay infers the transport solely from `command` (stdio) vs `url` (Streamable HTTP). The two auth shapes and the `{env:VAR}` expansion behavior are specific to MCP and covered below.
 
 ### Environment variable expansion (`{env:VAR}`)
 
@@ -151,7 +150,7 @@ Then, for both transports:
 **Timeouts** — a server that doesn't respond in time is marked `[FAILED]` with an error
 message:
 
-- Stdio reads use a **30-second timeout** (`read_timeout_ms`). POSIX polls the pipe and
+- Stdio reads use a **30-second** default timeout (`McpClient.read_timeout_ms`); override it per server with the `requestTimeoutMs` config field (clamped to ≥ 1 ms), see [CONFIG.md](CONFIG.md). POSIX polls the pipe and
   Windows uses `PeekNamedPipe` in short slices, so a stalled or abruptly closed server
   cannot wedge the handshake worker.
 - Remote requests apply a socket-level send/recv timeout on POSIX
@@ -256,10 +255,15 @@ Press `a` in the overlay to open a URL input form. Type or paste a remote MCP en
 or **Esc** to cancel. The server name is derived from the URL host.
 
 > [!NOTE]
-> **Runtime-only**: servers added through the overlay live in the running session's
-> config only — they are **not** written to `config.json` and disappear on restart. To
-> make a server permanent, add it to `mcpServers` in `~/.config/zay/config.json` (or the
-> project `.zay/config.json`) by hand.
+> **Persisted to global config**: a server added with `a` is appended to the live
+> `cached_config`, connected immediately, and written to the **global**
+> `config.json` — so it survives a restart and is available in future sessions.
+> Only the single new entry is written, which keeps project- and env-scoped
+> servers from leaking into the global file. The write is best-effort: a failure
+> leaves the server live in the running session and logs `mcp.add.persist.failed`.
+> To remove it permanently, delete its `mcpServers` entry from
+> `~/.config/zay/config.json` by hand. Toggling it off in the overlay only disables
+> the server for the current process and does not rewrite the persisted entry.
 
 ---
 
@@ -285,9 +289,11 @@ or **Esc** to cancel. The server name is derived from the URL host.
 - **Server-push requests**: Zay does not act on server-initiated Streamable HTTP GET
   streams (sampling/roots). The POST path (tool discovery + tool calls) is fully
   supported, which covers normal tool use.
-- **Overlay-added servers are runtime-only**: not persisted to `config.json` (see §5).
-- **Server names with underscores**: The `mcp__server__tool` namespace uses `__` as the
-  separator. Server names containing `_` will be incorrectly parsed. Use hyphens instead.
+- **Overlay-added servers are persisted** to the global `config.json` (see §5), so they survive a restart.
+- **Server names containing `__` are rejected**: the `mcp__server__tool` namespace uses `__` as
+  the separator, and parsing splits at the *first* separator — so **single underscores are
+  fine** (`codebase_memory_mcp` parses correctly). A name containing `__` is skipped at config
+  load with a warning and can never reach the wire.
 - **OAuth 2.1**: Remote servers requiring OAuth (`401` + `WWW-Authenticate`) are not yet
   supported. Use a server that accepts an API key in the URL or headers via `{env:VAR}`.
 - **JSON Schema composition in tool `inputSchema`**: `oneOf`/`anyOf` collapse to a single
