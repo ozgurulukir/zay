@@ -25,4 +25,5 @@ test {
     std.testing.refAllDecls(PluginManager);
     std.testing.refAllDecls(PluginInstance);
     std.testing.refAllDecls(Event);
+    std.testing.refAllDecls(@import("bridges/git.zig"));
 }
