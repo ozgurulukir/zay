@@ -159,11 +159,13 @@ fn renderQueryResult(gpa: std.mem.Allocator, res: *const db.service.QueryResult)
 pub fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
-    cwd: []const u8,
+    // _cwd is required by the common.Tool.run interface signature but unused
+    // because database operations target remote service endpoints or session backends.
+    _cwd: []const u8,
     arguments: []const u8,
     env: common.Env,
 ) common.Error!common.Output {
-    _ = cwd;
+    _ = _cwd;
     _ = env.userdata;
 
     var args = parseArgs(gpa, arguments) catch |err| switch (err) {
