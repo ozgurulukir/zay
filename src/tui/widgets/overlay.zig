@@ -31,6 +31,7 @@ const tui_status = @import("../status.zig");
 const codex = @import("../../auth/codex.zig");
 const settings_widget = @import("settings.zig");
 const theme_picker = @import("theme_picker.zig");
+const plugin_store_job = @import("../plugin_store_job.zig");
 
 const App = tui.App;
 
@@ -262,16 +263,15 @@ const OverlayInner = struct {
     fn drawPluginsContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         // Build both render snapshots from already-owned UI state. The draw
         // path never refreshes a catalog or mutates the live plugin manager.
+        const installed_plugins = try plugin_store_job.installedPlugins(app.gpa, app);
+        defer app.gpa.free(installed_plugins);
         var entries: std.ArrayList(plugins_status.PluginEntry) = .empty;
         defer entries.deinit(app.gpa);
-
-        var iter = app.plugin_manager.iterator();
-        while (iter.next()) |entry| {
-            try entries.append(app.gpa, .{
-                .name = entry.value_ptr.*.manifest.name,
-                .active = entry.value_ptr.*.active,
-            });
-        }
+        for (installed_plugins) |plugin| try entries.append(app.gpa, .{
+            .name = plugin.name,
+            .active = plugin.active,
+            .enabled = plugin.enabled,
+        });
 
         var available: std.ArrayList(plugins_status.StoreEntry) = .empty;
         defer available.deinit(ctx.arena);
@@ -283,7 +283,8 @@ const OverlayInner = struct {
                     .name = entry.plugin.name,
                     .version = entry.plugin.version,
                     .store = entry.store_name,
-                    .installed = app.plugin_manager.get(entry.plugin.id) != null,
+                    .installed = app.plugin_manager.get(entry.plugin.id) != null or
+                        !plugin_store_job.configuredEnabled(&app.cached_config, entry.plugin.id),
                 });
             }
         }
@@ -295,6 +296,7 @@ const OverlayInner = struct {
             .store_url_input = app.input_buffers.plugin_store_url.items,
             .notice = app.plugin_store.notice,
             .installing = app.plugin_store.operation == .installing,
+            .uninstalling = app.plugin_store.operation == .uninstalling,
         };
         return content.widget().draw(ctx);
     }

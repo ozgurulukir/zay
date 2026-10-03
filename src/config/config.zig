@@ -64,6 +64,7 @@ pub const mergeAndWriteGlobal = parse_mod.mergeAndWriteGlobal;
 pub const readProject = parse_mod.readProject;
 pub const writeProject = parse_mod.writeProject;
 pub const mergeAndWriteProject = parse_mod.mergeAndWriteProject;
+pub const removeProjectPlugin = parse_mod.removeProjectPlugin;
 pub const projectConfigExists = parse_mod.projectConfigExists;
 pub const globalConfigPath = parse_mod.globalConfigPath;
 /// Shared with the settings editor's write-time check so both sides count

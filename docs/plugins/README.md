@@ -126,12 +126,16 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 
 Open `/plugins` in the TUI. The Store tab always includes the Zay GitHub
 catalog; when running from a Zay checkout it uses `plugins/store.json`, and
-otherwise it fetches the same catalog from the repository. That catalog points
-at demo sources in `examples/plugins/`. Press `a`, enter another HTTP(S)
+otherwise it fetches the same catalog from the repository. Plugin packages and
+their catalog live together under `plugins/`. Press `a`, enter another HTTP(S)
 catalog URL, and press Enter to save it and refresh the catalog list. Select a
 plugin and press Enter to stage it into the user's global plugin directory.
 Store URLs are persisted globally in `plugin-stores.json` under Zay's platform
 config directory; installing from a checkout does not make the checkout dirty.
+In the Installed tab, press Space to enable or disable a plugin for the current
+project; restart Zay to apply the change. Press `x` to remove a disabled global
+installation, confirm with `y`, then restart to finish unloading it. Project
+plugins are not deleted by the Store removal action.
 
 Remote catalogs use explicit file URLs and must include `plugin.lua` and
 `init.lua` for each plugin. Catalogs and files have bounded sizes, relative
@@ -359,7 +363,7 @@ zig build test-plugin
 
 ## Example Plugins
 
-See `examples/plugins/` for complete, tested examples. These mirror the tool
+See `plugins/` for complete, tested plugin packages. These mirror the tool
 shapes models already know from Claude Code / OpenCode / Zed agents:
 
 - **file-tools** — `read` (numbered lines, binary guard, paging),

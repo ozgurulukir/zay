@@ -1,16 +1,17 @@
 {
-  "name": "Zay Examples",
+  "name": "Zay Plugin Store",
   "plugins": [
     {
       "id": "hello-world",
       "name": "Hello World",
       "version": "1.0.0",
       "description": "A minimal Lua plugin for learning the Zay bridge API.",
+      "sourceDir": "plugins/packages/hello-world",
       "files": [
-        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/init.lua" },
-        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/plugin.lua" },
-        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/prompt.md" },
-        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/hello-world/test.lua" }
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/hello-world/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/hello-world/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/hello-world/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/hello-world/test.lua" }
       ]
     },
     {
@@ -18,11 +19,12 @@
       "name": "Todo",
       "version": "1.0.0",
       "description": "A small persistent todo-list example.",
+      "sourceDir": "plugins/packages/todo",
       "files": [
-        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/init.lua" },
-        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/plugin.lua" },
-        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/prompt.md" },
-        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/todo/test.lua" }
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/todo/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/todo/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/todo/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/todo/test.lua" }
       ]
     },
     {
@@ -30,11 +32,12 @@
       "name": "File Tools",
       "version": "1.0.0",
       "description": "Safe file inspection and editing examples.",
+      "sourceDir": "plugins/packages/file-tools",
       "files": [
-        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/init.lua" },
-        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/plugin.lua" },
-        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/prompt.md" },
-        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/file-tools/test.lua" }
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-tools/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-tools/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-tools/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-tools/test.lua" }
       ]
     },
     {
@@ -42,11 +45,80 @@
       "name": "Search Tools",
       "version": "1.0.0",
       "description": "Project search helpers implemented as a Lua plugin.",
+      "sourceDir": "plugins/packages/search-tools",
       "files": [
-        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/init.lua" },
-        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/plugin.lua" },
-        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/prompt.md" },
-        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/examples/plugins/search-tools/test.lua" }
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/search-tools/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/search-tools/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/search-tools/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/search-tools/test.lua" }
+      ]
+    },
+    {
+      "id": "file-watcher",
+      "name": "File Watcher",
+      "version": "1.0.0",
+      "description": "Tracks file operations in the current session using tool events.",
+      "sourceDir": "plugins/packages/file-watcher",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-watcher/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-watcher/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-watcher/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/file-watcher/test.lua" }
+      ]
+    },
+    {
+      "id": "git-tools",
+      "name": "Git Tools",
+      "version": "1.0.0",
+      "description": "Inspect repository status, diffs, branches, history, and commits.",
+      "sourceDir": "plugins/packages/git-tools",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/git-tools/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/git-tools/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/git-tools/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/git-tools/test.lua" }
+      ]
+    },
+    {
+      "id": "path-tools",
+      "name": "Path Tools",
+      "version": "1.0.0",
+      "description": "Create directories and safely copy, move, and delete paths.",
+      "sourceDir": "plugins/packages/path-tools",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/path-tools/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/path-tools/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/path-tools/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/path-tools/test.lua" }
+      ]
+    },
+    {
+      "id": "modular-demo",
+      "name": "Modular Demo",
+      "version": "0.1.0",
+      "description": "Demonstrates a multi-file Lua plugin using zay.require.",
+      "sourceDir": "plugins/packages/modular-demo",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/modular-demo/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/modular-demo/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/modular-demo/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/modular-demo/test.lua" },
+        { "path": "helpers.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/modular-demo/helpers.lua" },
+        { "path": "formatter/init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/modular-demo/formatter/init.lua" }
+      ]
+    },
+    {
+      "id": "sitting-duck",
+      "name": "Sitting Duck",
+      "version": "1.0.1",
+      "description": "Query tree-sitter syntax trees with SQL through the DuckDB CLI.",
+      "sourceDir": "plugins/packages/sitting-duck",
+      "files": [
+        { "path": "init.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/sitting-duck/init.lua" },
+        { "path": "plugin.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/sitting-duck/plugin.lua" },
+        { "path": "prompt.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/sitting-duck/prompt.md" },
+        { "path": "test.lua", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/sitting-duck/test.lua" },
+        { "path": "README.md", "url": "https://raw.githubusercontent.com/ozgurulukir/zay/main/plugins/packages/sitting-duck/README.md" }
       ]
     }
   ]

@@ -34,7 +34,7 @@ zay = {
   list_dir = function() return nil end,
 }
 
-local f = assert(io.open("examples/plugins/file-tools/init.lua", "r"))
+local f = assert(io.open("plugins/packages/file-tools/init.lua", "r"))
 local src = f:read("*a")
 f:close()
 assert(load(src, "@file-tools/init.lua"))()

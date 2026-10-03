@@ -13,6 +13,7 @@ pub const State = struct {
     selection: usize = 0,
     view: View = .installed,
     adding: bool = false,
+    confirming_uninstall: bool = false,
 
     pub fn reset(self: *State) void {
         self.selection = 0;
@@ -39,6 +40,7 @@ pub const Content = struct {
     store_url_input: []const u8 = "",
     notice: ?[]const u8 = null,
     installing: bool = false,
+    uninstalling: bool = false,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -60,7 +62,7 @@ pub const Content = struct {
         const tabs = if (self.state.view == .installed) "[Installed]  Store" else "Installed  [Store]";
         try panel.lineStyledAt(&surface, 1, tabs, ctx, 2, p.info);
         const summary = if (self.state.view == .installed)
-            try std.fmt.allocPrint(ctx.arena, "Loaded: {d}", .{self.plugins.len})
+            try std.fmt.allocPrint(ctx.arena, "Installed: {d}", .{self.plugins.len})
         else
             try std.fmt.allocPrint(ctx.arena, "Available: {d}", .{self.available.len});
         try panel.lineStyledAt(&surface, 2, summary, ctx, 2, p.info);
@@ -72,6 +74,13 @@ pub const Content = struct {
             try panel.lineStyledAt(&surface, height -| 2, "[Enter] Add  [Esc] Cancel", ctx, 2, p.thinking_body);
             return surface;
         }
+        if (self.state.confirming_uninstall) {
+            const selected = if (self.state.selection < self.plugins.len) self.plugins[self.state.selection].name else "plugin";
+            const prompt = try std.fmt.allocPrint(ctx.arena, "Remove {s}? This cannot be undone.", .{selected});
+            try panel.lineStyledAt(&surface, 4, prompt, ctx, 2, p.notice);
+            try panel.lineStyledAt(&surface, height -| 2, "[y] Remove  [Esc] Cancel", ctx, 2, p.thinking_body);
+            return surface;
+        }
 
         var row: u16 = 4;
         var line_buf: [256]u8 = undefined;
@@ -80,12 +89,20 @@ pub const Content = struct {
                 if (row >= height -| 3) break;
                 const is_selected = i == self.state.selection;
                 const style = if (is_selected) p.selected_item else p.thinking_body;
-                const status_icon = if (plugin.active) "●" else "○";
+                const status = if (!plugin.enabled and plugin.active)
+                    "[off after restart]"
+                else if (!plugin.enabled)
+                    "[disabled]"
+                else if (plugin.active)
+                    "[enabled]"
+                else
+                    "[restart to enable]";
                 // A name longer than line_buf falls back to a per-frame
                 // allocation so the entry is never dropped from the list;
                 // the common path stays allocation-free.
-                const line = std.fmt.bufPrint(&line_buf, "  {s} {s}", .{ status_icon, plugin.name }) catch
-                    try std.fmt.allocPrint(ctx.arena, "  {s} {s}", .{ status_icon, plugin.name });
+                const icon = if (plugin.enabled) "●" else "○";
+                const line = std.fmt.bufPrint(&line_buf, "  {s} {s} {s}", .{ icon, plugin.name, status }) catch
+                    try std.fmt.allocPrint(ctx.arena, "  {s} {s} {s}", .{ icon, plugin.name, status });
                 try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
                 row += 1;
             }
@@ -109,8 +126,10 @@ pub const Content = struct {
         }
 
         if (self.notice) |notice| try panel.lineStyledAt(&surface, height -| 3, notice, ctx, 2, p.notice);
-        const footer = if (self.state.view == .installed)
-            "[Tab] Store  [Esc] Close"
+        const footer = if (self.state.view == .installed and self.uninstalling)
+            "Removing plugin..."
+        else if (self.state.view == .installed)
+            "[Space] Enable/disable  [x] Remove  [Tab] Store  [Esc] Close"
         else if (self.installing)
             "Installing..."
         else
@@ -123,6 +142,7 @@ pub const Content = struct {
 pub const PluginEntry = struct {
     name: []const u8,
     active: bool,
+    enabled: bool,
 };
 
 pub const StoreEntry = struct {
@@ -139,8 +159,8 @@ test "plugins_status Content.draw renders plugins list correctly" {
 
     var state: State = .{ .selection = 1 };
     const plugins = [_]PluginEntry{
-        .{ .name = "hello-world", .active = true },
-        .{ .name = "git-tools", .active = false },
+        .{ .name = "hello-world", .active = true, .enabled = true },
+        .{ .name = "git-tools", .active = false, .enabled = false },
     };
     var content: Content = .{
         .state = &state,
@@ -169,12 +189,12 @@ test "plugins_status Content.draw renders plugins list correctly" {
     // Read row 4 ("  ● hello-world")
     var buf4: [64]u8 = undefined;
     const line4 = panel.readRow(&surface, 4, &buf4);
-    try std.testing.expectEqualStrings("  ● hello-world", line4);
+    try std.testing.expectEqualStrings("  ● hello-world [enabled]", line4);
 
     // Read row 5 ("  ○ git-tools")
     var buf5: [64]u8 = undefined;
     const line5 = panel.readRow(&surface, 5, &buf5);
-    try std.testing.expectEqualStrings("  ○ git-tools", line5);
+    try std.testing.expectEqualStrings("  ○ git-tools [disabled]", line5);
 }
 
 test "plugins_status renders plugin names longer than the stack buffer" {
@@ -186,7 +206,7 @@ test "plugins_status renders plugin names longer than the stack buffer" {
     var long_name: [300]u8 = undefined;
     @memset(&long_name, 'x');
     const plugins = [_]PluginEntry{
-        .{ .name = &long_name, .active = true },
+        .{ .name = &long_name, .active = true, .enabled = true },
     };
     var content: Content = .{
         .state = &state,

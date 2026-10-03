@@ -1072,6 +1072,14 @@ pub const App = struct {
         return plugin_store_job_mod.startInstall(self);
     }
 
+    pub fn togglePluginEnabled(self: *App, name: []const u8) void {
+        plugin_store_job_mod.toggleEnabled(self, name);
+    }
+
+    pub fn uninstallPlugin(self: *App, name: []const u8) void {
+        plugin_store_job_mod.uninstall(self, name);
+    }
+
     pub fn addPluginStore(self: *App, url: []const u8) !void {
         return plugin_store_job_mod.addStore(self, url);
     }

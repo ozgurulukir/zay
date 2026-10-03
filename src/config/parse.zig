@@ -1557,6 +1557,42 @@ pub fn mergeAndWriteProject(
     try writeProject(gpa, io, cwd, current);
 }
 
+/// Remove a project-layer plugin override so lower config layers take effect again.
+pub fn removeProjectPlugin(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, name: []const u8) !void {
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*d| d.deinit(gpa);
+        diagnostics.deinit(gpa);
+    }
+    var current = try loadProjectFile(gpa, io, cwd, &diagnostics);
+    defer current.deinit(gpa);
+    if (diagnostics.items.len > 0) return error.ConfigRoundTripLoss;
+
+    var found_index: ?usize = null;
+    for (current.plugins, 0..) |plugin, index| {
+        if (std.mem.eql(u8, plugin.name, name)) {
+            found_index = index;
+            break;
+        }
+    }
+    const index = found_index orelse return;
+    const remaining = try gpa.alloc(PluginConfig, current.plugins.len - 1);
+    var initialized: usize = 0;
+    errdefer {
+        for (remaining[0..initialized]) |*plugin| plugin.deinit(gpa);
+        if (remaining.len > 0) gpa.free(remaining);
+    }
+    for (current.plugins, 0..) |plugin, source_index| {
+        if (source_index == index) continue;
+        remaining[initialized] = try plugin.clone(gpa);
+        initialized += 1;
+    }
+    for (current.plugins) |*plugin| plugin.deinit(gpa);
+    if (current.plugins.len > 0) gpa.free(current.plugins);
+    current.plugins = remaining;
+    try writeProject(gpa, io, cwd, current);
+}
+
 pub fn projectConfigExists(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) bool {
     const path = projectConfigPath(gpa, cwd) catch return false;
     defer gpa.free(path);
@@ -4051,6 +4087,42 @@ test "mergeAndWriteGlobal refuses to rewrite a config that would lose fields" {
     defer merged.deinit(gpa);
     try std.testing.expectEqualStrings("fresh", merged.system_prompt.?);
     try std.testing.expectEqualStrings("default", merged.theme.?);
+}
+
+test "removeProjectPlugin removes only the named override and is idempotent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const project_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(project_dir);
+
+    var plugin_list: std.ArrayList(PluginConfig) = .empty;
+    errdefer {
+        for (plugin_list.items) |*plugin| plugin.deinit(gpa);
+        plugin_list.deinit(gpa);
+    }
+    try plugin_list.ensureTotalCapacity(gpa, 2);
+    plugin_list.appendAssumeCapacity(.{ .name = try gpa.dupe(u8, "remove-me"), .enabled = false });
+    plugin_list.appendAssumeCapacity(.{ .name = try gpa.dupe(u8, "keep-me"), .enabled = false });
+    var project_config: Config = .{ .plugins = try plugin_list.toOwnedSlice(gpa) };
+    defer project_config.deinit(gpa);
+    try writeProject(gpa, io, project_dir, project_config);
+
+    try removeProjectPlugin(gpa, io, project_dir, "remove-me");
+    var after_remove = try readProject(gpa, io, project_dir);
+    defer after_remove.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), after_remove.plugins.len);
+    try std.testing.expectEqualStrings("keep-me", after_remove.plugins[0].name);
+    try std.testing.expect(!after_remove.plugins[0].enabled);
+
+    try removeProjectPlugin(gpa, io, project_dir, "remove-me");
+    var after_retry = try readProject(gpa, io, project_dir);
+    defer after_retry.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), after_retry.plugins.len);
+    try std.testing.expectEqualStrings("keep-me", after_retry.plugins[0].name);
 }
 
 test "parseObject drops oversized systemPrompt with a diagnostic" {

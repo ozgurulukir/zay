@@ -41,7 +41,7 @@ zay = {
   end,
 }
 
-local f = assert(io.open("examples/plugins/git-tools/init.lua", "r"))
+local f = assert(io.open("plugins/packages/git-tools/init.lua", "r"))
 local src = f:read("*a")
 f:close()
 assert(load(src, "@git-tools/init.lua"))()

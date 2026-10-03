@@ -44,7 +44,7 @@ zay = {
   end,
 }
 
-local f = assert(io.open("examples/plugins/hello-world/init.lua", "r"))
+local f = assert(io.open("plugins/packages/hello-world/init.lua", "r"))
 local src = f:read("*a")
 f:close()
 assert(load(src, "@hello-world/init.lua"))()

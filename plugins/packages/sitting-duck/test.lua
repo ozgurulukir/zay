@@ -136,7 +136,7 @@ local function fresh()
   version_q, bootstrap_q, query_q = {}, {}, {}
   config_table = nil
   env_table = {}
-  local f = assert(io.open("examples/plugins/sitting-duck/init.lua", "r"))
+  local f = assert(io.open("plugins/packages/sitting-duck/init.lua", "r"))
   local src = f:read("*a")
   f:close()
   assert(load(src, "@sitting-duck/init.lua"))()

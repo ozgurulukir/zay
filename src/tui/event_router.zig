@@ -329,12 +329,12 @@ fn routeKey(
             ctx.consumeAndRedraw();
             return;
         }
-        // The MCP overlay owns Enter: it is the add-server form's submit while
-        // `adding`, or the selected-server toggle otherwise. `submitMode` has
-        // no `.mcp` arm (it is in the "no Enter action" list and returns
-        // false), so routing Enter through the generic chat `submit` would
-        // swallow the key and leave the add-form permanently unsubmitable.
-        if (app.getMode() == .mcp) {
+        // The MCP and plugin overlays own Enter: it is the add form's submit
+        // while `adding`, or the selected-item action otherwise. `submitMode`
+        // has no `.mcp`/`.plugins` arm (both are in the "no Enter action"
+        // list), so routing Enter through the generic chat `submit` would
+        // bypass their handlers and leave these forms/actions inert.
+        if (app.getMode() == .mcp or app.getMode() == .plugins) {
             if (try app.handleCommandKey(key)) {
                 ctx.consumeAndRedraw();
             } else {
@@ -532,6 +532,47 @@ fn handleQuitSequence(
 
 const agent_mod = @import("../agent.zig");
 const log = std.log.scoped(.tui);
+
+test "plugin overlay routes Enter to its add form handler" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.mode = .plugins;
+    app.pickers.plugins.view = .store;
+    app.pickers.plugins.adding = true;
+    try app.input_buffers.plugin_store_url.appendSlice(gpa, "https://example.com/store.json");
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
+
+    try std.testing.expect(!app.pickers.plugins.adding);
+    try std.testing.expectEqualStrings("Could not add store: no active runtime.", app.plugin_store.notice.?);
+}
+
+test "plugin overlay reports an install request before the catalog is ready" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.mode = .plugins;
+    app.pickers.plugins.view = .store;
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
+
+    try std.testing.expectEqualStrings("Plugin catalog is not ready yet. Press r to refresh.", app.plugin_store.notice.?);
+}
 
 test "single Ctrl-C with empty input arms pending quit" {
     const gpa = std.testing.allocator;

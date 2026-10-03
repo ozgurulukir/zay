@@ -34,6 +34,8 @@ const clipboard_helper = @import("clipboard_helper.zig");
 const help_picker = @import("widgets/help_picker.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
+const plugin_store_job = @import("plugin_store_job.zig");
+const log = std.log.scoped(.tui);
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
 
@@ -719,6 +721,17 @@ const McpMode = struct {
 
 const PluginsMode = struct {
     fn handle(app: *App, key: vaxis.Key) !bool {
+        if (app.pickers.plugins.confirming_uninstall) {
+            if (key.matches(vaxis.Key.escape, .{}) or key.matches('n', .{})) {
+                app.pickers.plugins.confirming_uninstall = false;
+                return true;
+            }
+            if (key.matches('y', .{})) {
+                app.pickers.plugins.confirming_uninstall = false;
+                if (try selectedInstalledPlugin(app)) |name| app.uninstallPlugin(name);
+            }
+            return true;
+        }
         if (app.pickers.plugins.adding) return handleAddInput(app, key);
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
             tui.closePlugins(app);
@@ -734,9 +747,11 @@ const PluginsMode = struct {
             return true;
         }
         if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            const count = if (app.pickers.plugins.view == .installed)
-                app.plugin_manager.count()
-            else if (app.plugin_store.catalogs) |*catalogs|
+            const count = if (app.pickers.plugins.view == .installed) blk: {
+                const rows = try plugin_store_job.installedPlugins(app.gpa, app);
+                defer app.gpa.free(rows);
+                break :blk rows.len;
+            } else if (app.plugin_store.catalogs) |*catalogs|
                 catalogs.entryCount()
             else
                 0;
@@ -752,14 +767,46 @@ const PluginsMode = struct {
             return true;
         }
         if (app.pickers.plugins.view == .store and key.matches('r', .{})) {
-            try app.refreshPluginStore();
+            // startRefresh projects setup failures into the overlay notice.
+            app.refreshPluginStore() catch |err| {
+                log.warn("plugin_store.refresh.failed err={s}", .{@errorName(err)});
+            };
             return true;
         }
         if (app.pickers.plugins.view == .store and isEnterKey(key)) {
-            try app.installSelectedPlugin();
+            // startInstall projects setup failures into the overlay notice;
+            // worker failures are adopted and reported by the lifecycle.
+            app.installSelectedPlugin() catch |err| {
+                log.warn("plugin_store.install.start_failed err={s}", .{@errorName(err)});
+            };
+            return true;
+        }
+        if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches(' ', .{})) {
+            if (try selectedInstalledPlugin(app)) |name| app.togglePluginEnabled(name);
+            return true;
+        }
+        if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches('x', .{})) {
+            if (try selectedInstalledPlugin(app)) |name| {
+                if (plugin_store_job.configuredEnabled(&app.cached_config, name)) {
+                    app.pickers.plugins.confirming_uninstall = false;
+                    app.uninstallPlugin(name);
+                } else if (app.plugin_manager.get(name) != null) {
+                    app.pickers.plugins.confirming_uninstall = false;
+                    app.uninstallPlugin(name);
+                } else {
+                    app.pickers.plugins.confirming_uninstall = true;
+                }
+            }
             return true;
         }
         return false;
+    }
+
+    fn selectedInstalledPlugin(app: *App) !?[]const u8 {
+        const rows = try plugin_store_job.installedPlugins(app.gpa, app);
+        defer app.gpa.free(rows);
+        if (app.pickers.plugins.selection >= rows.len) return null;
+        return rows[app.pickers.plugins.selection].name;
     }
 
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
@@ -770,7 +817,8 @@ const PluginsMode = struct {
         }
         if (isEnterKey(key)) {
             const url = std.mem.trim(u8, app.input_buffers.plugin_store_url.items, " \t\r\n");
-            if (url.len > 0) app.addPluginStore(url) catch {};
+            // addStore owns validation and projects failures into the notice.
+            app.addPluginStore(url) catch {};
             app.pickers.plugins.adding = false;
             app.input_buffers.plugin_store_url.clearRetainingCapacity();
             return true;

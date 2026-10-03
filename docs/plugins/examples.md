@@ -1,14 +1,14 @@
-# Example Plugins Walkthrough
+# Shipped Plugins Walkthrough
 
-This guide walks through selected example plugins included with Zay (the
+This guide walks through selected plugins included with Zay (the
 full set — `hello-world`, `file-tools`, `search-tools`, `path-tools`,
 `git-tools`, `todo`, `file-watcher`, `modular-demo`, `sitting-duck` — lives
-in `examples/plugins/`). Each demonstrates a different aspect of the plugin
+in `plugins/packages/`). Each demonstrates a different aspect of the plugin
 API.
 
 ## 1. Hello World — Minimal Tool Plugin
 
-**Location:** `examples/plugins/hello-world/`
+**Location:** `plugins/packages/hello-world/`
 
 The simplest possible plugin. Registers two tools that the AI model can call.
 
@@ -73,7 +73,7 @@ Run with: `zig build test-plugin`
 
 ## 2. File Watcher — Event-Driven Plugin
 
-**Location:** `examples/plugins/file-watcher/`
+**Location:** `plugins/packages/file-watcher/`
 
 Demonstrates receiving tool-call notifications using `zay.on()`.
 
@@ -194,7 +194,7 @@ code is responsible for validating its own settings and applying defaults.
 
 ## 4. File Tools — the model's read/write/edit surface
 
-**Location:** `examples/plugins/file-tools/`
+**Location:** `plugins/packages/file-tools/`
 
 The largest example: registers `read`, `write`, `edit`, and `list_directory`,
 mirroring the tool shapes models already know (numbered lines, continuation
@@ -246,7 +246,7 @@ Key points:
 
 ## 5. Path Tools — sandboxed file operations
 
-**Location:** `examples/plugins/path-tools/`
+**Location:** `plugins/packages/path-tools/`
 
 Registers `create_directory`, `copy_path`, `move_path`, and `delete_path` —
 sandboxed alternatives to bash `cp`/`mv`/`rm`/`mkdir`. Every operation goes
@@ -265,7 +265,7 @@ Key points:
 
 ## 6. Search Tools — grep with a ripgrep backend
 
-**Location:** `examples/plugins/search-tools/`
+**Location:** `plugins/packages/search-tools/`
 
 Registers `grep` (content search) and `glob` (filename search via
 `zay.find_files`). `grep` has two backends: literal substring search through
