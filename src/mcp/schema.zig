@@ -210,7 +210,9 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
                             p_enum_count += 1;
                         },
                         .integer => |n| {
-                            ev_list[p_enum_count] = try std.fmt.allocPrint(gpa, "{d}", .{n});
+                            var buf: [32]u8 = undefined;
+                            const formatted = try std.fmt.bufPrint(&buf, "{d}", .{n});
+                            ev_list[p_enum_count] = try gpa.dupe(u8, formatted);
                             p_enum_count += 1;
                         },
                         else => continue,
@@ -225,21 +227,40 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
             }
         }
 
-        p_desc = if (p_enum != null) blk: {
+        p_desc = if (p_enum) |ev| blk: {
             // Append [enum: ...] to description when enum values exist
-            var dw: std.Io.Writer.Allocating = .init(gpa);
-            errdefer dw.deinit();
-            try dw.writer.writeAll(base_desc);
-            if (base_desc.len > 0) try dw.writer.writeAll(" ");
-            try dw.writer.writeAll("[enum: ");
-            if (p_enum) |ev| {
-                for (ev, 0..) |v, ei| {
-                    if (ei > 0) try dw.writer.writeAll(", ");
-                    try dw.writer.writeAll(v);
-                }
+            var total_len = base_desc.len + 8; // "[enum: " (7) + "]" (1) = 8
+            if (base_desc.len > 0) total_len += 1; // " "
+            for (ev, 0..) |v, ei| {
+                if (ei > 0) total_len += 2; // ", "
+                total_len += v.len;
             }
-            try dw.writer.writeAll("]");
-            break :blk try dw.toOwnedSlice();
+
+            const buf = try gpa.alloc(u8, total_len);
+            errdefer gpa.free(buf);
+
+            var offset: usize = 0;
+            if (base_desc.len > 0) {
+                @memcpy(buf[offset .. offset + base_desc.len], base_desc);
+                offset += base_desc.len;
+                buf[offset] = ' ';
+                offset += 1;
+            }
+            @memcpy(buf[offset .. offset + 7], "[enum: ");
+            offset += 7;
+            for (ev, 0..) |v, ei| {
+                if (ei > 0) {
+                    @memcpy(buf[offset .. offset + 2], ", ");
+                    offset += 2;
+                }
+                @memcpy(buf[offset .. offset + v.len], v);
+                offset += v.len;
+            }
+            buf[offset] = ']';
+            offset += 1;
+            std.debug.assert(offset == total_len);
+
+            break :blk buf;
         } else try gpa.dupe(u8, base_desc);
 
         // Extract default value as a raw JSON string fragment.
@@ -278,15 +299,23 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
 fn jsonValueToRawFragment(gpa: std.mem.Allocator, value: std.json.Value) ![]const u8 {
     switch (value) {
         .string => |s| {
-            var aw: std.Io.Writer.Allocating = .init(gpa);
-            errdefer aw.deinit();
-            try aw.writer.writeByte('"');
-            try aw.writer.writeAll(s);
-            try aw.writer.writeByte('"');
-            return aw.toOwnedSlice();
+            const buf = try gpa.alloc(u8, s.len + 2);
+            errdefer gpa.free(buf);
+            buf[0] = '"';
+            @memcpy(buf[1 .. 1 + s.len], s);
+            buf[1 + s.len] = '"';
+            return buf;
         },
-        .integer => |n| return std.fmt.allocPrint(gpa, "{d}", .{n}),
-        .float => |f| return std.fmt.allocPrint(gpa, "{d}", .{f}),
+        .integer => |n| {
+            var buf: [32]u8 = undefined;
+            const formatted = try std.fmt.bufPrint(&buf, "{d}", .{n});
+            return gpa.dupe(u8, formatted);
+        },
+        .float => |f| {
+            var buf: [64]u8 = undefined;
+            const formatted = try std.fmt.bufPrint(&buf, "{d}", .{f});
+            return gpa.dupe(u8, formatted);
+        },
         .bool => |b| return gpa.dupe(u8, if (b) "true" else "false"),
         .null => return gpa.dupe(u8, "null"),
         else => return gpa.dupe(u8, "null"),
