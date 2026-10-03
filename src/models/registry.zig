@@ -896,3 +896,102 @@ test "loadCacheWithOptions returns null when home_dir is empty" {
     const result = try loadCacheWithOptions(std.testing.allocator, std.testing.io, "", false);
     try std.testing.expect(result == null);
 }
+
+test "returnsProvider_whenIdExists" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "deepseek": {
+        \\    "api": "https://api.deepseek.com",
+        \\    "name": "DeepSeek",
+        \\    "models": { "deepseek-chat": {} }
+        \\  }
+        \\}
+    ;
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+
+    const provider = registry.lookup("deepseek");
+    try std.testing.expect(provider != null);
+    try std.testing.expectEqualStrings("deepseek", provider.?.id);
+    try std.testing.expectEqualStrings("DeepSeek", provider.?.name);
+}
+
+test "returnsNull_whenIdNotFound" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "deepseek": {
+        \\    "api": "https://api.deepseek.com",
+        \\    "name": "DeepSeek",
+        \\    "models": { "deepseek-chat": {} }
+        \\  }
+        \\}
+    ;
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+
+    try std.testing.expect(registry.lookup("unknown_provider") == null);
+}
+
+test "returnsNull_whenIdIsEmpty" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "deepseek": {
+        \\    "api": "https://api.deepseek.com",
+        \\    "name": "DeepSeek",
+        \\    "models": { "deepseek-chat": {} }
+        \\  }
+        \\}
+    ;
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+
+    try std.testing.expect(registry.lookup("") == null);
+}
+
+test "returnsNull_whenIdHasDifferentCase" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "deepseek": {
+        \\    "api": "https://api.deepseek.com",
+        \\    "name": "DeepSeek",
+        \\    "models": { "deepseek-chat": {} }
+        \\  }
+        \\}
+    ;
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+
+    try std.testing.expect(registry.lookup("DeepSeek") == null);
+    try std.testing.expect(registry.lookup("DEEPSEEK") == null);
+}
+
+test "returnsNull_whenIdIsPartialPrefix" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "deepseek": {
+        \\    "api": "https://api.deepseek.com",
+        \\    "name": "DeepSeek",
+        \\    "models": { "deepseek-chat": {} }
+        \\  }
+        \\}
+    ;
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+
+    try std.testing.expect(registry.lookup("deep") == null);
+    try std.testing.expect(registry.lookup("deepseek_extra") == null);
+}
+
+test "returnsNull_whenRegistryIsEmpty" {
+    const gpa = std.testing.allocator;
+    var registry = try parseModelsDevJson(gpa, "{}");
+    defer registry.deinit(gpa);
+
+    try std.testing.expect(registry.lookup("openai") == null);
+    try std.testing.expect(registry.lookup("") == null);
+}
