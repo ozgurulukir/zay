@@ -575,6 +575,10 @@ test {
     // (AGENTS.md test-runner quirk: a file only referenced lazily is never
     // analyzed and its tests silently never run).
     _ = @import("tui/telemetry.zig");
+    // Queue management was extracted from `tui.zig`; reference the extracted
+    // module directly so its inline mirror/steering tests cannot disappear
+    // behind the lazy production import.
+    _ = @import("tui/queue.zig");
     _ = @import("lua/root.zig");
     _ = @import("lua/state.zig");
     _ = @import("lua/bridge.zig");
@@ -588,6 +592,9 @@ test {
     // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
     _ = @import("ai/text_tool_call.zig");
     _ = @import("ai/model_compat.zig");
+    // The scripted provider seam is imported lazily through `ai.zig`; import
+    // it directly so its socket-free agent tests are part of this test root.
+    _ = @import("ai/scripted_client.zig");
     _ = @import("ai/provider_headers.zig");
     _ = @import("ai/json.zig");
     _ = @import("ai/openai_request.zig");
