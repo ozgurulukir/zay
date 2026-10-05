@@ -71,10 +71,16 @@ pub fn run(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype, en
     return turn;
 }
 
+const TextPart = struct {
+    content_index: u32,
+    text: []u8,
+};
+
 const ItemRoute = struct {
     id: ?[]u8,
     output_index: ?u32,
     block_index: usize,
+    text_parts: std.ArrayList(TextPart) = .empty,
 };
 
 pub const StreamState = struct {
@@ -92,7 +98,11 @@ pub const StreamState = struct {
     dropped: u32 = 0,
 
     pub fn deinit(self: *StreamState, gpa: std.mem.Allocator) void {
-        for (self.routes.items) |route| if (route.id) |id| gpa.free(id);
+        for (self.routes.items) |*route| {
+            if (route.id) |id| gpa.free(id);
+            for (route.text_parts.items) |part| gpa.free(part.text);
+            route.text_parts.deinit(gpa);
+        }
         self.routes.deinit(gpa);
         for (self.tools.items) |*tool| tool.deinit(gpa);
         self.tools.deinit(gpa);
@@ -392,6 +402,15 @@ fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayL
             if (blocks.items[index].text.responses_phase) |old| gpa.free(old);
             blocks.items[index].text.responses_phase = phase;
         }
+        if (textRoute(routes, index)) |route| {
+            if (route.text_parts.items.len > 0) {
+                try finishTextParts(gpa, route, item, observer);
+                const replacement = try gpa.dupe(u8, text);
+                gpa.free(blocks.items[index].text.text);
+                blocks.items[index].text.text = replacement;
+                return;
+            }
+        }
         try finishTextBlock(gpa, blocks, observer, index, text);
         return;
     }
@@ -438,10 +457,70 @@ fn outputTextFromItem(gpa: std.mem.Allocator, item: std.json.Value) !?[]u8 {
 fn onTextDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, routes: ?*std.ArrayList(ItemRoute)) !void {
     const delta = stringField(value, "delta") orelse return;
     const index = resolveItemBlock(value, blocks.items, routes, .text) orelse return;
-    const old = blocks.items[index].text.text;
-    blocks.items[index].text.text = try appendOwned(gpa, old, delta);
+    if (textRoute(routes, index)) |route| {
+        const part = try textPart(gpa, route, optionalU32(value, "content_index") orelse 0);
+        part.text = try appendOwned(gpa, part.text, delta);
+        var combined: std.ArrayList(u8) = .empty;
+        defer combined.deinit(gpa);
+        for (route.text_parts.items) |fragment| try combined.appendSlice(gpa, fragment.text);
+        const replacement = try combined.toOwnedSlice(gpa);
+        gpa.free(blocks.items[index].text.text);
+        blocks.items[index].text.text = replacement;
+    } else {
+        const old = blocks.items[index].text.text;
+        blocks.items[index].text.text = try appendOwned(gpa, old, delta);
+    }
     try observer.on_content(observer.ctx, delta);
     try observer.on_delta_end(observer.ctx);
+}
+
+// Item routes retain part identity because wire arrival order can differ from
+// the content array order, and final snapshots can fill unstreamed parts.
+fn textRoute(routes: ?*std.ArrayList(ItemRoute), block_index: usize) ?*ItemRoute {
+    const mapping = routes orelse return null;
+    for (mapping.items) |*route| if (route.block_index == block_index) return route;
+    return null;
+}
+
+fn textPart(gpa: std.mem.Allocator, route: *ItemRoute, content_index: u32) !*TextPart {
+    var position: usize = 0;
+    while (position < route.text_parts.items.len) : (position += 1) {
+        const part = &route.text_parts.items[position];
+        if (part.content_index == content_index) return part;
+        if (part.content_index > content_index) break;
+    }
+    const empty = try gpa.alloc(u8, 0);
+    errdefer gpa.free(empty);
+    try route.text_parts.insert(gpa, position, .{ .content_index = content_index, .text = empty });
+    return &route.text_parts.items[position];
+}
+
+fn itemPartText(part: std.json.Value) ?[]const u8 {
+    if (part != .object) return null;
+    const kind = stringField(part, "type") orelse return null;
+    if (std.mem.eql(u8, kind, "output_text")) return stringField(part, "text");
+    if (std.mem.eql(u8, kind, "refusal")) return stringField(part, "refusal");
+    return null;
+}
+
+fn finishTextParts(gpa: std.mem.Allocator, route: *ItemRoute, item: std.json.Value, observer: anytype) !void {
+    const content = item.object.get("content") orelse return;
+    if (content != .array) return;
+    // Validate every streamed part before publishing any snapshot suffix.
+    for (route.text_parts.items) |part| {
+        if (part.content_index >= content.array.items.len) return error.ResponseContentMismatch;
+        const final = itemPartText(content.array.items[part.content_index]) orelse return error.ResponseContentMismatch;
+        if (!std.mem.startsWith(u8, final, part.text)) return error.ResponseContentMismatch;
+    }
+    for (content.array.items, 0..) |part, content_index| {
+        const final = itemPartText(part) orelse continue;
+        const streamed = try textPart(gpa, route, @intCast(content_index));
+        const suffix = final[streamed.text.len..];
+        if (suffix.len == 0) continue;
+        streamed.text = try appendOwned(gpa, streamed.text, suffix);
+        try observer.on_content(observer.ctx, suffix);
+        try observer.on_delta_end(observer.ctx);
+    }
 }
 
 fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, routes: ?*std.ArrayList(ItemRoute)) !void {
@@ -814,6 +893,67 @@ test "openresponses routes reasoning and opaque snapshots to their own item" {
     try std.testing.expectEqualStrings("Second check", blocks[1].reasoning.text);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].reasoning.responses_item_json.?, "opaque") != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[1].reasoning.responses_item_json.?, "opaque") == null);
+}
+
+test "openresponses keeps interleaved content parts in canonical order" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+    var sequence: u64 = 0;
+    const events = [_][]const u8{
+        \\{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"a"}}
+        ,
+        \\{"type":"response.output_text.delta","item_id":"a","content_index":1,"delta":"Last"}
+        ,
+        \\{"type":"response.output_text.delta","item_id":"a","content_index":0,"delta":"First"}
+        ,
+    };
+    for (events) |event| try state.processJson(gpa, event, ai.streamNoop(), &sequence);
+    try std.testing.expectEqualStrings("FirstLast", state.blocks.items[0].text.text);
+    try state.processJson(gpa,
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"a","content":[{"type":"output_text","text":"First"},{"type":"output_text","text":"Last"}]}}
+    , ai.streamNoop(), &sequence);
+    try std.testing.expectEqualStrings("FirstLast", state.blocks.items[0].text.text);
+}
+
+test "openresponses snapshots fill earlier unstreamed content parts" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+    const Seen = struct {
+        text: std.ArrayList(u8) = .empty,
+
+        fn onContent(self: *@This(), delta: []const u8) anyerror!void {
+            try self.text.appendSlice(std.testing.allocator, delta);
+        }
+    };
+    var seen: Seen = .{};
+    defer seen.text.deinit(gpa);
+    var observer = ai.noopObserver(Seen, &seen);
+    observer.on_content = Seen.onContent;
+    var sequence: u64 = 0;
+    try state.processJson(gpa,
+        \\{"type":"response.output_item.added","item":{"type":"message","id":"a"}}
+    , observer, &sequence);
+    try state.processJson(gpa,
+        \\{"type":"response.output_text.delta","item_id":"a","content_index":1,"delta":"Last"}
+    , observer, &sequence);
+    try state.processJson(gpa,
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"a","content":[{"type":"refusal","refusal":"First"},{"type":"output_text","text":"Last plus"}]}}
+    , observer, &sequence);
+    try std.testing.expectEqualStrings("FirstLast plus", state.blocks.items[0].text.text);
+    try std.testing.expectEqualStrings("LastFirst plus", seen.text.items);
+    try state.processJson(gpa,
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"a","content":[{"type":"refusal","refusal":"First"},{"type":"output_text","text":"Last plus"}]}}
+    , observer, &sequence);
+    try std.testing.expectEqualStrings("LastFirst plus", seen.text.items);
+    try std.testing.expectError(error.ResponseContentMismatch, state.processJson(gpa,
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"a","content":[{"type":"refusal","refusal":"First"},{"type":"output_text","text":"Wrong"}]}}
+    , observer, &sequence));
+    try std.testing.expectEqualStrings("FirstLast plus", state.blocks.items[0].text.text);
+    try std.testing.expectEqualStrings("LastFirst plus", seen.text.items);
 }
 
 test "openresponses rejects snapshots that contradict already streamed answer bytes" {
