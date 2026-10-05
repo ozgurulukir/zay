@@ -85,3 +85,7 @@ The scripts automatically download the platform binary, verify the SHA256 checks
   already contains the upstream fixes previously carried as local patches.
 - Release notes are auto-generated from merged PRs
   (`generate_release_notes: true`).
+
+## Portability checks before tagging
+
+- **Release CI builds macOS and Windows — verify portability before tagging.** `release.yml` publishes on any `v*` tag push, so a POSIX-portability slip breaks the release after the fact (2026-09-12: `std.posix.kill(pid, 0)` in `src/os.zig` — a `comptime_int` does not coerce to libc's translated `SIG` enum on macOS; invisible in native builds because the non-Linux arm is never analyzed on Linux). Before tagging changes to OS-layer code (`src/os.zig` etc.), force cross-target semantic analysis: `zig test -target aarch64-macos -lc --test-no-exec src/<file>.zig` and `zig test -target x86_64-windows --test-no-exec src/<file>.zig` (plain `zig build-obj` is NOT enough — lazy analysis skips everything). `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast` full-graph cross-compiles locally, but macOS cannot link locally (no SDK frameworks) — only analysis checks are possible there. If a release run fails before publishing, re-point the tag (`git push origin :refs/tags/vX.Y.Z`, delete local, re-tag at the fix, push) rather than re-running the workflow. See [Cutting a release](#cutting-a-release) for the tagging process.
