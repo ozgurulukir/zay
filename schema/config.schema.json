@@ -88,9 +88,21 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "ResponsePolicy": {
+      "type": "object",
+      "description": "Inbound chat-completions field semantics. Unspecified fields inherit provider defaults; model overrides take precedence. Independent of request reasoning settings.",
+      "properties": {
+        "reasoning": { "enum": ["text", "reasoning", "ignore"] },
+        "reasoning_content": { "enum": ["text", "reasoning", "ignore"] },
+        "reasoning_details": { "enum": ["text", "reasoning", "ignore"] },
+        "thinking": { "enum": ["text", "reasoning", "ignore"] }
+      },
+      "additionalProperties": false
+    },
     "ProviderConfig": {
       "type": "object",
       "properties": {
+        "responsePolicy": { "$ref": "#/$defs/ResponsePolicy" },
         "baseURL": {
           "type": "string",
           "format": "uri",
@@ -112,6 +124,7 @@
     "ModelConfig": {
       "type": "object",
       "properties": {
+        "responsePolicy": { "$ref": "#/$defs/ResponsePolicy" },
         "reasoningEffort": {
           "type": "string",
           "enum": [

@@ -45,6 +45,7 @@ pub const StreamLimits = struct {
 pub const StreamEnv = struct {
     limits: StreamLimits = .{},
     id_seq: *u64,
+    response_policy: @import("response_policy.zig").Policy = .{},
 };
 
 /// The classification of one raw SSE line. Pure: the returned `data` slice

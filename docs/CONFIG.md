@@ -75,6 +75,16 @@ All `config.json` files use formatted, 2-space indented JSON with semver version
 
 ### Schema v2 (current)
 
+Chat-completions providers and individual models can declare `responsePolicy`
+to describe proxy-specific inbound fields. For example,
+`"responsePolicy":{"thinking":"text"}` treats that field as an answer.
+Supported fields are `reasoning`, `reasoning_content`, `reasoning_details`, and `thinking`; each maps
+to `text`, `reasoning`, or `ignore`. Unspecified fields inherit lower config
+layers and provider defaults, with model settings taking precedence. This is
+independent of `reasoningEffort` and applies when attaching or switching models.
+Use an override only when the provider's response schema gives that field a
+different meaning. Ordinary `content` always remains answer text.
+
 JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still accepted at parse time for backward compatibility; `serialize` always writes camelCase.
 
 ```json

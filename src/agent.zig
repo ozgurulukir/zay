@@ -2302,6 +2302,8 @@ test "run retries once when the provider truncates tool-call arguments" {
         .{ .status = .ok, .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-def\",\"function\":{\"name\":\"pwsh\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n" ++
             "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
             "data: [DONE]\n" },
+        .{ .status = .ok, .body = "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}\n" ++
+            "data: [DONE]\n" },
     });
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, MockHttpServer.serve, .{&server});
@@ -2330,11 +2332,11 @@ test "run retries once when the provider truncates tool-call arguments" {
 
     try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
 
-    // Exactly two requests hit the scripted server (the truncated call + the
-    // retry with the hint). A third would hang on script exhaustion, so this
-    // assertion is the loop-guard's observable: the truncation hint is
-    // injected, the model retries once and succeeds — the run does NOT loop.
-    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+    // One truncation retry, followed by the normal post-tool answer request.
+    // Omitting the final response leaves the client waiting on an exhausted
+    // server script, rather than testing the truncation retry bound.
+    try std.testing.expectEqual(@as(u32, 3), server.connection_count.load(.monotonic));
+    try std.testing.expectEqualStrings("Done", agent.messages()[agent.messages().len - 1].text());
 
     // History: user, assistant (empty — the truncated call produced no
     // content blocks, so takeAssistantMessage stored nothing), user hint,

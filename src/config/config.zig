@@ -357,6 +357,19 @@ pub const Config = struct {
         return &.{};
     }
 
+    pub fn responsePolicyForModel(self: *const Config, name: []const u8, model_id: []const u8, base_url: []const u8) @import("../ai/response_policy.zig").Policy {
+        var policy = @import("../ai/response_policy.zig").Policy.resolve(name, base_url);
+        for (self.providers) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            policy = entry.response_policy.apply(policy);
+            for (entry.models) |model| {
+                if (std.mem.eql(u8, model.id, model_id)) return model.response_policy.apply(policy);
+            }
+            return policy;
+        }
+        return policy;
+    }
+
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.version) |s| gpa.free(s);
         if (self.provider_name) |s| gpa.free(s);
