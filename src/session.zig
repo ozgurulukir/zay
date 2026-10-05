@@ -1359,6 +1359,10 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
 /// owns `text`.
 pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySummary {
     const display_max: u32 = 120;
+    if (std.mem.eql(u8, record.kind, "request_usage")) {
+        // Informational rows are hidden by the default timeline filter.
+        return .{ .session_info = .{ .text = try gpa.dupe(u8, "token usage") } };
+    }
     if (std.mem.eql(u8, record.kind, "branch_summary")) {
         return .{ .branch_summary = .{ .text = try gpa.dupe(u8, "branch summary") } };
     }
@@ -1698,6 +1702,43 @@ test "session persists and loads messages" {
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(.user, messages[0].role());
     try std.testing.expectEqualStrings("hello", messages[0].text());
+}
+
+test "request usage metadata is durable but never projected into model history" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const session_cwd = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(session_cwd);
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    const session = try manager.create(session_cwd, .{});
+    var writer: SessionWriter = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .manager = manager,
+        .session = session,
+        .queue = try gpa.alloc(session_type.QueuedEntry, 4),
+    };
+    defer writer.deinit();
+    writer.session.manager = &writer.manager;
+    try writer.recordUsage(.{ .input_tokens = 68000, .output_tokens = 40, .total_tokens = 68040 });
+    const entries = try writer.entries(gpa);
+    defer {
+        for (entries) |*record| record.deinit(gpa);
+        gpa.free(entries);
+    }
+    try std.testing.expectEqualStrings("request_usage", entries[0].kind);
+    var summary = try entrySummary(gpa, entries[0]);
+    defer summary.deinit(gpa);
+    try std.testing.expectEqual(EntryKind.session_info, summary.kind());
+    const parsed = try std.json.parseFromSlice(ai.Usage, gpa, entries[0].payload_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 68000), parsed.value.input_tokens);
+    const messages = try writer.messages(gpa);
+    defer gpa.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), messages.len);
 }
 
 test "session persists tool display labels and failures" {

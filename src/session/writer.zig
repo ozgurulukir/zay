@@ -38,6 +38,8 @@ pub const SessionWriter = struct {
     stopping: bool = false,
     title_written: bool = false,
     thread: ?std.Thread = null,
+    write_failure: ?anyerror = null,
+    failed_entry: ?QueuedEntry = null,
 
     pub const queue_capacity_default: u32 = 256;
 
@@ -129,14 +131,18 @@ pub const SessionWriter = struct {
     }
 
     pub fn deinit(self: *SessionWriter) void {
-        if (self.mutex.lock(self.io)) |_| {
-            self.stopping = true;
-            self.condition.signal(self.io);
-            self.mutex.unlock(self.io);
-        } else |_| {
-            // Lock failed (canceled) — signal/cleanup will happen via thread join.
-        }
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
         if (self.thread) |thread| thread.join();
+        if (self.write_failure) |failure| {
+            const unwritten_count = self.entry_queue.len() + @as(u32, @intFromBool(self.failed_entry != null));
+            log.warn("session writer stopped with {d} unpersisted entries: {s}", .{ unwritten_count, @errorName(failure) });
+        }
+        if (self.failed_entry) |*entry| {
+            entry.deinit(self.gpa);
+        }
         while (self.entry_queue.pop(self.queue)) |entry| {
             var owned = entry;
             owned.deinit(self.gpa);
@@ -160,6 +166,13 @@ pub const SessionWriter = struct {
         try self.enqueue(.{ .kind = "message", .role = role, .payload_json = payload, .title_candidate = title_candidate });
     }
 
+    /// Usage is session metadata, never a message projected into a prompt.
+    pub fn recordUsage(self: *SessionWriter, usage: ai.Usage) Error!void {
+        const payload = try std.json.Stringify.valueAlloc(self.gpa, usage, .{});
+        errdefer self.gpa.free(payload);
+        try self.enqueue(.{ .kind = "request_usage", .role = null, .payload_json = payload });
+    }
+
     /// Enqueue a compaction boundary for the background writer. Mirrors
     /// `append`: builds the payload and hands it to the writer thread. The
     /// branch on which it lands is whatever leaf is current when the writer
@@ -177,7 +190,7 @@ pub const SessionWriter = struct {
     /// queued writes first so the leaf reflects the entries the turn just wrote,
     /// then annotates that entry. No-op if the session has no leaf yet.
     pub fn setLeafSnapshot(self: *SessionWriter, sha: []const u8) Error!void {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         const leaf_id = self.session.leaf() orelse return;
         return self.session.setSnapshot(leaf_id, sha);
@@ -186,7 +199,7 @@ pub const SessionWriter = struct {
     /// Race-free `Session.snapshotAt`: the git snapshot bound to the active
     /// conversation position (nearest entry at/above the leaf). Caller owns it.
     pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.snapshotAt(gpa);
     }
@@ -195,7 +208,7 @@ pub const SessionWriter = struct {
     /// append — no dedup (the table is a per-session log; only the UI ring
     /// dedups).
     pub fn savePromptHistory(self: *SessionWriter, prompt: []const u8) Error!void {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.savePromptHistory(prompt);
     }
@@ -203,7 +216,7 @@ pub const SessionWriter = struct {
     /// Load the prompt history for this session, race-free. Caller owns the
     /// slice and each string.
     pub fn loadPromptHistory(self: *SessionWriter, gpa: std.mem.Allocator) Error![][]u8 {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.loadPromptHistory(gpa);
     }
@@ -211,7 +224,7 @@ pub const SessionWriter = struct {
     /// Drop the newest prompt-history row, race-free. `/undo`'s second half:
     /// keeps `[0]` tracking the active branch across chained undos. Idempotent.
     pub fn deleteNewestPromptHistory(self: *SessionWriter) Error!void {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.deleteNewestPromptHistory();
     }
@@ -219,7 +232,7 @@ pub const SessionWriter = struct {
     /// Race-free `Session.lastUserEntry`: the newest user message entry on the
     /// active path, or null when the session holds none. Allocation-free.
     pub fn lastUserEntry(self: *SessionWriter) Error!?session_type.UserEntryRef {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.lastUserEntry();
     }
@@ -227,7 +240,7 @@ pub const SessionWriter = struct {
     /// Load the whole session tree, race-free. Stops the background writer so
     /// the read has exclusive access to the connection, then restarts it.
     pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.entries(gpa);
     }
@@ -235,7 +248,7 @@ pub const SessionWriter = struct {
     /// Reconstruct the active-path messages (leaf→root), race-free. Used after
     /// `navigate` to rehydrate the agent's conversation from the new branch.
     pub fn messages(self: *SessionWriter, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.messages(gpa);
     }
@@ -243,7 +256,7 @@ pub const SessionWriter = struct {
     /// Race-free `Session.compactionCut`: flushes queued writes so the cut is
     /// computed against the persisted tree, then restarts the writer.
     pub fn compactionCut(self: *SessionWriter, gpa: std.mem.Allocator, keep_recent_tokens: u32) Error!?CompactionCut {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.compactionCut(gpa, keep_recent_tokens);
     }
@@ -252,7 +265,7 @@ pub const SessionWriter = struct {
     /// race-free with the background writer. The next appended message becomes
     /// a child of `entry_id`, forming a new branch.
     pub fn navigate(self: *SessionWriter, entry_id: []const u8) Error!void {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.branch(entry_id, null, null);
     }
@@ -260,7 +273,7 @@ pub const SessionWriter = struct {
     /// Update the model provider, ID, and reasoning effort for the current
     /// session. Called when the model selection changes during a session.
     pub fn updateModel(self: *SessionWriter, provider: []const u8, model_id: []const u8, effort_label: ?[]const u8) Error!void {
-        self.quiesce();
+        try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         try self.session.updateModel(provider, model_id, effort_label);
     }
@@ -273,33 +286,56 @@ pub const SessionWriter = struct {
     /// leaving the calling thread sole owner of the sqlite connection. Pair
     /// with `restart`. Queued entries are written (not dropped) so an
     /// in-flight assistant turn isn't lost.
-    fn quiesce(self: *SessionWriter) void {
-        if (self.mutex.lock(self.io)) |_| {
-            self.stopping = true;
-            self.condition.signal(self.io);
-            self.mutex.unlock(self.io);
-        } else |_| {
-            // Lock failed (canceled) — stop flag will be observed on next poll.
-        }
+    fn quiesce(self: *SessionWriter) Error!void {
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
+        if (self.write_failure) |failure| return failure;
         while (self.entry_queue.pop(self.queue)) |entry| {
             var owned = entry;
-            defer owned.deinit(self.gpa);
-            writeQueuedEntry(self, &owned) catch |err| log.warn("session writer flush failed: {s}", .{@errorName(err)});
+            writeQueuedEntry(self, &owned) catch |err| {
+                self.recordFailure(owned, err);
+                return err;
+            };
+            owned.deinit(self.gpa);
         }
+    }
+
+    /// An uncertain HTTP commit must not be blindly retried or overtaken by
+    /// later entries. Keep the failed payload and make every caller observe
+    /// the failure before it can replace history from the durable tree.
+    fn recordFailure(self: *SessionWriter, entry: QueuedEntry, failure: anyerror) void {
+        self.mutex.lockUncancelable(self.io);
+        assert(self.failed_entry == null);
+        self.failed_entry = entry;
+        self.write_failure = failure;
+        self.mutex.unlock(self.io);
+        log.warn("session writer failed; further writes suspended: {s}", .{@errorName(failure)});
     }
 
     fn restart(self: *SessionWriter) Error!void {
         assert(self.thread == null);
+        if (self.write_failure) |failure| return failure;
         self.stopping = false;
-        self.thread = try std.Thread.spawn(.{}, runWriter, .{self});
+        self.thread = std.Thread.spawn(.{}, runWriter, .{self}) catch |err| {
+            self.mutex.lockUncancelable(self.io);
+            self.write_failure = err;
+            self.mutex.unlock(self.io);
+            return err;
+        };
     }
 
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
         try self.mutex.lock(self.io);
+        if (self.write_failure) |failure| {
+            self.mutex.unlock(self.io);
+            return failure;
+        }
         if (!self.entry_queue.push(self.queue, entry)) {
             self.mutex.unlock(self.io);
             return error.QueueFull;
@@ -313,13 +349,16 @@ fn runWriter(writer: *SessionWriter) void {
     while (true) {
         if (takeQueuedEntry(writer)) |entry| {
             var owned = entry;
-            defer owned.deinit(writer.gpa);
-            writeQueuedEntry(writer, &owned) catch continue;
+            writeQueuedEntry(writer, &owned) catch |err| {
+                writer.recordFailure(owned, err);
+                return;
+            };
+            owned.deinit(writer.gpa);
         } else {
             // Queue is empty: wait for a signal rather than busy-yielding.
             // We hold the lock around the check+wait so we can't miss a
             // signal that lands between the check and the wait.
-            writer.mutex.lock(writer.io) catch return;
+            writer.mutex.lockUncancelable(writer.io);
             while (writer.entry_queue.empty() and !writer.stopping) {
                 writer.condition.waitUncancelable(writer.io, &writer.mutex);
             }
@@ -359,7 +398,55 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
 }
 
 fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
-    writer.mutex.lock(writer.io) catch return null;
+    writer.mutex.lockUncancelable(writer.io);
     defer writer.mutex.unlock(writer.io);
     return writer.entry_queue.pop(writer.queue);
+}
+
+test "session writer failure preserves ordering and refuses incomplete reprojection" {
+    for ([_]session_mod.BackendKind{ .local_sqlite, .remote_service, .turso_http, .d1_http }) |kind| {
+        try testWriteFailure(kind);
+    }
+}
+
+fn testWriteFailure(kind: session_mod.BackendKind) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(test_cwd);
+    const session_cwd = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(session_cwd);
+    var manager = try SessionManager.init(gpa, io, ":memory:");
+    const session = try manager.create(session_cwd, .{});
+    var writer: SessionWriter = .{
+        .gpa = gpa,
+        .io = io,
+        .manager = manager,
+        .session = session,
+        .queue = try gpa.alloc(QueuedEntry, 4),
+    };
+    writer.session.manager = &writer.manager;
+    defer writer.deinit();
+    // A failed batch must stop the common writer for every HTTP backend.
+    // Missing clients make the failure deterministic without real sockets.
+    const original_kind = writer.manager.backend.kind;
+    defer writer.manager.backend.kind = original_kind;
+    writer.manager.backend.kind = kind;
+    const expected_failure = if (kind == .local_sqlite) error.Sqlite else error.MissingConnection;
+    if (kind == .local_sqlite) try writer.manager.backend.exec(io, "pragma query_only = on", &.{});
+    try writer.recordUsage(.{ .input_tokens = 68000, .output_tokens = 40, .total_tokens = 68040 });
+    try writer.recordUsage(.{ .input_tokens = 68001, .output_tokens = 40, .total_tokens = 68041 });
+    runWriter(&writer);
+    try std.testing.expectEqual(expected_failure, writer.write_failure.?);
+    try std.testing.expect(writer.failed_entry != null);
+    try std.testing.expectEqual(@as(u32, 1), writer.entry_queue.len());
+    try std.testing.expectError(expected_failure, writer.messages(gpa));
+    try std.testing.expectError(expected_failure, writer.recordUsage(.{
+        .input_tokens = 1,
+        .output_tokens = 1,
+        .total_tokens = 2,
+    }));
+    try std.testing.expectEqual(@as(u32, 1), writer.entry_queue.len());
 }

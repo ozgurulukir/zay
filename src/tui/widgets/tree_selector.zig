@@ -171,7 +171,7 @@ pub const TreeState = struct {
 
         var active = std.AutoHashMap(Id, void).init(self.gpa);
         defer active.deinit();
-        // The conversation leaf is usually a (hidden) checkpoint; resolve it to
+        // The conversation leaf may be hidden metadata; resolve it to
         // the nearest real message so that row — not nothing — is selected on open.
         var effective_leaf: ?Id = null;
         if (leaf_id) |id| {
@@ -181,7 +181,7 @@ pub const TreeState = struct {
                 while (true) {
                     try active.put(current, {});
                     const index = record_index.get(current) orelse break;
-                    if (effective_leaf == null and !isCheckpointRecord(records[index])) effective_leaf = current;
+                    if (effective_leaf == null and !isMetadataRecord(records[index])) effective_leaf = current;
                     const parent = records[index].parent_id orelse break;
                     current = parent;
                 }
@@ -544,8 +544,8 @@ pub const TreeState = struct {
     }
 };
 
-fn isCheckpointRecord(record: session_mod.EntryRecord) bool {
-    return std.mem.eql(u8, record.kind, "checkpoint");
+fn isMetadataRecord(record: session_mod.EntryRecord) bool {
+    return std.mem.eql(u8, record.kind, "checkpoint") or std.mem.eql(u8, record.kind, "request_usage");
 }
 
 // Shared case-insensitive filter match (panel is the widget-side SSOT);
@@ -855,6 +855,29 @@ test "checkpoint entries never appear; descendants attach to nearest visible anc
     try std.testing.expectEqual(@as(usize, 2), state.visible.len);
     try std.testing.expect(std.mem.indexOf(u8, state.visible[0].text, "top") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.visible[1].text, "leaf") != null);
+}
+
+test "request usage leaf selects the last message and preserves snapshot navigation" {
+    const gpa = std.testing.allocator;
+    var state = TreeState.init(gpa);
+    defer state.deinit();
+
+    var records = [_]session_mod.EntryRecord{
+        makeMessage("aaaaaaaa", null, "user", "do it"),
+        makeMessage("bbbbbbbb", "aaaaaaaa", "assistant", "done"),
+        makeMessage("cccccccc", "bbbbbbbb", "assistant", ""),
+    };
+    records[2].kind = @constCast("request_usage");
+    records[2].role = null;
+    records[2].snapshot = @constCast("0123456789abcdef0123456789abcdef01234567");
+    try state.load(&records, "cccccccc");
+
+    try std.testing.expectEqual(@as(usize, 2), state.visible.len);
+    try std.testing.expectEqual(@as(usize, 1), state.selection);
+    try std.testing.expect(state.selectedIsLeaf());
+    try std.testing.expectEqualStrings("bbbbbbbb", state.selectedId().?);
+    try std.testing.expect(state.visible[1].has_snapshot);
+    try std.testing.expectEqualStrings("cccccccc", state.selectedNavigationId().?);
 }
 
 test "hidden snapshot entries tag their nearest visible ancestor, deepest wins" {

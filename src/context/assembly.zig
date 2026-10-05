@@ -834,6 +834,11 @@ fn readRuleFileWithPolicy(
         if (policy == .fail_on_error) return err;
         return null;
     };
+    if (stat.kind == .directory) {
+        log.warn("skipping {s} {s}: expected a file", .{ label, path });
+        if (policy == .fail_on_error) return error.NotDir;
+        return null;
+    }
     const size: usize = @intCast(stat.size);
     if (size <= max_project_rule_file_bytes) {
         // Small rule file: read it whole. readSliceShort returns the actual
@@ -843,9 +848,9 @@ fn readRuleFileWithPolicy(
         errdefer gpa.free(bytes);
         var reader = file.reader(io, &.{});
         const n = reader.interface.readSliceShort(bytes) catch |err| {
-            gpa.free(bytes);
             log.warn("skipping {s} {s}: {s}", .{ label, path, @errorName(err) });
             if (policy == .fail_on_error) return err;
+            gpa.free(bytes);
             return null;
         };
         if (n < size) {
