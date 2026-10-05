@@ -11,6 +11,7 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | [Philosophy](PHILOSOPHY.md) | Design philosophy | Why Zay is built the way it is — human-in-the-loop, the Trifecta (Bash, Worktrees, Tmux). |
 | [Architecture](ARCHITECTURE.md) | High-level architecture | LLM Gateway, agent tools (`bash`/`lane`), steering, timeline, parallel lanes, bash auto-review, safety. |
 | [Configuration](CONFIG.md) | Configuration | Layered config system, full setting table, environment variables, persistence & atomic writes, TUI management. |
+| [Response Classification](RESPONSE_CLASSIFICATION.md) | Inbound LLM semantics | Answer/reasoning classification, provider/model policy overrides, structured content and Responses item routing. |
 | [MCP](MCP.md) | MCP integration | Model Context Protocol — transports, protocol versions, `{env:VAR}` security, async connects, tool injection. |
 | [Patterns](PATTERNS.md) | Engineering reference | Hard-won implementation patterns for developers — TUI, type system, models.dev, config layering, reasoning, compaction, session resume, plugin internals. |
 | [Plugins](plugins/README.md) | Lua plugin development | Writing Lua plugins — quick start, permissions, API reference, examples. |

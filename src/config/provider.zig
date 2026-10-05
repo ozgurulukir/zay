@@ -185,6 +185,7 @@ fn providerSpec(provider: Provider) ProviderDef {
 
 pub const Model = struct {
     id: []u8,
+    response_policy: ai.response_policy.Overrides = .{},
     reasoning: ReasoningSetting = .unset,
     /// Explicit context window override for this model (tokens).
     /// When set, overrides the model catalogue lookup.
@@ -206,6 +207,7 @@ pub const Model = struct {
         var out: Model = .{
             .id = try gpa.dupe(u8, self.id),
             .reasoning = self.reasoning,
+            .response_policy = self.response_policy,
             .context_window = self.context_window,
             .max_output_tokens = self.max_output_tokens,
         };
@@ -297,6 +299,7 @@ pub fn expandProviderHeaders(gpa: std.mem.Allocator, raw: []const ProviderHeader
 }
 
 pub const ProviderConfig = struct {
+    response_policy: ai.response_policy.Overrides = .{},
     /// The JSON map key. For builtins this equals `provider.label()`;
     /// for custom providers it's the user-chosen name (e.g. "qwen-cloud").
     name: []u8,
@@ -324,6 +327,7 @@ pub const ProviderConfig = struct {
         var out: ProviderConfig = .{
             .name = try gpa.dupe(u8, self.name),
             .provider = self.provider,
+            .response_policy = self.response_policy,
         };
         errdefer out.deinit(gpa);
         switch (self.base_url) {

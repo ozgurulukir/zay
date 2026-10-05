@@ -140,7 +140,17 @@ pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
                 _ = try lane.transcript.append(app.gpa, .skill, title, "");
             }
         } else if (message.role() == .assistant) {
-            if (text.len > 0) _ = try lane.transcript.append(app.gpa, .agent, "agent", text);
+            for (message.assistant.content) |block| {
+                switch (block) {
+                    .text => |part| {
+                        if (part.text.len > 0) _ = try lane.transcript.append(app.gpa, .agent, "agent", part.text);
+                    },
+                    .reasoning => |part| {
+                        if (part.text.len > 0) _ = try lane.transcript.append(app.gpa, .thinking, "Thoughts", part.text);
+                    },
+                    else => {},
+                }
+            }
         } else if (message.role() == .tool) {
             const title = try resumedToolTitleFor(app, agent, message);
             defer app.gpa.free(title);

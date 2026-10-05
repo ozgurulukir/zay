@@ -94,6 +94,7 @@ pub const TurnView = struct {
     ) !bool {
         if (delta.len == 0) return false;
         _ = try self.finishThinking(gpa, transcript);
+        self.thinking_index = null;
         try self.applyContentDelta(gpa, transcript, delta);
         self.activity = .{ .writing_response = self.agent_index.? };
         self.pending_redraw = true;
@@ -106,6 +107,7 @@ pub const TurnView = struct {
         transcript: *transcript_mod.Transcript,
         delta: []const u8,
     ) !bool {
+        if (delta.len > 0) self.agent_index = null;
         if (try self.applyReasoningDelta(gpa, transcript, delta)) self.pending_redraw = true;
         if (self.thinking_index) |index| self.activity = .{ .thinking = index };
         return false;
@@ -118,6 +120,7 @@ pub const TurnView = struct {
         tool: ai.ToolDelta,
     ) !bool {
         const thinking_finished = try self.finishThinking(gpa, transcript);
+        self.thinking_index = null;
         if (try self.applyToolPreview(gpa, transcript, tool)) {
             self.activity = .calling_tools;
             self.pending_redraw = true;
@@ -290,11 +293,6 @@ pub const TurnView = struct {
         var visible_change = false;
         if (self.thinking_index) |index| {
             try transcript.appendThinkingDelta(gpa, index, delta);
-        } else if (self.agent_index) |agent_index| {
-            self.thinking_index = try transcript.insert(gpa, agent_index, .thinking, "Thinking...", delta);
-            self.agent_index = agent_index + 1;
-            transcript.select(self.thinking_index.?);
-            visible_change = true;
         } else {
             self.thinking_index = try transcript.append(gpa, .thinking, "Thinking...", delta);
             visible_change = true;

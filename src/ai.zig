@@ -9,6 +9,7 @@ pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
 pub const provider_headers = @import("ai/provider_headers.zig");
 pub const text_tool_call = @import("ai/text_tool_call.zig");
+pub const response_policy = @import("ai/response_policy.zig");
 
 pub const Tool = tools_common.Tool;
 
@@ -165,6 +166,9 @@ pub const default_max_parallel_tool_calls: u32 = 16;
 pub const default_system_prompt: []const u8 = "You are a helpful assistant.";
 
 pub const Config = struct {
+    /// Explicit inbound field semantics for a provider/model or proxy quirk.
+    /// Null resolves from provider identity, independently of WireDialect.
+    response_policy: ?@import("ai/response_policy.zig").Policy = null,
     /// Provider key (auth-key id for openai_compatible, config key for a
     /// builtin) of the connection this config describes. Borrowed through
     /// client initialization; clients that retain the config copy it. This

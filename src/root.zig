@@ -593,6 +593,7 @@ test {
     _ = @import("ai/openai_request.zig");
     _ = @import("ai/responses_request.zig");
     _ = @import("ai/responses_events.zig");
+    _ = @import("ai/response_policy.zig");
     _ = @import("ai/stream_part.zig");
     _ = @import("tools/executor_safety.zig");
     _ = @import("tools/executor_validation.zig");

@@ -71,7 +71,14 @@ pub fn run(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype, en
     return turn;
 }
 
+const ItemRoute = struct {
+    id: ?[]u8,
+    output_index: ?u32,
+    block_index: usize,
+};
+
 pub const StreamState = struct {
+    routes: std.ArrayList(ItemRoute) = .empty,
     blocks: std.ArrayList(ai.ContentBlock) = .empty,
     tools: std.ArrayList(ToolBuilder) = .empty,
     terminal: Terminal = .{},
@@ -85,6 +92,8 @@ pub const StreamState = struct {
     dropped: u32 = 0,
 
     pub fn deinit(self: *StreamState, gpa: std.mem.Allocator) void {
+        for (self.routes.items) |route| if (route.id) |id| gpa.free(id);
+        self.routes.deinit(gpa);
         for (self.tools.items) |*tool| tool.deinit(gpa);
         self.tools.deinit(gpa);
     }
@@ -95,7 +104,7 @@ pub const StreamState = struct {
     }
 
     pub fn processJson(self: *StreamState, gpa: std.mem.Allocator, data: []const u8, observer: anytype, call_seq: *u64) !void {
-        try processEvent(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.terminal, self.limits, &self.dropped);
+        try processEventRouted(gpa, data, &self.blocks, &self.tools, observer, call_seq, &self.terminal, self.limits, &self.dropped, &self.routes);
     }
 
     pub fn finish(self: *StreamState, gpa: std.mem.Allocator, call_seq: *u64) !ai.Turn {
@@ -122,6 +131,21 @@ pub fn processEvent(
     limits: stream_part.StreamLimits,
     dropped: *u32,
 ) !void {
+    return processEventRouted(gpa, data, blocks, tools, observer, call_seq, terminal, limits, dropped, null);
+}
+
+fn processEventRouted(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    blocks: *std.ArrayList(ai.ContentBlock),
+    tools: *std.ArrayList(ToolBuilder),
+    observer: anytype,
+    call_seq: *u64,
+    terminal: *Terminal,
+    limits: stream_part.StreamLimits,
+    dropped: *u32,
+    routes: ?*std.ArrayList(ItemRoute),
+) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
@@ -145,16 +169,31 @@ pub fn processEvent(
             return;
         },
         .lifecycle => return,
-        .output_item_added => return onItemAdded(gpa, parsed.value, blocks, tools, call_seq, limits, dropped),
-        .content_part_added => return onContentPartAdded(gpa, parsed.value, blocks),
-        .output_text_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
-        .refusal_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
-        .reasoning_text_delta => return onReasoningDelta(gpa, parsed.value, blocks, observer),
-        .reasoning_summary_text_delta => return onReasoningDelta(gpa, parsed.value, blocks, observer),
-        .reasoning_summary_part_done => return onReasoningSummaryPartDone(gpa, blocks, observer),
+        .output_item_added => {
+            const before = blocks.items.len;
+            try onItemAdded(gpa, parsed.value, blocks, tools, call_seq, limits, dropped);
+            if (routes) |mapping| {
+                if (blocks.items.len > before) {
+                    const item = parsed.value.object.get("item").?;
+                    const id = try optionalString(gpa, item, "id");
+                    errdefer if (id) |bytes| gpa.free(bytes);
+                    try mapping.append(gpa, .{ .id = id, .output_index = optionalU32(parsed.value, "output_index"), .block_index = before });
+                }
+            }
+        },
+        .content_part_added => {
+            if (hasItemIdentity(parsed.value) and routes != null) {
+                _ = resolveItemBlock(parsed.value, blocks.items, routes, .text) orelse return;
+                return;
+            }
+            return onContentPartAdded(gpa, parsed.value, blocks);
+        },
+        .output_text_delta, .refusal_delta => return onTextDelta(gpa, parsed.value, blocks, observer, routes),
+        .reasoning_text_delta, .reasoning_summary_text_delta => return onReasoningDelta(gpa, parsed.value, blocks, observer, routes),
+        .reasoning_summary_part_done => return onReasoningSummaryPartDone(gpa, parsed.value, blocks, observer, routes),
         .function_call_arguments_delta => return onArgumentsDelta(gpa, parsed.value, blocks, tools, observer),
         .function_call_arguments_done => return onArgumentsDone(gpa, parsed.value, blocks, tools, observer),
-        .output_item_done => return onItemDone(gpa, parsed.value, blocks, tools, observer),
+        .output_item_done => return onItemDone(gpa, parsed.value, blocks, tools, observer, routes),
     }
 }
 
@@ -272,9 +311,14 @@ fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.Array
     const kind = item.object.get("type") orelse return;
     if (kind != .string) return;
     if (std.mem.eql(u8, kind.string, "message")) {
-        try blocks.append(gpa, .{ .text = .{ .text = try gpa.alloc(u8, 0), .responses_item_id = try optionalString(gpa, item, "id") } });
+        var block: ai.ContentBlock = .{ .text = .{ .text = try gpa.alloc(u8, 0) } };
+        errdefer block.deinit(gpa);
+        block.text.responses_item_id = try optionalString(gpa, item, "id");
+        block.text.responses_phase = try optionalString(gpa, item, "phase");
+        try blocks.append(gpa, block);
     } else if (std.mem.eql(u8, kind.string, "reasoning")) {
         const raw = try std.json.Stringify.valueAlloc(gpa, item, .{});
+        errdefer gpa.free(raw);
         try blocks.append(gpa, .{ .reasoning = .{ .text = try gpa.alloc(u8, 0), .responses_item_json = raw } });
     } else if (std.mem.eql(u8, kind.string, "function_call")) {
         // Same parallel-call cap as the chat-completions parser: a call at or
@@ -335,20 +379,26 @@ fn onContentPartAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *st
     try blocks.append(gpa, .{ .text = .{ .text = try gpa.alloc(u8, 0) } });
 }
 
-fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype) !void {
+fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype, routes: ?*std.ArrayList(ItemRoute)) !void {
     const item = value.object.get("item") orelse return;
     if (item != .object) return;
     const kind = item.object.get("type") orelse return;
     if (kind != .string) return;
     if (std.mem.eql(u8, kind.string, "message")) {
-        const text = outputTextFromItem(item) orelse return;
-        try finishTextBlock(gpa, blocks, observer, text);
+        const index = resolveItemBlock(value, blocks.items, routes, .text) orelse return;
+        const text = try outputTextFromItem(gpa, item) orelse return;
+        defer gpa.free(text);
+        if (try optionalString(gpa, item, "phase")) |phase| {
+            if (blocks.items[index].text.responses_phase) |old| gpa.free(old);
+            blocks.items[index].text.responses_phase = phase;
+        }
+        try finishTextBlock(gpa, blocks, observer, index, text);
         return;
     }
     if (std.mem.eql(u8, kind.string, "reasoning")) {
+        const index = resolveItemBlock(value, blocks.items, routes, .reasoning) orelse return;
         const raw = try std.json.Stringify.valueAlloc(gpa, item, .{});
         errdefer gpa.free(raw);
-        const index = lastReasoningBlock(blocks.items) orelse return;
         if (blocks.items[index].reasoning.responses_item_json) |old| gpa.free(old);
         blocks.items[index].reasoning.responses_item_json = raw;
         return;
@@ -361,53 +411,46 @@ fn onItemDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayL
     }
 }
 
-fn outputTextFromItem(item: std.json.Value) ?[]const u8 {
+fn outputTextFromItem(gpa: std.mem.Allocator, item: std.json.Value) !?[]u8 {
     const content = item.object.get("content") orelse return null;
     if (content != .array) return null;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var found = false;
     for (content.array.items) |part| {
         if (part != .object) continue;
         const kind = part.object.get("type") orelse continue;
         if (kind != .string) continue;
         if (std.mem.eql(u8, kind.string, "output_text")) {
-            const text = part.object.get("text") orelse return null;
-            if (text != .string) return null;
-            return text.string;
+            const value = stringField(part, "text") orelse continue;
+            try text.appendSlice(gpa, value);
+            found = true;
         }
         if (std.mem.eql(u8, kind.string, "refusal")) {
-            const refusal = part.object.get("refusal") orelse return null;
-            if (refusal != .string) return null;
-            return refusal.string;
+            const value = stringField(part, "refusal") orelse continue;
+            try text.appendSlice(gpa, value);
+            found = true;
         }
     }
-    return null;
+    return if (found) try text.toOwnedSlice(gpa) else null;
 }
 
-fn onTextDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype) !void {
+fn onTextDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, routes: ?*std.ArrayList(ItemRoute)) !void {
     const delta = stringField(value, "delta") orelse return;
-    var index = blocks.items.len;
-    while (index > 0) {
-        index -= 1;
-        if (blocks.items[index] != .text) continue;
-        const old = blocks.items[index].text.text;
-        blocks.items[index].text.text = try appendOwned(gpa, old, delta);
-        try observer.on_content(observer.ctx, delta);
-        try observer.on_delta_end(observer.ctx);
-        return;
-    }
+    const index = resolveItemBlock(value, blocks.items, routes, .text) orelse return;
+    const old = blocks.items[index].text.text;
+    blocks.items[index].text.text = try appendOwned(gpa, old, delta);
+    try observer.on_content(observer.ctx, delta);
+    try observer.on_delta_end(observer.ctx);
 }
 
-fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype) !void {
+fn onReasoningDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, routes: ?*std.ArrayList(ItemRoute)) !void {
     const delta = stringField(value, "delta") orelse return;
-    var index = blocks.items.len;
-    while (index > 0) {
-        index -= 1;
-        if (blocks.items[index] != .reasoning) continue;
-        const old = blocks.items[index].reasoning.text;
-        blocks.items[index].reasoning.text = try appendOwned(gpa, old, delta);
-        try observer.on_reasoning(observer.ctx, delta);
-        try observer.on_delta_end(observer.ctx);
-        return;
-    }
+    const index = resolveItemBlock(value, blocks.items, routes, .reasoning) orelse return;
+    const old = blocks.items[index].reasoning.text;
+    blocks.items[index].reasoning.text = try appendOwned(gpa, old, delta);
+    try observer.on_reasoning(observer.ctx, delta);
+    try observer.on_delta_end(observer.ctx);
 }
 
 fn onArgumentsDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), tools: *std.ArrayList(ToolBuilder), observer: anytype) !void {
@@ -452,8 +495,7 @@ fn toolIndexForEvent(value: std.json.Value, tools: []const ToolBuilder) ?u32 {
     return null;
 }
 
-fn finishTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, text: []const u8) !void {
-    const index = lastTextBlock(blocks.items) orelse return;
+fn finishTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, index: usize, text: []const u8) !void {
     const old = blocks.items[index].text.text;
     if (std.mem.startsWith(u8, text, old)) {
         const suffix = text[old.len..];
@@ -464,38 +506,75 @@ fn finishTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBloc
             return;
         }
     } else {
-        const replacement = try gpa.dupe(u8, text);
-        gpa.free(old);
-        blocks.items[index].text.text = replacement;
-        if (text.len > 0) {
-            try observer.on_content(observer.ctx, text);
-            try observer.on_delta_end(observer.ctx);
-        }
+        // Append-only observers cannot retract already displayed bytes.
+        // Surface an inconsistent provider snapshot instead of duplicating
+        // text live while silently replacing the persisted answer.
+        return error.ResponseContentMismatch;
     }
 }
 
-fn onReasoningSummaryPartDone(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype) !void {
-    const index = lastReasoningBlock(blocks.items) orelse return;
+fn onReasoningSummaryPartDone(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.ArrayList(ai.ContentBlock), observer: anytype, routes: ?*std.ArrayList(ItemRoute)) !void {
+    const index = resolveItemBlock(value, blocks.items, routes, .reasoning) orelse return;
     const old = blocks.items[index].reasoning.text;
     blocks.items[index].reasoning.text = try appendOwned(gpa, old, "\n\n");
     try observer.on_reasoning(observer.ctx, "\n\n");
     try observer.on_delta_end(observer.ctx);
 }
 
-fn lastTextBlock(blocks: []const ai.ContentBlock) ?u32 {
+fn eventItemId(value: std.json.Value) ?[]const u8 {
+    if (stringField(value, "item_id")) |id| return id;
+    const item = value.object.get("item") orelse return null;
+    if (item != .object) return null;
+    return stringField(item, "id");
+}
+
+fn hasItemIdentity(value: std.json.Value) bool {
+    return eventItemId(value) != null or optionalU32(value, "output_index") != null;
+}
+
+fn resolveItemBlock(value: std.json.Value, blocks: []const ai.ContentBlock, routes: ?*const std.ArrayList(ItemRoute), kind: std.meta.Tag(ai.ContentBlock)) ?usize {
+    const id = eventItemId(value);
+    const output_index = optionalU32(value, "output_index");
+    if (id != null or output_index != null) {
+        if (routes) |mapping| {
+            for (mapping.items) |route| {
+                if (id) |requested| {
+                    const actual = route.id orelse continue;
+                    if (!std.mem.eql(u8, requested, actual)) continue;
+                }
+                if (output_index) |requested| {
+                    if (route.output_index != requested) continue;
+                }
+                if (route.block_index >= blocks.len) return null;
+                if (std.meta.activeTag(blocks[route.block_index]) != kind) return null;
+                return route.block_index;
+            }
+            // An explicit unknown/mismatched identity cannot fall back to a
+            // different item's latest block.
+            return null;
+        }
+    }
+    return switch (kind) {
+        .text => lastTextBlock(blocks),
+        .reasoning => lastReasoningBlock(blocks),
+        else => null,
+    };
+}
+
+fn lastTextBlock(blocks: []const ai.ContentBlock) ?usize {
     var index = blocks.len;
     while (index > 0) {
         index -= 1;
-        if (blocks[index] == .text) return @intCast(index);
+        if (blocks[index] == .text) return index;
     }
     return null;
 }
 
-fn lastReasoningBlock(blocks: []const ai.ContentBlock) ?u32 {
+fn lastReasoningBlock(blocks: []const ai.ContentBlock) ?usize {
     var index = blocks.len;
     while (index > 0) {
         index -= 1;
-        if (blocks[index] == .reasoning) return @intCast(index);
+        if (blocks[index] == .reasoning) return index;
     }
     return null;
 }
@@ -670,6 +749,89 @@ test "openresponses emits final item text when no delta arrived" {
     defer turn.deinit(gpa);
     try std.testing.expectEqualStrings("hello", seen.text.items);
     try std.testing.expectEqualStrings("hello", turn.assistant.assistant.content[0].text.text);
+}
+
+test "openresponses routes interleaved answers by item identity and preserves phases" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+    var sequence: u64 = 0;
+    const events = [_][]const u8{
+        \\{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"a","phase":"commentary"}}
+        ,
+        \\{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"b","phase":"final_answer"}}
+        ,
+        \\{"type":"response.output_text.delta","item_id":"a","output_index":0,"delta":"First"}
+        ,
+        \\{"type":"response.output_text.delta","output_index":1,"delta":"Last"}
+        ,
+        \\{"type":"response.output_text.delta","item_id":"missing","delta":"Wrong"}
+        ,
+        \\{"type":"response.output_text.delta","item_id":"a","output_index":1,"delta":"Wrong"}
+        ,
+        \\{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"a","phase":"commentary","content":[{"type":"output_text","text":"First"},{"type":"output_text","text":" plus"}]}}
+        ,
+        \\{"type":"response.completed"}
+        ,
+    };
+    for (events) |event| try state.processJson(gpa, event, ai.streamNoop(), &sequence);
+    var turn = try state.finish(gpa, &sequence);
+    defer turn.deinit(gpa);
+    const blocks = turn.assistant.assistant.content;
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("First plus", blocks[0].text.text);
+    try std.testing.expectEqualStrings("commentary", blocks[0].text.responses_phase.?);
+    try std.testing.expectEqualStrings("Last", blocks[1].text.text);
+    try std.testing.expectEqualStrings("final_answer", blocks[1].text.responses_phase.?);
+}
+
+test "openresponses routes reasoning and opaque snapshots to their own item" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+    var sequence: u64 = 0;
+    const events = [_][]const u8{
+        \\{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r1"}}
+        ,
+        \\{"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"r2"}}
+        ,
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"r1","delta":"First check"}
+        ,
+        \\{"type":"response.reasoning_summary_text.delta","output_index":1,"delta":"Second check"}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"r1","encrypted_content":"opaque"}}
+        ,
+        \\{"type":"response.completed"}
+        ,
+    };
+    for (events) |event| try state.processJson(gpa, event, ai.streamNoop(), &sequence);
+    var turn = try state.finish(gpa, &sequence);
+    defer turn.deinit(gpa);
+    const blocks = turn.assistant.assistant.content;
+    try std.testing.expectEqualStrings("First check", blocks[0].reasoning.text);
+    try std.testing.expectEqualStrings("Second check", blocks[1].reasoning.text);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].reasoning.responses_item_json.?, "opaque") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[1].reasoning.responses_item_json.?, "opaque") == null);
+}
+
+test "openresponses rejects snapshots that contradict already streamed answer bytes" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+    var sequence: u64 = 0;
+    try state.processJson(gpa,
+        \\{"type":"response.output_item.added","item":{"type":"message","id":"a"}}
+    , ai.streamNoop(), &sequence);
+    try state.processJson(gpa,
+        \\{"type":"response.output_text.delta","item_id":"a","delta":"Answer"}
+    , ai.streamNoop(), &sequence);
+    try std.testing.expectError(error.ResponseContentMismatch, state.processJson(gpa,
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"a","content":[{"type":"output_text","text":"Different"}]}}
+    , ai.streamNoop(), &sequence));
+    try std.testing.expectEqualStrings("Answer", state.blocks.items[0].text.text);
 }
 
 test "openresponses preserves text tool text block order" {

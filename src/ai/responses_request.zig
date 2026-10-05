@@ -177,6 +177,10 @@ fn writeAssistantItems(
                     try out.writeAll(",\"id\":");
                     try wire_json.writeString(out, gpa, id);
                 }
+                if (text.responses_phase) |phase| {
+                    try out.writeAll(",\"phase\":");
+                    try wire_json.writeString(out, gpa, phase);
+                }
                 try out.writeAll(",\"content\":[{\"type\":\"output_text\",\"text\":");
                 try wire_json.writeString(out, gpa, text.text);
                 try out.writeAll(",\"annotations\":[]}]}");
@@ -645,6 +649,21 @@ test "writeRequestPayload sanitizes empty tool call arguments to empty object" {
     try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"arguments\":\"{}\"") != null);
+}
+
+test "assistant classification replays commentary and final answer phases as message text" {
+    const gpa = std.testing.allocator;
+    var blocks = [_]ai.ContentBlock{
+        .{ .text = .{ .text = @constCast("Working"), .responses_phase = @constCast("commentary") } },
+        .{ .text = .{ .text = @constCast("Done"), .responses_phase = @constCast("final_answer") } },
+    };
+    const message: ai.ChatMessage = .{ .assistant = .{ .content = &blocks } };
+    var buffer: std.Io.Writer.Allocating = .init(gpa);
+    defer buffer.deinit();
+    try writeAssistantItems(&buffer.writer, message, gpa, "test", false);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "\"phase\":\"commentary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "\"phase\":\"final_answer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "\"type\":\"reasoning\"") == null);
 }
 
 test "writeRequestPayload clips minimal reasoning effort for minimal dialect" {

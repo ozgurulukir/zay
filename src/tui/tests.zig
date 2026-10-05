@@ -2913,6 +2913,24 @@ test "empty text deltas do not create selectable messages" {
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
 }
 
+test "assistant classification preserves answer reasoning answer order in the transcript" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+    var view: turn_view_mod.TurnView = .{};
+    defer view.deinit(gpa);
+    _ = try view.apply(gpa, &transcript, .{ .response_delta = "First answer" });
+    _ = try view.apply(gpa, &transcript, .{ .thinking_delta = "Check" });
+    _ = try view.apply(gpa, &transcript, .{ .response_delta = "Final answer" });
+    try std.testing.expectEqual(@as(usize, 3), transcript.messages.items.len);
+    try std.testing.expectEqual(.agent, transcript.messages.items[0].kind());
+    try std.testing.expectEqual(.thinking, transcript.messages.items[1].kind());
+    try std.testing.expectEqual(.agent, transcript.messages.items[2].kind());
+    try std.testing.expectEqualStrings("First answer", transcript.messages.items[0].mirror().body);
+    try std.testing.expectEqualStrings("Thoughts", transcript.messages.items[1].mirror().title);
+    try std.testing.expectEqualStrings("Final answer", transcript.messages.items[2].mirror().body);
+}
+
 test "agent app events update transcript on the ui side" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;
@@ -2942,12 +2960,14 @@ test "agent app events update transcript on the ui side" {
         .display_body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), app.thread.transcript.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].mirror().kind);
     try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[1].mirror().kind);
     try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].mirror().kind);
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
-    try std.testing.expectEqualStrings("checking files", app.thread.transcript.messages.items[1].mirror().body);
+    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[3].mirror().kind);
+    try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
+    try std.testing.expectEqualStrings("checking", app.thread.transcript.messages.items[1].mirror().body);
+    try std.testing.expectEqualStrings(" files", app.thread.transcript.messages.items[3].mirror().body);
     try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[2].mirror().title);
 }
 
@@ -3534,6 +3554,27 @@ test "collapsed tool title wraps to visible rows" {
     const index = try transcript.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
     try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
     try std.testing.expect(messageRowsCached(&transcript.messages.items[index], 12) > 3);
+}
+
+test "assistant classification restores every typed answer and reasoning block" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    const blocks = try gpa.alloc(ai.ContentBlock, 3);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "First answer") } };
+    blocks[1] = .{ .reasoning = .{ .text = try gpa.dupe(u8, "Check") } };
+    blocks[2] = .{ .text = .{ .text = try gpa.dupe(u8, "Final answer") } };
+    try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+    try app.rebuildTranscriptFromAgent();
+    const messages = app.thread.transcript.messages.items;
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqual(.agent, messages[0].kind());
+    try std.testing.expectEqual(.thinking, messages[1].kind());
+    try std.testing.expectEqual(.agent, messages[2].kind());
+    try std.testing.expectEqualStrings("First answer", messages[0].mirror().body);
+    try std.testing.expectEqualStrings("Final answer", messages[2].mirror().body);
 }
 
 test "resumed tool messages keep the tool icon" {

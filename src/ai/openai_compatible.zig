@@ -185,6 +185,7 @@ pub const Client = struct {
         const env: stream_part.StreamEnv = .{
             .limits = .{ .max_parallel_calls = self.config.max_parallel_tool_calls, .model_label = self.config.model },
             .id_seq = &self.tool_call_seq,
+            .response_policy = self.config.response_policy orelse ai.response_policy.Policy.resolve(self.config.provider_name, self.config.base_url),
         };
         return self.transport.prompt(transport_mod.payloadSource(ChatPayload, &payload), observer, stream_parser, env);
     }
