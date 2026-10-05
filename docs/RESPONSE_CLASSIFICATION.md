@@ -66,11 +66,12 @@ Responses items; completed turns keep each item's content separate.
 
 The optimized build and plugin suite pass. The full optimized test run
 (`zig build test -Doptimize=ReleaseFast`, with loopback access for HTTP fixtures)
-reports 1,887 passed, 28 skipped, and one unrelated failure: the unchanged
-`session_switcher` test "map-based resume sort does not fold pathsEqual-equal
-group keys into one entry" assumes Windows path equality on Linux. All
-classification, configuration, adapter, runtime-role and transcript regressions
-pass in that run. Formatting, JSON-schema parsing and diff checks also pass.
+passes, including the classification, configuration, adapter, runtime-role
+and transcript regressions. The `session_switcher` test "map-based resume sort
+does not fold pathsEqual-equal group keys into one entry" now uses separator-only
+drift, so its path-equality premise holds on Linux and Windows; its group-count
+and ordering assertions remain intact. Formatting, JSON-schema parsing and diff
+checks also pass.
 
 The default Debug test build still hits the Zig compiler SIGSEGV observed
 before this change; it is not a validated gate. A pre-existing exhausted HTTP
