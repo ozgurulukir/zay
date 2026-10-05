@@ -15,7 +15,7 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | [Patterns](PATTERNS.md) | Engineering reference | Hard-won implementation patterns for developers — TUI, type system, models.dev, config layering, reasoning, compaction, session resume, plugin internals. |
 | [Plugins](plugins/README.md) | Lua plugin development | Writing Lua plugins — quick start, permissions, API reference, examples. |
 | [Skills](SKILLS.md) | Skill discovery | Skill name charset, description cap, the `SKILL.md` convention, `$skill` invocation, `zay --strict` conformance scan. |
-| [Database & Sessions](DATABASE.md) | Storage & Roaming | Local SQLite, Turso / LibSQL Cloud, PostgreSQL service, multi-host roaming, fail-safe fallback. |
+| [Database & Sessions](DATABASE.md) | Storage & Roaming | Local SQLite, Turso / LibSQL Cloud, Cloudflare D1, PostgreSQL service, multi-host roaming, fail-safe fallback. |
 | [Development](DEVELOPMENT.md) | Zig development | Style, ownership, Zig 0.16 API recipes, and optimized-build debugging. |
 | [Code Discovery](CODE_INTELLIGENCE.md) | Graph tooling | Codebase Memory project identity, GitNexus impact/change checks, and CLI routing. |
 | [Building](BUILDING.md) | Source builds | Clone, fetch dependencies, build, test, and install. |
@@ -29,7 +29,7 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | Topic | Authoritative document |
 |-------|------------------------|
 | How to configure Zay (settings, env vars) | [Configuration](CONFIG.md) |
-| Database backends (Turso, Postgres, SQLite, roaming) | [Database & Sessions](DATABASE.md) |
+| Database backends (Turso, Cloudflare D1, PostgreSQL service, SQLite, roaming) | [Database & Sessions](DATABASE.md) |
 | How MCP servers connect & work | [MCP](MCP.md) |
 | How to write a Lua plugin | [Plugins](plugins/README.md) |
 | Skill name rules / `--strict` scan | [Skills](SKILLS.md) |

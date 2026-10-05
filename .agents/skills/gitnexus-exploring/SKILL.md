@@ -1,6 +1,6 @@
 ---
 name: gitnexus-exploring
-description: "Use only when the user explicitly asks for GitNexus exploration, processes, or graph queries. For ordinary Zay code walkthroughs and architecture questions, use the general repository workflow instead."
+description: "Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: \"How does X work?\", \"What calls this function?\", \"Show me the auth flow\""
 ---
 
 # Exploring Codebases with GitNexus

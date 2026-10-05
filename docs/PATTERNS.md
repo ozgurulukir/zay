@@ -516,7 +516,7 @@ Known limitation (narrowed 2026-09-24): live lane clients keep their spawn-time 
 
 ### External Database Service & Roaming Session Backend (2026-09-28)
 
-Zay unifies local embedded SQLite and external REST database servers through `SessionBackend` (`src/session/backend.zig`) and `db.Service` (`src/db/service.zig`). When configured via the `database` block or the legacy `databaseServerUrl` / `ZAY_DATABASE_SERVER_URL` settings, Zay delegates session history, timeline branches, and resume points to the selected backend (SQLite or PostgreSQL), allowing developers to move between machines without losing session state.
+Zay unifies local embedded SQLite and external database backends through `SessionBackend` (`src/session/backend.zig`). The active remote backends are the REST companion service (`zay_service`, implemented by `db.Service`), direct Turso/LibSQL HTTP, and direct Cloudflare D1 HTTP. When configured via the `database` block or the legacy `databaseServerUrl` / `ZAY_DATABASE_SERVER_URL` settings, Zay delegates session history, timeline branches, and resume points to the selected backend. The companion service can use SQLite or PostgreSQL; `postgres_native` is accepted by the parser but remains unimplemented.
 
 **Key Invariants & Mechanics:**
 

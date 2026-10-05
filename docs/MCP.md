@@ -219,8 +219,8 @@ When the model calls an MCP tool:
 - Tool schemas (`inputSchema`) are parsed from JSON Schema into Zay's internal
   `tools_common.Schema` format, preserving property types, descriptions, and required
   fields.
-- Discovered tools are injected into the AI provider's `tools` array alongside built-in
-  tools (bash), so the model can call them directly.
+- Discovered tools are injected into the AI provider's `tools` array alongside all
+  builtin tools, so the model can call them directly.
 - **`notifications/tools/list_changed`**: Handled for servers that advertise
   `capabilities.tools.listChanged`. The notification sets `pending_tools_refresh` on the
   client; the TUI tick's `drainMcpNotifications` polls it, re-runs `tools/list`, and
