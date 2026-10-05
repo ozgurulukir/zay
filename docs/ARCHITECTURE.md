@@ -74,9 +74,11 @@ User's can branch off at any point in their conversation to pursue different pat
 ## Session Persistence
 
 The session store (`sessions.sqlite`) records the active `model_provider`, `model_id`, and `reasoning_effort` on every turn and on every mid-session model switch, and resumes correctly across restarts — including cross-project resumes. The store defaults to a local
-`sessions.sqlite`, but the backend is pluggable: `local`, `zay_service`,
-`turso_http` (LibSQL/Turso), `postgres_native`, and `d1_http` (Cloudflare D1)
-are selectable through the `database` config block — see
+`sessions.sqlite`, but the backend is pluggable: the active backends are
+`local`, `zay_service`, `turso_http` (LibSQL/Turso), and `d1_http`
+(Cloudflare D1). PostgreSQL is supported through the `zay_service` companion;
+the `postgres_native` config value is accepted for compatibility but is not
+implemented and falls back where the startup path permits it. See
 [DATABASE.md](DATABASE.md). The full lifecycle (schema, resume paths, custom-provider round-tripping, dynamic-provider auth resolution, restart catalog restore) is documented in the [Mid-session model persistence pattern](PATTERNS.md#mid-session-model-persistence-pattern), the [Cross-project session resume pattern](PATTERNS.md#cross-project-session-resume-pattern), and the related provider patterns in Patterns.
 
 ## Parallel

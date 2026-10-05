@@ -29,4 +29,4 @@ An agent with a shell has real power, so safety is part of the design, not an af
 
 ## Local-first (with Roaming Options)
 
-Every session lives in a SQLite database on your machine by default. Your conversations, your timeline, your history — yours, on your disk, resumable at any time. When multi-machine roaming is needed, optional cloud and remote backends (Turso LibSQL, PostgreSQL) can be enabled without lock-in.
+Every session lives in a SQLite database on your machine by default. Your conversations, your timeline, your history — yours, on your disk, resumable at any time. When multi-machine roaming is needed, optional cloud and remote backends (Turso LibSQL, Cloudflare D1, or a PostgreSQL companion service) can be enabled without lock-in.

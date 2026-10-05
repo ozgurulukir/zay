@@ -8,6 +8,10 @@ Users can run Zay in four primary modes:
 3. **Cloudflare D1 (`d1_http`):** Direct serverless database over Cloudflare's REST API with zero proxy daemons.
 4. **Companion Service (`zay_service`):** Self-hosted or cloud-hosted Python service supporting SQLite and PostgreSQL (Neon, Supabase, Render, local Docker).
 
+The `postgres_native` backend name is accepted for configuration compatibility,
+but the native arm is not implemented. Use `zay_service` when the companion
+service is backed by PostgreSQL.
+
 ---
 
 ## Backend Comparison Matrix
