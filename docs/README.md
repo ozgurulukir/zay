@@ -16,6 +16,8 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | [Plugins](plugins/README.md) | Lua plugin development | Writing Lua plugins — quick start, permissions, API reference, examples. |
 | [Skills](SKILLS.md) | Skill discovery | Skill name charset, description cap, the `SKILL.md` convention, `$skill` invocation, `zay --strict` conformance scan. |
 | [Database & Sessions](DATABASE.md) | Storage & Roaming | Local SQLite, Turso / LibSQL Cloud, PostgreSQL service, multi-host roaming, fail-safe fallback. |
+| [Development](DEVELOPMENT.md) | Zig development | Style, ownership, Zig 0.16 API recipes, and optimized-build debugging. |
+| [Code Discovery](CODE_INTELLIGENCE.md) | Graph tooling | Codebase Memory project identity, GitNexus impact/change checks, and CLI routing. |
 | [Building](BUILDING.md) | Source builds | Clone, fetch dependencies, build, test, and install. |
 | [Releasing](RELEASING.md) | Release process | Cutting a release — tag & push, what the GitHub Actions workflow builds and attaches, `zay --version`. |
 | [Command Safety & Classifier](wiki/SAFETY_CLASSIFIER.md) | Safety stack | Tier 1 deterministic matcher, optional Tier 2 ModernBERT classifier REST service, fallback semantics. |
@@ -31,7 +33,9 @@ This documentation is organized as a **wiki**: each topic lives in exactly **one
 | How MCP servers connect & work | [MCP](MCP.md) |
 | How to write a Lua plugin | [Plugins](plugins/README.md) |
 | Skill name rules / `--strict` scan | [Skills](SKILLS.md) |
-| How to build Zay from source | [Building](BUILDING.md) |
+| How to build Zay from source / interpret test results | [Building](BUILDING.md) |
+| Zig conventions, API examples and memory safety | [Development](DEVELOPMENT.md) |
+| Graph discovery / impact analysis / change checks | [Code Discovery](CODE_INTELLIGENCE.md) |
 | Plugin `zay.*` bridge functions | [Plugins API reference](plugins/api-reference.md) |
 | The `union(enum)` type-system discipline | [Patterns](PATTERNS.md) |
 | Session persistence / reasoning-effort lifecycle | [Patterns](PATTERNS.md) |
