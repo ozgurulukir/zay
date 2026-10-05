@@ -553,6 +553,8 @@ fn parseTextValue(gpa: std.mem.Allocator, scanner: *Scanner, field_name: []const
     // This scanner is positioned inside a delta object. The top-level JSON
     // parser insists on end-of-document; innerParse consumes one value.
     const value = try std.json.innerParse(std.json.Value, arena.allocator(), scanner, .{ .allocate = .alloc_if_needed, .max_value_len = stream_part.bytes_max });
+    const reasoning_before = reasoning.items.len;
+    const parts_before = stream.parts.items.len;
     switch (value) {
         .string => |bytes| try appendSemanticText(gpa, field_kind, bytes, content, reasoning, stream, change),
         .array => |parts| {
@@ -560,6 +562,20 @@ fn parseTextValue(gpa: std.mem.Allocator, scanner: *Scanner, field_name: []const
         },
         .object => try parseTextPart(gpa, value, if (std.mem.eql(u8, field_name, "content")) null else field_kind, content, reasoning, stream, change),
         else => {},
+    }
+    // Aliases duplicate whole field payloads. Repeated parts within a field
+    // are independent bytes and must survive even when their text is equal.
+    if (change.reasoning_start) |start| {
+        if (start < reasoning_before and std.mem.eql(u8, reasoning.items[start..reasoning_before], reasoning.items[reasoning_before..])) {
+            reasoning.shrinkRetainingCapacity(reasoning_before);
+            var kept = parts_before;
+            for (stream.parts.items[parts_before..]) |part| {
+                if (part == .reasoning) continue;
+                stream.parts.items[kept] = part;
+                kept += 1;
+            }
+            stream.parts.shrinkRetainingCapacity(kept);
+        }
     }
 }
 
@@ -581,11 +597,6 @@ fn appendSemanticText(gpa: std.mem.Allocator, kind: ai.response_policy.TextKind,
     if (bytes.len == 0 or kind == .ignore) return;
     const buffer = if (kind == .text) content else reasoning;
     const before = buffer.items.len;
-    if (kind == .reasoning) {
-        if (change.reasoning_start) |start| {
-            if (std.mem.eql(u8, buffer.items[start..], bytes)) return;
-        }
-    }
     try buffer.appendSlice(gpa, bytes);
     const range: TextRange = .{ .start = before, .end = buffer.items.len };
     switch (kind) {
@@ -930,6 +941,31 @@ test "parseStreamChunk handles structured reasoning aliases without duplicating 
     try std.testing.expectEqualStrings("Check", reasoning.items);
     try std.testing.expectEqualStrings("Answer", content.items);
     try std.testing.expectEqual(@as(usize, 2), stream.parts.items.len);
+}
+
+test "parseStreamChunk preserves repeated reasoning parts and deduplicates whole aliases" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"choices":[{"delta":{"content":[{"type":"reasoning.text","text":"ha"},{"type":"reasoning.text","text":"ha"}],"reasoning":"haha"}}]}
+        ,
+        \\{"choices":[{"delta":{"reasoning":"haha","reasoning_details":[{"type":"reasoning.text","text":"ha"},{"type":"reasoning.text","text":"ha"}]}}]}
+    };
+    for (cases) |input| {
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(gpa);
+        var reasoning: std.ArrayList(u8) = .empty;
+        defer reasoning.deinit(gpa);
+        var stream: ToolCallStream = .{};
+        defer stream.deinit(gpa);
+        _ = try parseStreamChunk(gpa, input, &content, &reasoning, &stream);
+        try std.testing.expectEqualStrings("haha", reasoning.items);
+        var observed: std.ArrayList(u8) = .empty;
+        defer observed.deinit(gpa);
+        for (stream.parts.items) |part| {
+            try observed.appendSlice(gpa, reasoning.items[part.reasoning.start..part.reasoning.end]);
+        }
+        try std.testing.expectEqualStrings("haha", observed.items);
+    }
 }
 
 test "parseStreamChunk emits duplicate reasoning aliases once per chunk" {
