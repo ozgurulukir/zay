@@ -752,6 +752,20 @@ pub const LanguageModel = union(enum) {
         };
     }
 
+    /// Count the current wire catalog, including plugin and MCP definitions.
+    /// This is the same bytes/4 fallback used for message contents, not a
+    /// tokenizer measurement. Provider usage already includes this cost.
+    pub fn estimateToolTokens(self: LanguageModel) u32 {
+        const json = switch (self) {
+            .none, .scripted => return 0,
+            .openai_compatible => |c| c.tools_json,
+            .responses => |c| c.tools_json,
+            .codex_responses => |c| c.core_client.tools_json,
+        };
+        if (std.mem.eql(u8, json, "[]")) return 0;
+        return @intCast(@min(std.math.maxInt(u32), json.len / 4 + @intFromBool(json.len % 4 != 0)));
+    }
+
     /// Push the final, already-deduped tool list into the client. No-op when
     /// no client is connected.
     pub fn updateTools(self: LanguageModel, specs: []const tool_schema.ToolSpec) !void {

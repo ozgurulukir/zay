@@ -66,6 +66,7 @@ pub const Env = struct {
     session: ?*session_mod.SessionWriter = null,
     context_window_tokens: u32 = 0,
     settings: config_mod.CompactionSettings = .{},
+    tool_tokens: u32 = 0,
 
     /// Messages held in the live cache — the watermark anchor unit.
     historyCount: *const fn (*anyopaque) u32,
@@ -89,6 +90,7 @@ pub const AutoCompactor = struct {
     // ── Watermark: last real usage anchor + the message count it covered. ──
     last_usage: ?ai.Usage = null,
     last_usage_anchor_count: u32 = 0,
+    last_usage_tool_tokens: u32 = 0,
 
     // ── Circuit breaker (TD-6): after `failure_limit` consecutive failures
     //    the automatic path backs off so it stops respawning a doomed
@@ -108,9 +110,13 @@ pub const AutoCompactor = struct {
     /// provider has not accounted for yet. Falls back to a full estimate
     /// when no usage has been reported.
     pub fn currentContextTokens(self: *const AutoCompactor, env: Env) u32 {
-        const usage = self.last_usage orelse return env.estimateAll(env.ctx);
+        const usage = self.last_usage orelse return self.estimateAllTokens(env);
         const anchored = usage.input_tokens +| usage.output_tokens;
-        return anchored +| env.estimateTrailing(env.ctx, self.last_usage_anchor_count);
+        const adjusted = if (env.tool_tokens >= self.last_usage_tool_tokens)
+            anchored +| (env.tool_tokens - self.last_usage_tool_tokens)
+        else
+            anchored -| (self.last_usage_tool_tokens - env.tool_tokens);
+        return adjusted +| env.estimateTrailing(env.ctx, self.last_usage_anchor_count);
     }
 
     /// Record a completed turn's usage as the watermark anchor. The anchor is
@@ -119,6 +125,7 @@ pub const AutoCompactor = struct {
     pub fn recordUsage(self: *AutoCompactor, env: Env, usage: ?ai.Usage) void {
         self.last_usage = usage;
         self.last_usage_anchor_count = env.historyCount(env.ctx);
+        self.last_usage_tool_tokens = env.tool_tokens;
     }
 
     /// Drop the usage anchor, forcing a full re-estimate next turn. Used
@@ -126,6 +133,7 @@ pub const AutoCompactor = struct {
     pub fn resetUsage(self: *AutoCompactor) void {
         self.last_usage = null;
         self.last_usage_anchor_count = 0;
+        self.last_usage_tool_tokens = 0;
     }
 
     /// Whether the automatic path should back off after repeated failures.
@@ -285,7 +293,7 @@ pub const AutoCompactor = struct {
         if (state == .failed) return error.CompactionFailed;
 
         const result = self.core.result.?;
-        const tokens_before = env.estimateAll(env.ctx);
+        const tokens_before = self.estimateAllTokens(env);
         try env.swap(env.ctx, result.first_kept_id.slice(), result.stored_summary);
         self.resetUsage();
         // A successful manual compact proves the pipeline works: reset the
@@ -295,7 +303,7 @@ pub const AutoCompactor = struct {
         self.stuck_notified = false;
         return .{
             .tokens_before = tokens_before,
-            .tokens_after = env.estimateAll(env.ctx),
+            .tokens_after = self.estimateAllTokens(env),
         };
     }
 
@@ -344,7 +352,7 @@ pub const AutoCompactor = struct {
             return;
         }
         const result = self.core.result.?;
-        const tokens_before = env.estimateAll(env.ctx);
+        const tokens_before = self.estimateAllTokens(env);
         try env.swap(env.ctx, result.first_kept_id.slice(), result.stored_summary);
         self.resetUsage();
         // A successful apply proves the pipeline works: clear the breaker and
@@ -354,7 +362,7 @@ pub const AutoCompactor = struct {
         self.stuck_notified = false;
         try listener.emit(.{ .history_compacted = .{
             .tokens_before = tokens_before,
-            .tokens_after = env.estimateAll(env.ctx),
+            .tokens_after = self.estimateAllTokens(env),
         } });
     }
 
@@ -388,8 +396,8 @@ pub const AutoCompactor = struct {
         self.manual_started = false;
     }
 
-    fn estimateAllTokens(self: *AutoCompactor, env: Env) u32 {
+    fn estimateAllTokens(self: *const AutoCompactor, env: Env) u32 {
         _ = self;
-        return env.estimateAll(env.ctx);
+        return env.tool_tokens +| env.estimateAll(env.ctx);
     }
 };

@@ -81,11 +81,12 @@ pub const ContextManager = struct {
     /// Append to the cached list AND persist to the tree — the dual-write for
     /// a live conversation turn. Takes ownership of `message`.
     ///
-    /// Persists FIRST: the tree is the source of truth. On cache-append failure
-    /// (OOM) the tree is momentarily ahead — healable via `reloadFromSession` —
-    /// whereas the reverse (cache ahead) is undetectable. The writer holds its
-    /// own serialized copy (`messageToJson`), so caller cleanup on failure never
-    /// dangles the tree.
+    /// Admit to the writer queue FIRST, then update the cache. Admission is
+    /// not a disk commit: the writer stops and reports asynchronous failures,
+    /// and refuses reprojection until all admitted entries are durable.
+    /// Cache-append failure (OOM) can be healed by flushing and reloading the
+    /// tree. The writer owns a serialized copy, so caller cleanup cannot
+    /// invalidate an admitted entry.
     pub fn appendPersisted(self: *ContextManager, message: ai.ChatMessage) !void {
         if (self.session_writer) |sw| try sw.append(message);
         try self.messages.append(self.gpa, message);

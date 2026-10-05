@@ -256,6 +256,14 @@ Reasoning is controlled per-model and flows through a single chain: model picker
 
 ### Context & compaction config pattern
 
+Context usage before a provider measurement includes the pruned message estimate
+and the current client's serialized tool catalog (`LanguageModel.estimateToolTokens`,
+bytes/4). The real input/output usage anchor already includes tools; only catalog
+changes since that anchor adjust it. Tool definitions remain runtime state, not
+session messages. `request_usage` entries preserve provider token measurements
+as metadata; branch projection and compaction never emit them into the model's
+history.
+
 `Config.context: ContextSettings` carries `overrideContextWindow`, `maxOutputTokens`, `disablePromptCache`, and `compaction: CompactionSettings` (auto, threshold, keepRecentTokens — the old `bufferTokens` was removed, it never did anything). The runtime stores `context_settings` and passes `override_context_window` to `compaction.contextWindowTokens()` at client attach time. The agent stores `compaction_settings` and passes `threshold` to `shouldStartSummary`/`shouldSwap` and `keep_recent_tokens` to `keepRecentTokens`. When `auto` is false, `maybeCompact` returns immediately. The swap watermark is `threshold + 0.20` (capped at 0.95); `threshold` is accepted in [0.1, 1.0] and clamped down to the 0.90 ceiling at parse time (values outside the band are dropped and the 0.75 default is used) so the swap watermark can never fall below the start watermark. `startCompaction` calibrates the keep-recent budget by the ratio of the provider's real token count to the chars/4 estimate (`calibrateKeepBudget`) so CJK text keeps fewer messages and still compacts below swap. Background-summarizer clients (codex / responses_core) receive the minimal `compaction.summarizer_system_prompt` — never the full agent system prompt — so the summary request itself fits a small window. The automatic path carries a circuit breaker: after 3 consecutive failures it backs off (one transcript notice, `compaction_notice` event) and only `/compact` remains. `forceCompact` drains any in-flight background summary before starting (TD-1), as does `navigateToEntry` before a branch switch (TD-2). JSON Schema for editor autocompletion lives at `schema/config.schema.json`.
 
 **Codex Responses encrypted-reasoning replay:** `ResponsesConfig.include_encrypted_reasoning` and `scrub_encrypted_reasoning` are internal transport settings, not user configuration fields; do not add them to `schema/config.schema.json` or `docs/CONFIG.md`. The standard Responses client keeps encrypted reasoning enabled and preserves persisted `responses_item_json`. The ChatGPT Codex transport disables the server include and enables replay scrubbing because the Codex backend rejects persisted `encrypted_content` with a misleading 400. The scrubber removes only the top-level `encrypted_content` field, skips malformed/non-object JSON without failing the request, and is covered by tests for both Codex cleanup and standard Responses preservation. Keep these controls separate: requesting encrypted reasoning and sanitizing replayed history are different concerns.
@@ -424,6 +432,17 @@ Known limitation (narrowed 2026-09-24): live lane clients keep their spawn-time 
 Zay unifies local embedded SQLite and external REST database servers through `SessionBackend` (`src/session/backend.zig`) and `db.Service` (`src/db/service.zig`). When configured via the `database` block or the legacy `databaseServerUrl` / `ZAY_DATABASE_SERVER_URL` settings, Zay delegates session history, timeline branches, and resume points to the selected backend (SQLite or PostgreSQL), allowing developers to move between machines without losing session state.
 
 **Key Invariants & Mechanics:**
+
+The common `SessionWriter` admits entries to a bounded queue before updating the
+message cache; admission is not a durable commit. On a write failure it retains
+the failed entry, warns, stops later writes, and propagates the error through
+enqueue and all quiescing read/navigation operations. This prevents incomplete
+DB history from replacing live history. The same policy covers SQLite, REST,
+Turso, and D1. HTTP commit outcomes can be uncertain, so the writer does not
+blindly retry or switch stores mid-session. Uncommitted entries remain in memory
+until teardown, where a warning reports the failure; this is not an offline
+durability guarantee.
+
 1. **Atomic Batch Invariant (`INV-DB-BATCH`):**
    Stateless HTTP REST database services (like `tools/db_server/`) use connection pools. They cannot safely maintain an interactive SQL transaction across separate HTTP requests (`BEGIN` -> `INSERT` -> `COMMIT`) because distinct requests may checkout different pool connections. All multi-statement remote mutations MUST be executed via the atomic batch endpoint (`POST /v1/batch` -> `SessionBackend.execBatch` / `Session.appendQueuedPayload`). Calling `beginTransaction`, `commitTransaction`, or `rollbackTransaction` on a `.remote_service` backend explicitly raises `error.UnsupportedTransaction`.
 2. **Roaming & Machine Identification (`host_id`):**

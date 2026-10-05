@@ -1335,6 +1335,7 @@ pub const Agent = struct {
             .session = self.context_manager.session_writer,
             .context_window_tokens = self.context_window_tokens,
             .settings = self.compaction_settings,
+            .tool_tokens = self.client.estimateToolTokens(),
             .historyCount = historyCount,
             .estimateTrailing = estimateTrailingTokensCb,
             .estimateAll = estimateAllTokensCb,
@@ -1423,6 +1424,11 @@ pub const Agent = struct {
     /// Record a completed turn's usage as the watermark anchor.
     pub fn recordUsage(self: *Agent, usage: ?ai.Usage) void {
         self.compactor.recordUsage(self.compactionEnv(), usage);
+        if (usage) |measured| {
+            if (self.context_manager.session_writer) |writer| {
+                writer.recordUsage(measured) catch |err| log.warn("session usage write failed: {s}", .{@errorName(err)});
+            }
+        }
     }
 
     /// Drop the usage anchor, forcing a full re-estimate next turn. Used
@@ -1887,6 +1893,28 @@ test "context token estimate anchors on usage plus trailing messages" {
 
     // anchor total (1000 + 200) + trailing estimate (10) = 1210
     try std.testing.expectEqual(@as(u32, 1210), agent.currentContextTokens());
+}
+
+test "context footprint includes wire tools before usage without counting them twice" {
+    const gpa = std.testing.allocator;
+    var client: ai.openai_compatible.Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .api_key = "test",
+        .model = "test",
+        .base_url = "http://localhost:1",
+        .system_prompt = "",
+        .tools = tools.builtinRegistry(),
+    });
+    defer client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
+    defer agent.deinit();
+    try agent.context_manager.appendUnpersisted(try agent.makeTextMessage(.user, "hi"));
+    const tool_tokens = client.tools_json.len / 4 + @intFromBool(client.tools_json.len % 4 != 0);
+    try std.testing.expectEqual(@as(u32, @intCast(tool_tokens + 1)), agent.currentContextTokens());
+    agent.recordUsage(.{ .input_tokens = 68000, .output_tokens = 40, .total_tokens = 68040 });
+    try std.testing.expectEqual(@as(u32, 68040), agent.currentContextTokens());
+    try client.updateTools(&.{});
+    try std.testing.expectEqual(@as(u32, @intCast(68040 - tool_tokens)), agent.currentContextTokens());
 }
 
 test "queued user messages drain one at a time" {
