@@ -1,5 +1,7 @@
 # Zay Plugin API Reference
 
+> Plugin namespace: [overview](README.md) · [getting started](getting-started.md) · [permissions and runtime](permissions-and-runtime.md) · [testing and best practices](testing-and-best-practices.md)
+
 ## `zay` Global Table
 
 The `zay` table is the primary API surface for plugins. It is injected into
