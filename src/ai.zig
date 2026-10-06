@@ -9,6 +9,7 @@ pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
 pub const provider_headers = @import("ai/provider_headers.zig");
 pub const text_tool_call = @import("ai/text_tool_call.zig");
+pub const response_policy = @import("ai/response_policy.zig");
 
 pub const Tool = tools_common.Tool;
 
@@ -165,6 +166,9 @@ pub const default_max_parallel_tool_calls: u32 = 16;
 pub const default_system_prompt: []const u8 = "You are a helpful assistant.";
 
 pub const Config = struct {
+    /// Explicit inbound field semantics for a provider/model or proxy quirk.
+    /// Null resolves from provider identity, independently of WireDialect.
+    response_policy: ?@import("ai/response_policy.zig").Policy = null,
     /// Provider key (auth-key id for openai_compatible, config key for a
     /// builtin) of the connection this config describes. Borrowed through
     /// client initialization; clients that retain the config copy it. This
@@ -750,6 +754,20 @@ pub const LanguageModel = union(enum) {
             .none => null,
             inline else => |c| c.errorDetail(),
         };
+    }
+
+    /// Count the current wire catalog, including plugin and MCP definitions.
+    /// This is the same bytes/4 fallback used for message contents, not a
+    /// tokenizer measurement. Provider usage already includes this cost.
+    pub fn estimateToolTokens(self: LanguageModel) u32 {
+        const json = switch (self) {
+            .none, .scripted => return 0,
+            .openai_compatible => |c| c.tools_json,
+            .responses => |c| c.tools_json,
+            .codex_responses => |c| c.core_client.tools_json,
+        };
+        if (std.mem.eql(u8, json, "[]")) return 0;
+        return @intCast(@min(std.math.maxInt(u32), json.len / 4 + @intFromBool(json.len % 4 != 0)));
     }
 
     /// Push the final, already-deduped tool list into the client. No-op when

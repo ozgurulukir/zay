@@ -1,6 +1,6 @@
 ---
 name: gitnexus-impact-analysis
-description: "Use only when the user explicitly asks for GitNexus impact analysis. For ordinary Zay change-safety questions, use the repository's current invariants and change workflow."
+description: "Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: \"Is it safe to change X?\", \"What depends on this?\", \"What will break?\""
 ---
 
 # Impact Analysis with GitNexus
@@ -92,15 +92,6 @@ callers are not resolvable by the index" (plain-object property access, dynamic
 dispatch, cross-language calls), so few-callers ⇒ LOW does **not** apply. The
 result carries a `riskNote` saying so. Confirm with a text search before
 treating the symbol as safe to change or delete.
-
-`risk` is the edit gate: warn on HIGH/CRITICAL and stop on UNKNOWN until the
-uncertainty is resolved. Within single-repo mode, compare File and symbol
-targets with local `riskSharedAxes` (direct/total only). Within group mode,
-compare only group results: their `riskSharedAxes` overlays resolved
-cross-repo crossings on that local value. Never use either field to waive the
-edit gate. Check `riskScale.unusedAxes` before comparing kinds: MCP File walks
-omit process/module axes, while web Graph-RAG expands File targets to in-file
-symbols before enrichment.
 
 ## Tools
 

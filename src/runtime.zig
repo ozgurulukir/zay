@@ -662,13 +662,14 @@ pub const AgentRuntime = struct {
                 }
                 break :blk provider.anonymousApiKey() orelse "";
             };
-            try self.attachOpenAiCompatibleClient(
+            try self.attachOpenAiCompatibleClientWithPolicy(
                 config.provider_name orelse provider.label(),
                 base_url,
                 api_key,
                 model_id,
                 effort,
                 config.providerHeadersByName(config.provider_name orelse provider.label()),
+                config.responsePolicyForModel(config.provider_name orelse provider.label(), model_id, base_url),
             );
             return;
         };
@@ -704,7 +705,7 @@ pub const AgentRuntime = struct {
             .builtin => |b| b.model.id,
             .custom => |c| c.model.id,
         };
-        try self.attachOpenAiCompatibleClient(ms.providerName(), base_url, api_key, model_id_to_attach, effort, config.providerHeadersByName(ms.providerName()));
+        try self.attachOpenAiCompatibleClientWithPolicy(ms.providerName(), base_url, api_key, model_id_to_attach, effort, config.providerHeadersByName(ms.providerName()), config.responsePolicyForModel(ms.providerName(), model_id_to_attach, base_url));
     }
 
     fn tryAttachOpenAiResponsesFromConfig(
@@ -820,6 +821,7 @@ pub const AgentRuntime = struct {
     /// (tool surface cleared, prompt source) are derived in `attachClients`,
     /// so a role can never drift from the plan again.
     const AttachPlan = struct {
+        response_policy: ?ai.response_policy.Policy = null,
         adapter: AttachAdapter,
         base_url: []const u8,
         api_key: []const u8,
@@ -849,6 +851,7 @@ pub const AgentRuntime = struct {
         provider_specs: []const ai.provider_headers.Header,
     ) ai.Config {
         var cfg: ai.Config = .{
+            .response_policy = plan.response_policy,
             .provider_name = plan.provider_name,
             .base_url = plan.base_url,
             .api_key = plan.api_key,
@@ -969,7 +972,21 @@ pub const AgentRuntime = struct {
         effort: ai.ReasoningEffort,
         user_headers: []const config_mod.ProviderHeader,
     ) !void {
+        return self.attachOpenAiCompatibleClientWithPolicy(provider_name, base_url, api_key, model_id, effort, user_headers, ai.response_policy.Policy.resolve(provider_name, base_url));
+    }
+
+    pub fn attachOpenAiCompatibleClientWithPolicy(
+        self: *AgentRuntime,
+        provider_name: []const u8,
+        base_url: []const u8,
+        api_key: []const u8,
+        model_id: []const u8,
+        effort: ai.ReasoningEffort,
+        user_headers: []const config_mod.ProviderHeader,
+        response_policy: ai.response_policy.Policy,
+    ) !void {
         return self.attachClients(.{
+            .response_policy = response_policy,
             .adapter = .chat,
             .provider_name = provider_name,
             .base_url = base_url,
@@ -1345,7 +1362,8 @@ test "zen attach wires routing headers and session id into all chat clients" {
     const user_headers = [_]config_mod.ProviderHeader{
         .{ .name = @constCast("x-opencode-session"), .value = @constCast("pinned-session") },
     };
-    try runtime.attachOpenAiCompatibleClient("opencode", "https://opencode.ai/zen/v1", "public", "test-model", .medium, &user_headers);
+    const response_policy: ai.response_policy.Policy = .{ .thinking = .text };
+    try runtime.attachOpenAiCompatibleClientWithPolicy("opencode", "https://opencode.ai/zen/v1", "public", "test-model", .medium, &user_headers, response_policy);
 
     const main_client = switch (runtime.owned_client.?) {
         .openai_compatible => |client| client,
@@ -1361,6 +1379,7 @@ test "zen attach wires routing headers and session id into all chat clients" {
     };
 
     for ([_]*const ai.openai_compatible.Client{ main_client, compaction_client, naming_client }) |client| {
+        try std.testing.expectEqualDeep(response_policy, client.config.response_policy.?);
         const specs = client.provider_headers_owned;
         try std.testing.expectEqual(@as(usize, 2), specs.len);
         // The user's pinned session value replaced the auto header, in place.

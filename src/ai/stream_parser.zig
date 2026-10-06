@@ -13,6 +13,13 @@ const stream_part = @import("stream_part.zig");
 
 const Scanner = std.json.Scanner;
 
+const TextRange = struct { start: usize, end: usize };
+const Part = union(enum) {
+    text: TextRange,
+    reasoning: TextRange,
+    tool_call: u32,
+};
+
 /// Hard upper bound for fixed-size remap/index arrays in ToolCallStream
 /// and ChunkChange. The runtime-configurable gate is `max_parallel_tool_calls`
 /// in ai.Config (default 16); this cap just sizes the stack arrays.
@@ -123,6 +130,9 @@ const ToolCallBuilder = struct {
 /// deltas (which carry no ID) route through the remap to the correct slot.
 pub const ToolCallStream = struct {
     builders: std.ArrayList(ToolCallBuilder) = .empty,
+    /// Ordered references into the text buffers and tool builders. The same
+    /// sequence drives live callbacks and completed-turn assembly.
+    parts: std.ArrayList(Part) = .empty,
     remapped_slot: [tool_call_array_cap]u32 = @splat(0),
     is_remapped: [tool_call_array_cap]bool = @splat(false),
     /// Runtime-configurable upper bound on parallel tool calls (from
@@ -131,6 +141,7 @@ pub const ToolCallStream = struct {
     /// complete the turn. The hard `tool_call_array_cap` still aborts if it
     /// would overflow the fixed remap arrays.
     limits: stream_part.StreamLimits = .{},
+    response_policy: ai.response_policy.Policy = .{},
     /// Number of tool-call deltas dropped because their logical index was
     /// at or above `max_calls`. Surfaced at the end of the stream so the
     /// caller can decide whether to inform the model.
@@ -146,6 +157,7 @@ pub const ToolCallStream = struct {
     }
 
     pub fn deinit(self: *ToolCallStream, gpa: std.mem.Allocator) void {
+        self.parts.deinit(gpa);
         for (self.builders.items) |*b| b.deinit(gpa);
         self.builders.deinit(gpa);
     }
@@ -169,7 +181,7 @@ pub fn readStream(
     // (not `capacity == 0`) are the reliable one-shot signal.
     var content_sized: bool = false;
     var reasoning_sized: bool = false;
-    var stream: ToolCallStream = .{ .limits = env.limits };
+    var stream: ToolCallStream = .{ .limits = env.limits, .response_policy = env.response_policy };
     defer stream.deinit(gpa);
 
     // Parse and apply each chunk inline (rather than via `processStreamChunk`)
@@ -192,7 +204,7 @@ pub fn readStream(
             try reasoning.ensureTotalCapacity(gpa, reasoning.items.len * 4);
             reasoning_sized = true;
         }
-        try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
+        try applyChunkCallbacks(change, content.items, reasoning.items, &stream, observer);
     }
 
     try joinSeveredArguments(&stream.builders, gpa);
@@ -201,12 +213,7 @@ pub fn readStream(
         for (blocks.items) |*block| block.deinit(gpa);
         blocks.deinit(gpa);
     }
-    if (reasoning.items.len > 0) {
-        try blocks.append(gpa, .{ .reasoning = .{ .text = try reasoning.toOwnedSlice(gpa) } });
-    }
-    if (content.items.len > 0) {
-        try blocks.append(gpa, .{ .text = .{ .text = try content.toOwnedSlice(gpa) } });
-    }
+    var retained_calls: [tool_call_array_cap]bool = @splat(false);
     for (stream.builders.items, 0..) |*builder, i| {
         if (builder.name.items.len == 0) {
             // A builder that streamed an id or arguments but never a name is
@@ -240,7 +247,19 @@ pub fn readStream(
             "readStream.builder[{d}] name={s} id_len={d} args_len={d}",
             .{ i, builder.name.items, builder.id.items.len, builder.arguments.items.len },
         );
-        try blocks.append(gpa, .{ .tool_call = try builder.toToolCall(gpa, env.id_seq) });
+        retained_calls[i] = true;
+    }
+    for (stream.parts.items) |part| {
+        switch (part) {
+            .text => |range| try appendTextBlock(gpa, &blocks, .text, content.items[range.start..range.end]),
+            .reasoning => |range| try appendTextBlock(gpa, &blocks, .reasoning, reasoning.items[range.start..range.end]),
+            .tool_call => |index| {
+                if (!retained_calls[index]) continue;
+                try blocks.ensureUnusedCapacity(gpa, 1);
+                blocks.appendAssumeCapacity(.{ .tool_call = try stream.builders.items[index].toToolCall(gpa, env.id_seq) });
+                retained_calls[index] = false;
+            },
+        }
     }
     if (stream.dropped > 0) {
         log.warn("readStream.dropped dropped={d} max_calls={d} model={s}", .{ stream.dropped, stream.limits.max_parallel_calls, stream.limits.model_label });
@@ -249,7 +268,33 @@ pub fn readStream(
     return .{ .assistant = .{ .assistant = .{ .content = try blocks.toOwnedSlice(gpa) } }, .usage = usage, .finish_reason = finish_reason, .tool_calls_truncated = stream.truncated };
 }
 
+fn appendTextBlock(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), kind: ai.response_policy.TextKind, bytes: []const u8) !void {
+    std.debug.assert(kind != .ignore);
+    if (blocks.items.len > 0) {
+        const last = &blocks.items[blocks.items.len - 1];
+        const target: ?*[]u8 = switch (last.*) {
+            .text => if (kind == .text) &last.text.text else null,
+            .reasoning => if (kind == .reasoning) &last.reasoning.text else null,
+            else => null,
+        };
+        if (target) |text| {
+            const old_len = text.*.len;
+            text.* = try gpa.realloc(text.*, old_len + bytes.len);
+            @memcpy(text.*[old_len..], bytes);
+            return;
+        }
+    }
+    try blocks.ensureUnusedCapacity(gpa, 1);
+    const text = try gpa.dupe(u8, bytes);
+    blocks.appendAssumeCapacity(switch (kind) {
+        .text => .{ .text = .{ .text = text } },
+        .reasoning => .{ .reasoning = .{ .text = text } },
+        .ignore => unreachable,
+    });
+}
+
 pub const ChunkChange = struct {
+    parts_start: usize = 0,
     content_start: ?u32 = null,
     reasoning_start: ?u32 = null,
     tool_call_indexes: [tool_call_array_cap]u32 = @splat(0),
@@ -283,22 +328,18 @@ fn applyChunkCallbacks(
     change: ChunkChange,
     content: []const u8,
     reasoning: []const u8,
-    builders: []const ToolCallBuilder,
+    stream: *const ToolCallStream,
     observer: anytype,
 ) !void {
-    if (change.content_start) |start| {
-        try observer.on_content(observer.ctx, content[start..]);
-    }
-    if (change.reasoning_start) |start| {
-        try observer.on_reasoning(observer.ctx, reasoning[start..]);
-    }
-    for (change.tool_call_indexes[0..change.tool_call_count]) |idx| {
-        const builder = builders[idx];
-        try observer.on_tool_delta(observer.ctx, .{
-            .index = idx,
-            .name = builder.name.items,
-            .arguments = builder.arguments.items,
-        });
+    for (stream.parts.items[change.parts_start..]) |part| {
+        switch (part) {
+            .text => |range| try observer.on_content(observer.ctx, content[range.start..range.end]),
+            .reasoning => |range| try observer.on_reasoning(observer.ctx, reasoning[range.start..range.end]),
+            .tool_call => |index| {
+                const builder = &stream.builders.items[index];
+                try observer.on_tool_delta(observer.ctx, .{ .index = index, .name = builder.name.items, .arguments = builder.arguments.items });
+            },
+        }
     }
     if (change.empty()) return;
     try observer.on_delta_end(observer.ctx);
@@ -313,7 +354,7 @@ pub fn processStreamChunk(
     observer: anytype,
 ) !void {
     const change = try parseStreamChunk(gpa, data, content, reasoning, stream);
-    try applyChunkCallbacks(change, content.items, reasoning.items, stream.builders.items, observer);
+    try applyChunkCallbacks(change, content.items, reasoning.items, stream, observer);
 }
 
 pub fn parseStreamChunk(
@@ -325,12 +366,12 @@ pub fn parseStreamChunk(
 ) !ChunkChange {
     // Empty payloads carry no chunk (keep-alive lines). Return early rather than
     // feeding the scanner an empty document.
-    if (data.len == 0) return .{};
+    if (data.len == 0) return .{ .parts_start = stream.parts.items.len };
 
     var scanner = Scanner.initCompleteInput(gpa, data);
     defer scanner.deinit();
 
-    var change: ChunkChange = .{};
+    var change: ChunkChange = .{ .parts_start = stream.parts.items.len };
     try expectObjectBegin(&scanner);
     while (try nextObjectKey(&scanner)) |key| {
         if (std.mem.eql(u8, key, "choices")) {
@@ -494,32 +535,80 @@ fn parseDeltaObject(
 ) !void {
     try expectObjectBegin(scanner);
     while (try nextObjectKey(scanner)) |key| {
-        if (std.mem.eql(u8, key, "content")) {
-            const before: u32 = @intCast(content.items.len);
-            const appended = try appendStringValue(scanner, gpa, content, .allow_null);
-            if (appended) {
-                if (content.items.len > before) change.content_start = before;
-            }
-        } else if (std.mem.eql(u8, key, "reasoning") or
-            std.mem.eql(u8, key, "reasoning_content") or
-            std.mem.eql(u8, key, "thinking"))
-        {
-            // `reasoning`/`reasoning_content` are the OpenAI-compatible field
-            // names (Ollama's /v1/chat/completions uses `reasoning` in the
-            // delta; DeepSeek and others use `reasoning_content`). `thinking`
-            // is Ollama's native /api/chat name — never on the /v1 path we
-            // use, but some OpenAI-compatible proxies forward it verbatim, so
-            // recognise it as a fallback to avoid silently dropping reasoning.
-            const before: u32 = @intCast(reasoning.items.len);
-            const appended = try appendStringValue(scanner, gpa, reasoning, .allow_null);
-            if (appended) {
-                if (reasoning.items.len > before) change.reasoning_start = before;
-            }
-        } else if (std.mem.eql(u8, key, "tool_calls")) {
+        if (std.mem.eql(u8, key, "tool_calls")) {
             try parseToolCallsArray(gpa, scanner, stream, change);
         } else {
-            try scanner.skipValue();
+            switch (stream.response_policy.fieldKind(key)) {
+                .text => try parseTextValue(gpa, scanner, key, .text, content, reasoning, stream, change),
+                .reasoning => try parseTextValue(gpa, scanner, key, .reasoning, content, reasoning, stream, change),
+                .ignore => try scanner.skipValue(),
+            }
         }
+    }
+}
+
+fn parseTextValue(gpa: std.mem.Allocator, scanner: *Scanner, field_name: []const u8, field_kind: ai.response_policy.TextKind, content: *std.ArrayList(u8), reasoning: *std.ArrayList(u8), stream: *ToolCallStream, change: *ChunkChange) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // This scanner is positioned inside a delta object. The top-level JSON
+    // parser insists on end-of-document; innerParse consumes one value.
+    const value = try std.json.innerParse(std.json.Value, arena.allocator(), scanner, .{ .allocate = .alloc_if_needed, .max_value_len = stream_part.bytes_max });
+    const reasoning_before = reasoning.items.len;
+    const parts_before = stream.parts.items.len;
+    switch (value) {
+        .string => |bytes| try appendSemanticText(gpa, field_kind, bytes, content, reasoning, stream, change),
+        .array => |parts| {
+            for (parts.items) |part| try parseTextPart(gpa, part, if (std.mem.eql(u8, field_name, "content")) null else field_kind, content, reasoning, stream, change);
+        },
+        .object => try parseTextPart(gpa, value, if (std.mem.eql(u8, field_name, "content")) null else field_kind, content, reasoning, stream, change),
+        else => {},
+    }
+    // Aliases duplicate whole field payloads. Repeated parts within a field
+    // are independent bytes and must survive even when their text is equal.
+    if (change.reasoning_start) |start| {
+        if (start < reasoning_before and std.mem.eql(u8, reasoning.items[start..reasoning_before], reasoning.items[reasoning_before..])) {
+            reasoning.shrinkRetainingCapacity(reasoning_before);
+            var kept = parts_before;
+            for (stream.parts.items[parts_before..]) |part| {
+                if (part == .reasoning) continue;
+                stream.parts.items[kept] = part;
+                kept += 1;
+            }
+            stream.parts.shrinkRetainingCapacity(kept);
+        }
+    }
+}
+
+fn parseTextPart(gpa: std.mem.Allocator, part: std.json.Value, field_kind: ?ai.response_policy.TextKind, content: *std.ArrayList(u8), reasoning: *std.ArrayList(u8), stream: *ToolCallStream, change: *ChunkChange) !void {
+    if (part != .object) return;
+    const type_value = part.object.get("type") orelse return;
+    if (type_value != .string) return;
+    const explicit_kind = stream.response_policy.partKind(type_value.string);
+    if (explicit_kind == .ignore) return;
+    // A reasoning_details field override also applies to its structured
+    // reasoning parts; ordinary content parts use their explicit type.
+    const kind = if (explicit_kind == .reasoning) field_kind orelse explicit_kind else explicit_kind;
+    const bytes_value = part.object.get("text") orelse part.object.get("summary") orelse part.object.get("refusal") orelse part.object.get("thinking") orelse return;
+    if (bytes_value != .string) return;
+    try appendSemanticText(gpa, kind, bytes_value.string, content, reasoning, stream, change);
+}
+
+fn appendSemanticText(gpa: std.mem.Allocator, kind: ai.response_policy.TextKind, bytes: []const u8, content: *std.ArrayList(u8), reasoning: *std.ArrayList(u8), stream: *ToolCallStream, change: *ChunkChange) !void {
+    if (bytes.len == 0 or kind == .ignore) return;
+    const buffer = if (kind == .text) content else reasoning;
+    const before = buffer.items.len;
+    try buffer.appendSlice(gpa, bytes);
+    const range: TextRange = .{ .start = before, .end = buffer.items.len };
+    switch (kind) {
+        .text => {
+            if (change.content_start == null) change.content_start = @intCast(before);
+            try stream.parts.append(gpa, .{ .text = range });
+        },
+        .reasoning => {
+            if (change.reasoning_start == null) change.reasoning_start = @intCast(before);
+            try stream.parts.append(gpa, .{ .reasoning = range });
+        },
+        .ignore => unreachable,
     }
 }
 
@@ -690,7 +779,9 @@ fn parseToolCallObject(
         try target.name.appendSlice(gpa, pending.name.items);
     }
     if (has_pending_arguments) try target.arguments.appendSlice(gpa, pending.arguments.items);
+    const before = change.tool_call_count;
     change.recordToolCall(physical);
+    if (change.tool_call_count > before) try stream.parts.append(gpa, .{ .tool_call = physical });
 }
 
 fn parseToolCallFunction(
@@ -779,7 +870,123 @@ fn appendStringValue(
     }
 }
 
-test "parseStreamChunk handles thinking field in delta" {
+test "readStream preserves answer reasoning tool answer order in callbacks and completed turn" {
+    const gpa = std.testing.allocator;
+    const Seen = struct {
+        kinds: [8]u8 = undefined,
+        count: usize = 0,
+        fn record(self: *@This(), kind: u8) void {
+            self.kinds[self.count] = kind;
+            self.count += 1;
+        }
+        fn text(ctx: *@This(), _: []const u8) anyerror!void {
+            record(ctx, 'T');
+        }
+        fn reasoning(ctx: *@This(), _: []const u8) anyerror!void {
+            record(ctx, 'R');
+        }
+        fn tool(ctx: *@This(), _: ai.ToolDelta) anyerror!void {
+            record(ctx, 'C');
+        }
+        fn end(_: *@This()) anyerror!void {}
+    };
+    var seen: Seen = .{};
+    const observer: ai.StreamObserver(Seen) = .{ .ctx = &seen, .on_content = Seen.text, .on_reasoning = Seen.reasoning, .on_tool_delta = Seen.tool, .on_delta_end = Seen.end };
+    var reader: std.Io.Reader = .fixed("data: {\"choices\":[{\"delta\":{\"content\":\"First\",\"reasoning\":\"Check\"}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Last\"}}]}\n" ++
+        "data: [DONE]\n");
+    var sequence: u64 = 0;
+    var turn = try readStream(gpa, &reader, observer, .{ .id_seq = &sequence });
+    defer turn.deinit(gpa);
+    try std.testing.expectEqualStrings("TRCT", seen.kinds[0..seen.count]);
+    const blocks = turn.assistant.assistant.content;
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expectEqualStrings("First", blocks[0].text.text);
+    try std.testing.expectEqualStrings("Check", blocks[1].reasoning.text);
+    try std.testing.expectEqualStrings("bash", blocks[2].tool_call.name);
+    try std.testing.expectEqualStrings("Last", blocks[3].text.text);
+}
+
+test "parseStreamChunk preserves typed content and ignores encrypted reasoning" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"content":[{"type":"text","text":"First"},{"type":"reasoning.text","text":"Check"},{"type":"reasoning.encrypted","data":"secret"},{"type":"output_text","text":"Last"}]}}]}
+    , &content, &reasoning, &stream);
+    try std.testing.expectEqualStrings("FirstLast", content.items);
+    try std.testing.expectEqualStrings("Check", reasoning.items);
+    try std.testing.expectEqual(@as(usize, 3), stream.parts.items.len);
+    try std.testing.expect(stream.parts.items[0] == .text);
+    try std.testing.expect(stream.parts.items[1] == .reasoning);
+    try std.testing.expect(stream.parts.items[2] == .text);
+}
+
+test "parseStreamChunk handles structured reasoning aliases without duplicating them" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+    _ = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"reasoning":"Check","reasoning_details":[{"type":"reasoning.text","text":"Check"},{"type":"reasoning.encrypted","data":"secret"}],"content":"Answer"}}]}
+    , &content, &reasoning, &stream);
+    try std.testing.expectEqualStrings("Check", reasoning.items);
+    try std.testing.expectEqualStrings("Answer", content.items);
+    try std.testing.expectEqual(@as(usize, 2), stream.parts.items.len);
+}
+
+test "parseStreamChunk preserves repeated reasoning parts and deduplicates whole aliases" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"choices":[{"delta":{"content":[{"type":"reasoning.text","text":"ha"},{"type":"reasoning.text","text":"ha"}],"reasoning":"haha"}}]}
+        ,
+        \\{"choices":[{"delta":{"reasoning":"haha","reasoning_details":[{"type":"reasoning.text","text":"ha"},{"type":"reasoning.text","text":"ha"}]}}]}
+    };
+    for (cases) |input| {
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(gpa);
+        var reasoning: std.ArrayList(u8) = .empty;
+        defer reasoning.deinit(gpa);
+        var stream: ToolCallStream = .{};
+        defer stream.deinit(gpa);
+        _ = try parseStreamChunk(gpa, input, &content, &reasoning, &stream);
+        try std.testing.expectEqualStrings("haha", reasoning.items);
+        var observed: std.ArrayList(u8) = .empty;
+        defer observed.deinit(gpa);
+        for (stream.parts.items) |part| {
+            try observed.appendSlice(gpa, reasoning.items[part.reasoning.start..part.reasoning.end]);
+        }
+        try std.testing.expectEqualStrings("haha", observed.items);
+    }
+}
+
+test "parseStreamChunk emits duplicate reasoning aliases once per chunk" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+    const input =
+        \\{"choices":[{"delta":{"reasoning":"check","reasoning_content":"check"}}]}
+    ;
+    _ = try parseStreamChunk(gpa, input, &content, &reasoning, &stream);
+    try std.testing.expectEqualStrings("check", reasoning.items);
+    _ = try parseStreamChunk(gpa, input, &content, &reasoning, &stream);
+    try std.testing.expectEqualStrings("checkcheck", reasoning.items);
+    try std.testing.expectEqual(@as(usize, 2), stream.parts.items.len);
+}
+
+test "parseStreamChunk handles thinking field in delta with explicit provider semantics" {
     // Ollama's /v1/chat/completions surfaces reasoning in `delta.reasoning`,
     // but its native /api/chat uses `delta.thinking`. Some OpenAI-compatible
     // proxies forward `thinking` verbatim — recognise it so reasoning content
@@ -789,7 +996,7 @@ test "parseStreamChunk handles thinking field in delta" {
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
     defer reasoning.deinit(gpa);
-    var stream: ToolCallStream = .{};
+    var stream: ToolCallStream = .{ .response_policy = .{ .thinking = .reasoning } };
     defer stream.deinit(gpa);
 
     const change = try parseStreamChunk(gpa,
@@ -798,6 +1005,40 @@ test "parseStreamChunk handles thinking field in delta" {
     try std.testing.expect(change.reasoning_start != null);
     try std.testing.expectEqualStrings("let me reason about this", reasoning.items);
     try std.testing.expectEqualStrings("", content.items);
+}
+
+test "parseStreamChunk classifies proxy answer fields using explicit semantics" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{ .response_policy = .{ .thinking = .text } };
+    defer stream.deinit(gpa);
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"thinking":"Direct answer. ","content":"More answer.","reasoning_content":"Private reasoning."}}]}
+    , &content, &reasoning, &stream);
+    try std.testing.expectEqual(@as(?u32, 0), change.content_start);
+    try std.testing.expectEqualStrings("Direct answer. More answer.", content.items);
+    try std.testing.expectEqualStrings("Private reasoning.", reasoning.items);
+}
+
+test "parseStreamChunk ignores undeclared provider extensions without losing answers" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var stream: ToolCallStream = .{};
+    defer stream.deinit(gpa);
+
+    const change = try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"thinking":{"enabled":true},"content":"Visible answer"}}]}
+    , &content, &reasoning, &stream);
+    try std.testing.expect(change.reasoning_start == null);
+    try std.testing.expectEqualStrings("Visible answer", content.items);
+    try std.testing.expectEqualStrings("", reasoning.items);
 }
 
 test "parseStreamChunk handles reasoning field in delta" {

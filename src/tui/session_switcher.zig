@@ -1404,34 +1404,34 @@ test "map-based resume sort sends map misses to the end and breaks misses by raw
     }
     // Direct comparator probes of the miss branch: equal minInt fallbacks
     // resolve via raw-key byte order, deterministically.
-    try std.testing.expect(resumeSummaryLessThanWithMap(&map, summaries[3], summaries[2]));
-    try std.testing.expect(!resumeSummaryLessThanWithMap(&map, summaries[2], summaries[3]));
+    try std.testing.expect(resumeSummaryLessThanWithMap(&map, summaries[2], summaries[3]));
+    try std.testing.expect(!resumeSummaryLessThanWithMap(&map, summaries[3], summaries[2]));
 }
 
 test "map-based resume sort does not fold pathsEqual-equal group keys into one entry" {
     const gpa = std.testing.allocator;
-    // `C:\Repo\Gamma` and `c:/repo/gamma` are pathsEqual-equal but
-    // byte-different. The production fold keys the map by raw bytes, so they
-    // stay two entries and two byte-key groups (the pathsEqual folding lives
+    // Separator-only drift is pathsEqual-equal on every platform; case
+    // drift would only compare equal on Windows. The map uses raw bytes, so
+    // these spellings stay two entries and two byte-key groups (folding lives
     // in the render/fold toggle, not in the sort). One key carries two
     // members to prove the byte-equal group stays contiguous internally.
     var summaries: [3]session_mod.SessionSummary = undefined;
     summaries[0] = try makeSortSummaryFixture(gpa, .{
-        .id = "gamma-upper-new",
+        .id = "gamma-backslash-new",
         .cwd = "/repo/gamma",
         .project_key = "C:\\Repo\\Gamma",
         .updated_at_ms = 100,
     });
     summaries[1] = try makeSortSummaryFixture(gpa, .{
-        .id = "gamma-upper-old",
+        .id = "gamma-backslash-old",
         .cwd = "/repo/gamma",
         .project_key = "C:\\Repo\\Gamma",
         .updated_at_ms = 20,
     });
     summaries[2] = try makeSortSummaryFixture(gpa, .{
-        .id = "gamma-lower",
+        .id = "gamma-forward-slash",
         .cwd = "/repo/gamma",
-        .project_key = "c:/repo/gamma",
+        .project_key = "C:/Repo/Gamma",
         .updated_at_ms = 50,
     });
     defer {
@@ -1445,7 +1445,7 @@ test "map-based resume sort does not fold pathsEqual-equal group keys into one e
     try std.testing.expect(paths.pathsEqual(resume_picker.groupKeyOf(&summaries[0]), resume_picker.groupKeyOf(&summaries[2])));
 
     std.mem.sort(session_mod.SessionSummary, summaries[0..], &map, resumeSummaryLessThanWithMap);
-    const order = [_][]const u8{ "gamma-upper-new", "gamma-upper-old", "gamma-lower" };
+    const order = [_][]const u8{ "gamma-backslash-new", "gamma-backslash-old", "gamma-forward-slash" };
     for (order, summaries[0..]) |want, *summary| {
         try std.testing.expectEqualStrings(want, summary.id);
     }

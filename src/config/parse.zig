@@ -375,6 +375,7 @@ fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: Provid
     // and subsequent entries silently overwrite it.
     for (target.providers, 0..) |*provider, index| {
         if (!std.mem.eql(u8, provider.name, updates.name)) continue;
+        provider.response_policy.overlay(updates.response_policy);
         switch (updates.base_url) {
             .custom => |s| try replaceBaseUrl(gpa, &provider.base_url, s),
             .default => {},
@@ -407,6 +408,7 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
         var replaced = false;
         for (target.models) |*model| {
             if (!std.mem.eql(u8, model.id, update.id)) continue;
+            model.response_policy.overlay(update.response_policy);
             switch (update.reasoning) {
                 .effort => model.reasoning = update.reasoning,
                 .unset => {},
@@ -1145,6 +1147,84 @@ fn parsePlugins(
     return try plugins.toOwnedSlice(gpa);
 }
 
+test "response policy configuration survives overlays cloning and serialization" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*diagnostic| diagnostic.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var lower = try parseFile(gpa, "<lower>",
+        \\{"providers":{"proxy":{"responsePolicy":{"thinking":"reasoning","reasoning":"ignore"},"models":{"m":{"reasoningEffort":"high","responsePolicy":{"reasoning_content":"text"}}}}}}
+    , &sink);
+    defer lower.deinit(gpa);
+    var upper = try parseFile(gpa, "<upper>",
+        \\{"providers":{"proxy":{"responsePolicy":{"thinking":"text"},"models":{"m":{"responsePolicy":{"reasoning":"reasoning"}}}}}}
+    , &sink);
+    defer upper.deinit(gpa);
+    var merged = try mergeLayers(gpa, &.{ lower, upper });
+    defer merged.deinit(gpa);
+    const policy = merged.responsePolicyForModel("proxy", "m", "https://example.invalid/v1");
+    try std.testing.expectEqual(ai.response_policy.TextKind.text, policy.thinking);
+    try std.testing.expectEqual(ai.response_policy.TextKind.text, policy.reasoning_content);
+    try std.testing.expectEqual(ai.response_policy.TextKind.reasoning, policy.reasoning);
+    try std.testing.expectEqual(ai.response_policy.TextKind.ignore, merged.responsePolicyForModel("proxy", "other", "https://example.invalid/v1").reasoning);
+
+    var buffer: std.Io.Writer.Allocating = .init(gpa);
+    defer buffer.deinit();
+    try serialize(gpa, &buffer.writer, merged);
+    var roundtrip = try parseFile(gpa, "<roundtrip>", buffer.written(), &sink);
+    defer roundtrip.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    try std.testing.expectEqualDeep(policy, roundtrip.responsePolicyForModel("proxy", "m", "https://example.invalid/v1"));
+}
+
+test "response policy configuration rejects misspelled kinds and fields" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const u8{ "{\"thinking\":\"thought\"}", "{\"thought\":\"reasoning\"}", "{\"thinking\":true}", "null" };
+    for (cases) |input| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidResponsePolicy, parseResponsePolicy(parsed.value));
+    }
+}
+
+fn parseResponsePolicy(value: std.json.Value) !ai.response_policy.Overrides {
+    if (value != .object) return error.InvalidResponsePolicy;
+    var result: ai.response_policy.Overrides = .{};
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        var recognized = false;
+        inline for (std.meta.fields(ai.response_policy.Overrides)) |field| {
+            if (std.mem.eql(u8, entry.key_ptr.*, field.name)) {
+                if (entry.value_ptr.* != .string) return error.InvalidResponsePolicy;
+                @field(result, field.name) = std.meta.stringToEnum(ai.response_policy.TextKind, entry.value_ptr.string) orelse return error.InvalidResponsePolicy;
+                recognized = true;
+            }
+        }
+        if (!recognized) return error.InvalidResponsePolicy;
+    }
+    return result;
+}
+
+fn writeResponsePolicy(writer: *std.Io.Writer, policy: ai.response_policy.Overrides, wrote_field: *bool) !void {
+    var present = false;
+    inline for (std.meta.fields(ai.response_policy.Overrides)) |field| {
+        if (@field(policy, field.name) != null) present = true;
+    }
+    if (!present) return;
+    try writeKeyNoIndent(writer, "responsePolicy", wrote_field);
+    try writer.writeByte('{');
+    var wrote_kind = false;
+    inline for (std.meta.fields(ai.response_policy.Overrides)) |field| {
+        if (@field(policy, field.name)) |kind| {
+            try writeKeyNoIndent(writer, field.name, &wrote_kind);
+            try std.json.Stringify.value(@tagName(kind), .{}, writer);
+        }
+    }
+    try writer.writeByte('}');
+}
+
 fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
     var out: ProviderConfig = .{
         .name = try gpa.dupe(u8, name),
@@ -1152,6 +1232,7 @@ fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provi
     };
     errdefer out.deinit(gpa);
     if (stringFieldCompat(value, "baseURL", "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
+    if (value.object.get("responsePolicy")) |policy| out.response_policy = try parseResponsePolicy(policy);
     if (value.object.get("headers")) |headers_value| {
         if (headers_value == .object) out.headers = try parseProviderHeaders(gpa, headers_value);
     }
@@ -1253,8 +1334,10 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const val = entry.value_ptr.*;
+        const response_policy = if (val.object.get("responsePolicy")) |policy| try parseResponsePolicy(policy) else ai.response_policy.Overrides{};
         var model: ProviderModel = .{
             .id = try gpa.dupe(u8, entry.key_ptr.*),
+            .response_policy = response_policy,
             .reasoning = if (stringField(val, "reasoningEffort")) |effort|
                 if (reasoning_efforts_by_name.get(effort)) |e| .{ .effort = e } else .unset
             else
@@ -1987,6 +2070,7 @@ fn writeProviders(writer: *std.Io.Writer, providers: []const ProviderConfig) !vo
 fn writeProvider(writer: *std.Io.Writer, provider: ProviderConfig) !void {
     try writer.writeByte('{');
     var wrote_any = false;
+    try writeResponsePolicy(writer, provider.response_policy, &wrote_any);
     switch (provider.base_url) {
         .custom => |base_url| {
             try writeKeyNoIndent(writer, "baseURL", &wrote_any);
@@ -2014,7 +2098,9 @@ fn writeProviderModels(writer: *std.Io.Writer, models: []const ProviderModel) !v
         try writer.writeByte(':');
         try writer.writeByte('{');
         var wrote_field = false;
+        try writeResponsePolicy(writer, model.response_policy, &wrote_field);
         if (model.reasoning == .effort) {
+            if (wrote_field) try writer.writeByte(',');
             try std.json.Stringify.value("reasoningEffort", .{}, writer);
             try writer.writeByte(':');
             try std.json.Stringify.value(model.reasoning.effort.label(), .{}, writer);

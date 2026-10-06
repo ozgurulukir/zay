@@ -170,6 +170,11 @@ pub fn summarize(gpa: std.mem.Allocator, client: ai.LanguageModel, prefix_text: 
 
     var turn = try client.prompt(&.{.{ .borrowed = &message }}, ai.streamNoop());
     defer turn.deinit(gpa);
+    // A provider can return text while reporting a token limit or filter.
+    // That partial summary must never replace the complete conversation.
+    if (turn.finish_reason) |reason| {
+        if (reason != .stop) return error.IncompleteSummary;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);

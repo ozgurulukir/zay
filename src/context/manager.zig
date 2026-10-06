@@ -51,6 +51,18 @@ pub const ContextManager = struct {
         try self.messages.append(self.gpa, message);
     }
 
+    /// Takes ownership of the projected messages only on success. Allocate
+    /// before clearing history so OOM leaves the current context untouched.
+    pub fn replaceConversation(self: *ContextManager, projected: []const ai.ChatMessage) !void {
+        var system_count: usize = 0;
+        for (self.messages.items) |message| {
+            if (message == .system) system_count += 1;
+        }
+        try self.messages.ensureTotalCapacity(self.gpa, system_count + projected.len);
+        self.clearNonSystem();
+        self.messages.appendSliceAssumeCapacity(projected);
+    }
+
     /// Replace the cached system prompt without touching persisted history.
     /// The replacement is already fully allocated, so this operation cannot
     /// fail once it starts mutating the cache.
@@ -81,11 +93,12 @@ pub const ContextManager = struct {
     /// Append to the cached list AND persist to the tree — the dual-write for
     /// a live conversation turn. Takes ownership of `message`.
     ///
-    /// Persists FIRST: the tree is the source of truth. On cache-append failure
-    /// (OOM) the tree is momentarily ahead — healable via `reloadFromSession` —
-    /// whereas the reverse (cache ahead) is undetectable. The writer holds its
-    /// own serialized copy (`messageToJson`), so caller cleanup on failure never
-    /// dangles the tree.
+    /// Admit to the writer queue FIRST, then update the cache. Admission is
+    /// not a disk commit: the writer stops and reports asynchronous failures,
+    /// and refuses reprojection until all admitted entries are durable.
+    /// Cache-append failure (OOM) can be healed by flushing and reloading the
+    /// tree. The writer owns a serialized copy, so caller cleanup cannot
+    /// invalidate an admitted entry.
     pub fn appendPersisted(self: *ContextManager, message: ai.ChatMessage) !void {
         if (self.session_writer) |sw| try sw.append(message);
         try self.messages.append(self.gpa, message);
@@ -108,6 +121,28 @@ pub const ContextManager = struct {
         self.messages.shrinkRetainingCapacity(kept);
     }
 };
+
+test "failed conversation replacement preserves context and caller ownership" {
+    const gpa = std.testing.allocator;
+    var context: ContextManager = .{ .gpa = gpa };
+    defer context.deinit();
+    try context.appendUnpersisted(try textMessage(gpa, .system, "system"));
+    try context.appendUnpersisted(try textMessage(gpa, .user, "original"));
+    const replacement = try textMessage(gpa, .user, "summary");
+    const projected = try gpa.alloc(ai.ChatMessage, context.messages.capacity + 1);
+    defer gpa.free(projected);
+    @memset(projected, replacement);
+    // All views alias one owned message; failure must leave it to the caller.
+    var owned = replacement;
+    defer owned.deinit(gpa);
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    context.gpa = failing.allocator();
+    defer context.gpa = gpa;
+    try std.testing.expectError(error.OutOfMemory, context.replaceConversation(projected));
+    try std.testing.expectEqual(@as(usize, 2), context.items().len);
+    try std.testing.expectEqualStrings("original", context.items()[1].text());
+    try std.testing.expectEqualStrings("summary", owned.text());
+}
 
 test "context manager appends and clears keeping system" {
     const gpa = std.testing.allocator;
