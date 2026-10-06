@@ -170,3 +170,54 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
     }
     try std.testing.expectEqual(count, 1);
 }
+
+/// Resolves the platform-aware config directory for `home_dir` and ensures
+/// that it exists on disk, creating parent directories as necessary.
+/// Caller owns the returned slice.
+pub fn ensureConfigDir(io: std.Io, gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    const config_dir = try platformConfigDir(gpa, home_dir);
+    errdefer gpa.free(config_dir);
+
+    try std.Io.Dir.createDirPath(.cwd(), io, config_dir);
+    return config_dir;
+}
+
+test "ensureConfigDir: creates directory on disk and is idempotent" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_path);
+
+    // Initial creation: directory should not exist yet
+    const config_dir = try ensureConfigDir(std.testing.io, gpa, home_path);
+    defer gpa.free(config_dir);
+
+    // Verify directory exists on disk
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, config_dir, .{});
+    dir.close(std.testing.io);
+
+    // Idempotency check: calling again on existing directory succeeds
+    const config_dir2 = try ensureConfigDir(std.testing.io, gpa, home_path);
+    defer gpa.free(config_dir2);
+
+    try std.testing.expectEqualStrings(config_dir, config_dir2);
+}
+
+test "ensureConfigDir: fails gracefully when a file exists at directory path" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_path);
+
+    // Create a file where the config dir segment or full path would be
+    const expected_sub = if (os.is_windows) "AppData" else ".config";
+    var file = try tmp.dir.createFile(std.testing.io, expected_sub, .{});
+    file.close(std.testing.io);
+
+    // Attempting to create config dir through a file path should return NotDir or similar error
+    try std.testing.expectError(error.NotDir, ensureConfigDir(std.testing.io, gpa, home_path));
+}
