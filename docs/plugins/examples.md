@@ -1,5 +1,7 @@
 # Shipped Plugins Walkthrough
 
+> Plugin namespace: [overview](README.md) · [getting started](getting-started.md) · [permissions and runtime](permissions-and-runtime.md) · [testing and best practices](testing-and-best-practices.md)
+
 This guide walks through selected plugins included with Zay (the
 full set — `hello-world`, `file-tools`, `search-tools`, `path-tools`,
 `git-tools`, `todo`, `file-watcher`, `modular-demo`, `sitting-duck` — lives
