@@ -19,7 +19,7 @@ const assert = std.debug.assert;
 pub const Compactor = @This();
 
 state: std.atomic.Value(State) = .init(.idle),
-thread: ?std.Thread = null,
+task: ?std.Io.Future(std.Io.Cancelable!void) = null,
 job: ?Job = null,
 result: ?Result = null,
 
@@ -54,17 +54,41 @@ pub fn stateIs(self: *const Compactor, expected: State) bool {
 /// Body of the summarizer thread: produce the stored summary from the job's
 /// frozen prefix, publish it, and flip the state. Acquire/release on `state`
 /// makes the result visible to the worker once it observes `.ready`.
-pub fn runThread(compactor: *Compactor) void {
+pub fn runThread(compactor: *Compactor) std.Io.Cancelable!void {
     assert(compactor.stateIs(.running));
     const job = compactor.job.?;
     defer job.gpa.free(job.prefix_text);
     const stored = produceStoredSummary(job) catch |err| {
-        log.warn("compaction summarize failed: {s}", .{@errorName(err)});
+        if (err != error.Canceled and err != error.TurnCancelled)
+            log.warn("compaction summarize failed: {s}", .{@errorName(err)});
         compactor.state.store(.failed, .release);
+        if (err == error.Canceled or err == error.TurnCancelled) return error.Canceled;
         return;
     };
     compactor.result = .{ .first_kept_id = job.first_kept_id, .stored_summary = stored };
     compactor.state.store(.ready, .release);
+}
+
+test "cancel interrupts a compactor waiting for a provider permit" {
+    const io = std.testing.io;
+    var limiter: request_limiter_mod.RequestLimiter = .{ .permits = 1 };
+    try limiter.acquire(io);
+    defer limiter.release(io);
+    var compactor: Compactor = .{};
+    compactor.job = .{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .client = .none,
+        .limiter = &limiter,
+        .first_kept_id = undefined,
+        .prefix_text = try std.testing.allocator.dupe(u8, "unchanged history"),
+    };
+    compactor.state.store(.running, .release);
+    compactor.task = try io.concurrent(runThread, .{&compactor});
+    try std.testing.expectError(error.Canceled, compactor.task.?.cancel(io));
+    try std.testing.expect(compactor.stateIs(.failed));
+    try std.testing.expect(compactor.result == null);
+    try std.testing.expectEqual(@as(u32, 1), limiter.in_flight);
 }
 
 fn produceStoredSummary(job: Job) ![]u8 {
@@ -76,7 +100,7 @@ fn produceStoredSummary(job: Job) ![]u8 {
         break :blk try compaction.summarize(job.gpa, job.client, job.prefix_text);
     } else try compaction.summarize(job.gpa, job.client, job.prefix_text);
     defer job.gpa.free(summary);
-    if (summary.len == 0) return error.EmptySummary;
+    if (std.mem.trim(u8, summary, " \t\r\n").len == 0) return error.EmptySummary;
     return compaction.buildStoredSummary(job.gpa, summary);
 }
 

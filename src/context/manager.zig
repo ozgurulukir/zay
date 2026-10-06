@@ -51,6 +51,18 @@ pub const ContextManager = struct {
         try self.messages.append(self.gpa, message);
     }
 
+    /// Takes ownership of the projected messages only on success. Allocate
+    /// before clearing history so OOM leaves the current context untouched.
+    pub fn replaceConversation(self: *ContextManager, projected: []const ai.ChatMessage) !void {
+        var system_count: usize = 0;
+        for (self.messages.items) |message| {
+            if (message == .system) system_count += 1;
+        }
+        try self.messages.ensureTotalCapacity(self.gpa, system_count + projected.len);
+        self.clearNonSystem();
+        self.messages.appendSliceAssumeCapacity(projected);
+    }
+
     /// Replace the cached system prompt without touching persisted history.
     /// The replacement is already fully allocated, so this operation cannot
     /// fail once it starts mutating the cache.
@@ -109,6 +121,28 @@ pub const ContextManager = struct {
         self.messages.shrinkRetainingCapacity(kept);
     }
 };
+
+test "failed conversation replacement preserves context and caller ownership" {
+    const gpa = std.testing.allocator;
+    var context: ContextManager = .{ .gpa = gpa };
+    defer context.deinit();
+    try context.appendUnpersisted(try textMessage(gpa, .system, "system"));
+    try context.appendUnpersisted(try textMessage(gpa, .user, "original"));
+    const replacement = try textMessage(gpa, .user, "summary");
+    const projected = try gpa.alloc(ai.ChatMessage, context.messages.capacity + 1);
+    defer gpa.free(projected);
+    @memset(projected, replacement);
+    // All views alias one owned message; failure must leave it to the caller.
+    var owned = replacement;
+    defer owned.deinit(gpa);
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    context.gpa = failing.allocator();
+    defer context.gpa = gpa;
+    try std.testing.expectError(error.OutOfMemory, context.replaceConversation(projected));
+    try std.testing.expectEqual(@as(usize, 2), context.items().len);
+    try std.testing.expectEqualStrings("original", context.items()[1].text());
+    try std.testing.expectEqualStrings("summary", owned.text());
+}
 
 test "context manager appends and clears keeping system" {
     const gpa = std.testing.allocator;

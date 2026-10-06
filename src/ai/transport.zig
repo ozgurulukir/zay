@@ -175,10 +175,10 @@ pub const Transport = struct {
         return std.ascii.indexOfIgnoreCase(detail, "cache") != null;
     }
 
-    fn sleepMs(self: *const Transport, ms: u64) void {
+    fn sleepMs(self: *const Transport, ms: u64) std.Io.Cancelable!void {
         if (ms == 0) return;
         const clamped: i64 = @intCast(@min(ms, std.math.maxInt(i64)));
-        self.io.sleep(std.Io.Duration.fromMilliseconds(clamped), .awake) catch {};
+        try self.io.sleep(std.Io.Duration.fromMilliseconds(clamped), .awake);
     }
 
     fn materializeHeaders(self: *const Transport, buffer: []std.http.Header) []const std.http.Header {
@@ -270,7 +270,7 @@ pub const Transport = struct {
                     if (attempt >= self.max_retries) return err;
                     const delay_ms = http.retryDelayMs(self.retry_base_delay_ms, attempt, retry_after_secs);
                     log.warn("{s}.retry attempt={d} err={s} delay_ms={d}", .{ self.log_tag, attempt + 1, @errorName(err), delay_ms });
-                    self.sleepMs(delay_ms);
+                    try self.sleepMs(delay_ms);
                     continue;
                 };
                 return turn;
@@ -283,6 +283,20 @@ pub const Transport = struct {
             if (downgrade_done) return error.HttpClientError;
             unreachable; // guarded by the return paths above
         }
+    }
+
+    /// Preserve cancellation hidden behind std.http's Read/WriteFailed so
+    /// aborting an upload or a head read cannot start another request.
+    fn headFailure(req: *std.http.Client.Request, err: anyerror) anyerror {
+        if (req.connection) |conn| {
+            if (conn.stream_reader.err) |reason| {
+                if (reason == error.Canceled) return error.Canceled;
+            }
+            if (conn.stream_writer.err) |reason| {
+                if (reason == error.Canceled) return error.Canceled;
+            }
+        }
+        return http.headPhaseFailure(err);
     }
 
     /// Perform one HTTP round-trip with the already-serialized payload.
@@ -314,10 +328,10 @@ pub const Transport = struct {
 
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
-        var body_writer = req.sendBodyUnflushed(&body_buffer) catch |err| return http.headPhaseFailure(err);
-        body_writer.writer.writeAll(payload) catch |err| return http.headPhaseFailure(err);
-        body_writer.end() catch |err| return http.headPhaseFailure(err);
-        req.connection.?.flush() catch |err| return http.headPhaseFailure(err);
+        var body_writer = req.sendBodyUnflushed(&body_buffer) catch |err| return headFailure(&req, err);
+        body_writer.writer.writeAll(payload) catch |err| return headFailure(&req, err);
+        body_writer.end() catch |err| return headFailure(&req, err);
+        req.connection.?.flush() catch |err| return headFailure(&req, err);
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = req.receiveHead(&redirect_buffer) catch |err| {
@@ -330,6 +344,7 @@ pub const Transport = struct {
             if (err == error.ReadFailed or err == error.WriteFailed or err == error.HttpRequestTruncated) {
                 if (req.connection) |conn| {
                     const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
+                    if (reason == error.Canceled) return error.Canceled;
                     self.recordReadFailure(reason);
                 }
             }
@@ -351,9 +366,14 @@ pub const Transport = struct {
             var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
             var decompress: std.http.Decompress = undefined;
             const error_reader = http_response.readerDecompressing(&error_buffer, &decompress, &decompress_buffer);
-            const error_body = error_reader.allocRemaining(self.gpa, .limited(response_bytes_max)) catch |err| switch (err) {
-                error.StreamTooLong => return error.ResponseTooLarge,
-                else => |e| return e,
+            const error_body = error_reader.allocRemaining(self.gpa, .limited(response_bytes_max)) catch |err| {
+                if (req.connection) |conn| {
+                    if (conn.stream_reader.err) |reason| {
+                        if (reason == error.Canceled) return error.Canceled;
+                    }
+                }
+                if (err == error.StreamTooLong) return error.ResponseTooLarge;
+                return err;
             };
             defer self.gpa.free(error_body);
             // Tail-aware log truncation (same variant as the request body):
@@ -389,6 +409,7 @@ pub const Transport = struct {
                     // `Connection.getReadError` would panic on `.?` there —
                     // see the head-phase note above.
                     const reason: anyerror = if (conn.stream_reader.err) |e| e else if (http_response.bodyErr()) |e| e else err;
+                    if (reason == error.Canceled) return error.Canceled;
                     self.recordReadFailure(reason);
                     if (reason == error.Timeout) return error.Timeout;
                 }
