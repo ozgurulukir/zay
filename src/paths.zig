@@ -170,3 +170,77 @@ test "platformConfigDir: rejects a path that drifts from the platform layout" {
     }
     try std.testing.expectEqual(count, 1);
 }
+
+/// Ensures that a directory and any parent directories exist on disk.
+/// Idempotent if the directory already exists.
+pub fn ensureDir(io: std.Io, dir_path: []const u8) !void {
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_path);
+}
+
+/// Computes the platform-aware global config directory for `home_dir` and ensures
+/// that the directory exists on disk. Returns the gpa-allocated path slice.
+/// Caller owns the returned slice.
+pub fn ensureConfigDir(io: std.Io, gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+    const config_dir = try platformConfigDir(gpa, home_dir);
+    errdefer gpa.free(config_dir);
+    try ensureDir(io, config_dir);
+    return config_dir;
+}
+
+test "ensureDir: creates single and nested directory structures" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+
+    const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "nested", "sub_dir" });
+    defer gpa.free(dir_path);
+
+    // Directory does not exist prior to ensureDir
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.access(.cwd(), io, dir_path, .{}));
+
+    // Act: Ensure directory creation
+    try ensureDir(io, dir_path);
+
+    // Assert: Directory now exists
+    try std.Io.Dir.access(.cwd(), io, dir_path, .{});
+
+    // Act & Assert: Idempotent call on existing directory succeeds
+    try ensureDir(io, dir_path);
+}
+
+test "ensureConfigDir: creates platform config directory structure in tmpDir" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "user_home" });
+    defer gpa.free(home_dir);
+
+    // Act: Ensure config directory creation
+    const config_dir = try ensureConfigDir(io, gpa, home_dir);
+    defer gpa.free(config_dir);
+
+    // Assert: Directory exists on disk
+    try std.Io.Dir.access(.cwd(), io, config_dir, .{});
+
+    // Assert: Directory ends with "zay" and contains home_dir as prefix
+    try std.testing.expect(std.mem.startsWith(u8, config_dir, home_dir));
+    try std.testing.expect(std.mem.endsWith(u8, config_dir, "zay"));
+
+    // Act & Assert: Re-running ensureConfigDir on existing directory succeeds idempotently
+    const config_dir_2 = try ensureConfigDir(io, gpa, home_dir);
+    defer gpa.free(config_dir_2);
+
+    try std.testing.expectEqualStrings(config_dir, config_dir_2);
+    try std.Io.Dir.access(.cwd(), io, config_dir_2, .{});
+}
