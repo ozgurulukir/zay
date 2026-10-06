@@ -280,13 +280,41 @@ fn netReadWithSocketTimeout(
     }
     std.debug.assert(vector_count > 0);
 
+    const io: std.Io = .{ .userdata = userdata, .vtable = threaded_vtable };
+    var timeout: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+    var timeout_len: std.posix.socklen_t = @sizeOf(std.posix.timeval);
+    const option_result = std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&timeout), &timeout_len);
+    if (std.posix.errno(option_result) != .SUCCESS) return std.posix.unexpectedErrno(std.posix.errno(option_result));
+    const timeout_ns: i96 = @as(i96, timeout.sec) * std.time.ns_per_s + @as(i96, timeout.usec) * std.time.ns_per_us;
+    // Without a socket timeout the native read is already cancellable and
+    // cannot hit the backend's SO_RCVTIMEO/EAGAIN bug.
+    if (timeout_ns == 0) return threaded_vtable.netRead(userdata, fd, data);
+    const started = std.Io.Timestamp.now(io, .awake);
+    var message: std.posix.msghdr = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &vectors,
+        .iovlen = @intCast(vector_count),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
     while (true) {
         try threaded_vtable.checkCancel(userdata);
-        const result = std.posix.system.readv(fd, &vectors, @intCast(vector_count));
+        // A raw blocking read never enters Threaded's cancellable syscall
+        // state. Nonblocking reads plus cancellable sleep preserve both the
+        // socket timeout and Future.cancel, including a stalled SSE body.
+        const result = std.posix.system.recvmsg(fd, &message, std.posix.MSG.DONTWAIT);
         switch (std.posix.errno(result)) {
             .SUCCESS => return @intCast(result),
             .INTR => continue,
-            .AGAIN, .TIMEDOUT => return error.Timeout,
+            .AGAIN => {
+                const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+                if (elapsed >= timeout_ns) return error.Timeout;
+                const delay_ns = @min(10 * std.time.ns_per_ms, timeout_ns - elapsed);
+                try io.sleep(.{ .nanoseconds = delay_ns }, .awake);
+            },
+            .TIMEDOUT => return error.Timeout,
             .NOBUFS, .NOMEM => return error.SystemResources,
             .NOTCONN, .PIPE => return error.SocketUnconnected,
             .CONNRESET => return error.ConnectionResetByPeer,

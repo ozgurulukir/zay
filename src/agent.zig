@@ -1446,10 +1446,10 @@ pub const Agent = struct {
         // Project first, swap second: a failed reprojection leaves the live
         // cache intact instead of stranded with only the system prompt (TD-5).
         const projected = try session_writer.messages(self.gpa);
-        errdefer self.gpa.free(projected);
-        self.clearNonSystemMessages();
-        for (projected) |message| try self.context_manager.appendUnpersisted(message);
-        self.gpa.free(projected);
+        defer self.gpa.free(projected);
+        errdefer for (projected) |*message| message.deinit(self.gpa);
+        try self.context_manager.replaceConversation(projected);
+        self.tool_view_cache.clear(self.gpa);
     }
 };
 
@@ -2907,7 +2907,7 @@ test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clear
         .prefix_text = try gpa.dupe(u8, "some prefix"),
     };
     agent.compactor.core.state.store(.running, .release);
-    agent.compactor.core.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor.core});
+    agent.compactor.core.task = try std.testing.io.concurrent(agent_compactor.Compactor.runThread, .{&agent.compactor.core});
     agent.compactor.manual_pending = true;
     agent.compactor.manual_started = true;
 
@@ -3011,7 +3011,102 @@ test "drain discards a ready summary and returns the compactor to idle" {
 
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
     try std.testing.expect(agent.compactor.core.result == null);
-    try std.testing.expect(agent.compactor.core.thread == null);
+    try std.testing.expect(agent.compactor.core.task == null);
+}
+
+test "drain and failed compaction preserve live and persisted context" {
+    if (@import("os.zig").is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var allocator: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
+    defer std.testing.expect(allocator.deinit() == .ok) catch @panic("compaction test leaked");
+    const gpa = allocator.allocator();
+    const mock = @import("ai/mock_http_server.zig");
+    const openai = @import("ai/openai_compatible.zig");
+
+    const Scenario = enum { stalled_head, stalled_body, stalled_error_body, retry_backoff, rejected, empty_summary, whitespace, truncated, filtered, success };
+    for (std.enums.values(Scenario)) |scenario| {
+        const stalled = scenario == .stalled_head or scenario == .stalled_body or scenario == .stalled_error_body or scenario == .retry_backoff;
+        const responses = [_]mock.Response{.{
+            .status = if (scenario == .rejected) .bad_request else if (scenario == .retry_backoff or scenario == .stalled_error_body) .too_many_requests else .ok,
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/event-stream" }},
+            .body = switch (scenario) {
+                .whitespace => "data: {\"choices\":[{\"delta\":{\"content\":\"  \\n\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                .truncated => "data: {\"choices\":[{\"delta\":{\"content\":\"partial summary\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+                .filtered => "data: {\"choices\":[{\"delta\":{\"content\":\"partial summary\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
+                .success => "data: {\"choices\":[{\"delta\":{\"content\":\"complete summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                else => "data: [DONE]\n\n",
+            },
+            .head_delay_ms = if (scenario == .stalled_head) 1500 else 0,
+            .body_delay_ms = if (scenario == .stalled_body or scenario == .stalled_error_body) 1500 else 0,
+        }};
+        var server = try mock.MockHttpServer.init(io, &responses);
+        defer server.deinit();
+        var serving = try io.concurrent(mock.MockHttpServer.serve, .{&server});
+        defer serving.cancel(io);
+        const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+        defer gpa.free(base_url);
+        var client: openai.Client = undefined;
+        try client.init(gpa, io, .{ .base_url = base_url, .api_key = "test", .model = "test", .request_timeout_seconds = 30 });
+        defer client.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+        defer gpa.free(home_dir);
+        var writer: session_mod.SessionWriter = undefined;
+        try session_mod.SessionWriter.initDefault(&writer, gpa, io, home_dir, "/tmp");
+        defer writer.deinit();
+        var agent = Agent.init(gpa, io, ".", .none);
+        defer agent.deinit();
+        agent.attachSessionWriter(&writer);
+        agent.compaction_client = .{ .openai_compatible = &client };
+        agent.context_window_tokens = 4096;
+        try fillSessionForCompaction(&agent, 10);
+        _ = try writer.lastUserEntry();
+        const leaf_before = try gpa.dupe(u8, writer.session.leaf().?);
+        defer gpa.free(leaf_before);
+        const history_before = agent.messages().len;
+        const text_before = try gpa.dupe(u8, agent.messages()[0].text());
+        defer gpa.free(text_before);
+        try agent.requestManualCompact();
+        var spins: u32 = 0;
+        while (server.connection_count.load(.acquire) == 0 and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(2), .awake);
+        try std.testing.expect(server.connection_count.load(.acquire) == 1);
+        if (stalled) {
+            try io.sleep(.fromMilliseconds(100), .awake);
+            try std.testing.expect(agent.compactor.core.stateIs(.running));
+            const started = std.Io.Timestamp.now(io, .awake);
+            if (scenario == .stalled_error_body)
+                try std.testing.expectError(error.Canceled, agent.compactor.core.task.?.cancel(io));
+            agent.drainBackgroundCompaction();
+            const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake));
+            try std.testing.expect(elapsed.nanoseconds < 600 * std.time.ns_per_ms);
+        } else {
+            spins = 0;
+            while (agent.compactor.core.stateIs(.running) and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(2), .awake);
+            if (scenario == .success) {
+                try std.testing.expect((try agent.pollManualCompact()) != null);
+            } else {
+                try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+            }
+        }
+        // Repeated teardown is harmless, including manual-submit flags.
+        agent.drainBackgroundCompaction();
+        try std.testing.expect(agent.compactor.core.stateIs(.idle));
+        try std.testing.expect(agent.compactor.core.task == null);
+        try std.testing.expect(agent.compactor.core.result == null);
+        try std.testing.expect(!agent.compactor.manual_pending);
+        try std.testing.expect(!agent.compactor.manual_started);
+        _ = try writer.lastUserEntry();
+        if (scenario == .success) {
+            try std.testing.expect(agent.messages().len < history_before);
+            try std.testing.expect(!std.mem.eql(u8, leaf_before, writer.session.leaf().?));
+        } else {
+            try std.testing.expectEqual(history_before, agent.messages().len);
+            try std.testing.expectEqualStrings(text_before, agent.messages()[0].text());
+            try std.testing.expectEqualStrings(leaf_before, writer.session.leaf().?);
+        }
+        try std.testing.expectEqual(@as(u32, 1), server.connection_count.load(.acquire));
+    }
 }
 
 test "drain joins a running summarizer that fails against a dead server" {
@@ -3035,7 +3130,7 @@ test "drain joins a running summarizer that fails against a dead server" {
         .prefix_text = try gpa.dupe(u8, "some prefix"),
     };
     agent.compactor.core.state.store(.running, .release);
-    agent.compactor.core.thread = try std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&agent.compactor.core});
+    agent.compactor.core.task = try std.testing.io.concurrent(agent_compactor.Compactor.runThread, .{&agent.compactor.core});
 
     // Wait for the summarizer to fail (connection refused, so this is fast).
     var spins: u32 = 0;
@@ -3046,7 +3141,7 @@ test "drain joins a running summarizer that fails against a dead server" {
 
     agent.drainBackgroundCompaction();
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
-    try std.testing.expect(agent.compactor.core.thread == null);
+    try std.testing.expect(agent.compactor.core.task == null);
 }
 
 test "compaction breaker trips after repeated failures and backs off automatically" {

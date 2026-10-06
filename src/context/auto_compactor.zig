@@ -46,6 +46,45 @@ pub const CompactionNotice = enum {
     waiting,
 };
 
+test "canceling a turn awaiting compaction preserves cancellation on the turn" {
+    const io = std.testing.io;
+    var limiter: request_limiter_mod.RequestLimiter = .{ .permits = 1 };
+    try limiter.acquire(io);
+    defer limiter.release(io);
+    var target: AutoCompactor = .{};
+    target.core.job = .{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .client = .none,
+        .limiter = &limiter,
+        .first_kept_id = undefined,
+        .prefix_text = try std.testing.allocator.dupe(u8, "original history"),
+    };
+    target.core.state.store(.running, .release);
+    target.core.task = try io.concurrent(agent_compactor.Compactor.runThread, .{&target.core});
+    defer if (target.core.task) |*task| {
+        task.cancel(io) catch {};
+    };
+    var entered: std.atomic.Value(bool) = .init(false);
+    const Turn = struct {
+        fn run(compactor: *AutoCompactor, worker_io: std.Io, ready: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            ready.store(true, .release);
+            compactor.joinCompactor();
+            // The next provider request must see cancellation too.
+            try worker_io.checkCancel();
+        }
+    };
+    var turn = try io.concurrent(Turn.run, .{ &target, io, &entered });
+    defer turn.cancel(io) catch {};
+    var spins: u32 = 0;
+    while (!entered.load(.acquire) and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(2), .awake);
+    try std.testing.expect(entered.load(.acquire));
+    try std.testing.expectError(error.Canceled, turn.cancel(io));
+    try std.testing.expect(target.core.task == null);
+    try std.testing.expect(target.core.stateIs(.failed));
+    try std.testing.expectEqual(@as(u32, 1), limiter.in_flight);
+}
+
 /// Emitted after the agent replaces summarized history with a compaction
 /// summary. Token counts are estimates for display only.
 pub const HistoryCompacted = struct {
@@ -330,7 +369,7 @@ pub const AutoCompactor = struct {
             .prefix_text = cut.prefix_text,
         };
         self.core.state.store(.running, .release);
-        self.core.thread = std.Thread.spawn(.{}, agent_compactor.Compactor.runThread, .{&self.core}) catch |err| {
+        self.core.task = env.io.concurrent(agent_compactor.Compactor.runThread, .{&self.core}) catch |err| {
             env.gpa.free(cut.prefix_text);
             self.core.job = null;
             self.core.state.store(.idle, .release);
@@ -366,12 +405,14 @@ pub const AutoCompactor = struct {
         } });
     }
 
-    /// Join the summarizer thread if one is alive. Blocks until it finishes —
-    /// used both for the overflow wait and at teardown.
+    /// Await a summary that the caller intends to apply. Teardown uses cancel.
     pub fn joinCompactor(self: *AutoCompactor) void {
-        if (self.core.thread) |thread| {
-            thread.join();
-            self.core.thread = null;
+        if (self.core.task) |*task| {
+            const io = self.core.job.?.io;
+            // Await forwards the owning turn's cancellation to this task.
+            // Re-arm it on the turn so it cannot continue with a new prompt.
+            task.await(io) catch io.recancel();
+            self.core.task = null;
         }
     }
 
@@ -383,14 +424,17 @@ pub const AutoCompactor = struct {
         self.core.state.store(.idle, .release);
     }
 
-    /// Wait for any in-flight background summary and discard it. Call before
+    /// Cancel any in-flight background summary and discard it. Call before
     /// freeing or replacing `compaction_client` so the summarizer thread is
     /// never left running against a client that is about to be torn down.
     /// Also aborts any in-flight manual compact: the run (if any) is gone, so
     /// the pending flags are reset to keep the TUI's submit gate from
     /// dangling on a summary that can never land.
     pub fn drain(self: *AutoCompactor, env: Env) void {
-        self.joinCompactor();
+        if (self.core.task) |*task| {
+            task.cancel(env.io) catch {};
+            self.core.task = null;
+        }
         self.finishCompactor(env);
         self.manual_pending = false;
         self.manual_started = false;

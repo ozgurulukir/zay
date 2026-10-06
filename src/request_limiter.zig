@@ -48,7 +48,8 @@ pub const RequestLimiter = struct {
 
     /// Free this request's slot and wake one waiter (if any).
     pub fn release(self: *RequestLimiter, io: std.Io) void {
-        self.mutex.lock(io) catch return;
+        // Cleanup must return the permit even if cancellation arrives here.
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.in_flight -= 1;
         self.condition.signal(io);
@@ -64,6 +65,27 @@ pub const RequestLimiter = struct {
         self.condition.signal(io);
     }
 };
+
+test "release returns the permit with pending cancellation" {
+    const io = std.testing.io;
+    var limiter: RequestLimiter = .{ .permits = 1 };
+    try limiter.acquire(io);
+    var started: std.atomic.Value(bool) = .init(false);
+    const Worker = struct {
+        fn run(target: *RequestLimiter, worker_io: std.Io, ready: *std.atomic.Value(bool)) void {
+            ready.store(true, .release);
+            worker_io.sleep(.fromSeconds(30), .awake) catch worker_io.recancel();
+            target.release(worker_io);
+        }
+    };
+    var task = try io.concurrent(Worker.run, .{ &limiter, io, &started });
+    defer task.cancel(io);
+    var spins: u32 = 0;
+    while (!started.load(.acquire) and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(2), .awake);
+    try std.testing.expect(started.load(.acquire));
+    task.cancel(io);
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+}
 
 /// Test helper: current in-flight count, read under the mutex so a concurrent
 /// worker's acquire/release is seen atomically.
