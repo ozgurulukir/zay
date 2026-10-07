@@ -920,7 +920,12 @@ static void GCTM (lua_State *L) {
     lu_byte oldah = L->allowhook;
     int oldgcstp  = g->gcstp;
     g->gcstp |= GCSTPGC;  /* avoid GC steps */
-    L->allowhook = 0;  /* stop debug hooks during GC metamethod */
+    /* Zay uses a count-only host hook for execution limits/cancellation.
+       Keep it active in finalizers; otherwise __gc can hold the plugin gate
+       forever. GC remains stopped and errors stay inside luaD_pcall below.
+       Retain upstream suppression for ordinary call/line debug hooks. */
+    if (L->hookmask != LUA_MASKCOUNT)
+      L->allowhook = 0;
     setobj2s(L, L->top.p++, tm);  /* push finalizer... */
     setobj2s(L, L->top.p++, &v);  /* ... and its argument */
     L->ci->callstatus |= CIST_FIN;  /* will run a finalizer */

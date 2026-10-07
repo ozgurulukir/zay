@@ -13,12 +13,9 @@
 //! schema parsing for free.
 
 const std = @import("std");
-const log = std.log.scoped(.lua);
-const c = @import("c");
 const lua_mod = @import("root.zig");
 const PluginManager = lua_mod.PluginManager;
 const PluginInstance = lua_mod.PluginInstance;
-const plugin_api = lua_mod.plugin_api;
 const tools_mod = @import("../tools.zig");
 const tools_common = @import("../tools/common.zig");
 const Tool = tools_common.Tool;
@@ -33,6 +30,7 @@ const Tool = tools_common.Tool;
 pub const PluginToolKey = struct {
     plugin_name: []u8,
     tool_name: []u8,
+    schema: tools_common.Schema = .{ .properties = &.{} },
 };
 
 /// Free callback for `Tool.userdata_free`. Decodes the `*anyopaque` back
@@ -41,6 +39,7 @@ pub fn freePluginToolKey(gpa: std.mem.Allocator, ud: *anyopaque) void {
     const key: *PluginToolKey = @ptrCast(@alignCast(ud));
     gpa.free(key.plugin_name);
     gpa.free(key.tool_name);
+    key.schema.deinit(gpa);
     gpa.destroy(key);
 }
 
@@ -72,8 +71,10 @@ fn allocPluginToolKey(
 ) !*PluginToolKey {
     const key = try gpa.create(PluginToolKey);
     errdefer gpa.destroy(key);
+    const owned_plugin_name = try gpa.dupe(u8, plugin_name);
+    errdefer gpa.free(owned_plugin_name);
     key.* = .{
-        .plugin_name = try gpa.dupe(u8, plugin_name),
+        .plugin_name = owned_plugin_name,
         .tool_name = try gpa.dupe(u8, tool_name),
     };
     return key;
@@ -100,6 +101,7 @@ pub fn runPluginTool(
         key.tool_name[0..],
         args,
     ) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         return tools_common.failFmt(
             gpa,
             1,
@@ -147,10 +149,11 @@ pub fn buildPluginTool(
     errdefer gpa.free(desc_owned);
     const key = try allocPluginToolKey(gpa, plugin.manifest.name, tool_name);
     errdefer freePluginToolKey(gpa, @ptrCast(key));
+    key.schema = try schema.clone(gpa);
     return .{
         .name = full_name,
         .description = desc_owned,
-        .schema = schema,
+        .schema = key.schema,
         .run = runPluginTool,
         .display = displayPluginTool,
         .userdata = @ptrCast(key),
@@ -168,226 +171,32 @@ pub fn buildPluginToolDescriptors(
     gpa: std.mem.Allocator,
     manager: *PluginManager,
 ) ![]Tool {
-    // First pass: count active tools so we can allocate exactly once.
-    var total: u32 = 0;
+    try manager.beginUse();
+    defer manager.endUse();
+    var out: std.ArrayList(Tool) = .empty;
+    errdefer {
+        for (out.items) |*tool| {
+            if (tool.userdata_free) |free_fn| free_fn(gpa, tool.userdata);
+            gpa.free(tool.name);
+            gpa.free(tool.description);
+        }
+        out.deinit(gpa);
+    }
     var iter = manager.iterator();
     while (iter.next()) |entry| {
         const plugin = entry.value_ptr.*;
         if (!plugin.active) continue;
-        total += plugin_api.countTools(plugin.state.handle);
-    }
-    if (total == 0) return &.{};
-
-    var out: std.ArrayList(Tool) = .empty;
-    errdefer {
-        for (out.items) |*t| {
-            if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
-            gpa.free(t.name);
-            gpa.free(t.description);
+        for (plugin.tool_snapshots) |snapshot| {
+            const tool = try buildPluginTool(gpa, plugin, snapshot.name, snapshot.description, snapshot.schema);
+            errdefer {
+                freePluginToolKey(gpa, tool.userdata);
+                gpa.free(tool.name);
+                gpa.free(tool.description);
+            }
+            try out.append(gpa, tool);
         }
-        out.deinit(gpa);
-    }
-    try out.ensureTotalCapacity(gpa, total);
-
-    // Second pass: materialize each tool.
-    var iter2 = manager.iterator();
-    while (iter2.next()) |entry| {
-        const plugin = entry.value_ptr.*;
-        if (!plugin.active) continue;
-        const L = plugin.state.handle;
-
-        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
-        if (c.lua_isnil(L, -1)) {
-            c.lua_pop(L, 1);
-            continue;
-        }
-        const tools_len = c.lua_rawlen(L, -1);
-        var tool_i: c_int = 1;
-        while (tool_i <= @as(c_int, @intCast(tools_len))) : (tool_i += 1) {
-            _ = c.lua_rawgeti(L, -1, tool_i);
-
-            // name (at -1, just above the entry table)
-            _ = c.lua_getfield(L, -1, "name");
-            var name_len: usize = 0;
-            const name_ptr = c.lua_tolstring(L, -1, &name_len);
-            const tn = if (name_ptr) |p| p[0..name_len] else "";
-
-            // description (at -1; entry now at -2)
-            _ = c.lua_getfield(L, -2, "description");
-            var desc_len: usize = 0;
-            const desc_ptr = c.lua_tolstring(L, -1, &desc_len);
-            const desc = if (desc_ptr) |p| p[0..desc_len] else "";
-
-            // Push a copy of the entry so buildToolSchemaFromLua can read
-            // the parameters table from -1, then restore. Entry was at
-            // -3 (before name+description were pushed); push a copy.
-            _ = c.lua_pushvalue(L, -3);
-            const schema = buildToolSchemaFromLua(gpa, L) catch |err| blk: {
-                log.warn(
-                    "plugin.tool.schema.failed plugin={s} tool={s} err={s}",
-                    .{ plugin.manifest.name, tn, @errorName(err) },
-                );
-                break :blk tools_common.Schema{ .properties = &.{} };
-            };
-            c.lua_pop(L, 1); // pop the entry copy
-
-            const tool_obj = buildPluginTool(
-                gpa,
-                plugin,
-                tn,
-                desc,
-                schema,
-            ) catch |err| {
-                log.warn(
-                    "plugin.tool.build.failed plugin={s} tool={s} err={s}",
-                    .{ plugin.manifest.name, tn, @errorName(err) },
-                );
-                c.lua_pop(L, 3); // pop desc, name, entry
-                continue;
-            };
-            out.appendAssumeCapacity(tool_obj);
-
-            c.lua_pop(L, 3); // pop desc, name, entry
-        }
-        c.lua_pop(L, 1); // pop zay_tools
     }
     return out.toOwnedSlice(gpa);
-}
-
-/// Parse a `parameters` table at the top of the Lua stack into a
-/// `tools_common.Schema`. Mirrors the previous private helper in
-/// `tui/provider_model.zig`; relocated here so plugin-side and
-/// agent-side share one definition.
-fn buildToolSchemaFromLua(
-    gpa: std.mem.Allocator,
-    L: *c.lua_State,
-) !tools_common.Schema {
-    _ = c.lua_getfield(L, -1, "parameters");
-    defer c.lua_pop(L, 1);
-    if (!c.lua_istable(L, -1)) return .{ .properties = &.{} };
-
-    var props: std.ArrayList(tools_common.Schema.Property) = .empty;
-    errdefer {
-        for (props.items) |p| {
-            gpa.free(p.name);
-            gpa.free(p.description);
-            if (p.enum_values) |ev| {
-                for (ev) |v| gpa.free(v);
-                gpa.free(ev);
-            }
-            if (p.default_value) |dv| gpa.free(dv);
-        }
-        props.deinit(gpa);
-    }
-
-    c.lua_pushnil(L);
-    while (c.lua_next(L, -2) != 0) {
-        var key_len: usize = 0;
-        const key_ptr = c.lua_tolstring(L, -2, &key_len);
-        const param_name = if (key_ptr) |p| try gpa.dupe(u8, p[0..key_len]) else {
-            c.lua_pop(L, 1);
-            continue;
-        };
-        if (!c.lua_istable(L, -1)) {
-            gpa.free(param_name);
-            c.lua_pop(L, 1);
-            continue;
-        }
-
-        _ = c.lua_getfield(L, -1, "type");
-        var type_len: usize = 0;
-        const type_ptr = c.lua_tolstring(L, -1, &type_len);
-        const kind = if (type_ptr) |p| parseToolParamType(p[0..type_len]) else .string;
-        c.lua_pop(L, 1);
-
-        _ = c.lua_getfield(L, -1, "description");
-        var desc_len: usize = 0;
-        const desc_ptr = c.lua_tolstring(L, -1, &desc_len);
-        const description = if (desc_ptr) |p| try gpa.dupe(u8, p[0..desc_len]) else try gpa.dupe(u8, "");
-        c.lua_pop(L, 1);
-
-        _ = c.lua_getfield(L, -1, "optional");
-        const optional = c.lua_isboolean(L, -1) and c.lua_toboolean(L, -1) != 0;
-        c.lua_pop(L, 1);
-
-        _ = c.lua_getfield(L, -1, "nullable");
-        const nullable = c.lua_isboolean(L, -1) and c.lua_toboolean(L, -1) != 0;
-        c.lua_pop(L, 1);
-
-        var enum_values: ?[]const []const u8 = null;
-        _ = c.lua_getfield(L, -1, "enum");
-        if (c.lua_istable(L, -1)) {
-            const enum_len = c.lua_rawlen(L, -1);
-            if (enum_len > 0) {
-                var ev_list = try gpa.alloc([]const u8, enum_len);
-                var ev_idx: u32 = 0;
-                var ei: c_int = 1;
-                while (ei <= @as(c_int, @intCast(enum_len))) : (ei += 1) {
-                    _ = c.lua_rawgeti(L, -1, ei);
-                    var ev_len: usize = 0;
-                    const ev_ptr = c.lua_tolstring(L, -1, &ev_len);
-                    if (ev_len > 0) {
-                        ev_list[ev_idx] = try gpa.dupe(u8, ev_ptr[0..ev_len]);
-                        ev_idx += 1;
-                    }
-                    c.lua_pop(L, 1);
-                }
-                if (ev_idx == 0) gpa.free(ev_list) else enum_values = try gpa.realloc(ev_list, ev_idx);
-            }
-        }
-        c.lua_pop(L, 1);
-
-        var default_value: ?[]const u8 = null;
-        _ = c.lua_getfield(L, -1, "default");
-        if (!c.lua_isnil(L, -1)) {
-            default_value = try luaValueToJson(gpa, L);
-        }
-        c.lua_pop(L, 1);
-
-        try props.append(gpa, .{
-            .name = param_name,
-            .kind = kind,
-            .description = description,
-            .required = !optional,
-            .nullable = nullable,
-            .enum_values = enum_values,
-            .default_value = default_value,
-        });
-        c.lua_pop(L, 1); // pop value, keep key for next iteration
-    }
-    return .{ .properties = try props.toOwnedSlice(gpa) };
-}
-
-fn parseToolParamType(type_str: []const u8) tools_common.Schema.Kind {
-    if (std.mem.eql(u8, type_str, "string")) return .string;
-    if (std.mem.eql(u8, type_str, "integer")) return .integer;
-    if (std.mem.eql(u8, type_str, "number")) return .number;
-    if (std.mem.eql(u8, type_str, "boolean")) return .boolean;
-    if (std.mem.eql(u8, type_str, "object")) return .object;
-    if (std.mem.eql(u8, type_str, "array")) return .array;
-    return .string;
-}
-
-fn luaValueToJson(gpa: std.mem.Allocator, L: *c.lua_State) ![]const u8 {
-    if (c.lua_isnil(L, -1)) return gpa.dupe(u8, "null");
-    if (c.lua_isboolean(L, -1)) return gpa.dupe(u8, if (c.lua_toboolean(L, -1) != 0) "true" else "false");
-    if (c.lua_isnumber(L, -1) != 0) {
-        var len: usize = 0;
-        const ptr = c.lua_tolstring(L, -1, &len);
-        if (len > 0) return gpa.dupe(u8, ptr[0..len]);
-        return gpa.dupe(u8, "0");
-    }
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(L, -1, &len);
-    if (len > 0) {
-        var aw: std.Io.Writer.Allocating = .init(gpa);
-        errdefer aw.deinit();
-        try aw.writer.writeByte('"');
-        try aw.writer.writeAll(ptr[0..len]);
-        try aw.writer.writeByte('"');
-        return aw.toOwnedSlice();
-    }
-    return gpa.dupe(u8, "\"\"");
 }
 
 test "buildPluginToolName: formats lua__<plugin>__<tool>" {

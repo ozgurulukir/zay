@@ -108,3 +108,44 @@ test "event: name returns correct string" {
     const e7 = Event{ .plugin_unloaded = .{ .name = @as([]const u8, "test") } };
     try std.testing.expectEqualStrings("plugin_unloaded", e7.name());
 }
+
+pub const Subscriptions = std.atomic.Value(u8);
+const subscriptions_key = "zay_event_subscriptions";
+
+fn bit(name: []const u8) u8 {
+    inline for (std.meta.tags(std.meta.Tag(Event))) |tag| {
+        if (std.mem.eql(u8, name, @tagName(tag))) return @as(u8, 1) << @as(u3, @intCast(@intFromEnum(tag)));
+    }
+    return 0;
+}
+
+pub fn subscribed(subscriptions: *const Subscriptions, event: Event) bool {
+    return subscriptions.load(.acquire) & bit(event.name()) != 0;
+}
+
+/// Exclusively owned initialization; the atomic address is stable with the
+/// heap PluginInstance. Lua owns no allocation behind this borrowed pointer.
+pub fn bindSubscriptions(L: *c.lua_State, subscriptions: *Subscriptions) void {
+    const top = c.lua_gettop(L);
+    defer c.lua_settop(L, top);
+    var mask: u8 = 0;
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_events");
+    if (c.lua_istable(L, -1)) {
+        inline for (std.meta.tags(std.meta.Tag(Event))) |tag| {
+            _ = c.lua_getfield(L, -1, @tagName(tag));
+            if (c.lua_istable(L, -1) and c.lua_rawlen(L, -1) != 0) mask |= bit(@tagName(tag));
+            c.lua_pop(L, 1);
+        }
+    }
+    subscriptions.store(mask, .release);
+    c.lua_pushlightuserdata(L, subscriptions);
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, subscriptions_key);
+}
+
+pub fn noteSubscription(L: *c.lua_State, name: []const u8) void {
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, subscriptions_key);
+    defer c.lua_pop(L, 1);
+    const raw = c.lua_touserdata(L, -1) orelse return; // unpublished init.lua
+    const subscriptions: *Subscriptions = @ptrCast(@alignCast(raw));
+    _ = subscriptions.fetchOr(bit(name), .release);
+}

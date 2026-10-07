@@ -9,6 +9,7 @@ const c = @import("c");
 const State = @import("state.zig").State;
 const plugin_api = @import("plugin_api.zig");
 const platform = @import("platform");
+const execution = @import("execution.zig");
 
 /// Permissions granted to a plugin.
 pub const Permissions = struct {
@@ -41,16 +42,7 @@ pub const Permissions = struct {
 };
 
 /// Data stored in lua_getextraspace for the instruction hook.
-const HookData = struct {
-    instruction_limit: u32,
-    instruction_count: u32,
-    memory_limit: usize,
-    /// Timeout in ms for the current dispatch (0 = no timeout).
-    timeout_ms: u32,
-    /// Absolute deadline (ns since epoch) for the current dispatch, or 0 when
-    /// no timeout is set. Reset per-dispatch by `resetInstructionBudget`.
-    deadline_ns: i128 = 0,
-};
+const HookData = execution.Budget;
 
 /// Monotonic clock reading in nanoseconds, used for the per-dispatch timeout.
 /// The instruction hook has no `Io` handle, so it reads the OS clock directly.
@@ -66,19 +58,15 @@ fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
     const L_ptr = L orelse return;
     const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L_ptr))));
     const data = slot.* orelse return;
-    data.instruction_count += 1;
-    if (data.instruction_count >= data.instruction_limit) {
-        _ = c.luaL_error(L_ptr, "instruction limit exceeded");
+    execution.check(L_ptr);
+    if (data.stop_reason == .none) {
+        data.instruction_count +|= 1;
+        if (data.instruction_count >= data.instruction_limit) data.stop_reason = .instruction_limit;
+        const mem_kb = c.lua_gc(L_ptr, c.LUA_GCCOUNT, @as(c_int, 0));
+        // Lua rejects GC queries during finalizers with -1.
+        if (mem_kb >= 0 and @as(usize, @intCast(mem_kb)) * 1024 >= data.memory_limit) data.stop_reason = .memory_limit;
     }
-    // Approximate timeout check (1000-instruction granularity, by design).
-    if (data.deadline_ns != 0 and monotonicNowNs() >= data.deadline_ns) {
-        _ = c.luaL_error(L_ptr, "timeout exceeded");
-    }
-    // Check memory every 1000 instructions
-    const mem_kb = c.lua_gc(L_ptr, c.LUA_GCCOUNT, @as(c_int, 0));
-    if (@as(usize, @intCast(mem_kb)) * 1024 >= data.memory_limit) {
-        _ = c.luaL_error(L_ptr, "memory limit exceeded");
-    }
+    execution.raiseIfStopped(L_ptr);
 }
 
 /// Reset the per-dispatch instruction budget and timeout deadline on `L`.
@@ -86,15 +74,16 @@ fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
 /// resets; without this, a busy plugin eventually fails every call with
 /// "instruction limit exceeded" for the rest of the session. Resetting here
 /// makes the limit mean "per tool call / per event", which matches intuition.
-/// No-op when the hook data is null (full-access sandboxes have no hook).
+/// No-op only for a Lua state not created by this sandbox builder.
 pub fn resetInstructionBudget(L: *c.lua_State) void {
     const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
     const data = slot.* orelse return;
     data.instruction_count = 0;
-    data.deadline_ns = if (data.timeout_ms > 0)
+    data.stop_reason = .none;
+    data.deadline_ns = @intCast(if (data.timeout_ms > 0)
         monotonicNowNs() + @as(i128, data.timeout_ms) * std.time.ns_per_ms
     else
-        0;
+        0);
 }
 
 /// Create a new sandboxed Lua state with restricted permissions.
@@ -133,7 +122,15 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
 
     if (!permissions.full_access) {
         createRestrictedEnvironment(L, permissions);
-        try setupInstructionHook(L, permissions);
+    }
+    try setupInstructionHook(L, permissions);
+    execution.budget(L).?.io = io;
+    execution.installProtectedCallGuards(L);
+    if (permissions.full_access) {
+        _ = c.lua_getglobal(L, "os");
+        execution.pushGuardedFunction(L, boundedOsExecute);
+        c.lua_setfield(L, -2, "execute");
+        c.lua_pop(L, 1);
     }
 
     return State{ .handle = L };
@@ -202,7 +199,7 @@ fn registerPluginApi(L: *c.lua_State) void {
     };
 
     for (funcs) |f| {
-        c.lua_pushcfunction(L, f.func);
+        execution.pushGuardedFunction(L, f.func);
         c.lua_setfield(L, -2, f.name.ptr);
     }
 
@@ -257,7 +254,8 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
         copyOsFunction(L, os_index, "time");
         copyOsFunction(L, os_index, "difftime");
         if (permissions.allow_os_execute) {
-            copyOsFunction(L, os_index, "execute");
+            execution.pushGuardedFunction(L, boundedOsExecute);
+            c.lua_setfield(L, os_index, "execute");
         }
         if (permissions.allow_os_remove) {
             c.lua_pushcfunction(L, plugin_api.deletePath);
@@ -281,6 +279,29 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
     c.lua_pop(L, 1);
 }
 
+/// os.execute remains a convenience API, but uses the bounded, cancelable
+/// native shell bridge rather than libc system() while owning the Lua gate.
+fn boundedOsExecute(L: ?*c.lua_State) callconv(.c) c_int {
+    const state = L.?;
+    if (c.lua_isnoneornil(state, 1)) {
+        c.lua_pushboolean(state, 1);
+        return 1;
+    }
+    if (execution.budget(state).?.io == null) {
+        c.lua_pushnil(state);
+        _ = c.lua_pushstring(state, "os.execute requires plugin I/O");
+        return 2;
+    }
+    const count = plugin_api.runShell(state);
+    if (count != 1 or !c.lua_istable(state, -1)) return count;
+    _ = c.lua_getfield(state, -1, "code");
+    const code = c.lua_tointegerx(state, -1, null);
+    if (code == 0) c.lua_pushboolean(state, 1) else c.lua_pushnil(state);
+    _ = c.lua_pushstring(state, "exit");
+    c.lua_pushinteger(state, code);
+    return 3;
+}
+
 /// Copy a global function/table from the real _G into the environment.
 fn copyGlobal(L: *c.lua_State, env_index: c_int, name: [:0]const u8) void {
     _ = c.lua_getglobal(L, name.ptr);
@@ -299,10 +320,10 @@ fn copyOsFunction(L: *c.lua_State, os_index: c_int, name: [:0]const u8) void {
 
 /// Set up the instruction count hook for resource limits.
 fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Allocator.Error!void {
-    if (permissions.instruction_limit == 0 and permissions.memory_limit_mb == 0) return;
-
-    const allocator = std.heap.page_allocator;
-    const data = try allocator.create(HookData);
+    // Coroutines copy the extraspace pointer. Keep the budget VM-owned and
+    // strongly referenced until lua_close finishes every Lua finalizer.
+    const data = @as(*HookData, @ptrCast(@alignCast(c.lua_newuserdata(L, @sizeOf(HookData)))));
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_execution_budget");
     data.* = HookData{
         .instruction_limit = if (permissions.instruction_limit > 0) permissions.instruction_limit else std.math.maxInt(u32),
         .instruction_count = 0,
@@ -311,16 +332,13 @@ fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Alloc
     };
     @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = data;
     c.lua_sethook(L, instructionHook, c.LUA_MASKCOUNT, 1000);
+    resetInstructionBudget(L);
 }
 
-/// Free the hook data allocated in setupInstructionHook.
-/// Must be called before lua_close.
+/// Prepare bounded finalization. Retained SDK entry point; VM-owned userdata
+/// and hooks stay alive through lua_close, including main-thread finalizers.
 pub fn freeHookData(L: *c.lua_State) void {
-    const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
-    if (slot.*) |data| {
-        std.heap.page_allocator.destroy(data);
-        slot.* = null;
-    }
+    execution.capDeadline(L, 1000);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

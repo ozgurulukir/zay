@@ -586,6 +586,7 @@ test {
     _ = @import("lua/plugin.zig");
     _ = @import("lua/manifest.zig");
     _ = @import("lua/manager.zig");
+    _ = @import("lua/concurrency_tests.zig");
     _ = @import("lua/events.zig");
     // The text-tool-call recovery module (T1). Pure module, only consumed by
     // the agent at call sites — reference it explicitly so its exhaustive

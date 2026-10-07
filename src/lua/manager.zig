@@ -15,6 +15,9 @@ const State = @import("state.zig").State;
 const sandbox = @import("sandbox.zig");
 const plugin_api = @import("plugin_api.zig");
 const events = @import("events.zig");
+const execution = @import("execution.zig");
+const bridge = @import("bridge.zig");
+const tool_snapshot = @import("tool_snapshot.zig");
 const Manifest = @import("manifest.zig").Manifest;
 const plugin_config = @import("../config/plugin.zig");
 
@@ -54,6 +57,10 @@ fn pluginDirUnderProjectDir(plugin_dir: []const u8, project_dir: []const u8) boo
 pub const PluginInstance = struct {
     manifest: Manifest,
     state: State,
+    execution_mutex: std.Io.Mutex = .init,
+    event_subscriptions: events.Subscriptions = .init(0),
+    /// Immutable owned metadata; consumers never inspect the live Lua stack.
+    tool_snapshots: []tool_snapshot.ToolSnapshot,
     /// Path to the plugin directory (for reloading)
     dir_path: []const u8,
     /// Whether this plugin is active (not disabled)
@@ -63,7 +70,33 @@ pub const PluginInstance = struct {
 
     const Self = @This();
 
+    /// The guard lives outside pcall, so Lua longjmp cannot skip its unlock.
+    fn lockExecution(self: *Self, io: std.Io, wait_ms: u32) !void {
+        const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, wait_ms) * std.time.ns_per_ms;
+        while (true) {
+            try io.checkCancel();
+            if (bridge.cancel_requested_slot) |flag| if (flag.load(.acquire)) return error.Canceled;
+            if (self.execution_mutex.tryLock()) {
+                io.checkCancel() catch |err| {
+                    self.execution_mutex.unlock(io);
+                    return err;
+                };
+                if (bridge.cancel_requested_slot) |flag| {
+                    if (flag.load(.acquire)) {
+                        self.execution_mutex.unlock(io);
+                        return error.Canceled;
+                    }
+                }
+                return;
+            }
+            const remaining = deadline - std.Io.Timestamp.now(io, .awake).nanoseconds;
+            if (remaining <= 0) return error.PluginBusy;
+            try io.sleep(.fromNanoseconds(@intCast(@min(remaining, 10 * std.time.ns_per_ms))), .awake);
+        }
+    }
+
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        tool_snapshot.deinit(allocator, self.tool_snapshots);
         self.manifest.deinit(allocator);
         sandbox.freeHookData(self.state.handle);
         self.state.deinit();
@@ -94,6 +127,45 @@ pub const PluginManager = struct {
     /// mid-session `Config` swaps (a session switch frees the old config while
     /// the manager lives on), so borrowed slices would dangle.
     plugin_configs: std.ArrayListUnmanaged(plugin_config.PluginConfig) = .empty,
+    /// Low bits count live turns/dispatches; high bit exclusively owns map
+    /// mutation. App copies happen before workers are wired, never while used.
+    lifecycle: std.atomic.Value(u32) = .init(0),
+    /// Host policy, independent of Lua's per-dispatch execution budget.
+    execution_policy: ExecutionPolicy = .{},
+
+    pub const ExecutionPolicy = struct {
+        tool_wait_ms: u32 = 1000,
+        /// Total time for one emission, including lock waits and callbacks.
+        event_budget_ms: u32 = 1000,
+    };
+
+    const mutation_bit: u32 = 1 << 31;
+
+    /// Pin the plugin generation for a turn, dispatch, or metadata copy.
+    pub fn beginUse(self: *Self) !void {
+        var state = self.lifecycle.load(.acquire);
+        while (true) {
+            if (state & mutation_bit != 0) return error.InFlightTurn;
+            if (state == mutation_bit - 1) return error.TooManyPluginUsers;
+            state = self.lifecycle.cmpxchgWeak(state, state + 1, .acq_rel, .acquire) orelse return;
+        }
+    }
+
+    pub fn endUse(self: *Self) void {
+        const previous = self.lifecycle.fetchSub(1, .release);
+        std.debug.assert(previous > 0);
+        std.debug.assert(previous & mutation_bit == 0);
+    }
+
+    fn beginMutation(self: *Self) !void {
+        if (self.lifecycle.cmpxchgStrong(0, mutation_bit, .acq_rel, .acquire) != null)
+            return error.InFlightTurn;
+    }
+
+    fn endMutation(self: *Self) void {
+        std.debug.assert(self.lifecycle.load(.monotonic) == mutation_bit);
+        self.lifecycle.store(0, .release);
+    }
 
     const Self = @This();
 
@@ -126,6 +198,8 @@ pub const PluginManager = struct {
 
     /// Deinitialize the manager, unloading all plugins.
     pub fn deinit(self: *Self) void {
+        // The owner must cancel and join every worker before teardown.
+        std.debug.assert(self.lifecycle.load(.acquire) == 0);
         var it = self.plugins.iterator();
         while (it.next()) |entry| {
             var plugin = entry.value_ptr.*;
@@ -174,6 +248,8 @@ pub const PluginManager = struct {
     /// previous set). Clones rather than borrows: the caller's `Config` may be
     /// freed mid-session (session switch) while the manager lives on.
     pub fn syncPluginConfig(self: *Self, plugins: []const plugin_config.PluginConfig) !void {
+        try self.beginMutation();
+        defer self.endMutation();
         var next: std.ArrayListUnmanaged(plugin_config.PluginConfig) = .empty;
         errdefer {
             for (next.items) |*pc| pc.deinit(self.allocator);
@@ -209,6 +285,8 @@ pub const PluginManager = struct {
     /// settings are read once at load time and are never re-evaluated on a
     /// mid-session config reload — restart the App to apply config changes.
     pub fn loadAll(self: *Self) !usize {
+        try self.beginMutation();
+        defer self.endMutation();
         if (self.initialized) return self.plugins.count();
         self.initialized = true;
 
@@ -232,6 +310,12 @@ pub const PluginManager = struct {
     /// Load a single plugin from a directory path.
     /// Returns the loaded plugin instance, or an error.
     pub fn loadOne(self: *Self, dir_path: []const u8, is_embedded: bool) !*PluginInstance {
+        try self.beginMutation();
+        defer self.endMutation();
+        return self.loadOneDuringMutation(dir_path, is_embedded);
+    }
+
+    fn loadOneDuringMutation(self: *Self, dir_path: []const u8, is_embedded: bool) !*PluginInstance {
         // Read and parse the manifest
         var manifest = try self.readManifest(dir_path);
         errdefer manifest.deinit(self.allocator);
@@ -290,6 +374,8 @@ pub const PluginManager = struct {
             return error.PluginInitFailed;
         }
 
+        const snapshots = try tool_snapshot.capture(self.allocator, L.handle);
+        errdefer tool_snapshot.deinit(self.allocator, snapshots);
         const instance = try self.allocator.create(PluginInstance);
         errdefer self.allocator.destroy(instance);
         const owned_dir = try self.allocator.dupe(u8, dir_path);
@@ -300,6 +386,7 @@ pub const PluginManager = struct {
         instance.* = .{
             .manifest = manifest,
             .state = L,
+            .tool_snapshots = snapshots,
             .dir_path = owned_dir,
             .active = true,
             .permissions = permissions,
@@ -310,6 +397,7 @@ pub const PluginManager = struct {
             existing.deinit(self.allocator);
             self.allocator.destroy(existing);
         }
+        events.bindSubscriptions(instance.state.handle, &instance.event_subscriptions);
         self.plugins.putAssumeCapacity(instance.manifest.name, instance);
 
         return instance;
@@ -317,37 +405,27 @@ pub const PluginManager = struct {
 
     /// Reload a plugin by name. Saves state, reloads, restores state.
     pub fn reload(self: *Self, name: []const u8) !void {
+        try self.beginMutation();
+        defer self.endMutation();
         const entry = self.plugins.get(name) orelse return error.PluginNotFound;
-        const dir_path = entry.dir_path;
+        const dir_path = try self.allocator.dupe(u8, entry.dir_path);
+        defer self.allocator.free(dir_path);
         const is_embedded = entry.manifest.is_embedded;
-
-        // Save state
-        var saved_state: ?[]u8 = null;
-        if (self.savePluginState(entry)) |state| {
-            saved_state = state;
-        }
-
-        // Unload
-        entry.deinit(self.allocator);
-        self.allocator.destroy(entry);
-        _ = self.plugins.remove(name);
-
-        // Reload
-        const new_instance = try self.loadOne(dir_path, is_embedded);
-
-        // Restore state
-        if (saved_state) |state| {
-            self.restorePluginState(new_instance, state);
-            self.allocator.free(state);
-        }
+        const saved_state = self.savePluginState(entry);
+        defer if (saved_state) |state| self.allocator.free(state);
+        // Build-before-swap retains the previous plugin on any load failure.
+        const new_instance = try self.loadOneDuringMutation(dir_path, is_embedded);
+        if (saved_state) |state| self.restorePluginState(new_instance, state);
     }
 
     /// Unload a plugin by name.
-    pub fn unload(self: *Self, name: []const u8) void {
+    pub fn unload(self: *Self, name: []const u8) !void {
+        try self.beginMutation();
+        defer self.endMutation();
         const entry = self.plugins.get(name) orelse return;
+        _ = self.plugins.remove(name);
         entry.deinit(self.allocator);
         self.allocator.destroy(entry);
-        _ = self.plugins.remove(name);
     }
 
     /// Get a loaded plugin by name.
@@ -364,11 +442,33 @@ pub const PluginManager = struct {
         tool_name: []const u8,
         params_json: []const u8,
     ) !plugin_api.ToolHandlerResult {
+        try self.beginUse();
+        defer self.endUse();
         const plugin = self.plugins.get(plugin_name) orelse return error.PluginNotFound;
         if (!plugin.active) return error.PluginDisabled;
-        const tool_index = plugin_api.findToolIndex(plugin.state.handle, tool_name) orelse
-            return error.ToolNotFound;
-        return plugin_api.callToolHandler(plugin.state.handle, self.allocator, tool_index, params_json);
+        try plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms);
+        defer plugin.execution_mutex.unlock(self.io);
+        const top = c.lua_gettop(plugin.state.handle);
+        defer c.lua_settop(plugin.state.handle, top);
+        for (plugin.tool_snapshots) |snapshot| {
+            if (std.mem.eql(u8, snapshot.name, tool_name)) {
+                var result = try plugin_api.callToolHandler(plugin.state.handle, self.allocator, snapshot.index, params_json);
+                if (execution.budget(plugin.state.handle)) |data| {
+                    if (data.stop_reason == .canceled) {
+                        result.deinit(self.allocator);
+                        return error.Canceled;
+                    }
+                }
+                if (bridge.cancel_requested_slot) |flag| {
+                    if (flag.load(.acquire)) {
+                        result.deinit(self.allocator);
+                        return error.Canceled;
+                    }
+                }
+                return result;
+            }
+        }
+        return error.ToolNotFound;
     }
 
     /// Get the number of loaded plugins.
@@ -387,14 +487,30 @@ pub const PluginManager = struct {
     /// every stored callback ref with the event payload as a Lua table.
     ///
     /// Errors in individual callbacks are logged and do not stop delivery to
-    /// other plugins. Must be called on the agent worker thread, at tool-call
-    /// boundaries, so a plugin's state is never re-entered mid-handler.
+    /// other plugins. Called at tool boundaries on the emitting worker; each
+    /// state is exclusively held, even when another lane is in a handler.
     pub fn emitEvent(self: *Self, event: events.Event) void {
+        self.beginUse() catch return;
+        defer self.endUse();
         const event_name = event.name();
+        const deadline = std.Io.Timestamp.now(self.io, .awake).nanoseconds + @as(i96, self.execution_policy.event_budget_ms) * std.time.ns_per_ms;
         var iter = self.plugins.iterator();
         while (iter.next()) |entry| {
             const plugin = entry.value_ptr.*;
-            if (!plugin.active) continue;
+            if (!plugin.active or !events.subscribed(&plugin.event_subscriptions, event)) continue;
+            const remaining = @max(0, deadline - std.Io.Timestamp.now(self.io, .awake).nanoseconds);
+            const remaining_ms: u32 = @intCast(@divFloor(remaining, std.time.ns_per_ms));
+            plugin.lockExecution(self.io, remaining_ms) catch |err| {
+                if (err == error.Canceled) return;
+                log.warn("plugin.event.skipped plugin={s} event={s} err={s}", .{ plugin.manifest.name, event_name, @errorName(err) });
+                continue;
+            };
+            defer plugin.execution_mutex.unlock(self.io);
+            const top = c.lua_gettop(plugin.state.handle);
+            defer c.lua_settop(plugin.state.handle, top);
+            sandbox.resetInstructionBudget(plugin.state.handle);
+            const execution_remaining = @max(0, deadline - std.Io.Timestamp.now(self.io, .awake).nanoseconds);
+            execution.capDeadline(plugin.state.handle, @intCast(@divFloor(execution_remaining, std.time.ns_per_ms)));
             drainEventCallbacks(plugin.state.handle, plugin.manifest.name, event_name, event);
         }
     }
@@ -407,6 +523,8 @@ pub const PluginManager = struct {
     /// all-lanes-idle guarantee — unloading frees Lua states mid-dispatch
     /// would be fatal.
     pub fn repointProjectDir(self: *Self, new_cwd: []const u8) !void {
+        try self.beginMutation();
+        defer self.endMutation();
         // Step 1: snapshot both old roots and compute both new roots — all
         // BEFORE any mutation, so an allocation failure leaves the manager
         // intact.
@@ -502,7 +620,7 @@ pub const PluginManager = struct {
 
                     if (!self.fileExists(manifest_path)) continue;
 
-                    _ = self.loadOne(plugin_dir, false) catch |err| switch (err) {
+                    _ = self.loadOneDuringMutation(plugin_dir, false) catch |err| switch (err) {
                         error.PluginDisabled => continue,
                         else => {
                             try self.recordLoadFailure(plugin_dir, err);
@@ -589,10 +707,6 @@ pub const PluginManager = struct {
             state.newTable();
             events.pushEventData(&state, event);
 
-            // Reset the per-dispatch instruction budget and timeout deadline so
-            // the limits mean "per event", not "per session" (T1/T2).
-            sandbox.resetInstructionBudget(L);
-
             const rc = state.pcall(1, 0);
             if (rc != c.LUA_OK) {
                 const err = state.getErrorMessage();
@@ -600,6 +714,7 @@ pub const PluginManager = struct {
                     plugin_name, event_name, err orelse "unknown",
                 });
                 state.pop(1); // pop error message
+                if (execution.stopped(L)) break;
             }
         }
     }
@@ -642,7 +757,7 @@ pub const PluginManager = struct {
 
             if (!self.fileExists(manifest_path)) continue;
 
-            _ = self.loadOne(plugin_dir, is_embedded) catch |err| {
+            _ = self.loadOneDuringMutation(plugin_dir, is_embedded) catch |err| {
                 if (err == error.PluginDisabled) {
                     // A disabled plugin is a skip, not a load failure.
                     log.info("plugin.load.skipped_disabled path={s}", .{plugin_dir});
@@ -725,6 +840,11 @@ pub const PluginManager = struct {
 
     /// Save plugin state by calling get_state() in the plugin.
     fn savePluginState(self: *Self, plugin: *PluginInstance) ?[]u8 {
+        plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms) catch return null;
+        defer plugin.execution_mutex.unlock(self.io);
+        const top = c.lua_gettop(plugin.state.handle);
+        defer c.lua_settop(plugin.state.handle, top);
+        sandbox.resetInstructionBudget(plugin.state.handle);
         _ = c.lua_getglobal(plugin.state.handle, "get_state");
         if (!plugin.state.isFunction(-1)) {
             plugin.state.pop(1);
@@ -743,7 +863,11 @@ pub const PluginManager = struct {
 
     /// Restore plugin state by calling set_state(state) in the plugin.
     fn restorePluginState(self: *Self, plugin: *PluginInstance, state: []const u8) void {
-        _ = self;
+        plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms) catch return;
+        defer plugin.execution_mutex.unlock(self.io);
+        const top = c.lua_gettop(plugin.state.handle);
+        defer c.lua_settop(plugin.state.handle, top);
+        sandbox.resetInstructionBudget(plugin.state.handle);
         _ = c.lua_getglobal(plugin.state.handle, "set_state");
         if (!plugin.state.isFunction(-1)) {
             plugin.state.pop(1);

@@ -149,9 +149,43 @@ zay.on("tool_call_finished", function(data)
 end)
 ```
 
-Callbacks run synchronously on the agent worker thread, at the boundary
-between tool calls (after the plugin's own handler has returned), so it is safe
-to read/write the plugin's own Lua state.
+Each loaded plugin has one shared Lua state across lanes. Globals and event
+subscriptions are shared, not lane-local. A per-instance execution mutex
+serializes handlers, callbacks and state persistence; different plugins can
+execute concurrently. Callbacks run synchronously on the calling worker at
+tool boundaries, with that worker's cwd and classifier context. Within one
+worker, started → handler → finished order is preserved; events from different
+lanes have no total ordering guarantee. Event delivery checks host-owned
+subscription bits before entering Lua. It has
+a shared 1000 ms budget for waiting and callbacks across subscribed plugins.
+Delivery is best-effort: a busy instance that exhausts the wait budget is
+skipped and logged; events are not queued for later replay. A callback that
+exhausts the execution budget stops the remaining callbacks.
+
+Tool registration is initialization-only. Tool names, descriptions and schemas
+are captured after `init.lua`; UI/provider reads use independent owned copies
+without entering Lua or waiting for the execution mutex.
+
+Tool calls wait at most 1000 ms for the instance mutex, then return
+`PluginBusy`. Cancellation while waiting exits before touching Lua. Running
+handlers retain the mutex through bridge I/O. Their sandbox budget starts
+after the mutex is acquired. Cancellation and resource exhaustion remain
+latched until the next host dispatch: `pcall`, `xpcall`, and coroutine resume
+cannot swallow them. Ordinary Lua errors remain catchable. The instruction
+hook also runs for `full_access` and timeout-only configurations; zero limits
+disable those limits but retain cancellation checks.
+
+Shell and git subprocesses use the remaining Lua deadline, and permitted
+`os.execute` uses the bounded native shell bridge. Classifier network requests
+have a cancelable watchdog covering connection, response headers, and body.
+File reads reject non-regular files. These protections do not provide a hard
+kill for uninterruptible kernel/filesystem I/O. Trusted `full_access` plugins
+can also replace hooks or invoke arbitrary native code; a strict termination
+guarantee would require process isolation.
+
+Reload, unload and project repoint refuse with `InFlightTurn` while
+turns or dispatches remain active. Owners must cancel and join workers before
+teardown, including workers still interrupting.
 
 ### Plugin state persistence (reload)
 

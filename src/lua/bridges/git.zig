@@ -8,6 +8,7 @@ const c = @import("c");
 const State = @import("../state.zig").State;
 const bridge = @import("../bridge.zig");
 const bash_exec = @import("../../tools/bash_exec.zig");
+const execution = @import("../execution.zig");
 
 fn getIo(L: *c.lua_State) std.Io {
     return bridge.getIo(L);
@@ -131,7 +132,7 @@ pub fn gitStatus(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer resolved.deinit();
 
-    var result = bash_exec.run(std.heap.page_allocator, io, resolved.path, "git status --porcelain") catch |err| {
+    var result = runGitCommand(L_ptr, io, resolved.path, "git status --porcelain", null) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -186,7 +187,7 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     }
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = resolved.path, .command = cmd }) catch |err| {
+    var result = runGitCommand(L_ptr, io, resolved.path, cmd, null) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -228,7 +229,7 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = resolved.path, .command = cmd }) catch |err| {
+    var result = runGitCommand(L_ptr, io, resolved.path, cmd, null) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -260,7 +261,7 @@ pub fn gitBranch(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer resolved.deinit();
 
-    var result = bash_exec.run(std.heap.page_allocator, io, resolved.path, "git branch --show-current") catch |err| {
+    var result = runGitCommand(L_ptr, io, resolved.path, "git branch --show-current", null) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -358,10 +359,7 @@ pub fn gitAdd(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
-        .cwd = cwd,
-        .command = cmd,
-    }) catch |err| {
+    var result = runGitCommand(L_ptr, io, cwd, cmd, null) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -465,11 +463,7 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
-        .cwd = cwd,
-        .command = cmd,
-        .stdin = msg,
-    }) catch |err| {
+    var result = runGitCommand(L_ptr, io, cwd, cmd, msg) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -554,4 +548,17 @@ test "quoteShellArg: PowerShell rules (pwsh_rules = true)" {
         defer gpa.free(q);
         try std.testing.expectEqualStrings("'x''; rm -rf ~; #'", q);
     }
+}
+
+fn runGitCommand(L: *c.lua_State, io: std.Io, cwd: []const u8, command: []const u8, stdin: ?[]const u8) !bash_exec.Result {
+    return bash_exec.runWithOptions(std.heap.page_allocator, io, .{
+        .cwd = cwd,
+        .command = command,
+        .stdin = stdin,
+        .cancel_requested = bridge.cancel_requested_slot,
+        .timeout = execution.ioTimeout(L, bash_exec.timeout_seconds_default),
+    }) catch |err| {
+        execution.noteError(L, err);
+        return err;
+    };
 }
