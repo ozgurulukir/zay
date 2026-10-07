@@ -110,6 +110,7 @@ pub fn createSandboxedState(permissions: Permissions) !State {
 /// Returns `error.LuaInitFailed` if the Lua runtime cannot allocate the state.
 pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ LuaInitFailed, OutOfMemory }!State {
     const L = c.luaL_newstate() orelse return error.LuaInitFailed;
+    errdefer c.lua_close(L);
 
     // Initialize extraspace to null (no hook data yet)
     @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = null;

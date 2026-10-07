@@ -271,6 +271,9 @@ const OverlayInner = struct {
             .name = plugin.name,
             .active = plugin.active,
             .enabled = plugin.enabled,
+            .missing = plugin.path.len == 0,
+            .failed = plugin.diagnostic != null and plugin.path.len > 0,
+            .shadowed = plugin.shadowed,
         });
 
         var available: std.ArrayList(plugins_status.StoreEntry) = .empty;
@@ -283,20 +286,54 @@ const OverlayInner = struct {
                     .name = entry.plugin.name,
                     .version = entry.plugin.version,
                     .store = entry.store_name,
-                    .installed = app.plugin_manager.get(entry.plugin.id) != null or
-                        !plugin_store_job.configuredEnabled(&app.cached_config, entry.plugin.id),
+                    .installed = plugin_store_job.isInstalled(app, entry.catalog_source, entry.plugin.id),
+                    .stale = catalogs.catalogs[entry.catalog_index].stale,
                 });
             }
         }
 
+        var sources: std.ArrayList(plugins_status.StoreSourceEntry) = .empty;
+        defer sources.deinit(ctx.arena);
+        if (app.plugin_store.catalogs) |*catalogs| {
+            for (catalogs.stores) |source| try sources.append(ctx.arena, .{
+                .url = source.url,
+                .enabled = source.enabled,
+                .catalog_name = source.catalog_name,
+                .stale = source.stale,
+                .failure = source.failure,
+            });
+        }
+
+        const selected = app.pickers.plugins.selection;
+        const details = if (app.pickers.plugins.view == .installed and selected < installed_plugins.len) blk: {
+            const row = installed_plugins[selected];
+            var requested: std.ArrayList([]const u8) = .empty;
+            defer requested.deinit(ctx.arena);
+            if (row.permissions.file_access) try requested.append(ctx.arena, "file");
+            if (row.permissions.network_access) try requested.append(ctx.arena, "network");
+            if (row.permissions.allow_os_execute) try requested.append(ctx.arena, "os.execute");
+            if (row.permissions.allow_os_remove) try requested.append(ctx.arena, "os.remove/rename");
+            if (row.permissions.full_access) try requested.append(ctx.arena, "full Lua access");
+            const permission_summary = if (requested.items.len == 0) "no extra permissions requested" else try std.mem.join(ctx.arena, ", ", requested.items);
+            break :blk try std.fmt.allocPrint(ctx.arena, "v{s} · {s} · {s} · manifest requests: {s} · {s}", .{ row.version, row.origin, if (row.managed) "Store-managed" else "manual", permission_summary, row.diagnostic orelse row.path });
+        } else if (app.pickers.plugins.view == .store and app.plugin_store.catalogs != null) blk: {
+            const entry = app.plugin_store.catalogs.?.entryAt(selected) orelse break :blk "";
+            break :blk try std.fmt.allocPrint(ctx.arena, "{s} · {s} · {s}", .{ entry.plugin.description, entry.catalog_source, if (plugin_store_job.verified(entry.plugin)) "verified files" else "unverified files" });
+        } else if (app.pickers.plugins.view == .sources and selected < sources.items.len) blk: {
+            const source = sources.items[selected];
+            break :blk source.failure orelse source.catalog_name orelse source.url;
+        } else "";
         var content: plugins_status.Content = .{
             .state = &app.pickers.plugins,
             .plugins = entries.items,
             .available = available.items,
+            .sources = sources.items,
             .store_url_input = app.input_buffers.plugin_store_url.items,
             .notice = app.plugin_store.notice,
             .installing = app.plugin_store.operation == .installing,
             .uninstalling = app.plugin_store.operation == .uninstalling,
+            .refreshing = app.plugin_store.operation == .refreshing or app.plugin_store.operation == .scanning,
+            .details = details,
         };
         return content.widget().draw(ctx);
     }

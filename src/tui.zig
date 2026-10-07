@@ -393,6 +393,7 @@ pub const App = struct {
         // client's serialized schema — without waiting for a
         // `mcp_connect_pending` tick.
         provider_model.registerPluginTools(&app);
+        try runtime.reconcilePluginPrompts(&app.plugin_manager);
         search_mod.start(gpa, io, runtime.cwd);
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
@@ -1580,7 +1581,7 @@ pub fn openPlugins(app: *App) void {
 
 pub fn closePlugins(app: *App) void {
     app.mode = .normal;
-    app.pickers.plugins.adding = false;
+    app.pickers.plugins.reset();
     app.input_buffers.plugin_store_url.clearRetainingCapacity();
     app.clearInput();
     app.clearPaletteInput();
