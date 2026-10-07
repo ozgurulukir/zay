@@ -316,16 +316,40 @@ pub const Client = struct {
             }
         }
 
+        if (table_names.items.len == 0) {
+            return SchemaResult{
+                .arena = arena,
+                .tables = &.{},
+            };
+        }
+
+        // Batch all pragma_table_info queries in a single pipeline roundtrip to eliminate N+1 queries.
+        var out: std.Io.Writer.Allocating = .init(aa);
+        defer out.deinit();
+        try out.writer.writeAll("{\"requests\":[");
+        for (table_names.items, 0..) |tbl_name, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            const table_param = [_]db.Value{.{ .text = tbl_name }};
+            try serializeHranaStatement(&out.writer, aa, "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)", &table_param);
+        }
+        try out.writer.writeAll(",{\"type\":\"close\"}]}");
+
+        const payload = try out.toOwnedSlice();
+        const response_bytes = try self.fetchPipeline(aa, io, payload);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, aa, response_bytes, .{}) catch return error.InvalidResponse;
+        if (parsed.value != .object) return error.InvalidResponse;
+
+        const results_arr = parsed.value.object.get("results") orelse return error.InvalidResponse;
+        if (results_arr != .array or results_arr.array.items.len != table_names.items.len + 1) return error.InvalidResponse;
+
+        try validateCloseResponse(results_arr.array.items[table_names.items.len], "schema close");
+
         var table_schemas: std.ArrayList(SchemaResult.TableSchema) = .empty;
         errdefer table_schemas.deinit(aa);
 
-        for (table_names.items) |tbl_name| {
-            const table_param = [_]db.Value{.{ .text = tbl_name }};
-            var info_query = self.query(
-                io,
-                "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
-                &table_param,
-            ) catch |err| {
+        for (table_names.items, 0..) |tbl_name, idx| {
+            const resp_obj = requireOkResponse(results_arr.array.items[idx], "execute", "schema pragma") catch |err| {
                 // A missing table is not an error here — pragma_table_info
                 // returns zero rows for one — so every failure on this path
                 // is transport/auth/protocol and must not silently shrink
@@ -333,27 +357,37 @@ pub const Client = struct {
                 log.warn("turso.schema: pragma_table_info failed for table \"{s}\": {s}", .{ tbl_name, @errorName(err) });
                 return err;
             };
-            defer info_query.deinit();
+
+            const result_data = resp_obj.object.get("result") orelse return error.InvalidResponse;
+            if (result_data != .object) return error.InvalidResponse;
+
+            const rows_val = result_data.object.get("rows") orelse return error.InvalidResponse;
+            if (rows_val != .array) return error.InvalidResponse;
 
             var cols: std.ArrayList(ColumnSchema) = .empty;
             errdefer cols.deinit(aa);
 
             // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-            for (info_query.rows) |row| {
-                if (row.len < 6) continue;
-                const col_name = switch (row[1]) {
+            for (rows_val.array.items) |row_item| {
+                if (row_item != .array or row_item.array.items.len < 6) continue;
+
+                const col_name_val = try parseHranaValue(aa, row_item.array.items[1]);
+                const col_name = switch (col_name_val) {
                     .text => |t| t,
                     else => continue,
                 };
-                const col_type = switch (row[2]) {
+                const col_type_val = try parseHranaValue(aa, row_item.array.items[2]);
+                const col_type = switch (col_type_val) {
                     .text => |t| t,
                     else => "TEXT",
                 };
-                const notnull = switch (row[3]) {
+                const notnull_val = try parseHranaValue(aa, row_item.array.items[3]);
+                const notnull = switch (notnull_val) {
                     .int => |v| (v != 0),
                     else => false,
                 };
-                const pk = switch (row[5]) {
+                const pk_val = try parseHranaValue(aa, row_item.array.items[5]);
+                const pk = switch (pk_val) {
                     .int => |v| (v != 0),
                     else => false,
                 };
@@ -371,7 +405,6 @@ pub const Client = struct {
                 .columns = try cols.toOwnedSlice(aa),
             });
         }
-
         return SchemaResult{
             .arena = arena,
             .tables = try table_schemas.toOwnedSlice(aa),
@@ -986,4 +1019,49 @@ test "schema propagates pragma_table_info failures instead of omitting tables" {
     const client = Client.init(gpa, endpoint, null);
 
     try std.testing.expectError(error.HttpError, client.schema(io, null));
+}
+
+
+test "schema fetches multiple table schemas in a single batched pipeline request" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const listing_body =
+        \\{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"name"}],"rows":[[{"type":"text","value":"users"}],[{"type":"text","value":"posts"}]]}}},{"type":"ok","response":{"type":"close"}}]}
+    ;
+    const pragma_batched_body =
+        \\{"results":[
+        \\  {"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"cid"},{"name":"name"},{"name":"type"},{"name":"notnull"},{"name":"dflt_value"},{"name":"pk"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"id"},{"type":"text","value":"INTEGER"},{"type":"integer","value":"1"},{"type":"null"},{"type":"integer","value":"1"}],[{"type":"integer","value":"1"},{"type":"text","value":"email"},{"type":"text","value":"TEXT"},{"type":"integer","value":"1"},{"type":"null"},{"type":"integer","value":"0"}]]}}},
+        \\  {"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"cid"},{"name":"name"},{"name":"type"},{"name":"notnull"},{"name":"dflt_value"},{"name":"pk"}],"rows":[[{"type":"integer","value":"0"},{"type":"text","value":"id"},{"type":"text","value":"INTEGER"},{"type":"integer","value":"1"},{"type":"null"},{"type":"integer","value":"1"}],[{"type":"integer","value":"1"},{"type":"text","value":"title"},{"type":"text","value":"TEXT"},{"type":"integer","value":"0"},{"type":"null"},{"type":"integer","value":"0"}]]}}},
+        \\  {"type":"ok","response":{"type":"close"}}
+        \\]}
+    ;
+    const responses = [_]mock_http_server.Response{
+        // 1st roundtrip: sqlite_master lists two tables.
+        .{ .status = .ok, .body = listing_body },
+        // 2nd roundtrip: batched pragma_table_info pipeline query for both tables in 1 HTTP roundtrip.
+        .{ .status = .ok, .body = pragma_batched_body },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(endpoint);
+    const client = Client.init(gpa, endpoint, null);
+
+    var res = try client.schema(io, null);
+    defer res.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), res.tables.len);
+    try std.testing.expectEqualStrings("users", res.tables[0].name);
+    try std.testing.expectEqual(@as(usize, 2), res.tables[0].columns.len);
+    try std.testing.expectEqualStrings("id", res.tables[0].columns[0].name);
+    try std.testing.expectEqualStrings("email", res.tables[0].columns[1].name);
+
+    try std.testing.expectEqualStrings("posts", res.tables[1].name);
+    try std.testing.expectEqual(@as(usize, 2), res.tables[1].columns.len);
+    try std.testing.expectEqualStrings("id", res.tables[1].columns[0].name);
+    try std.testing.expectEqualStrings("title", res.tables[1].columns[1].name);
 }
