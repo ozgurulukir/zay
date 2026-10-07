@@ -8,15 +8,20 @@ const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 
 pub const State = struct {
-    pub const View = enum { installed, store };
+    pub const View = enum { installed, store, sources };
 
     selection: usize = 0,
     view: View = .installed,
     adding: bool = false,
     confirming_uninstall: bool = false,
+    /// Borrowed from the immutable inventory; reset before its replacement.
+    confirmed_path: ?[]const u8 = null,
 
     pub fn reset(self: *State) void {
         self.selection = 0;
+        self.confirming_uninstall = false;
+        self.confirmed_path = null;
+        self.adding = false;
     }
 
     pub fn moveUp(self: *State) void {
@@ -37,10 +42,13 @@ pub const Content = struct {
     /// Catalog entries are a borrowed render snapshot owned by the TUI job
     /// state. Drawing never performs catalog I/O or touches PluginManager.
     available: []const StoreEntry = &.{},
+    sources: []const StoreSourceEntry = &.{},
     store_url_input: []const u8 = "",
     notice: ?[]const u8 = null,
     installing: bool = false,
     uninstalling: bool = false,
+    refreshing: bool = false,
+    details: []const u8 = "",
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -59,12 +67,18 @@ pub const Content = struct {
         );
 
         try panel.lineStyledAt(&surface, 0, "LUA PLUGINS", ctx, 2, p.panel_header);
-        const tabs = if (self.state.view == .installed) "[Installed]  Store" else "Installed  [Store]";
+        const tabs = switch (self.state.view) {
+            .installed => "[Installed]  Store  Sources",
+            .store => "Installed  [Store]  Sources",
+            .sources => "Installed  Store  [Sources]",
+        };
         try panel.lineStyledAt(&surface, 1, tabs, ctx, 2, p.info);
         const summary = if (self.state.view == .installed)
             try std.fmt.allocPrint(ctx.arena, "Installed: {d}", .{self.plugins.len})
+        else if (self.state.view == .store)
+            try std.fmt.allocPrint(ctx.arena, "Available: {d}", .{self.available.len})
         else
-            try std.fmt.allocPrint(ctx.arena, "Available: {d}", .{self.available.len});
+            try std.fmt.allocPrint(ctx.arena, "Custom stores: {d}", .{self.sources.len});
         try panel.lineStyledAt(&surface, 2, summary, ctx, 2, p.info);
 
         if (self.state.adding) {
@@ -75,7 +89,7 @@ pub const Content = struct {
             return surface;
         }
         if (self.state.confirming_uninstall) {
-            const selected = if (self.state.selection < self.plugins.len) self.plugins[self.state.selection].name else "plugin";
+            const selected = if (self.state.confirmed_path) |path| std.fs.path.basename(path) else "plugin";
             const prompt = try std.fmt.allocPrint(ctx.arena, "Remove {s}? This cannot be undone.", .{selected});
             try panel.lineStyledAt(&surface, 4, prompt, ctx, 2, p.notice);
             try panel.lineStyledAt(&surface, height -| 2, "[y] Remove  [Esc] Cancel", ctx, 2, p.thinking_body);
@@ -83,13 +97,27 @@ pub const Content = struct {
         }
 
         var row: u16 = 4;
+        const count = switch (self.state.view) {
+            .installed => self.plugins.len,
+            .store => self.available.len,
+            .sources => self.sources.len,
+        };
+        const reserved_rows: u16 = if (self.details.len > 0) 8 else 7;
+        const viewport = panel.ViewportWindow.compute(@intCast(self.state.selection), @intCast(count), height -| reserved_rows);
         var line_buf: [256]u8 = undefined;
         if (self.state.view == .installed) {
             for (self.plugins, 0..) |plugin, i| {
-                if (row >= height -| 3) break;
+                if (i < viewport.start_index) continue;
+                if (i >= viewport.end_index) break;
                 const is_selected = i == self.state.selection;
                 const style = if (is_selected) p.selected_item else p.thinking_body;
-                const status = if (!plugin.enabled and plugin.active)
+                const status = if (plugin.missing)
+                    "[missing]"
+                else if (plugin.failed)
+                    "[load error]"
+                else if (plugin.shadowed)
+                    "[shadowed]"
+                else if (!plugin.enabled and plugin.active)
                     "[off after restart]"
                 else if (!plugin.enabled)
                     "[disabled]"
@@ -107,29 +135,48 @@ pub const Content = struct {
                 row += 1;
             }
             if (self.plugins.len == 0) {
-                try panel.lineStyledAt(&surface, 4, "No plugins loaded. Install one into <project>/plugins.", ctx, 2, p.notice);
+                try panel.lineStyledAt(&surface, 4, if (self.refreshing) "Loading plugin inventory..." else "No plugins installed. Press Tab to browse the Store.", ctx, 2, p.notice);
             }
-        } else {
+        } else if (self.state.view == .store) {
             for (self.available, 0..) |plugin, i| {
-                if (row >= height -| 3) break;
+                if (i < viewport.start_index) continue;
+                if (i >= viewport.end_index) break;
                 const is_selected = i == self.state.selection;
                 const style = if (is_selected) p.selected_item else p.thinking_body;
-                const marker = if (plugin.installed) "●" else "+";
+                const marker = if (plugin.stale) "~" else if (plugin.installed) "●" else "+";
                 const line = std.fmt.bufPrint(&line_buf, "  {s} {s} v{s} — {s}", .{ marker, plugin.name, plugin.version, plugin.store }) catch
                     try std.fmt.allocPrint(ctx.arena, "  {s} {s} v{s} — {s}", .{ marker, plugin.name, plugin.version, plugin.store });
                 try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
                 row += 1;
             }
             if (self.available.len == 0) {
-                try panel.lineStyledAt(&surface, 4, "No catalogs loaded. Press [a] to add a store.", ctx, 2, p.notice);
+                try panel.lineStyledAt(&surface, 4, if (self.refreshing) "Refreshing catalogs..." else "No catalogs loaded. Press [a] to add a store.", ctx, 2, p.notice);
+            }
+        } else {
+            for (self.sources, 0..) |source, i| {
+                if (i < viewport.start_index) continue;
+                if (i >= viewport.end_index) break;
+                const style = if (i == self.state.selection) p.selected_item else p.thinking_body;
+                const marker = if (!source.enabled) "○" else if (source.failure != null) "!" else if (source.stale) "~" else "●";
+                const status = if (!source.enabled) "disabled" else source.failure orelse source.catalog_name orelse "No catalog loaded";
+                const line = std.fmt.bufPrint(&line_buf, "  {s} {s} — {s}", .{ marker, source.url, status }) catch
+                    try std.fmt.allocPrint(ctx.arena, "  {s} {s} — {s}", .{ marker, source.url, status });
+                try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
+                row += 1;
+            }
+            if (self.sources.len == 0) {
+                try panel.lineStyledAt(&surface, 4, "No custom stores. Press Tab for Store, then [a] to add one.", ctx, 2, p.notice);
             }
         }
 
+        if (self.details.len > 0) try panel.lineStyledAt(&surface, height -| 4, self.details, ctx, 2, p.info);
         if (self.notice) |notice| try panel.lineStyledAt(&surface, height -| 3, notice, ctx, 2, p.notice);
         const footer = if (self.state.view == .installed and self.uninstalling)
             "Removing plugin..."
         else if (self.state.view == .installed)
             "[Space] Enable/disable  [x] Remove  [Tab] Store  [Esc] Close"
+        else if (self.state.view == .sources)
+            "[Space] Enable/disable  [x] Remove  [r] Retry  [Tab] Store  [Esc] Close"
         else if (self.installing)
             "Installing..."
         else
@@ -143,6 +190,9 @@ pub const PluginEntry = struct {
     name: []const u8,
     active: bool,
     enabled: bool,
+    missing: bool = false,
+    failed: bool = false,
+    shadowed: bool = false,
 };
 
 pub const StoreEntry = struct {
@@ -150,6 +200,15 @@ pub const StoreEntry = struct {
     version: []const u8,
     store: []const u8,
     installed: bool,
+    stale: bool = false,
+};
+
+pub const StoreSourceEntry = struct {
+    url: []const u8,
+    enabled: bool = true,
+    catalog_name: ?[]const u8 = null,
+    stale: bool = false,
+    failure: ?[]const u8 = null,
 };
 
 test "plugins_status Content.draw renders plugins list correctly" {
@@ -230,4 +289,40 @@ test "plugins_status renders plugin names longer than the stack buffer" {
     try std.testing.expect(rendered.len >= 20);
     try std.testing.expect(std.mem.startsWith(u8, rendered, "  ● "));
     try std.testing.expect(std.mem.startsWith(u8, rendered[6..], long_name[0..16]));
+}
+
+test "plugins_status keeps last selection visible across resize with details" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var state: State = .{ .view = .store, .selection = 4 };
+    const available = [_]StoreEntry{
+        .{ .name = "first", .version = "1", .store = "test", .installed = false },
+        .{ .name = "second", .version = "1", .store = "test", .installed = false },
+        .{ .name = "third", .version = "1", .store = "test", .installed = false },
+        .{ .name = "fourth", .version = "1", .store = "test", .installed = false },
+        .{ .name = "last", .version = "1", .store = "test", .installed = false },
+    };
+    var content: Content = .{
+        .state = &state,
+        .plugins = &.{},
+        .available = &available,
+        .details = "Selected package details",
+    };
+
+    for ([_]u16{ 12, 9, 11 }) |height| {
+        const ctx: vxfw.DrawContext = .{
+            .arena = arena.allocator(),
+            .min = .{},
+            .max = .{ .width = 60, .height = height },
+            .cell_size = .{ .width = 10, .height = 20 },
+        };
+        const surface = try content.widget().draw(ctx);
+        var row_buf: [128]u8 = undefined;
+        const selected_row = panel.readRow(&surface, height - 5, &row_buf);
+        try std.testing.expect(std.mem.indexOf(u8, selected_row, "last v1") != null);
+        const detail_row = panel.readRow(&surface, height - 4, &row_buf);
+        try std.testing.expectEqualStrings(content.details, detail_row);
+        try std.testing.expectEqual(@as(usize, 4), state.selection);
+    }
 }

@@ -682,7 +682,10 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     const runtime = try app.gpa.create(runtime_mod.AgentRuntime);
     errdefer app.gpa.destroy(runtime);
     const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
-    errdefer current.gpa.free(diagnostics);
+    var runtime_initialized = false;
+    errdefer {
+        if (runtime_initialized) runtime.deinit() else current.gpa.free(diagnostics);
+    }
     // Host identity carried from the process boundary (App init); tests that
     // build a bare App fall back to the same sentinel the session layer uses.
     const host_id: []const u8 = if (app.host_id.len > 0) app.host_id else "default-host";
@@ -716,6 +719,8 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
         });
     }
 
+    runtime_initialized = true;
+
     // If config was reloaded, replace the app's cached config and re-sync MCP.
     if (reloaded_config) |rc| {
         if (app.cached_config_owned) app.cached_config.deinit(app.gpa);
@@ -731,6 +736,7 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
 
     // Cross-project plugin repoint: sync config, repoint discovery, re-register.
     if (cross_project) {
+        try @import("plugin_store_job.zig").repoint(app, cwd);
         app.plugin_manager.syncPluginConfig(app.cached_config.plugins) catch |err| {
             log.warn("session.plugin.syncPluginConfig_failed err={s}", .{@errorName(err)});
         };
@@ -743,6 +749,7 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
         // Push the merged list into every live, turn-free lane client (the
         // anyLaneTurnActive refusal above guarantees none is mid-turn).
         provider_model.refreshAllLaneTools(app);
+        try runtime.reconcilePluginPrompts(&app.plugin_manager);
     }
 
     runtime.agent.background_manager = app.background;

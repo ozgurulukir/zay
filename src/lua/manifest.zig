@@ -10,6 +10,65 @@ const log = std.log.scoped(.lua);
 const State = @import("state.zig").State;
 const bridge = @import("bridge.zig");
 const sandbox = @import("sandbox.zig");
+const platform = @import("platform");
+
+pub const max_manifest_bytes = 256 * 1024;
+
+/// Evaluate metadata without opening any Lua libraries or Zay bridges. The
+/// allocator is bounded even during compilation; hooks alone cannot bound C
+/// library allocations or parser work. No pcall/coroutine globals are exposed,
+/// so a manifest cannot catch a budget error and keep running.
+pub fn evaluate(gpa: std.mem.Allocator, bytes: []const u8) !Manifest {
+    if (bytes.len > max_manifest_bytes) return error.ManifestTooLarge;
+    var budget: ManifestBudget = .{ .deadline_ns = platform.monotonicNowNs() + std.time.ns_per_s };
+    const handle = c.lua_newstate(ManifestBudget.allocate, &budget) orelse return error.OutOfMemory;
+    var state: State = .{ .handle = handle };
+    defer state.deinit();
+    @as(*?*ManifestBudget, @ptrCast(@alignCast(c.lua_getextraspace(handle)))).* = &budget;
+    c.lua_sethook(handle, ManifestBudget.hook, c.LUA_MASKCOUNT, 1000);
+    const source = if (std.mem.startsWith(u8, bytes, "\xEF\xBB\xBF")) bytes[3..] else bytes;
+    const load_status = c.luaL_loadbufferx(handle, source.ptr, source.len, "plugin.lua", "t");
+    if (load_status == c.LUA_ERRMEM) return error.ManifestMemoryLimit;
+    if (load_status != c.LUA_OK) return error.InvalidManifest;
+    const run_status = c.lua_pcallk(handle, 0, 1, 0, 0, null);
+    if (run_status == c.LUA_ERRMEM) return error.ManifestMemoryLimit;
+    if (budget.exhausted) return error.ManifestInstructionLimit;
+    if (run_status != c.LUA_OK) return error.InvalidManifest;
+    return Manifest.parse(gpa, &state);
+}
+
+const ManifestBudget = struct {
+    used_bytes: usize = 0,
+    hook_count: u32 = 0,
+    exhausted: bool = false,
+    deadline_ns: i128 = 0,
+
+    fn allocate(context: ?*anyopaque, pointer: ?*anyopaque, old_size: usize, new_size: usize) callconv(.c) ?*anyopaque {
+        const self: *ManifestBudget = @ptrCast(@alignCast(context.?));
+        const accounted_old_size = if (pointer == null) 0 else old_size;
+        if (new_size == 0) {
+            std.c.free(pointer);
+            self.used_bytes -= accounted_old_size;
+            return null;
+        }
+        const retained = self.used_bytes - accounted_old_size;
+        if (new_size > 2 * 1024 * 1024 - retained) return null;
+        const next = std.c.realloc(pointer, new_size) orelse return null;
+        self.used_bytes = retained + new_size;
+        return next;
+    }
+
+    fn hook(handle: ?*c.lua_State, debug: [*c]c.lua_Debug) callconv(.c) void {
+        _ = debug;
+        const state = handle.?;
+        const self = @as(*?*ManifestBudget, @ptrCast(@alignCast(c.lua_getextraspace(state)))).*.?;
+        self.hook_count += 1;
+        if (self.hook_count >= 1000 or platform.monotonicNowNs() >= self.deadline_ns) {
+            self.exhausted = true;
+            _ = c.luaL_error(state, "manifest instruction limit exceeded");
+        }
+    }
+};
 
 /// Parsed plugin manifest.
 pub const Manifest = struct {
@@ -100,9 +159,9 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
     // Clamp on the i64 before the u32 cast so a negative value (a manifest typo
     // or a hand-edited plugin.lua) cannot wrap to ~4e9. 0 keeps its "unlimited"
     // semantics, so clamp only the lower bound at 0.
-    if (bridge.getTableInteger(L, -1, "instruction_limit")) |v| perms.instruction_limit = @intCast(@max(v, 0));
-    if (bridge.getTableInteger(L, -1, "memory_limit_mb")) |v| perms.memory_limit_mb = @intCast(@max(v, 0));
-    if (bridge.getTableInteger(L, -1, "timeout_ms")) |v| perms.timeout_ms = @intCast(@max(v, 0));
+    if (bridge.getTableInteger(L, -1, "instruction_limit")) |v| perms.instruction_limit = @intCast(std.math.clamp(v, 0, std.math.maxInt(u32)));
+    if (bridge.getTableInteger(L, -1, "memory_limit_mb")) |v| perms.memory_limit_mb = @intCast(std.math.clamp(v, 0, std.math.maxInt(u32)));
+    if (bridge.getTableInteger(L, -1, "timeout_ms")) |v| perms.timeout_ms = @intCast(std.math.clamp(v, 0, std.math.maxInt(u32)));
 
     return perms;
 }
@@ -161,6 +220,34 @@ test "manifest: parse valid table" {
     try testing.expectEqualStrings("test_plugin", manifest.name);
     try testing.expectEqualStrings("1.0.0", manifest.version);
     try testing.expectEqualStrings("dev", manifest.author);
+}
+
+test "manifest evaluator has no host libraries or plugin bridges" {
+    var manifest = try evaluate(std.testing.allocator,
+        \\return { name = "safe", version = "1", description = os or io or package or debug or zay or plugin or load or pcall or coroutine or "isolated" }
+    );
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("isolated", manifest.description);
+    try std.testing.expectError(error.InvalidManifest, evaluate(std.testing.allocator, "os.execute('echo unsafe'); return {}"));
+    try std.testing.expectError(error.InvalidManifest, evaluate(std.testing.allocator, "io.open('manifest-marker', 'w'); return {}"));
+}
+
+test "manifest evaluator bounds instructions and allocations" {
+    try std.testing.expectError(error.ManifestInstructionLimit, evaluate(std.testing.allocator, "while true do end"));
+    try std.testing.expectError(error.ManifestMemoryLimit, evaluate(std.testing.allocator, "local t = {}; for i = 1, 90000 do t[i] = {} end; return t"));
+}
+
+test "manifest evaluator accepts every shipped manifest" {
+    inline for (.{ "hello-world", "todo", "file-tools", "search-tools", "file-watcher", "git-tools", "path-tools", "modular-demo", "sitting-duck" }) |name| {
+        const file = try std.Io.Dir.openFile(.cwd(), std.testing.io, "plugins/packages/" ++ name ++ "/plugin.lua", .{});
+        defer file.close(std.testing.io);
+        var reader = file.reader(std.testing.io, &.{});
+        const bytes = try reader.interface.allocRemaining(std.testing.allocator, .limited(max_manifest_bytes));
+        defer std.testing.allocator.free(bytes);
+        var manifest = try evaluate(std.testing.allocator, bytes);
+        defer manifest.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(name, manifest.name);
+    }
 }
 
 test "manifest: missing name returns error" {

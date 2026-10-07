@@ -1,11 +1,11 @@
 ## Plugin Discovery
 
-Zay discovers plugins from two directories:
+Zay discovers plugins from these directories:
 
 | Directory | Scope |
 |-----------|-------|
 | `~/.config/zay/plugins/` | Global — available in all projects (on Windows, `%APPDATA%\zay\plugins` is probed first, falling back to `.config\zay\plugins`) |
-| `plugins/` | Checked-in distribution/catalog content; not the TUI install destination |
+| `plugins/` | Project-local plugins; `plugins/packages/` contains distribution/catalog packages |
 | `.zay/plugins/` | Project-local plugins — read as a fallback for existing projects |
 
 Each subdirectory containing a `plugin.lua` file is treated as a plugin.
@@ -18,18 +18,33 @@ otherwise it fetches the same catalog from the repository. Plugin packages and
 their catalog live together under `plugins/`. Press `a`, enter another HTTP(S)
 catalog URL, and press Enter to save it and refresh the catalog list. Select a
 plugin and press Enter to stage it into the user's global plugin directory.
+Use Tab to move among Installed, Store, and Sources. Sources shows custom
+catalog status, including stale cached entries and fetch errors. Press Space
+to disable or re-enable a source, `x` to remove it, and `r` to retry catalog
+refresh.
 Store URLs are persisted globally in `plugin-stores.json` under Zay's platform
 config directory; installing from a checkout does not make the checkout dirty.
 In the Installed tab, press Space to enable or disable a plugin for the current
 project; restart Zay to apply the change. Press `x` to remove a disabled global
-installation, confirm with `y`, then restart to finish unloading it. Project
+installation after restarting to unload it, and confirm with `y`. Project
 plugins are not deleted by the Store removal action.
 
 Remote catalogs use explicit file URLs and must include `plugin.lua` and
 `init.lua` for each plugin. Catalogs and files have bounded sizes, relative
 package paths, and safe plugin IDs; installs are published only after all
-files are validated. A newly installed plugin is loaded by the next runtime
-or session so a live Lua state is never torn down while a turn can dispatch.
+files are validated. Restart Zay to activate a newly installed plugin.
+Same-project sessions reuse the loaded plugin set. A guarded cross-project
+resume rediscovers project plugins only when no lane turn is active.
+
+### Plugin prompts
+
+A directory containing `plugin.lua` may provide `prompt.md` instructions.
+These use the manifest name for enablement and are included only for the
+active physical copy loaded by the runtime. Disabled, invalid, failed-init,
+and shadowed copies do not contribute tool instructions. A directory with
+`prompt.md` and no manifest is intentionally supported as standalone prompt
+content. Same-project lanes clone the assembled prompt inputs; plugin
+changes take effect at restart or the guarded project-switch boundary.
 
 ## Plugin API — `zay` Bridge Functions
 

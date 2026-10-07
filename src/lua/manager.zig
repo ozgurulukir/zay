@@ -84,6 +84,9 @@ pub const PluginManager = struct {
     legacy_project_dir: []const u8,
     /// Loaded plugins, indexed by name
     plugins: std.StringHashMapUnmanaged(*PluginInstance),
+    /// Recoverable discovery errors keyed by physical plugin directory.
+    /// Values use static error names so only map keys are owned.
+    load_failures: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Whether the manager has been initialized
     initialized: bool,
     /// Cloned per-plugin config entries (enabled/settings), synced from the
@@ -130,11 +133,40 @@ pub const PluginManager = struct {
             self.allocator.destroy(plugin);
         }
         self.plugins.deinit(self.allocator);
+        var failures = self.load_failures.iterator();
+        while (failures.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.load_failures.deinit(self.allocator);
         for (self.plugin_configs.items) |*pc| pc.deinit(self.allocator);
         self.plugin_configs.deinit(self.allocator);
         if (self.global_dir.len > 0) self.allocator.free(self.global_dir);
         if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
         if (self.legacy_project_dir.len > 0) self.allocator.free(self.legacy_project_dir);
+    }
+
+    fn recordLoadFailure(self: *Self, path: []const u8, err: anyerror) !void {
+        const reason = @errorName(err);
+        if (self.load_failures.getPtr(path)) |existing| {
+            existing.* = reason;
+            return;
+        }
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.load_failures.put(self.allocator, owned_path, reason);
+    }
+
+    fn clearLoadFailure(self: *Self, path: []const u8) void {
+        if (self.load_failures.fetchRemove(path)) |removed| self.allocator.free(removed.key);
+    }
+
+    fn clearLoadFailuresUnder(self: *Self, root: []const u8) void {
+        var failures = self.load_failures.iterator();
+        while (failures.next()) |entry| {
+            const path = entry.key_ptr.*;
+            if (!pluginDirUnderProjectDir(path, root)) continue;
+            // Removal does not resize the map, so iteration stays valid.
+            const removed = self.load_failures.fetchRemove(path).?;
+            self.allocator.free(removed.key);
+        }
     }
 
     /// Clone the per-plugin config entries (enabled/settings) into the manager.
@@ -216,17 +248,8 @@ pub const PluginManager = struct {
             }
         }
 
-        // Check for duplicate
-        if (self.plugins.get(manifest.name)) |existing| {
-            // Project overrides global — unload the existing one
-            if (!existing.manifest.is_embedded) {
-                _ = self.plugins.remove(manifest.name);
-                existing.deinit(self.allocator);
-                self.allocator.destroy(existing);
-            } else {
-                return error.CannotOverrideEmbeddedPlugin;
-            }
-        }
+        const previous = self.plugins.get(manifest.name);
+        if (previous) |existing| if (existing.manifest.is_embedded) return error.CannotOverrideEmbeddedPlugin;
 
         // Determine permissions from manifest
         const permissions = if (is_embedded)
@@ -237,6 +260,10 @@ pub const PluginManager = struct {
         // Create the plugin instance with Io so zay.* bridge functions
         // (register_tool, read_file, etc.) are available in the sandbox.
         var L = try sandbox.createSandboxedStateWithIo(permissions, self.io);
+        errdefer {
+            sandbox.freeHookData(L.handle);
+            L.deinit();
+        }
 
         // Store the plugin root directory in the registry so zay.require knows its base path
         _ = c.lua_pushlstring(L.handle, dir_path.ptr, dir_path.len);
@@ -260,21 +287,30 @@ pub const PluginManager = struct {
         log.debug("plugin.loadOne.init path={s} loaded={}", .{ init_path, loaded });
         if (!loaded) {
             log.warn("plugin.loadOne.init_failed path={s}", .{init_path});
-            sandbox.freeHookData(L.handle);
-            L.deinit();
             return error.PluginInitFailed;
         }
 
         const instance = try self.allocator.create(PluginInstance);
+        errdefer self.allocator.destroy(instance);
+        const owned_dir = try self.allocator.dupe(u8, dir_path);
+        errdefer self.allocator.free(owned_dir);
+        // Reserve before replacing: failures leave the old Lua state and map
+        // key intact. A map replacement must replace its borrowed key too.
+        try self.plugins.ensureUnusedCapacity(self.allocator, 1);
         instance.* = .{
             .manifest = manifest,
             .state = L,
-            .dir_path = try self.allocator.dupe(u8, dir_path),
+            .dir_path = owned_dir,
             .active = true,
             .permissions = permissions,
         };
 
-        try self.plugins.put(self.allocator, instance.manifest.name, instance);
+        if (previous) |existing| {
+            _ = self.plugins.remove(existing.manifest.name);
+            existing.deinit(self.allocator);
+            self.allocator.destroy(existing);
+        }
+        self.plugins.putAssumeCapacity(instance.manifest.name, instance);
 
         return instance;
     }
@@ -459,6 +495,7 @@ pub const PluginManager = struct {
 
                     const plugin_dir = try std.fs.path.join(self.allocator, &.{ self.global_dir, entry.name });
                     defer self.allocator.free(plugin_dir);
+                    self.clearLoadFailure(plugin_dir);
 
                     const manifest_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, "plugin.lua" });
                     defer self.allocator.free(manifest_path);
@@ -468,6 +505,7 @@ pub const PluginManager = struct {
                     _ = self.loadOne(plugin_dir, false) catch |err| switch (err) {
                         error.PluginDisabled => continue,
                         else => {
+                            try self.recordLoadFailure(plugin_dir, err);
                             log.warn("plugin.repoint.global_restore_failed name={s} reason={s}", .{ entry.name, @errorName(err) });
                             continue;
                         },
@@ -478,6 +516,8 @@ pub const PluginManager = struct {
 
         // Step 4: free old project roots, store both new roots. Transferring
         // ownership disarms the corresponding errdefers.
+        self.clearLoadFailuresUnder(old_project_dir);
+        self.clearLoadFailuresUnder(old_legacy_project_dir);
         if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
         self.project_dir = new_project_dir;
         new_project_dir = "";
@@ -567,6 +607,9 @@ pub const PluginManager = struct {
     /// Load all plugins from a directory.
     fn loadFromDir(self: *Self, dir_path: []const u8, is_embedded: bool) !void {
         log.debug("plugin.loadFromDir.start dir={s} is_embedded={}", .{ dir_path, is_embedded });
+        // Each scan replaces its diagnostic snapshot, including deleted
+        // packages and roots that no longer exist.
+        self.clearLoadFailuresUnder(dir_path);
         var dir = std.Io.Dir.openDir(.cwd(), self.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
                 log.warn("plugin.loadFromDir.not_found dir={s}", .{dir_path});
@@ -591,6 +634,7 @@ pub const PluginManager = struct {
 
             const plugin_dir = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
             defer self.allocator.free(plugin_dir);
+            self.clearLoadFailure(plugin_dir);
 
             // Check for plugin.lua manifest
             const manifest_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, "plugin.lua" });
@@ -602,11 +646,14 @@ pub const PluginManager = struct {
                 if (err == error.PluginDisabled) {
                     // A disabled plugin is a skip, not a load failure.
                     log.info("plugin.load.skipped_disabled path={s}", .{plugin_dir});
+                    self.clearLoadFailure(plugin_dir);
                     continue;
                 }
+                try self.recordLoadFailure(plugin_dir, err);
                 log.warn("plugin.load.failed path={s} reason={s}", .{ plugin_dir, @errorName(err) });
                 continue;
             };
+            self.clearLoadFailure(plugin_dir);
         }
     }
 
@@ -615,14 +662,9 @@ pub const PluginManager = struct {
         const manifest_path = try std.fs.path.join(self.allocator, &.{ dir_path, "plugin.lua" });
         defer self.allocator.free(manifest_path);
 
-        var L = try State.init();
-        defer L.deinit();
-
-        if (!self.loadLuaFile(&L, manifest_path)) {
-            return error.InvalidManifest;
-        }
-
-        return try Manifest.parse(self.allocator, &L);
+        const bytes = try self.readFileBytes(manifest_path);
+        defer self.allocator.free(bytes);
+        return @import("manifest.zig").evaluate(self.allocator, bytes);
     }
 
     /// Load a Lua file and execute it, leaving the result on the stack.
@@ -825,6 +867,35 @@ fn writeFixturePlugin(abs_root: []const u8, name: []const u8, init_lua: []const 
     defer std.testing.allocator.free(manifest);
     try d.writeFile(std.testing.io, .{ .sub_path = "plugin.lua", .data = manifest });
     try d.writeFile(std.testing.io, .{ .sub_path = "init.lua", .data = init_lua });
+}
+
+test "disabled hostile manifests cannot access the host or evade budgets" {
+    const testing = std.testing;
+    const root = "/tmp/zay_test_disabled_hostile_manifest";
+    const plugins_root = root ++ "/plugins";
+    const marker = root ++ "/marker";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+    try writeFixturePlugin(plugins_root, "hostile", "return {}");
+    try writeFixturePlugin(plugins_root, "looping", "return {}");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = plugins_root ++ "/hostile/plugin.lua",
+        .data = "os.execute('touch " ++ marker ++ "'); return {name='hostile',version='1'}",
+    });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = plugins_root ++ "/looping/plugin.lua",
+        .data = "while true do end; return {name='looping',version='1'}",
+    });
+    var manager = PluginManager.init(testing.allocator, testing.io, "", root);
+    defer manager.deinit();
+    var hostile: plugin_config.PluginConfig = .{ .name = try testing.allocator.dupe(u8, "hostile"), .enabled = false };
+    defer hostile.deinit(testing.allocator);
+    var looping: plugin_config.PluginConfig = .{ .name = try testing.allocator.dupe(u8, "looping"), .enabled = false };
+    defer looping.deinit(testing.allocator);
+    try manager.syncPluginConfig(&.{ hostile, looping });
+    try testing.expectEqual(@as(usize, 0), try manager.loadAll());
+    try testing.expectEqualStrings("InvalidManifest", manager.load_failures.get(plugins_root ++ "/hostile").?);
+    try testing.expectEqualStrings("ManifestInstructionLimit", manager.load_failures.get(plugins_root ++ "/looping").?);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, marker, .{}));
 }
 
 test "plugin manager: syncPluginConfig skips disabled plugins (P2)" {
@@ -1145,6 +1216,37 @@ test "plugin manager: file-watcher counts a real failed/successful completion ev
 }
 
 // ── repointProjectDir tests ──────────────────────────────────────
+
+test "plugin load diagnostics prune departed projects and removed packages" {
+    const testing = std.testing;
+    const root = "/tmp/zay_test_load_failure_pruning";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+    const old_root = root ++ "/old/plugins";
+    const legacy_root = root ++ "/old/.zay/plugins";
+    const global_root = root ++ "/home/.config/zay/plugins";
+    try writeFixturePlugin(old_root, "old_bad", "error('broken')");
+    try writeFixturePlugin(legacy_root, "legacy_bad", "error('broken')");
+    try writeFixturePlugin(global_root, "global_bad", "error('broken')");
+    var manager = PluginManager.init(testing.allocator, testing.io, root ++ "/home", root ++ "/old");
+    defer manager.deinit();
+    _ = try manager.loadAll();
+    try testing.expectEqual(@as(u32, 3), manager.load_failures.count());
+    // A sibling with a shared path prefix must not be pruned.
+    try manager.recordLoadFailure(old_root ++ "-other/keep", error.PluginInitFailed);
+    try manager.repointProjectDir(root ++ "/new");
+    try testing.expectEqual(@as(u32, 2), manager.load_failures.count());
+    try testing.expect(manager.load_failures.contains(global_root ++ "/global_bad"));
+    try testing.expect(manager.load_failures.contains(old_root ++ "-other/keep"));
+
+    try std.Io.Dir.cwd().deleteTree(testing.io, global_root ++ "/global_bad");
+    try manager.loadFromDir(global_root, false);
+    try testing.expect(!manager.load_failures.contains(global_root ++ "/global_bad"));
+    try manager.recordLoadFailure(global_root ++ "/missing", error.PluginInitFailed);
+    try std.Io.Dir.cwd().deleteTree(testing.io, global_root);
+    try manager.loadFromDir(global_root, false);
+    try testing.expect(!manager.load_failures.contains(global_root ++ "/missing"));
+    try testing.expectEqual(@as(u32, 1), manager.load_failures.count());
+}
 
 test "repointProjectDir swaps project plugins, keeps globals" {
     const testing = std.testing;

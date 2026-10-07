@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const plugin_store = @import("../plugin_store.zig");
+const package = @import("../plugin_package.zig");
+const sandbox = @import("../lua/sandbox.zig");
 const config_mod = @import("../config/config.zig");
 const job_mod = @import("job.zig");
 const paths = @import("../paths.zig");
@@ -15,15 +17,29 @@ const tui = @import("../tui.zig");
 const App = tui.App;
 
 pub const RefreshResult = union(enum) {
-    ready: plugin_store.CatalogBundle,
+    ready: struct { catalogs: plugin_store.CatalogBundle, inventory: package.Inventory },
     failed: []u8,
 
     fn deinit(self: *RefreshResult, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .ready => |*bundle| bundle.deinit(gpa),
+            .ready => |*snapshot| {
+                snapshot.catalogs.deinit(gpa);
+                snapshot.inventory.deinit(gpa);
+            },
             .failed => |message| if (message.len > 0) gpa.free(message),
         }
         self.* = undefined;
+    }
+};
+
+pub const InventoryResult = union(enum) {
+    ready: package.Inventory,
+    failed: []u8,
+    fn deinit(self: *InventoryResult, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .ready => |*inventory| inventory.deinit(gpa),
+            .failed => |message| if (message.len > 0) gpa.free(message),
+        }
     }
 };
 
@@ -56,11 +72,19 @@ pub const InstalledPlugin = struct {
     name: []const u8,
     active: bool,
     enabled: bool,
+    path: []const u8 = "",
+    version: []const u8 = "unknown",
+    origin: []const u8 = "settings only",
+    diagnostic: ?[]const u8 = null,
+    managed: bool = false,
+    shadowed: bool = false,
+    permissions: sandbox.Permissions = .{},
 };
 
 pub const Operation = union(enum) {
     idle,
-    refreshing: struct { job: job_mod.Job(RefreshResult) },
+    refreshing: struct { job: job_mod.Job(RefreshResult), generation: u64 },
+    scanning: struct { job: job_mod.Job(InventoryResult), generation: u64 },
     installing: struct { job: job_mod.Job(InstallResult) },
     uninstalling: struct { job: job_mod.Job(UninstallResult) },
 };
@@ -69,11 +93,16 @@ pub const State = struct {
     catalogs: ?plugin_store.CatalogBundle = null,
     operation: Operation = .idle,
     notice: ?[]u8 = null,
+    inventory: package.Inventory = .{},
+    project_root: []u8 = &.{},
+    generation: u64 = 0,
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         std.debug.assert(self.operation == .idle);
         if (self.catalogs) |*bundle| bundle.deinit(gpa);
         if (self.notice) |message| gpa.free(message);
+        self.inventory.deinit(gpa);
+        if (self.project_root.len > 0) gpa.free(self.project_root);
         self.* = undefined;
     }
 };
@@ -84,20 +113,49 @@ pub fn installedPlugins(gpa: std.mem.Allocator, app: *App) ![]InstalledPlugin {
     var rows: std.ArrayList(InstalledPlugin) = .empty;
     errdefer rows.deinit(gpa);
 
-    var iter = app.plugin_manager.iterator();
-    while (iter.next()) |entry| {
-        const name = entry.value_ptr.*.manifest.name;
+    for (app.plugin_store.inventory.packages) |*disk| {
+        const name = disk.name();
+        const loaded = app.plugin_manager.get(name);
+        const same_copy = if (loaded) |entry| paths.pathsEqual(entry.dir_path, disk.path) else false;
         try rows.append(gpa, .{
             .name = name,
-            .active = entry.value_ptr.*.active,
+            .active = if (same_copy) loaded.?.active else false,
             .enabled = configuredEnabled(&app.cached_config, name),
+            .path = disk.path,
+            .version = disk.version(),
+            .origin = @tagName(disk.origin),
+            .diagnostic = disk.diagnostic orelse app.plugin_manager.load_failures.get(disk.path),
+            .managed = disk.origin == .global and disk.receipt != null and disk.ordinary_directory,
+            .shadowed = loaded != null and !same_copy,
+            .permissions = if (disk.manifest) |value| value.permissions else .{},
         });
     }
     for (app.cached_config.plugins) |configured| {
-        if (configured.enabled or app.plugin_manager.get(configured.name) != null) continue;
-        try rows.append(gpa, .{ .name = configured.name, .active = false, .enabled = false });
+        var exists = false;
+        for (rows.items) |row| if (std.mem.eql(u8, row.name, configured.name)) {
+            exists = true;
+            break;
+        };
+        if (exists) continue;
+        try rows.append(gpa, .{ .name = configured.name, .active = false, .enabled = configured.enabled, .diagnostic = "Package is missing; project preference retained." });
     }
     return rows.toOwnedSlice(gpa);
+}
+
+/// Invalidates only project-scoped snapshots. The armed job stays in place
+/// until adoption/join; moving it would invalidate its captured done pointer.
+pub fn repoint(app: *App, project_root: []const u8) !void {
+    if (paths.pathsEqual(app.plugin_store.project_root, project_root)) return;
+    const owned = try app.gpa.dupe(u8, project_root);
+    if (app.plugin_store.project_root.len > 0) app.gpa.free(app.plugin_store.project_root);
+    app.plugin_store.project_root = owned;
+    app.plugin_store.generation += 1;
+    if (app.plugin_store.catalogs) |*catalogs| catalogs.deinit(app.gpa);
+    app.plugin_store.catalogs = null;
+    app.plugin_store.inventory.deinit(app.gpa);
+    app.pickers.plugins.reset();
+    app.pickers.plugins.confirming_uninstall = false;
+    app.pickers.plugins.adding = false;
 }
 
 pub fn configuredEnabled(config: *const config_mod.Config, name: []const u8) bool {
@@ -105,6 +163,24 @@ pub fn configuredEnabled(config: *const config_mod.Config, name: []const u8) boo
         if (std.mem.eql(u8, entry.name, name)) return entry.enabled;
     }
     return true;
+}
+
+pub fn isInstalled(app: *const App, catalog: []const u8, id: []const u8) bool {
+    for (app.plugin_store.inventory.packages) |disk| {
+        const receipt = disk.receipt orelse continue;
+        if (disk.origin == .global and std.mem.eql(u8, receipt.value.id, id) and std.mem.eql(u8, receipt.value.catalog, catalog)) return true;
+    }
+    return false;
+}
+
+pub fn verified(plugin: *const plugin_store.Plugin) bool {
+    return switch (plugin.source) {
+        .local_dir => true,
+        .files => |files| blk: {
+            for (files) |file| if (file.sha256 == null) break :blk false;
+            break :blk true;
+        },
+    };
 }
 
 pub fn isProjectPlugin(app: *App, name: []const u8) bool {
@@ -145,42 +221,41 @@ pub fn uninstall(app: *App, name: []const u8) void {
         const message: []const u8 = switch (err) {
             error.ProjectPluginNotStoreManaged => "Store removal only removes global installs; project plugins are kept.",
             error.DisableAndRestartFirst, error.RestartRequired => "Disable this plugin and restart Zay before removing it.",
+            error.UnmanagedInstallation => "This plugin is not Store-managed; remove it manually by its directory.",
             error.PluginNotFound => "No global Store install found; project plugins are kept by Store removal.",
             error.InvalidPluginName => "Could not remove plugin: invalid plugin name.",
             error.PluginOperationBusy => "Another plugin operation is already in progress.",
-            error.ProjectPathUnavailable, error.NoActiveRuntime => "Could not remove plugin: project paths are unavailable.",
             else => "Could not start plugin removal.",
         };
         setNotice(app, message);
     };
 }
 
-pub fn startUninstall(app: *App, name: []const u8) !void {
+pub fn startUninstall(app: *App, selected_path: []const u8) !void {
     if (app.plugin_store.operation != .idle) return error.PluginOperationBusy;
-    if (isProjectPlugin(app, name)) return error.ProjectPluginNotStoreManaged;
-    if (configuredEnabled(&app.cached_config, name)) return error.DisableAndRestartFirst;
-    if (app.plugin_manager.get(name) != null) return error.RestartRequired;
-
-    const runtime = app.liveRuntime() orelse app.templateRuntime() orelse return error.NoActiveRuntime;
-    if (runtime.home_dir.len == 0 or runtime.cwd.len == 0) return error.ProjectPathUnavailable;
-    if (!safePluginDirectoryName(name)) return error.InvalidPluginName;
-
-    const plugin_dir = findPluginDirectory(app, runtime.home_dir, name) orelse return error.PluginNotFound;
-    const worker = app.gpa.create(UninstallWorker) catch |err| {
-        app.gpa.free(plugin_dir);
-        return err;
+    var selected: ?*const package.Package = null;
+    for (app.plugin_store.inventory.packages) |*disk| if (paths.pathsEqual(disk.path, selected_path)) {
+        selected = disk;
+        break;
     };
-    const name_copy = app.gpa.dupe(u8, name) catch |err| {
-        app.gpa.destroy(worker);
-        app.gpa.free(plugin_dir);
-        return err;
-    };
-    worker.* = .{ .gpa = app.gpa, .io = app.io, .name = name_copy, .plugin_dir = plugin_dir };
-
+    const disk = selected orelse return error.PluginNotFound;
+    if (disk.origin != .global) return error.ProjectPluginNotStoreManaged;
+    if (!disk.ordinary_directory or disk.receipt == null) return error.UnmanagedInstallation;
+    if (configuredEnabled(&app.cached_config, disk.name())) return error.DisableAndRestartFirst;
+    if (app.plugin_manager.get(disk.name()) != null) return error.RestartRequired;
+    const root = std.fs.path.dirname(disk.path) orelse return error.InvalidPluginName;
+    const worker = try app.gpa.create(UninstallWorker);
+    errdefer app.gpa.destroy(worker);
+    const root_copy = try app.gpa.dupe(u8, root);
+    errdefer app.gpa.free(root_copy);
+    const directory = try app.gpa.dupe(u8, disk.directory);
+    errdefer app.gpa.free(directory);
+    const fingerprint_copy = try app.gpa.dupe(u8, disk.receipt.?.value.fingerprint);
+    errdefer app.gpa.free(fingerprint_copy);
+    worker.* = .{ .gpa = app.gpa, .io = app.io, .root = root_copy, .directory = directory, .fingerprint = fingerprint_copy };
     app.plugin_store.operation = .{ .uninstalling = .{ .job = .{} } };
     app.plugin_store.operation.uninstalling.job.spawn(app.io, worker, runUninstall) catch |err| {
         app.plugin_store.operation = .idle;
-        worker.deinit();
         return err;
     };
 }
@@ -188,57 +263,28 @@ pub fn startUninstall(app: *App, name: []const u8) !void {
 const UninstallWorker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    name: []u8,
-    plugin_dir: []u8,
+    root: []u8,
+    directory: []u8,
+    fingerprint: []u8,
 
     fn deinit(self: *UninstallWorker) void {
-        self.gpa.free(self.name);
-        self.gpa.free(self.plugin_dir);
+        self.gpa.free(self.root);
+        self.gpa.free(self.directory);
+        self.gpa.free(self.fingerprint);
         self.gpa.destroy(self);
     }
 };
 
 fn runUninstall(worker: *UninstallWorker) UninstallResult {
     defer worker.deinit();
-    std.Io.Dir.deleteTree(.cwd(), worker.io, worker.plugin_dir) catch |err| {
-        return .{ .failed = std.fmt.allocPrint(worker.gpa, "Could not remove {s}: {s}", .{ worker.name, @errorName(err) }) catch &.{} };
+    // Allocate the result before deletion so OOM cannot turn a committed
+    // removal into a pre-commit failure or erase the selected identity.
+    const directory = worker.gpa.dupe(u8, worker.directory) catch return .{ .failed = &.{} };
+    package.remove(worker.gpa, worker.io, worker.root, worker.directory, worker.fingerprint) catch |err| {
+        worker.gpa.free(directory);
+        return .{ .failed = failureMessage(worker.gpa, "Plugin removal failed", err) };
     };
-    return .{ .removed = worker.gpa.dupe(u8, worker.name) catch &.{} };
-}
-
-fn findPluginDirectory(app: *App, home_dir: []const u8, name: []const u8) ?[]u8 {
-    const global_root = paths.globalPluginsDir(app.gpa, app.io, home_dir) catch return null;
-    defer app.gpa.free(global_root);
-    if (!isOrdinaryPluginDirectory(app.io, global_root, name)) return null;
-    const global = std.fs.path.join(app.gpa, &.{ global_root, name }) catch return null;
-    if (hasPluginManifest(app.gpa, app.io, global)) return global;
-    app.gpa.free(global);
-    return null;
-}
-
-fn isOrdinaryPluginDirectory(io: std.Io, root_path: []const u8, name: []const u8) bool {
-    var root = std.Io.Dir.openDir(.cwd(), io, root_path, .{ .iterate = true }) catch return false;
-    defer root.close(io);
-    var iter = root.iterate();
-    while (iter.next(io) catch return false) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.kind == .directory;
-    }
-    return false;
-}
-
-fn hasPluginManifest(gpa: std.mem.Allocator, io: std.Io, plugin_dir: []const u8) bool {
-    const manifest_path = std.fs.path.join(gpa, &.{ plugin_dir, "plugin.lua" }) catch return false;
-    defer gpa.free(manifest_path);
-    std.Io.Dir.access(.cwd(), io, manifest_path, .{}) catch return false;
-    return true;
-}
-
-fn safePluginDirectoryName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 64 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
-    for (name) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return false;
-    }
-    return true;
+    return .{ .removed = directory };
 }
 
 fn clonePluginConfigsWithEnabled(
@@ -275,30 +321,6 @@ fn deinitPluginConfigs(gpa: std.mem.Allocator, plugins: []config_mod.PluginConfi
     gpa.free(plugins);
 }
 
-fn clonePluginConfigsWithout(
-    gpa: std.mem.Allocator,
-    current: []const config_mod.PluginConfig,
-    name: []const u8,
-) ![]config_mod.PluginConfig {
-    var found = false;
-    for (current) |plugin| if (std.mem.eql(u8, plugin.name, name)) {
-        found = true;
-        break;
-    };
-    const next = try gpa.alloc(config_mod.PluginConfig, current.len - @intFromBool(found));
-    var initialized: usize = 0;
-    errdefer {
-        for (next[0..initialized]) |*plugin| plugin.deinit(gpa);
-        if (next.len > 0) gpa.free(next);
-    }
-    for (current) |plugin| {
-        if (std.mem.eql(u8, plugin.name, name)) continue;
-        next[initialized] = try plugin.clone(gpa);
-        initialized += 1;
-    }
-    return next;
-}
-
 const Worker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -306,6 +328,7 @@ const Worker = struct {
     project_root: []u8,
     catalog_source: []u8 = &.{},
     plugin_id: []u8 = &.{},
+    fingerprint: [32]u8 = @splat(0),
 
     fn deinit(self: *Worker) void {
         self.gpa.free(self.home_dir);
@@ -319,10 +342,35 @@ const Worker = struct {
 fn runRefresh(worker: *Worker) RefreshResult {
     const gpa = worker.gpa;
     defer worker.deinit();
+    var inventory = package.loadInventory(gpa, worker.io, worker.home_dir, worker.project_root) catch |err| {
+        return .{ .failed = failureMessage(gpa, "Plugin inventory refresh failed", err) };
+    };
     const catalogs = plugin_store.loadCatalogs(gpa, worker.io, worker.home_dir, worker.project_root) catch |err| {
+        inventory.deinit(gpa);
         return .{ .failed = failureMessage(gpa, "Plugin store refresh failed", err) };
     };
-    return .{ .ready = catalogs };
+    return .{ .ready = .{ .catalogs = catalogs, .inventory = inventory } };
+}
+
+fn runInventory(worker: *Worker) InventoryResult {
+    defer worker.deinit();
+    const inventory = package.loadInventory(worker.gpa, worker.io, worker.home_dir, worker.project_root) catch |err| {
+        return .{ .failed = failureMessage(worker.gpa, "Plugin inventory refresh failed", err) };
+    };
+    return .{ .ready = inventory };
+}
+
+fn startInventory(app: *App) !void {
+    if (app.plugin_store.operation != .idle) return;
+    const runtime = app.liveRuntime() orelse app.templateRuntime() orelse return;
+    try repoint(app, runtime.cwd);
+    const worker = try makeWorker(app, runtime.home_dir, runtime.cwd, null);
+    errdefer worker.deinit();
+    app.plugin_store.operation = .{ .scanning = .{ .job = .{}, .generation = app.plugin_store.generation } };
+    app.plugin_store.operation.scanning.job.spawn(app.io, worker, runInventory) catch |err| {
+        app.plugin_store.operation = .idle;
+        return err;
+    };
 }
 
 fn runInstall(worker: *Worker) InstallResult {
@@ -335,6 +383,7 @@ fn runInstall(worker: *Worker) InstallResult {
         worker.project_root,
         worker.catalog_source,
         worker.plugin_id,
+        worker.fingerprint,
     ) catch |err| {
         return .{ .failed = failureMessage(gpa, "Plugin installation failed", err) };
     };
@@ -352,12 +401,13 @@ pub fn startRefresh(app: *App) !void {
         return;
     }
 
+    try repoint(app, runtime.cwd);
     const worker = makeWorker(app, runtime.home_dir, runtime.cwd, null) catch |err| {
         setErrorNotice(app, "Could not start plugin store refresh", err);
         return err;
     };
     errdefer worker.deinit();
-    app.plugin_store.operation = .{ .refreshing = .{ .job = .{} } };
+    app.plugin_store.operation = .{ .refreshing = .{ .job = .{}, .generation = app.plugin_store.generation } };
     app.plugin_store.operation.refreshing.job.spawn(app.io, worker, runRefresh) catch |err| {
         app.plugin_store.operation = .idle;
         setErrorNotice(app, "Could not start plugin store refresh", err);
@@ -430,19 +480,56 @@ pub fn drain(app: *App) !bool {
         .idle => return false,
         .refreshing => |*refresh| {
             if (!refresh.job.isDone()) return false;
+            const generation = refresh.generation;
             var result = refresh.job.adopt(app.io);
             app.plugin_store.operation = .idle;
+            if (generation != app.plugin_store.generation) {
+                result.deinit(app.gpa);
+                try startRefresh(app);
+                return true;
+            }
             switch (result) {
-                .ready => |bundle| {
+                .ready => |snapshot| {
+                    const selection = refreshedSelection(app, &snapshot.inventory, &snapshot.catalogs);
                     if (app.plugin_store.catalogs) |*old| old.deinit(app.gpa);
-                    app.plugin_store.catalogs = bundle;
-                    if (app.pickers.plugins.view == .store) app.pickers.plugins.reset();
-                    setNotice(app, "Catalog refreshed.");
+                    app.plugin_store.catalogs = snapshot.catalogs;
+                    app.plugin_store.inventory.deinit(app.gpa);
+                    app.plugin_store.inventory = snapshot.inventory;
+                    app.pickers.plugins.reset();
+                    app.pickers.plugins.selection = selection;
+                    app.pickers.plugins.confirming_uninstall = false;
+                    if (snapshot.catalogs.failures.len == 0) {
+                        setNotice(app, "Catalog refreshed.");
+                    } else {
+                        const failure = snapshot.catalogs.failures[0];
+                        const message = std.fmt.allocPrint(app.gpa, "Store failed ({s}): {s}. Cached entries are stale; press r to retry.", .{ failure.message, failure.source }) catch null;
+                        if (message) |owned| takeNotice(app, owned) else setNotice(app, "Some stores failed; press r to retry.");
+                    }
                 },
-                .failed => |message| {
-                    takeNotice(app, message);
-                    result.failed = &.{};
+                .failed => |message| takeNotice(app, message),
+            }
+            return true;
+        },
+        .scanning => |*scan| {
+            if (!scan.job.isDone()) return false;
+            const generation = scan.generation;
+            var result = scan.job.adopt(app.io);
+            app.plugin_store.operation = .idle;
+            if (generation != app.plugin_store.generation) {
+                result.deinit(app.gpa);
+                try startInventory(app);
+                return true;
+            }
+            switch (result) {
+                .ready => |inventory| {
+                    const selection = refreshedSelection(app, &inventory, if (app.plugin_store.catalogs) |*catalogs| catalogs else null);
+                    app.plugin_store.inventory.deinit(app.gpa);
+                    app.plugin_store.inventory = inventory;
+                    app.pickers.plugins.reset();
+                    app.pickers.plugins.selection = selection;
+                    app.pickers.plugins.confirming_uninstall = false;
                 },
+                .failed => |message| takeNotice(app, message),
             }
             return true;
         },
@@ -459,11 +546,9 @@ pub fn drain(app: *App) !bool {
                     if (message) |owned| takeNotice(app, owned) else setNotice(app, "Plugin installation completed.");
                     report.deinit(app.gpa);
                 },
-                .failed => |message| {
-                    takeNotice(app, message);
-                    result.failed = &.{};
-                },
+                .failed => |message| takeNotice(app, message),
             }
+            try startInventory(app);
             return true;
         },
         .uninstalling => |*removal| {
@@ -472,26 +557,10 @@ pub fn drain(app: *App) !bool {
             app.plugin_store.operation = .idle;
             switch (result) {
                 .removed => |name| {
-                    const runtime = app.liveRuntime() orelse app.templateRuntime();
-                    const next_plugins = clonePluginConfigsWithout(app.gpa, app.cached_config.plugins, name) catch null;
-                    if (runtime == null or next_plugins == null) {
-                        if (next_plugins) |plugins| deinitPluginConfigs(app.gpa, plugins);
-                        setNotice(app, "Removed plugin, but could not update its project settings. Restart Zay to reload settings.");
-                    } else {
-                        config_mod.removeProjectPlugin(app.gpa, app.io, runtime.?.cwd, name) catch |err| {
-                            deinitPluginConfigs(app.gpa, next_plugins.?);
-                            setErrorNotice(app, "Removed plugin, but could not clear its project setting", err);
-                            app.gpa.free(name);
-                            result.removed = &.{};
-                            result.deinit(app.gpa);
-                            return true;
-                        };
-                        if (app.cached_config.plugins.len > 0) deinitPluginConfigs(app.gpa, app.cached_config.plugins);
-                        app.cached_config.plugins = next_plugins.?;
-                        const message = std.fmt.allocPrint(app.gpa, "Removed {s}. Restart Zay to finish unloading it.", .{name}) catch null;
-                        if (message) |owned| takeNotice(app, owned) else setNotice(app, "Plugin removed. Restart Zay to finish unloading it.");
-                    }
-                    app.gpa.free(name);
+                    // Global removal leaves every project's preferences intact.
+                    const message = std.fmt.allocPrint(app.gpa, "Removed {s}; project preferences retained.", .{name}) catch null;
+                    if (message) |owned| takeNotice(app, owned) else setNotice(app, "Plugin removed; project preferences retained.");
+                    if (name.len > 0) app.gpa.free(name);
                     result.removed = &.{};
                 },
                 .failed => |message| {
@@ -500,14 +569,68 @@ pub fn drain(app: *App) !bool {
                 },
             }
             result.deinit(app.gpa);
+            try startInventory(app);
             return true;
         },
     }
 }
 
+/// Resolve selection against the new snapshot while the old identities are
+/// still alive. Confirmation always resets even when the row survives.
+fn refreshedSelection(app: *const App, inventory: *const package.Inventory, catalogs: ?*const plugin_store.CatalogBundle) usize {
+    const selection = app.pickers.plugins.selection;
+    switch (app.pickers.plugins.view) {
+        .installed => {
+            if (selection >= app.plugin_store.inventory.packages.len) return 0;
+            const path = app.plugin_store.inventory.packages[selection].path;
+            for (inventory.packages, 0..) |disk, index| {
+                if (paths.pathsEqual(path, disk.path)) return index;
+            }
+        },
+        .store => {
+            const old = if (app.plugin_store.catalogs) |*bundle| bundle.entryAt(selection) orelse return 0 else return 0;
+            const next = catalogs orelse return 0;
+            for (0..next.entryCount()) |index| {
+                const entry = next.entryAt(index).?;
+                if (std.mem.eql(u8, old.catalog_source, entry.catalog_source) and std.mem.eql(u8, old.plugin.id, entry.plugin.id)) return index;
+            }
+        },
+        .sources => {
+            const old = if (app.plugin_store.catalogs) |*bundle| bundle else return 0;
+            if (selection >= old.stores.len) return 0;
+            const next = catalogs orelse return 0;
+            for (next.stores, 0..) |source, index| {
+                if (std.mem.eql(u8, old.stores[selection].url, source.url)) return index;
+            }
+        },
+    }
+    return 0;
+}
+
+test "inventory refresh preserves selected physical copy across row changes" {
+    const first: package.Package = .{ .directory = @constCast("first"), .path = @constCast("/plugins/first"), .origin = .global };
+    const selected: package.Package = .{ .directory = @constCast("selected"), .path = @constCast("/plugins/selected"), .origin = .global };
+    var old_packages = [_]package.Package{ first, selected };
+    var next_packages = [_]package.Package{ selected, first };
+    var app: App = undefined;
+    app.plugin_store = .{ .inventory = .{ .packages = &old_packages } };
+    app.pickers.plugins = .{ .view = .installed, .selection = 1 };
+    const inventory: package.Inventory = .{ .packages = &next_packages };
+    try std.testing.expectEqual(@as(usize, 0), refreshedSelection(&app, &inventory, null));
+    app.pickers.plugins.selection = 0;
+    try std.testing.expectEqual(@as(usize, 1), refreshedSelection(&app, &inventory, null));
+    const empty: package.Inventory = .{};
+    try std.testing.expectEqual(@as(usize, 0), refreshedSelection(&app, &empty, null));
+}
+
 pub fn cancel(app: *App) void {
     switch (app.plugin_store.operation) {
         .idle => {},
+        .scanning => |*scan| {
+            var result = scan.job.cancel(app.io);
+            result.deinit(app.gpa);
+            app.plugin_store.operation = .idle;
+        },
         .refreshing => |*refresh| {
             var result = refresh.job.cancel(app.io);
             result.deinit(app.gpa);
@@ -548,6 +671,7 @@ fn makeWorker(app: *App, home_dir: []const u8, project_root: []const u8, entry: 
         .project_root = project_copy,
         .catalog_source = catalog_source,
         .plugin_id = plugin_id,
+        .fingerprint = if (entry) |selected| plugin_store.fingerprint(selected.plugin) else @splat(0),
     };
     return worker;
 }

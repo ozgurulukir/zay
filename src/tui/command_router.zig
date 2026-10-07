@@ -35,6 +35,7 @@ const help_picker = @import("widgets/help_picker.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
 const plugin_store_job = @import("plugin_store_job.zig");
+const plugin_store = @import("../plugin_store.zig");
 const log = std.log.scoped(.tui);
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
@@ -724,11 +725,13 @@ const PluginsMode = struct {
         if (app.pickers.plugins.confirming_uninstall) {
             if (key.matches(vaxis.Key.escape, .{}) or key.matches('n', .{})) {
                 app.pickers.plugins.confirming_uninstall = false;
+                app.pickers.plugins.confirmed_path = null;
                 return true;
             }
             if (key.matches('y', .{})) {
                 app.pickers.plugins.confirming_uninstall = false;
-                if (try selectedInstalledPlugin(app)) |name| app.uninstallPlugin(name);
+                if (app.pickers.plugins.confirmed_path) |path| app.uninstallPlugin(path);
+                app.pickers.plugins.confirmed_path = null;
             }
             return true;
         }
@@ -738,7 +741,11 @@ const PluginsMode = struct {
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            app.pickers.plugins.view = if (app.pickers.plugins.view == .installed) .store else .installed;
+            app.pickers.plugins.view = switch (app.pickers.plugins.view) {
+                .installed => .store,
+                .store => .sources,
+                .sources => .installed,
+            };
             app.pickers.plugins.reset();
             return true;
         }
@@ -751,10 +758,11 @@ const PluginsMode = struct {
                 const rows = try plugin_store_job.installedPlugins(app.gpa, app);
                 defer app.gpa.free(rows);
                 break :blk rows.len;
-            } else if (app.plugin_store.catalogs) |*catalogs|
-                catalogs.entryCount()
-            else
-                0;
+            } else if (app.plugin_store.catalogs) |*catalogs| switch (app.pickers.plugins.view) {
+                .store => catalogs.entryCount(),
+                .sources => catalogs.stores.len,
+                .installed => 0,
+            } else 0;
             app.pickers.plugins.moveDown(count);
             return true;
         }
@@ -773,6 +781,58 @@ const PluginsMode = struct {
             };
             return true;
         }
+        if (app.pickers.plugins.view == .sources and key.matches('s', .{})) {
+            app.pickers.plugins.view = .store;
+            app.pickers.plugins.reset();
+            return true;
+        }
+        if (app.pickers.plugins.view == .sources and
+            app.plugin_store.operation == .idle and
+            key.matches(' ', .{}))
+        {
+            const bundle = app.plugin_store.catalogs orelse return true;
+            if (app.pickers.plugins.selection < bundle.stores.len) {
+                const source = &bundle.stores[app.pickers.plugins.selection];
+                const runtime = app.liveRuntime() orelse app.templateRuntime() orelse return true;
+                plugin_store.setStoreUrlEnabled(app.gpa, app.io, runtime.home_dir, source.url, !source.enabled) catch |err| {
+                    const notice = std.fmt.allocPrint(app.gpa, "Could not update store: {s}", .{@errorName(err)}) catch null;
+                    if (notice) |owned| setPluginStoreNotice(app, owned);
+                    return true;
+                };
+                const enabled = !source.enabled;
+                setPluginStoreNotice(app, app.gpa.dupe(u8, if (enabled) "Store enabled; refreshing catalogs..." else "Store disabled.") catch return true);
+                app.refreshPluginStore() catch |err| log.warn("plugin_store.refresh.failed err={s}", .{@errorName(err)});
+            }
+            return true;
+        }
+        if (app.pickers.plugins.view == .sources and
+            app.plugin_store.operation == .idle and
+            key.matches('r', .{}))
+        {
+            app.refreshPluginStore() catch |err| log.warn("plugin_store.retry.failed err={s}", .{@errorName(err)});
+            return true;
+        }
+        if (app.pickers.plugins.view == .sources and
+            app.plugin_store.operation == .idle and
+            key.matches('x', .{}))
+        {
+            const bundle = app.plugin_store.catalogs orelse return true;
+            if (app.pickers.plugins.selection < bundle.stores.len) {
+                const source = bundle.stores[app.pickers.plugins.selection].url;
+                const runtime = app.liveRuntime() orelse app.templateRuntime() orelse return true;
+                plugin_store.removeStoreUrl(app.gpa, app.io, runtime.home_dir, source) catch |err| {
+                    const notice = std.fmt.allocPrint(app.gpa, "Could not remove store: {s}", .{@errorName(err)}) catch null;
+                    if (notice) |owned| setPluginStoreNotice(app, owned);
+                    return true;
+                };
+                if (app.gpa.dupe(u8, "Store removed; refreshing catalogs...")) |notice| {
+                    setPluginStoreNotice(app, notice);
+                } else |_| {}
+                app.refreshPluginStore() catch |err| log.warn("plugin_store.refresh.failed err={s}", .{@errorName(err)});
+                app.pickers.plugins.selection = 0;
+            }
+            return true;
+        }
         if (app.pickers.plugins.view == .store and isEnterKey(key)) {
             // startInstall projects setup failures into the overlay notice;
             // worker failures are adopted and reported by the lifecycle.
@@ -782,19 +842,20 @@ const PluginsMode = struct {
             return true;
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches(' ', .{})) {
-            if (try selectedInstalledPlugin(app)) |name| app.togglePluginEnabled(name);
+            if (try selectedInstalledPlugin(app)) |plugin| app.togglePluginEnabled(plugin.name);
             return true;
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches('x', .{})) {
-            if (try selectedInstalledPlugin(app)) |name| {
-                if (plugin_store_job.configuredEnabled(&app.cached_config, name)) {
+            if (try selectedInstalledPlugin(app)) |plugin| {
+                if (plugin_store_job.configuredEnabled(&app.cached_config, plugin.name)) {
                     app.pickers.plugins.confirming_uninstall = false;
-                    app.uninstallPlugin(name);
-                } else if (app.plugin_manager.get(name) != null) {
+                    app.uninstallPlugin(plugin.path);
+                } else if (app.plugin_manager.get(plugin.name) != null) {
                     app.pickers.plugins.confirming_uninstall = false;
-                    app.uninstallPlugin(name);
+                    app.uninstallPlugin(plugin.path);
                 } else {
                     app.pickers.plugins.confirming_uninstall = true;
+                    app.pickers.plugins.confirmed_path = plugin.path;
                 }
             }
             return true;
@@ -802,11 +863,11 @@ const PluginsMode = struct {
         return false;
     }
 
-    fn selectedInstalledPlugin(app: *App) !?[]const u8 {
+    fn selectedInstalledPlugin(app: *App) !?plugin_store_job.InstalledPlugin {
         const rows = try plugin_store_job.installedPlugins(app.gpa, app);
         defer app.gpa.free(rows);
         if (app.pickers.plugins.selection >= rows.len) return null;
-        return rows[app.pickers.plugins.selection].name;
+        return rows[app.pickers.plugins.selection];
     }
 
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
@@ -840,6 +901,11 @@ const PluginsMode = struct {
         return true;
     }
 };
+
+fn setPluginStoreNotice(app: *App, owned_message: []u8) void {
+    if (app.plugin_store.notice) |old| app.gpa.free(old);
+    app.plugin_store.notice = owned_message;
+}
 
 const agent_mod = @import("../agent.zig");
 

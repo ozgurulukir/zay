@@ -13,6 +13,8 @@ const os = @import("os.zig");
 const assert = std.debug.assert;
 
 const skill_mod = @import("skill.zig");
+const package = @import("plugin_package.zig");
+const plugin_config = @import("config/plugin.zig");
 
 const log = std.log.scoped(.plugin_prompt);
 
@@ -32,6 +34,7 @@ pub const PluginPrompt = struct {
     name: []u8,
     body: []u8,
     path: []u8,
+    associated_plugin: bool = false,
 
     const Self = @This();
 
@@ -57,19 +60,30 @@ pub fn loadAll(
     home_dir: []const u8,
     cwd: []const u8,
 ) ![]PluginPrompt {
+    return loadConfigured(gpa, io, home_dir, cwd, &.{});
+}
+
+pub fn loadConfigured(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    cwd: []const u8,
+    configs: []const plugin_config.PluginConfig,
+) ![]PluginPrompt {
     var prompts: std.ArrayList(PluginPrompt) = .empty;
-    errdefer deinitAll(gpa, prompts.items);
+    defer prompts.deinit(gpa);
+    errdefer for (prompts.items) |*prompt| prompt.deinit(gpa);
 
     const global_parts = [_][]const u8{ ".config", "zay", "plugins" };
     const legacy_project_parts = [_][]const u8{ ".zay", "plugins" };
     const project_parts = [_][]const u8{"plugins"};
     if (os.is_windows and home_dir.len > 0) {
         const appdata_parts = [_][]const u8{ "AppData", "Roaming", "zay", "plugins" };
-        try scanRoot(gpa, io, home_dir, &appdata_parts, &prompts);
+        try scanRoot(gpa, io, home_dir, &appdata_parts, configs, &prompts);
     }
-    try scanRoot(gpa, io, home_dir, &global_parts, &prompts);
-    try scanRoot(gpa, io, cwd, &legacy_project_parts, &prompts);
-    try scanRoot(gpa, io, cwd, &project_parts, &prompts);
+    try scanRoot(gpa, io, home_dir, &global_parts, configs, &prompts);
+    try scanRoot(gpa, io, cwd, &legacy_project_parts, configs, &prompts);
+    try scanRoot(gpa, io, cwd, &project_parts, configs, &prompts);
 
     return prompts.toOwnedSlice(gpa);
 }
@@ -138,6 +152,7 @@ pub fn cloneAll(gpa: std.mem.Allocator, prompts: []const PluginPrompt) ![]Plugin
             .name = name,
             .body = body,
             .path = path,
+            .associated_plugin = prompt.associated_plugin,
         };
         built = i + 1;
     }
@@ -153,6 +168,7 @@ fn scanRoot(
     io: std.Io,
     root: []const u8,
     parts: []const []const u8,
+    configs: []const plugin_config.PluginConfig,
     out: *std.ArrayList(PluginPrompt),
 ) !void {
     if (root.len == 0) return;
@@ -181,14 +197,44 @@ fn scanRoot(
         const prompt_path = try std.fs.path.join(gpa, &.{ plugin_dir, "prompt.md" });
         defer gpa.free(prompt_path);
 
-        if (loadOne(gpa, io, prompt_path, entry.name)) |prompt| {
-            replaceOrAppend(gpa, out, prompt) catch |err| {
+        var manifest = package.readManifest(gpa, io, plugin_dir) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.OutOfMemory, error.Canceled => return err,
+            else => {
+                log.warn("skipping plugin prompt {s}: invalid manifest {s}", .{ prompt_path, @errorName(err) });
+                continue;
+            },
+        };
+        defer if (manifest) |*value| value.deinit(gpa);
+        const name = if (manifest) |value| value.name else entry.name;
+        var enabled = true;
+        if (manifest != null) {
+            for (configs) |config| {
+                if (std.mem.eql(u8, config.name, name)) {
+                    enabled = config.enabled;
+                    break;
+                }
+            }
+        }
+        if (!enabled) continue;
+
+        if (loadOne(gpa, io, prompt_path, name)) |loaded| {
+            var prompt = loaded;
+            prompt.associated_plugin = manifest != null;
+            // Keep physical candidates until runtime reconciliation: a failed
+            // project override can leave the global instance active.
+            const appended = if (prompt.associated_plugin)
+                out.append(gpa, prompt)
+            else
+                replaceOrAppend(gpa, out, prompt);
+            appended catch |err| {
                 var mut = prompt;
                 mut.deinit(gpa);
                 return err;
             };
         } else |err| switch (err) {
             error.FileNotFound => {},
+            error.OutOfMemory, error.Canceled => return err,
             else => log.warn("skipping plugin prompt {s}: {s}", .{ prompt_path, @errorName(err) }),
         }
     }
@@ -207,22 +253,21 @@ fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8, plugin_name: []
     if (stat.size == 0) return error.FileNotFound;
 
     const raw = try gpa.alloc(u8, @intCast(stat.size));
-    errdefer gpa.free(raw);
+    defer gpa.free(raw);
     var reader = file.reader(io, &.{});
     try reader.interface.readSliceAll(raw);
 
     const body = skill_mod.stripFrontmatter(raw);
-    if (body.len == 0) {
-        gpa.free(raw);
-        return error.FileNotFound;
-    }
+    if (body.len == 0) return error.FileNotFound;
 
     const body_owned = try gpa.dupe(u8, body);
-    gpa.free(raw);
     errdefer gpa.free(body_owned);
 
+    const name = try gpa.dupe(u8, plugin_name);
+    errdefer gpa.free(name);
+
     return .{
-        .name = try gpa.dupe(u8, plugin_name),
+        .name = name,
         .body = body_owned,
         .path = try gpa.dupe(u8, path),
     };
@@ -245,6 +290,65 @@ fn replaceOrAppend(gpa: std.mem.Allocator, out: *std.ArrayList(PluginPrompt), pr
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "plugin prompt policy resolves manifest identity and excludes disabled packages" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = ".zig-cache/plugin-prompt-policy-test";
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try package.atomicWrite(io, root ++ "/plugins/directory-alias/plugin.lua", "return {name='actual', version='1.0.0'}");
+    try package.atomicWrite(io, root ++ "/plugins/directory-alias/prompt.md", "Associated tool instructions.");
+    try package.atomicWrite(io, root ++ "/plugins/standalone/prompt.md", "Standalone project instructions.");
+    try package.atomicWrite(io, root ++ "/plugins/broken/plugin.lua", "return os.execute('false')");
+    try package.atomicWrite(io, root ++ "/plugins/broken/prompt.md", "Unavailable tool instructions.");
+    var name = [_]u8{ 'a', 'c', 't', 'u', 'a', 'l' };
+    const configs = [_]plugin_config.PluginConfig{.{ .name = &name, .enabled = false }};
+    const disabled = try loadConfigured(gpa, io, "", root, &configs);
+    defer deinitAll(gpa, disabled);
+    try std.testing.expectEqual(@as(usize, 1), disabled.len);
+    try std.testing.expectEqualStrings("standalone", disabled[0].name);
+    try std.testing.expect(!disabled[0].associated_plugin);
+
+    const enabled = try loadConfigured(gpa, io, "", root, &.{});
+    defer deinitAll(gpa, enabled);
+    try std.testing.expectEqual(@as(usize, 2), enabled.len);
+    var found = false;
+    for (enabled) |prompt| {
+        if (std.mem.eql(u8, prompt.name, "actual")) {
+            found = true;
+            try std.testing.expect(prompt.associated_plugin);
+        }
+    }
+    try std.testing.expect(found);
+    const cloned = try cloneAll(gpa, enabled);
+    defer deinitAll(gpa, cloned);
+    for (enabled, cloned) |original, copy| {
+        try std.testing.expectEqual(original.associated_plugin, copy.associated_plugin);
+        try std.testing.expectEqualStrings(original.path, copy.path);
+    }
+}
+
+test "plugin prompt loadOne unwinds every allocation failure and empty body" {
+    const io = std.testing.io;
+    const path = ".zig-cache/plugin-prompt-allocation-test/prompt.md";
+    try std.Io.Dir.cwd().createDirPath(io, ".zig-cache/plugin-prompt-allocation-test");
+    defer std.Io.Dir.cwd().deleteTree(io, ".zig-cache/plugin-prompt-allocation-test") catch {};
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, "Use the plugin tool.");
+
+    for (0..4) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, loadOne(failing.allocator(), io, path, "example"));
+    }
+
+    var prompt = try loadOne(std.testing.allocator, io, path, "example");
+    defer prompt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Use the plugin tool.", prompt.body);
+
+    try file.setLength(io, 0);
+    try std.testing.expectError(error.FileNotFound, loadOne(std.testing.allocator, io, path, "example"));
+}
 
 test "loadAll finds prompt.md and strips frontmatter" {
     const gpa = std.testing.allocator;

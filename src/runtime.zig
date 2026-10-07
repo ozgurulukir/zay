@@ -11,6 +11,8 @@ const provider_types = @import("config/provider.zig");
 const context_assembly = @import("context/assembly.zig");
 const modelsdev = @import("models/registry.zig");
 const plugin_prompt = @import("plugin_prompt.zig");
+const plugin_manager_mod = @import("lua/manager.zig");
+const paths = @import("paths.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools_mod = @import("tools.zig");
@@ -206,7 +208,7 @@ pub const AgentRuntime = struct {
         // instead of re-scanning the workspace (which is a checkout of the same repo).
         const skills = if (template) |t| try skill_mod.cloneAll(gpa, t.skills) else try skill_mod.loadProject(gpa, io, home_dir, cwd);
         errdefer skill_mod.deinitAll(gpa, skills);
-        const plugin_prompts = if (template) |t| try plugin_prompt.cloneAll(gpa, t.plugin_prompts) else try plugin_prompt.loadAll(gpa, io, home_dir, cwd);
+        const plugin_prompts = if (template) |t| try plugin_prompt.cloneAll(gpa, t.plugin_prompts) else try plugin_prompt.loadConfigured(gpa, io, home_dir, cwd, config.plugins);
         errdefer plugin_prompt.deinitAll(gpa, plugin_prompts);
         // A lane shares the parent's stable skills/plugin prompt inputs, but
         // Git and project rules belong to its own worktree.
@@ -335,6 +337,36 @@ pub const AgentRuntime = struct {
 
     /// Refresh turn-scoped context on the worker, before user messages enter
     /// history. A failed assembly leaves the last-good prompt untouched.
+    /// Startup/repoint only: callers must keep lane turns quiescent. Prompts
+    /// describe the loaded physical copy, rather than another copy with the
+    /// same manifest name. Standalone text directories remain supported.
+    pub fn reconcilePluginPrompts(self: *AgentRuntime, manager: *const plugin_manager_mod.PluginManager) !void {
+        var selected: std.ArrayList(plugin_prompt.PluginPrompt) = .empty;
+        defer selected.deinit(self.gpa);
+        for (self.plugin_prompts) |prompt| {
+            if (prompt.associated_plugin) {
+                const instance = manager.plugins.get(prompt.name) orelse continue;
+                if (!instance.active) continue;
+                const directory = std.fs.path.dirname(prompt.path) orelse continue;
+                if (!paths.pathsEqual(directory, instance.dir_path)) continue;
+            }
+            try selected.append(self.gpa, prompt);
+        }
+        if (selected.items.len == self.plugin_prompts.len) return;
+        const prompts = try plugin_prompt.cloneAll(self.gpa, selected.items);
+        errdefer plugin_prompt.deinitAll(self.gpa, prompts);
+        const next = try context_assembly.assembleSystemPrompt(self.gpa, self.io, self.base_system_prompt, self.home_dir, self.cwd, self.skills, prompts);
+        errdefer self.gpa.free(next);
+        try self.client.updateSystemPrompt(next);
+        try self.agent.replaceSystem(next);
+        plugin_prompt.deinitAll(self.gpa, self.plugin_prompts);
+        self.plugin_prompts = prompts;
+        self.gpa.free(self.system_prompt);
+        self.system_prompt = next;
+        if (self.refresh_snapshot) |*snapshot| snapshot.deinit(self.gpa);
+        self.refresh_snapshot = null;
+    }
+
     pub fn refreshSystemPrompt(self: *AgentRuntime, cwd: []const u8) !void {
         var next_snapshot = try context_assembly.captureRefreshSnapshot(self.gpa, self.io, self.home_dir, cwd);
         errdefer next_snapshot.deinit(self.gpa);
@@ -1144,6 +1176,65 @@ pub const AgentRuntime = struct {
 };
 fn codexRefreshNeeded(expires_ms: i64, now_ms: i64) bool {
     return expires_ms <= now_ms + codex_refresh_margin_ms;
+}
+
+test "plugin prompts exclude failed and shadowed copies and survive lane cloning" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const package = @import("plugin_package.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const process_cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(process_cwd);
+    const root = try std.fs.path.join(gpa, &.{ process_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root);
+    const fixtures = [_][2][]const u8{
+        .{ ".config/zay/plugins/shadow/plugin.lua", "return {name='shadow',version='1'}" },
+        .{ ".config/zay/plugins/shadow/init.lua", "return {}" },
+        .{ ".config/zay/plugins/shadow/prompt.md", "Global shadow instructions." },
+        .{ "plugins/shadow/plugin.lua", "return {name='shadow',version='2'}" },
+        .{ "plugins/shadow/init.lua", "error('failed override')" },
+        .{ "plugins/shadow/prompt.md", "Failed override instructions." },
+        .{ "plugins/good/plugin.lua", "return {name='good',version='1'}" },
+        .{ "plugins/good/init.lua", "return {}" },
+        .{ "plugins/good/prompt.md", "Working tool instructions." },
+        .{ "plugins/standalone/prompt.md", "Standalone instructions." },
+    };
+    for (fixtures) |fixture| {
+        const path = try std.fs.path.join(gpa, &.{ root, fixture[0] });
+        defer gpa.free(path);
+        try package.atomicWrite(io, path, fixture[1]);
+    }
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = io,
+        .cwd = root,
+        .home_dir = root,
+        .session_dir = root,
+        .base_system_prompt = "Test system prompt.",
+        .host_id = "test-host",
+        .config = .{},
+        .diagnostics = &.{},
+    });
+    defer runtime.deinit();
+    var manager = plugin_manager_mod.PluginManager.init(gpa, io, root, root);
+    defer manager.deinit();
+    _ = try manager.loadAll();
+    try std.testing.expectEqualStrings("1", manager.plugins.get("shadow").?.manifest.version);
+    try runtime.reconcilePluginPrompts(&manager);
+    try std.testing.expectEqual(@as(usize, 3), runtime.plugin_prompts.len);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system_prompt, "Global shadow instructions.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system_prompt, "Working tool instructions.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system_prompt, "Standalone instructions.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system_prompt, "Failed override instructions.") == null);
+    const cloned = try plugin_prompt.cloneAll(gpa, runtime.plugin_prompts);
+    defer plugin_prompt.deinitAll(gpa, cloned);
+    try std.testing.expectEqual(@as(usize, 3), cloned.len);
+    for (runtime.plugin_prompts, cloned) |original, copy| {
+        try std.testing.expectEqualStrings(original.path, copy.path);
+        try std.testing.expectEqual(original.associated_plugin, copy.associated_plugin);
+    }
 }
 
 test "OwnedClient.updateTools pushes plugin tools into a freshly-attached client" {
