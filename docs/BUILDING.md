@@ -41,6 +41,12 @@ If dependency fetching fails, resolve the network or Git error and rerun
 `zig build --fetch`. The dependency is fetched into Zig's package cache; it
 does not need to be modified in the Zay checkout.
 
+Zay's x86_64 Debug artifacts use LLVM explicitly to avoid a Zig 0.16.0
+compiler SIGSEGV in the default backend. The failure also reproduces with
+the vendored C sources removed; changing SQLite or Lua is unnecessary.
+Debug safety checks and the C trap sanitizer remain enabled. Other targets
+and optimization modes retain Zig's default backend selection.
+
 ## Verifying
 
 Run after code changes:
