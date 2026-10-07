@@ -4,6 +4,10 @@ const builtin = @import("builtin");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Zig 0.16.0's x86_64 Debug backend crashes while generating Zay code,
+    // even without the vendored C sources. Keep Debug checks and C sanitizers
+    // enabled, and use LLVM for artifacts that compile the Zay module.
+    const zay_use_llvm: ?bool = if (target.result.cpu.arch == .x86_64 and optimize == .Debug) true else null;
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
@@ -297,6 +301,7 @@ pub fn build(b: *std.Build) void {
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
         .name = "zay",
+        .use_llvm = zay_use_llvm,
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -387,6 +392,7 @@ pub fn build(b: *std.Build) void {
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .use_llvm = zay_use_llvm,
         .filters = test_filters,
     });
 
@@ -398,6 +404,7 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_llvm = zay_use_llvm,
         .filters = test_filters,
     });
 
@@ -451,6 +458,7 @@ pub fn build(b: *std.Build) void {
     {
         const lua_test_exe = b.addExecutable(.{
             .name = "lua-test-runner",
+            .use_llvm = zay_use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tools/lua_test_runner.zig"),
                 .target = target,
