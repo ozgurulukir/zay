@@ -209,78 +209,77 @@ pub const Client = struct {
         const aa = arena.allocator();
 
         const sql = if (table_filter) |_|
-            "SELECT name FROM sqlite_master WHERE type='table' AND name = ? ORDER BY name"
+            "SELECT m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_cf_%' AND m.name = ? ORDER BY m.name, p.cid"
         else
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name";
+            "SELECT m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_cf_%' ORDER BY m.name, p.cid";
 
         const params = if (table_filter) |tbl|
             &[_]db.Value{.{ .text = tbl }}
         else
             &[_]db.Value{};
 
-        var tables_res = try self.query(io, sql, params);
-        defer tables_res.deinit();
+        var schema_res = try self.query(io, sql, params);
+        defer schema_res.deinit();
 
         var tables_list: std.ArrayList(TableSchema) = .empty;
         defer tables_list.deinit(self.allocator);
 
-        for (tables_res.rows) |row| {
-            if (row.len == 0) continue;
+        var current_table_name: ?[]const u8 = null;
+        var cols_list: std.ArrayList(ColumnSchema) = .empty;
+        defer cols_list.deinit(self.allocator);
+
+        for (schema_res.rows) |row| {
+            if (row.len < 7) continue;
             const table_name = switch (row[0]) {
                 .text => |t| t,
                 else => continue,
             };
 
-            const table_param = [_]db.Value{.{ .text = table_name }};
-            var pragma_res = self.query(
-                io,
-                "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
-                &table_param,
-            ) catch |err| {
-                // A missing table is not an error here — pragma_table_info
-                // returns zero rows for one — so every failure on this path
-                // is transport/auth/protocol and must not silently shrink
-                // the reported schema (turso parity, #160).
-                log.warn("d1.schema: pragma_table_info failed for table \"{s}\": {s}", .{ table_name, @errorName(err) });
-                return err;
-            };
-            defer pragma_res.deinit();
-
-            var cols_list: std.ArrayList(ColumnSchema) = .empty;
-            defer cols_list.deinit(self.allocator);
-
-            for (pragma_res.rows) |col_row| {
-                if (col_row.len < 6) continue;
-                const col_name = switch (col_row[1]) {
-                    .text => |t| t,
-                    else => continue,
-                };
-                const col_type = switch (col_row[2]) {
-                    .text => |t| t,
-                    else => "TEXT",
-                };
-                const not_null = switch (col_row[3]) {
-                    .int => |v| v != 0,
-                    else => false,
-                };
-                const pk = switch (col_row[5]) {
-                    .int => |v| v != 0,
-                    else => false,
-                };
-
-                try cols_list.append(self.allocator, .{
-                    .name = try aa.dupe(u8, col_name),
-                    .type_name = try aa.dupe(u8, col_type),
-                    .nullable = !not_null,
-                    .primary_key = pk,
-                });
+            if (current_table_name) |curr| {
+                if (!std.mem.eql(u8, curr, table_name)) {
+                    const cols_slice = try aa.alloc(ColumnSchema, cols_list.items.len);
+                    @memcpy(cols_slice, cols_list.items);
+                    try tables_list.append(self.allocator, .{
+                        .name = try aa.dupe(u8, curr),
+                        .columns = cols_slice,
+                    });
+                    cols_list.clearRetainingCapacity();
+                    current_table_name = table_name;
+                }
+            } else {
+                current_table_name = table_name;
             }
 
+            const col_name = switch (row[2]) {
+                .text => |t| t,
+                else => continue,
+            };
+            const col_type = switch (row[3]) {
+                .text => |t| t,
+                else => "TEXT",
+            };
+            const not_null = switch (row[4]) {
+                .int => |v| v != 0,
+                else => false,
+            };
+            const pk = switch (row[6]) {
+                .int => |v| v != 0,
+                else => false,
+            };
+
+            try cols_list.append(self.allocator, .{
+                .name = try aa.dupe(u8, col_name),
+                .type_name = try aa.dupe(u8, col_type),
+                .nullable = !not_null,
+                .primary_key = pk,
+            });
+        }
+
+        if (current_table_name) |curr| {
             const cols_slice = try aa.alloc(ColumnSchema, cols_list.items.len);
             @memcpy(cols_slice, cols_list.items);
-
             try tables_list.append(self.allocator, .{
-                .name = try aa.dupe(u8, table_name),
+                .name = try aa.dupe(u8, curr),
                 .columns = cols_slice,
             });
         }
@@ -637,4 +636,49 @@ test "D1 response-head stalls use the shared deadline" {
     client.timeout_seconds = 1;
 
     try std.testing.expectError(error.ServerTimeout, client.query(io, "SELECT 1", &.{}));
+}
+
+
+test "D1 schema query fetches tables and columns in a single roundtrip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema_json =
+        \\{"success":true,"result":[{"results":{"columns":["name","cid","name","type","notnull","dflt_value","pk"],"rows":[["users",0,"id","INTEGER",1,null,1],["users",1,"email","TEXT",1,null,0],["posts",0,"id","INTEGER",1,null,1],["posts",1,"title","TEXT",0,null,0]]}}]}
+    ;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = schema_json },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/query", .{server.port()});
+    defer gpa.free(endpoint);
+    const client = Client.init(gpa, endpoint, null);
+
+    var res = try client.schema(io, null);
+    defer res.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), res.tables.len);
+
+    try std.testing.expectEqualStrings("users", res.tables[0].name);
+    try std.testing.expectEqual(@as(usize, 2), res.tables[0].columns.len);
+    try std.testing.expectEqualStrings("id", res.tables[0].columns[0].name);
+    try std.testing.expectEqualStrings("INTEGER", res.tables[0].columns[0].type_name);
+    try std.testing.expectEqual(false, res.tables[0].columns[0].nullable);
+    try std.testing.expectEqual(true, res.tables[0].columns[0].primary_key);
+
+    try std.testing.expectEqualStrings("email", res.tables[0].columns[1].name);
+    try std.testing.expectEqualStrings("TEXT", res.tables[0].columns[1].type_name);
+    try std.testing.expectEqual(false, res.tables[0].columns[1].nullable);
+    try std.testing.expectEqual(false, res.tables[0].columns[1].primary_key);
+
+    try std.testing.expectEqualStrings("posts", res.tables[1].name);
+    try std.testing.expectEqual(@as(usize, 2), res.tables[1].columns.len);
+    try std.testing.expectEqualStrings("id", res.tables[1].columns[0].name);
+    try std.testing.expectEqualStrings("title", res.tables[1].columns[1].name);
+    try std.testing.expectEqual(true, res.tables[1].columns[1].nullable);
 }
