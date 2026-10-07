@@ -209,9 +209,9 @@ pub const Client = struct {
         const aa = arena.allocator();
 
         const sql = if (table_filter) |_|
-            "SELECT m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_cf_%' AND m.name = ? ORDER BY m.name, p.cid"
+            "SELECT m.name AS table_name, p.cid, p.name AS column_name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_cf_%' AND m.name = ? ORDER BY m.name, p.cid"
         else
-            "SELECT m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_cf_%' ORDER BY m.name, p.cid";
+            "SELECT m.name AS table_name, p.cid, p.name AS column_name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT LIKE '_cf_%' ORDER BY m.name, p.cid";
 
         const params = if (table_filter) |tbl|
             &[_]db.Value{.{ .text = tbl }}
@@ -638,19 +638,23 @@ test "D1 response-head stalls use the shared deadline" {
     try std.testing.expectError(error.ServerTimeout, client.query(io, "SELECT 1", &.{}));
 }
 
-
 test "D1 schema query fetches tables and columns in a single roundtrip" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     const schema_json =
-        \\{"success":true,"result":[{"results":{"columns":["name","cid","name","type","notnull","dflt_value","pk"],"rows":[["users",0,"id","INTEGER",1,null,1],["users",1,"email","TEXT",1,null,0],["posts",0,"id","INTEGER",1,null,1],["posts",1,"title","TEXT",0,null,0]]}}]}
+        \\{"success":true,"result":[{"success":true,"results":[
+        \\  {"table_name":"users","cid":0,"column_name":"id","type":"INTEGER","notnull":1,"dflt_value":null,"pk":1},
+        \\  {"table_name":"users","cid":1,"column_name":"email","type":"TEXT","notnull":1,"dflt_value":null,"pk":0},
+        \\  {"table_name":"posts","cid":0,"column_name":"id","type":"INTEGER","notnull":1,"dflt_value":null,"pk":1},
+        \\  {"table_name":"posts","cid":1,"column_name":"title","type":"TEXT","notnull":0,"dflt_value":null,"pk":0}
+        \\]}]}
     ;
 
     const responses = [_]mock_http_server.Response{
         .{ .status = .ok, .body = schema_json },
     };
-    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    var server = try mock_http_server.MockHttpServer.initCapturing(gpa, io, &responses);
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
     defer thread.join();
@@ -661,6 +665,12 @@ test "D1 schema query fetches tables and columns in a single roundtrip" {
 
     var res = try client.schema(io, null);
     defer res.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), server.connection_count.load(.monotonic));
+    const request = server.captured[0] orelse return error.TestUnexpectedResult;
+    // D1 object rows must retain both names from the joined schema query.
+    try std.testing.expect(std.mem.indexOf(u8, request, "m.name AS table_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "p.name AS column_name") != null);
 
     try std.testing.expectEqual(@as(usize, 2), res.tables.len);
 
