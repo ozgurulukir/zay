@@ -80,27 +80,36 @@ pub fn editFileSplice(io: std.Io, clean_path: []const u8, old_string: []const u8
 
 /// Read file bytes with size limit.
 pub fn readFileBytes(io: std.Io, path: []const u8, max_size: usize) ![]u8 {
+    errdefer |err| preserveCancellation(io, err);
+    // Reject FIFOs/devices before opening: size limits cannot bound a blocking
+    // stream open. Recheck the opened file as well for ordinary path changes.
+    const path_stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    if (path_stat.kind != .file) return error.UnsupportedFileType;
     var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
+    if (stat.kind != .file) return error.UnsupportedFileType;
     const read_size = @min(@as(usize, @intCast(stat.size)), max_size);
     const bytes = try std.heap.page_allocator.alloc(u8, read_size);
     errdefer std.heap.page_allocator.free(bytes);
     var reader = file.reader(io, &.{});
-    try reader.interface.readSliceAll(bytes);
+    reader.interface.readSliceAll(bytes) catch |err| {
+        return reader.err orelse err;
+    };
     return bytes;
 }
 
 /// Stat a file and return its on-disk size in bytes.
 pub fn statFileSize(io: std.Io, path: []const u8) !u64 {
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    const stat = try file.stat(io);
+    errdefer |err| preserveCancellation(io, err);
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     return stat.size;
 }
 
 /// Atomic file write: write to temp, then rename.
-pub fn writeFileAtomic(io: std.Io, path: []const u8, content: []const u8) !void {
+const WriteFileError = std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.Writer.Error || std.Io.Dir.RenameError;
+
+pub fn writeFileAtomic(io: std.Io, path: []const u8, content: []const u8) WriteFileError!void {
     var random: [4]u8 = undefined;
     io.random(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
@@ -108,25 +117,37 @@ pub fn writeFileAtomic(io: std.Io, path: []const u8, content: []const u8) !void 
     defer std.heap.page_allocator.free(tmp_path);
 
     var file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch |err| {
+        preserveCancellation(io, err);
         return err;
     };
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
     writer.interface.writeAll(content) catch |err| {
+        const canceled = if (writer.err) |write_error| write_error == error.Canceled else false;
         file.close(io);
         deleteFileBestEffort(io, tmp_path);
+        if (canceled) {
+            io.recancel();
+            return error.Canceled;
+        }
         return err;
     };
     writer.interface.flush() catch |err| {
+        const canceled = if (writer.err) |write_error| write_error == error.Canceled else false;
         file.close(io);
         deleteFileBestEffort(io, tmp_path);
+        if (canceled) {
+            io.recancel();
+            return error.Canceled;
+        }
         return err;
     };
     file.close(io);
 
     std.Io.Dir.renameAbsolute(tmp_path, path, io) catch |err| {
         deleteFileBestEffort(io, tmp_path);
+        preserveCancellation(io, err);
         return err;
     };
 }
@@ -199,4 +220,8 @@ pub fn getMimeType(path: []const u8) []const u8 {
 pub fn getExtension(path: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "";
     return path[dot + 1 ..];
+}
+
+fn preserveCancellation(io: std.Io, err: anyerror) void {
+    if (err == error.Canceled) io.recancel();
 }

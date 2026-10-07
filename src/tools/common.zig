@@ -368,14 +368,23 @@ pub const Schema = struct {
             }
         }
         for (self.properties, 0..) |prop, i| {
+            const name = try gpa.dupe(u8, prop.name);
+            errdefer gpa.free(name);
+            const description = try gpa.dupe(u8, prop.description);
+            errdefer gpa.free(description);
+            const enum_values = if (prop.enum_values) |ev| try cloneEnumValues(gpa, ev) else null;
+            errdefer if (enum_values) |values| {
+                for (values) |value| gpa.free(value);
+                gpa.free(values);
+            };
             props[i] = .{
-                .name = try gpa.dupe(u8, prop.name),
+                .name = name,
                 .kind = prop.kind,
-                .description = try gpa.dupe(u8, prop.description),
+                .description = description,
                 .required = prop.required,
                 .nullable = prop.nullable,
                 .object_value_kind = prop.object_value_kind,
-                .enum_values = if (prop.enum_values) |ev| try cloneEnumValues(gpa, ev) else null,
+                .enum_values = enum_values,
                 .default_value = if (prop.default_value) |dv| try gpa.dupe(u8, dv) else null,
             };
             built = i + 1;

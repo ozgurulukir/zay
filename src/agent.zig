@@ -540,6 +540,10 @@ pub const Agent = struct {
     fn onNothingCtx(_: *anyopaque, _: Event) anyerror!void {}
 
     pub fn run(self: *Agent, listener: anytype) !void {
+        // Keep the loaded plugin generation alive through the entire turn,
+        // including model waits and gaps between tool batches.
+        if (self.plugin_manager) |manager| try manager.beginUse();
+        defer if (self.plugin_manager) |manager| manager.endUse();
         // The listener's `ctx` field is `*Ctx`; extract `Ctx` (the pointee
         // type) so `Listener(Ctx)` matches the struct the caller built.
         const Ctx = @typeInfo(@TypeOf(listener.ctx)).pointer.child;

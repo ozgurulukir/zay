@@ -251,6 +251,10 @@ pub const ExecutorService = struct {
         calls: []const ai.ToolCall,
         observer: anytype,
     ) ![]ToolResult {
+        const prev_cancel_slot = lua_mod.bridge.cancel_requested_slot;
+        lua_mod.bridge.cancel_requested_slot = self.ctx.cancel_requested;
+        defer lua_mod.bridge.cancel_requested_slot = prev_cancel_slot;
+
         // Shell-safety classifier URL for plugin `zay.run_bash`/`run_shell`
         // calls: set for the WHOLE batch, not just `produceOutput` — the
         // observers below fire plugin event callbacks (emitEvent → Lua) after

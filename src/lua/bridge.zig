@@ -19,6 +19,9 @@ const State = @import("state.zig").State;
 /// import cycle.
 pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
 
+/// Derived from the executor's turn cancellation flag, including events.
+pub threadlocal var cancel_requested_slot: ?*const std.atomic.Value(bool) = null;
+
 /// Thread-local carrying the remote shell-safety classifier URL to the Lua C
 /// boundary, so `zay.run_bash`/`zay.run_shell` gate plugin shell execution
 /// through the same classifier as the builtin tool (`bash_safety.classify`).

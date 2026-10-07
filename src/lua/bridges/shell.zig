@@ -4,6 +4,7 @@
 //! `zay.get_project_root`, and `zay.shell_quote`.
 
 const std = @import("std");
+const execution = @import("../execution.zig");
 const c = @import("c");
 const State = @import("../state.zig").State;
 const bridge = @import("../bridge.zig");
@@ -191,13 +192,21 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
         return 2;
     }
 
+    execution.check(L_ptr);
+    if (execution.stopped(L_ptr)) {
+        state.pushNil();
+        state.pushString("plugin execution stopped before shell spawn");
+        return 2;
+    }
     if (backend == .pwsh) {
         var result = pwsh_exec.runWithOptions(std.heap.page_allocator, io, .{
             .cwd = resolved_cwd,
             .command = cmd,
             .stdin = stdin_bytes,
-            .timeout = pwsh_exec.timeoutFromSeconds(timeout_seconds),
+            .cancel_requested = bridge.cancel_requested_slot,
+            .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
         }) catch |err| {
+            execution.noteError(L_ptr, err);
             state.pushNil();
             state.pushString(shellBackendErrorMessage(err, backend));
             return 2;
@@ -217,8 +226,10 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
             .cwd = resolved_cwd,
             .command = cmd,
             .stdin = stdin_bytes,
-            .timeout = bash_exec.timeoutFromSeconds(timeout_seconds),
+            .cancel_requested = bridge.cancel_requested_slot,
+            .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
         }) catch |err| {
+            execution.noteError(L_ptr, err);
             state.pushNil();
             state.pushString(shellBackendErrorMessage(err, backend));
             return 2;

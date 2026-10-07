@@ -17,12 +17,10 @@ const assert = std.debug.assert;
 
 const response_bytes_max: u32 = 4096;
 const redirect_buffer_bytes = http.redirect_buffer_bytes;
-/// Per-call budget for the remote classifier exchange: the response
-/// receive phase must finish inside it or the call fails to the local
-/// matcher. The classifier is a localhost sidecar; one that stalls this
+/// Per-call budget for all phases of the remote classifier exchange,
+/// including connect/send/body on Windows and HTTPS. Timeout or network
+/// failure falls back to the local matcher. The classifier is a localhost sidecar; one that stalls this
 /// long is broken, and fail-open beats wedging the turn indefinitely.
-/// POSIX http only — Windows and https URLs keep the plain `fetch`
-/// exchange without a deadline (see `classifyOverClient`).
 const classifier_timeout_seconds: u32 = 5;
 /// Fixed receive buffer for the classifier response (head + body). A
 /// larger response fails to the local matcher instead of growing.
@@ -64,7 +62,8 @@ pub fn classify(
     const u = url orelse return localClassify(command);
     if (u.len == 0) return localClassify(command);
 
-    const remote = classifyFallible(gpa, io, u, cwd, command, classifier_timeout_seconds) catch {
+    const remote = classifyFallible(gpa, io, u, cwd, command, classifier_timeout_seconds) catch |err| {
+        if (err == error.Canceled) io.recancel();
         // Remote classifier unavailable — fall back to local pattern matching.
         return localClassify(command);
     };
@@ -468,25 +467,54 @@ fn classifyFallible(
     defer payload.deinit();
     try writeRequest(&payload.writer, cwd, command);
 
-    // Windows keeps the plain `fetch` exchange: the deadline path is
-    // POSIX-only (raw poll rounds on the socket fd). Branch-scoped so the
-    // comptime-known-Windows build never analyzes `std.posix.poll`/`read`
-    // (both are compile errors there).
-    if (os.is_windows) {
-        return classifyOverClient(gpa, io, url, payload.written());
-    } else {
-        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-        // https keeps the plain `fetch` exchange too: std's TLS client
-        // offers no deadline hook, and the classifier sidecar is plain
-        // http in every shipped configuration.
-        if (std.mem.eql(u8, uri.scheme, "https")) return classifyOverClient(gpa, io, url, payload.written());
-        if (!std.mem.eql(u8, uri.scheme, "http")) return error.UnsupportedScheme;
-        return classifyOverSocket(gpa, io, uri, payload.written(), timeout_seconds);
-    }
+    const uri = try std.Uri.parse(url);
+    const transport: ClassifierExchange.Transport = if (os.is_windows or std.mem.eql(u8, uri.scheme, "https")) .http_client else .socket;
+    return classifyExchange(gpa, io, url, payload.written(), timeout_seconds, transport);
 }
 
-/// Plain `std.http.Client.fetch` exchange, kept for https classifier URLs
-/// and Windows. This path carries no deadline: std's HTTP client cannot
+fn classifyExchange(gpa: std.mem.Allocator, io: std.Io, url: []const u8, payload: []const u8, timeout_seconds: u32, transport: ClassifierExchange.Transport) !Verdict {
+    var exchange: ClassifierExchange = .{ .gpa = gpa, .io = io, .url = url, .payload = payload, .timeout_seconds = timeout_seconds, .transport = transport };
+    var task = try io.concurrent(ClassifierExchange.run, .{&exchange});
+    // Join before releasing payload/context on success, timeout, cancellation
+    // or a network error. The child owns its client/socket until it unwinds.
+    defer task.cancel(io);
+    exchange.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(timeout_seconds), .clock = .awake } }) catch |err| switch (err) {
+        error.Timeout => return error.ClassifierTimeout,
+        else => return err,
+    };
+    task.await(io);
+    return exchange.result;
+}
+
+const ClassifierExchange = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    payload: []const u8,
+    timeout_seconds: u32,
+    transport: Transport,
+    done: std.Io.Event = .unset,
+    result: anyerror!Verdict = error.Unexpected,
+
+    const Transport = enum { socket, http_client };
+
+    fn run(self: *ClassifierExchange) void {
+        self.result = self.fetch();
+        self.done.set(self.io);
+    }
+
+    fn fetch(self: *ClassifierExchange) !Verdict {
+        if (os.is_windows) return classifyOverClient(self.gpa, self.io, self.url, self.payload);
+        if (self.transport == .http_client) return classifyOverClient(self.gpa, self.io, self.url, self.payload);
+        const uri = try std.Uri.parse(self.url);
+
+        if (!std.mem.eql(u8, uri.scheme, "http")) return error.UnsupportedScheme;
+        return classifyOverSocket(self.gpa, self.io, uri, self.payload, self.timeout_seconds);
+    }
+};
+
+/// Explicit `std.http.Client` exchange for HTTPS and Windows, executed
+/// under ClassifierExchange's cancelable watchdog. The client itself cannot
 /// bound its reads here (a socket read timeout surfaces as EAGAIN, which
 /// the `Io.Threaded` read path treats as a programmer bug — panic in
 /// Debug), so the deadline-carrying http path is `classifyOverSocket`.
@@ -496,28 +524,46 @@ fn classifyOverClient(
     url: []const u8,
     payload: []const u8,
 ) !Verdict {
-    var response_body: std.Io.Writer.Allocating = .init(gpa);
-    defer response_body.deinit();
+    var body_buffer: [response_bytes_max]u8 = undefined;
+    var response_body: std.Io.Writer = .fixed(&body_buffer);
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    const status = try client.fetch(.{
-        .method = .POST,
-        .location = .{ .url = url },
-        .payload = payload,
-        .response_writer = &response_body.writer,
-        .redirect_buffer = &redirect_buffer,
-        .keep_alive = true,
-        .headers = .{
-            .content_type = .{ .override = http.content_type_json },
-        },
+    const uri = try std.Uri.parse(url);
+    var request = try client.request(.POST, uri, .{
+        .keep_alive = false,
+        .redirect_behavior = .unhandled,
+        .headers = .{ .content_type = .{ .override = http.content_type_json } },
     });
-    if (response_body.written().len > response_bytes_max) return error.ResponseTooLarge;
-    const status_code: u16 = @intFromEnum(status.status);
-    if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
-    return parseResponse(gpa, response_body.written());
+    defer request.deinit();
+    request.transfer_encoding = .{ .content_length = payload.len };
+    var body = try request.sendBodyUnflushed(&.{});
+    try body.writer.writeAll(payload);
+    try body.end();
+    try request.connection.?.flush();
+    var response = try request.receiveHead(&redirect_buffer);
+    if (!http.isSuccess(@intFromEnum(response.head.status))) return error.HttpUnexpectedStatus;
+    const decompress_size: usize = switch (response.head.content_encoding) {
+        .identity => 0,
+        .zstd => std.compress.zstd.default_window_len,
+        .deflate, .gzip => std.compress.flate.max_window_len,
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    const decompress_buffer = try gpa.alloc(u8, decompress_size);
+    defer gpa.free(decompress_buffer);
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&response_body) catch |err| switch (err) {
+        // Zig 0.16 fetch unwraps bodyErr unconditionally, but cancellation
+        // of a content-length read can leave it null. Preserve that failure
+        // without panicking, and let the outer watchdog join the task.
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        else => return err,
+    };
+    return parseResponse(gpa, response_body.buffered());
 }
 
 /// Deadline-bounded HTTP/1.1 exchange over a raw socket, POSIX http only.
@@ -597,6 +643,7 @@ fn receiveResponseBounded(
 ) ![]const u8 {
     var received: usize = 0;
     while (true) {
+        try io.checkCancel();
         const remaining_ns = classifierRemainingNs(io, deadline_ns);
         if (remaining_ns <= 0) return error.ClassifierTimeout;
         var fds = [_]std.posix.pollfd{.{
@@ -604,7 +651,7 @@ fn receiveResponseBounded(
             .events = std.posix.POLL.IN | std.posix.POLL.ERR,
             .revents = 0,
         }};
-        if (try std.posix.poll(&fds, pollTimeoutMs(remaining_ns)) == 0) return error.ClassifierTimeout;
+        if (try std.posix.poll(&fds, @min(pollTimeoutMs(remaining_ns), 20)) == 0) continue;
         const n = try std.posix.read(fd, buffer[received..]);
         if (n == 0) return buffer[0..received]; // Server closed: response complete.
         received += n;
@@ -912,4 +959,45 @@ test "classifyFallible times out a stalled classifier and falls back to the loca
     // of a slow test.
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
     try std.testing.expect(elapsed_ms < 10_000);
+}
+
+const ClassifierStallFixture = struct {
+    server: *StallServer,
+    send_head: bool,
+
+    fn run(self: *ClassifierStallFixture) void {
+        const io = self.server.io;
+        const stream = self.server.server.accept(io) catch return;
+        defer stream.close(io);
+        var read_buf: [8192]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var write_buf: [8192]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+        _ = http_server.receiveHead() catch return;
+        if (self.send_head) {
+            writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n") catch return;
+            writer.interface.flush() catch return;
+        }
+        io.sleep(.fromSeconds(30), .awake) catch {};
+    }
+};
+
+test "lock architecture: client classifier watchdog cancels stalled response heads and bodies" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |send_head| {
+        var server = try StallServer.init(io);
+        defer server.deinit();
+        var fixture: ClassifierStallFixture = .{ .server = &server, .send_head = send_head };
+        var task = try io.concurrent(ClassifierStallFixture.run, .{&fixture});
+        defer task.cancel(io);
+        const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/classify", .{server.port()});
+        defer gpa.free(url);
+        const start = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        // Select the same std.http.Client path used by Windows and HTTPS,
+        // even on POSIX, so this regression is exercised on every platform.
+        try std.testing.expectError(error.ClassifierTimeout, classifyExchange(gpa, io, url, "{}", 1, .http_client));
+        try std.testing.expect(std.Io.Timestamp.now(io, .awake).nanoseconds - start < 3 * std.time.ns_per_s);
+    }
 }

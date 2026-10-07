@@ -9,7 +9,11 @@ the plugin's sandboxed environment at load time.
 
 ### `zay.register_tool(spec)`
 
-Register a tool that the AI model can invoke.
+Register a tool that the AI model can invoke. Managed plugins must register
+all tools during `init.lua`. After initialization this returns `nil,
+"tools may only be registered during plugin initialization"`. Names,
+descriptions and parameter schemas are captured as owned immutable metadata
+for the tool registry.
 
 **Parameters:**
 
@@ -209,7 +213,9 @@ Run all registered test suites. Returns `true` if all tests pass.
 e.g. `zay.run_bash("cat", { stdin = "hello" })` returns
 `{ stdout = "hello", code = 0 }`.
 
-**`opts.timeout`** is in seconds: default 30, maximum 3600.
+**`opts.timeout`** is in seconds: default 30, maximum 3600. Execution is also
+capped by the remaining Lua dispatch deadline. Cancellation and deadline
+errors abort the dispatch even inside Lua protected calls.
 
 **Shell safety gate.** Every `run_bash`/`run_shell` command is classified by
 the same shell-safety checker as the built-in `bash` tool *before* it runs.

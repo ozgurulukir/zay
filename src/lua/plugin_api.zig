@@ -370,6 +370,15 @@ pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
 
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, @import("tool_snapshot.zig").registration_closed_key);
+    const closed = c.lua_toboolean(L_ptr, -1) != 0;
+    c.lua_pop(L_ptr, 1);
+    if (closed) {
+        state.pushNil();
+        state.pushString("tools may only be registered during plugin initialization");
+        return 2;
+    }
+
     // arg 1: spec table
     if (!state.isTable(1)) {
         state.pushNil();
@@ -523,6 +532,7 @@ pub fn onEvent(L: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_rawseti(L_ptr, event_subtable, @as(c_int, @intCast(next_idx)));
 
     state.pop(2); // pop event_subtable and events_table
+    @import("events.zig").noteSubscription(L_ptr, event_name);
 
     state.pushBoolean(true);
     return 1;
@@ -654,6 +664,8 @@ pub fn callToolHandler(
     tool_index: c_int,
     params_json: []const u8,
 ) !ToolHandlerResult {
+    const initial_top = c.lua_gettop(L);
+    defer c.lua_settop(L, initial_top);
     // Get zay_tools[index].handler_ref
     _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
     if (c.lua_isnil(L, -1)) {
