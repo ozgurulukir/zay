@@ -15,6 +15,7 @@ const log = std.log.scoped(.auth);
 
 const keyring = @import("keyring.zig");
 const paths = @import("../paths.zig");
+const os = @import("../os.zig");
 
 const keyring_service = "Zay";
 
@@ -803,4 +804,51 @@ test "Credentials.deinit frees all credential slices" {
     // BEFORE the allocator hook runs, so no watch-allocator can observe the
     // pre-free contents. The explicit zeroize still matters in ReleaseFast,
     // where that scribble is compiled out and `deinit` is the only scrub.
+}
+
+
+test "authPath returns HomeNotSet error when home_dir is empty" {
+    // Arrange
+    const gpa = std.testing.allocator;
+
+    // Act
+    const result = authPath(gpa, "");
+
+    // Assert
+    try std.testing.expectError(error.HomeNotSet, result);
+}
+
+test "authPath constructs platform config auth.json path for given home_dir" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const home_dir = "/tmp/test-home";
+
+    // Act
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+
+    // Assert
+    const want_suffix = if (os.is_windows) "AppData/Roaming/zay/auth.json" else ".config/zay/auth.json";
+    const expected = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ home_dir, want_suffix });
+    defer gpa.free(expected);
+
+    try std.testing.expect(paths.pathsEqual(path, expected));
+    try std.testing.expectEqualStrings("auth.json", paths.lastPathSegment(path));
+}
+
+test "authPath handles home_dir with trailing slashes consistently" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const home_dir = "/tmp/test-home";
+    const home_dir_trailing = "/tmp/test-home/";
+
+    // Act
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    const path_trailing = try authPath(gpa, home_dir_trailing);
+    defer gpa.free(path_trailing);
+
+    // Assert
+    try std.testing.expect(paths.pathsEqual(path, path_trailing));
+    try std.testing.expectEqualStrings("auth.json", paths.lastPathSegment(path_trailing));
 }
