@@ -167,24 +167,24 @@ fn writeAssistantItems(
     scrub_encrypted_reasoning: bool,
 ) !void {
     var first = true;
-    for (message.assistant.content) |block| {
+    const blocks = message.assistant.content;
+    var index: usize = 0;
+    while (index < blocks.len) {
+        const block = blocks[index];
+        var end = index + 1;
+        if (textBlock(block)) |text| {
+            if (text.responses_item_id) |id| {
+                while (end < blocks.len) : (end += 1) {
+                    const next = textBlock(blocks[end]) orelse break;
+                    const next_id = next.responses_item_id orelse break;
+                    if (!std.mem.eql(u8, id, next_id)) break;
+                }
+            }
+        }
         if (!first) try out.writeByte(',');
         first = false;
         switch (block) {
-            .text => |text| {
-                try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"");
-                if (text.responses_item_id) |id| {
-                    try out.writeAll(",\"id\":");
-                    try wire_json.writeString(out, gpa, id);
-                }
-                if (text.responses_phase) |phase| {
-                    try out.writeAll(",\"phase\":");
-                    try wire_json.writeString(out, gpa, phase);
-                }
-                try out.writeAll(",\"content\":[{\"type\":\"output_text\",\"text\":");
-                try wire_json.writeString(out, gpa, text.text);
-                try out.writeAll(",\"annotations\":[]}]}");
-            },
+            .text, .refusal => try writeTextItem(out, gpa, blocks[index..end]),
             .reasoning => |reasoning| {
                 if (reasoning.responses_item_json) |json| {
                     if (scrub_encrypted_reasoning) {
@@ -207,8 +207,48 @@ fn writeAssistantItems(
             .tool_call => |call| try writeFunctionCall(out, gpa, call),
             .image => try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}"),
         }
+        index = end;
     }
     if (first) try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"\"}");
+}
+
+fn textBlock(block: ai.ContentBlock) ?ai.TextBlock {
+    return switch (block) {
+        .text, .refusal => |text| text,
+        else => null,
+    };
+}
+
+fn writeTextItem(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+    const text = textBlock(blocks[0]).?;
+    try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"");
+    if (text.responses_item_id) |id| {
+        try out.writeAll(",\"id\":");
+        try wire_json.writeString(out, gpa, id);
+    }
+    if (text.responses_phase) |phase| {
+        try out.writeAll(",\"phase\":");
+        try wire_json.writeString(out, gpa, phase);
+    }
+    try out.writeAll(",\"content\":[");
+    var first = true;
+    for (blocks) |block| {
+        const part = textBlock(block).?;
+        // Message-added events create a text placeholder before the part kind is known.
+        if (block == .text and part.text.len == 0 and blocks.len > 1) continue;
+        if (!first) try out.writeByte(',');
+        first = false;
+        if (block == .refusal) {
+            try out.writeAll("{\"type\":\"refusal\",\"refusal\":");
+            try wire_json.writeString(out, gpa, part.text);
+            try out.writeByte('}');
+        } else {
+            try out.writeAll("{\"type\":\"output_text\",\"text\":");
+            try wire_json.writeString(out, gpa, part.text);
+            try out.writeAll(",\"annotations\":[]}");
+        }
+    }
+    try out.writeAll("]}");
 }
 
 fn writeFunctionCall(out: *std.Io.Writer, gpa: std.mem.Allocator, call: ai.ToolCall) !void {
@@ -239,7 +279,7 @@ fn writeInputContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []cons
     var count: u32 = 0;
     for (blocks) |block| {
         switch (block) {
-            .text => |text| {
+            .text, .refusal => |text| {
                 if (count > 0) try out.writeByte(',');
                 try out.writeAll("{\"type\":\"input_text\",\"text\":");
                 try wire_json.writeString(out, gpa, text.text);
@@ -265,6 +305,61 @@ fn writeInputContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []cons
     try out.writeByte(']');
 }
 
+test "assistant replay groups refusal and prose by item identity" {
+    const gpa = std.testing.allocator;
+    var blocks = [_]ai.ContentBlock{
+        .{ .refusal = .{ .text = @constCast("Declined"), .responses_item_id = @constCast("msg_refusal"), .responses_phase = @constCast("final_answer") } },
+        .{ .text = .{ .text = @constCast(""), .responses_item_id = @constCast("msg_refusal") } },
+        .{ .text = .{ .text = @constCast("Separate"), .responses_item_id = @constCast("msg_other") } },
+    };
+    for ([_][]const u8{ "", "Alternative" }) |prose| {
+        blocks[1].text.text = @constCast(prose);
+        var payload: std.Io.Writer.Allocating = .init(gpa);
+        defer payload.deinit();
+        try payload.writer.writeByte('[');
+        try writeAssistantItems(&payload.writer, .{ .assistant = .{ .content = &blocks } }, gpa, "test", false);
+        try payload.writer.writeByte(']');
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload.written(), .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 2), items.len);
+        try std.testing.expectEqualStrings("msg_refusal", items[0].object.get("id").?.string);
+        try std.testing.expectEqualStrings("final_answer", items[0].object.get("phase").?.string);
+        const parts = items[0].object.get("content").?.array.items;
+        try std.testing.expectEqual(@as(usize, if (prose.len == 0) 1 else 2), parts.len);
+        try std.testing.expectEqualStrings("refusal", parts[0].object.get("type").?.string);
+        try std.testing.expectEqualStrings("Declined", parts[0].object.get("refusal").?.string);
+        try std.testing.expect(parts[0].object.get("annotations") == null);
+        if (prose.len > 0) {
+            try std.testing.expectEqualStrings("output_text", parts[1].object.get("type").?.string);
+            try std.testing.expectEqualStrings(prose, parts[1].object.get("text").?.string);
+        }
+        try std.testing.expectEqualStrings("msg_other", items[1].object.get("id").?.string);
+    }
+}
+
+test "writeRequestPayload preserves refusal content type" {
+    const gpa = std.testing.allocator;
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .refusal = .{ .text = try gpa.dupe(u8, "Declined") } };
+    var message = ai.ChatMessage{ .assistant = .{ .content = blocks } };
+    defer message.deinit(gpa);
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{.{ .borrowed = &message }}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"refusal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"refusal\":\"Declined\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"output_text\"") == null);
+}
 test "writeRequestPayload puts system prompt in instructions for standard mode" {
     const gpa = std.testing.allocator;
     const empty_content = try gpa.alloc(ai.ContentBlock, 0);

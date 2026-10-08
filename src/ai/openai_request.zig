@@ -64,7 +64,7 @@ fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
     defer aw.deinit();
     for (blocks) |block| {
         switch (block) {
-            .text => |text| try aw.writer.writeAll(text.text),
+            .text, .refusal => |text| try aw.writer.writeAll(text.text),
             .reasoning, .image, .tool_call => {},
         }
     }
@@ -76,7 +76,7 @@ fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
     var count: u32 = 0;
     for (blocks) |block| {
         switch (block) {
-            .text => |text| {
+            .text, .refusal => |text| {
                 if (count > 0) try out.writeByte(',');
                 try out.writeAll("{\"type\":\"text\",\"text\":");
                 try wire_json.writeString(out, gpa, text.text);
