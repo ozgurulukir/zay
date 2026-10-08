@@ -112,16 +112,18 @@ pub const Model = struct {
 
 const StaticModel = struct { id: []const u8, label: []const u8 };
 
-/// ChatGPT-account Codex models selectable today (verified 2026-08-25,
-/// openai.com GPT-5.6 price-performance announcement + learn.chatgpt.com
-/// /docs/models):
-/// Plus/Pro/Business/Enterprise choose Sol, Terra, Luna. Everything older is
-/// deprecated or retired for ChatGPT sign-in — gpt-5.2/gpt-5.3-codex reject
-/// with HTTP 400 ("model is not supported when using Codex with a ChatGPT
-/// account"), gpt-5.4/gpt-5.4-mini retire 2026-08-31, gpt-5.3-codex-spark
-/// never left the Pro research preview. API-key workflows can still reach
-/// other models via their own provider entries.
+/// ChatGPT-account Codex models selectable today (verified 2026-10-08 against
+/// developers.openai.com/codex/models and OpenAI Help Center):
+/// Plus/Pro/Business/Enterprise plans include Astra, GPT-6.1 Sol, GPT-6 Sol,
+/// GPT-6 Luna, and the GPT-5.6 family in Codex, subject to rollout and
+/// workspace permissions. Free/Go availability differs. This catalogue cannot
+/// inspect account entitlements, so the backend remains authoritative.
+/// API-key workflows can still reach other models via their own provider entries.
 const static_models = [_]StaticModel{
+    .{ .id = "gpt-6-astra", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6 Astra" },
+    .{ .id = "gpt-6.1-sol", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6.1 Sol" },
+    .{ .id = "gpt-6-sol", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6 Sol" },
+    .{ .id = "gpt-6-luna", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6 Luna" },
     .{ .id = "gpt-5.6-sol", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Sol" },
     .{ .id = "gpt-5.6-terra", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Terra" },
     .{ .id = "gpt-5.6-luna", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Luna" },
@@ -709,13 +711,21 @@ test "loadStaticModels_returnsExpectedCodexCatalogModels_whenCalledWithAllocator
     }
 
     // Assert
-    try std.testing.expectEqual(@as(usize, 3), loaded.len);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", loaded[0].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Sol", loaded[0].label);
-    try std.testing.expectEqualStrings("gpt-5.6-terra", loaded[1].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Terra", loaded[1].label);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", loaded[2].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Luna", loaded[2].label);
+    try std.testing.expectEqual(@as(usize, 7), loaded.len);
+    try std.testing.expectEqualStrings("gpt-6-astra", loaded[0].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6 Astra", loaded[0].label);
+    try std.testing.expectEqualStrings("gpt-6.1-sol", loaded[1].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6.1 Sol", loaded[1].label);
+    try std.testing.expectEqualStrings("gpt-6-sol", loaded[2].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6 Sol", loaded[2].label);
+    try std.testing.expectEqualStrings("gpt-6-luna", loaded[3].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-6 Luna", loaded[3].label);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", loaded[4].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Sol", loaded[4].label);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", loaded[5].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Terra", loaded[5].label);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", loaded[6].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Luna", loaded[6].label);
 }
 
 test "loadStaticModels_returnsOutOfMemory_whenAllocationFails" {
