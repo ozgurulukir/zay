@@ -40,6 +40,17 @@ pub const SkillContext = struct {
         return self.body(name) != null;
     }
 
+    /// Undo entries prepared for a message that was not admitted.
+    pub fn rollbackTo(self: *SkillContext, gpa: std.mem.Allocator, count: usize) void {
+        std.debug.assert(count <= self.entries.items.len);
+        for (self.entries.items[count..]) |entry| {
+            self.bytes -= entry.name.len + entry.body.len;
+            gpa.free(entry.name);
+            gpa.free(entry.body);
+        }
+        self.entries.items.len = count;
+    }
+
     /// First activation wins, including when discovery later changes the body.
     /// All fallible work precedes admission, so failure leaves the ledger intact.
     pub fn activate(self: *SkillContext, gpa: std.mem.Allocator, name: []const u8, instructions: []const u8) !Activation {
