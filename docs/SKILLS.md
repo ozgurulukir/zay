@@ -28,6 +28,9 @@ An invalid skill is skipped with a log warning; it never aborts loading. Reasons
 
 ## Invocation
 
-- `$name` in a prompt injects the skill body into that message (deduplicated, case-insensitive; a 256 KB per-turn budget applies).
+- `$name` injects the skill body on its first activation in the active conversation branch (case-insensitive; a 256 KB per-turn inline budget applies). Later mentions keep the user prompt without injecting the body again.
 - The model calls the `skill` tool with `{"name": "…"}` when the task matches a description.
-- On resume, previously injected skills are re-derived from the persisted transcript.
+- Successful model `skill` calls register the same activation. Repeated calls still receive a protocol result, with a short already-loaded notice.
+- Full activated instructions survive ordinary tool-result pruning, compaction, branch reload, and resume, even when the original skill file is missing. The first admitted body wins; changing a file does not replace an active body.
+- Branch-scoped `skill_context` session entries store owned bodies. Old sessions recover complete generated inline blocks and successful results correlated with explicit `skill` calls; ambiguous or incomplete history is ignored.
+- Each branch can retain at most 256 skills and 1 MiB of instruction bytes, with a 256 KiB per-body limit. Capacity errors reject new activation without evicting existing instructions.

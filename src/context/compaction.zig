@@ -12,6 +12,8 @@ const std = @import("std");
 
 const tools_common = @import("../tools/common.zig");
 const ai = @import("../ai.zig");
+const skill_history = @import("skill_history.zig");
+const SkillContext = @import("skill_context.zig").SkillContext;
 /// Runtime models.dev registry — provides `ModelInfo` for capability lookups.
 const modelsdev = @import("../models/registry.zig");
 
@@ -302,15 +304,24 @@ fn lastUserIndex(messages: []const ai.ChatMessage) ?u32 {
 /// at `tool_output_render_cap_bytes` so one large output cannot dominate. The
 /// result is the user content of the compaction request. Caller owns it.
 pub fn serializePrefix(gpa: std.mem.Allocator, messages: []const ai.ChatMessage) ![]u8 {
+    return serializePrefixWithSkills(gpa, messages, &.{});
+}
+
+/// Omit bodies only when the persisted branch ledger owns an exact copy.
+pub fn serializePrefixWithSkills(gpa: std.mem.Allocator, messages: []const ai.ChatMessage, skills: *const SkillContext) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    for (messages) |message| {
-        try writeMessage(gpa, &out.writer, message);
+    for (messages, 0..) |message, index| {
+        if (skill_history.retainedTool(skills, messages, index)) {
+            try out.writer.writeAll("[tool result]: Skill instructions activated; full bodies retained in session skill_context metadata.\n");
+            continue;
+        }
+        try writeMessage(gpa, &out.writer, message, skills);
     }
     return out.toOwnedSlice();
 }
 
-fn writeMessage(gpa: std.mem.Allocator, out: *std.Io.Writer, message: ai.ChatMessage) !void {
+fn writeMessage(gpa: std.mem.Allocator, out: *std.Io.Writer, message: ai.ChatMessage, skills: *const SkillContext) !void {
     switch (message) {
         .tool => |t| {
             // Sandwich the tool result so the summarizer sees the conclusion
@@ -329,7 +340,10 @@ fn writeMessage(gpa: std.mem.Allocator, out: *std.Io.Writer, message: ai.ChatMes
             };
             for (m.content) |block| {
                 switch (block) {
-                    .text => |text| try out.print("[{s}]: {s}\n", .{ label, text.text }),
+                    .text => |text| {
+                        const rendered = if (message == .user) try skill_history.writeInlineNotices(out, text.text, skills) else text.text;
+                        try out.print("[{s}]: {s}\n", .{ label, rendered });
+                    },
                     .tool_call => |call| try out.print("[{s} tool_call]: {s}({s})\n", .{ label, call.name, cappedText(call.arguments) }),
                     // Images vanish without a marker today; leave an explicit
                     // placeholder so the summary keeps a positional hint (M6).
@@ -787,4 +801,51 @@ test "shouldStartSummary_handlesBoundaryThresholdsCorrectly" {
     // Act & Assert max_threshold
     try std.testing.expect(!shouldStartSummary(90_000, context_window, max_threshold));
     try std.testing.expect(shouldStartSummary(90_001, context_window, max_threshold));
+}
+
+test "skill context compaction emits durable pointers instead of instruction bodies" {
+    const gpa = std.testing.allocator;
+    var skills: SkillContext = .{};
+    defer skills.deinit(gpa);
+    _ = try skills.activate(gpa, "how", "FULL INLINE INSTRUCTIONS");
+    _ = try skills.activate(gpa, "tool-skill", "FULL TOOL INSTRUCTIONS");
+    var user_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = @constCast("<skill name=\"how\" location=\"/gone/SKILL.md\">\nReferences are relative to /gone.\n\nFULL INLINE INSTRUCTIONS\n</skill>\n\nPlease continue") } }};
+    var calls = [_]ai.ContentBlock{.{ .tool_call = .{
+        .call_id = .{ .value = @constCast("call") },
+        .name = @constCast("skill"),
+        .arguments = @constCast("{\"name\":\"how\"}"),
+    } }};
+    var result = [_]ai.ContentBlock{.{ .text = .{ .text = @constCast("FULL TOOL INSTRUCTIONS") } }};
+    const messages = [_]ai.ChatMessage{
+        .{ .user = .{ .content = &user_blocks } },
+        .{ .assistant = .{ .content = &calls } },
+        .{ .tool = .{ .call_id = .{ .value = @constCast("call") }, .content = &result } },
+        .{ .tool = .{ .call_id = .{ .value = @constCast("ordinary") }, .content = &result } },
+    };
+    const text = try serializePrefixWithSkills(gpa, &messages, &skills);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "FULL INLINE INSTRUCTIONS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[skill activated]: how") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "skill_context metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Please continue") != null);
+    // Only the correlated skill result is removed; ordinary output is retained.
+    const first = std.mem.indexOf(u8, text, "FULL TOOL INSTRUCTIONS").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, text, first + 1, "FULL TOOL INSTRUCTIONS") == null);
+
+    // No metadata means there is no durable copy, including when legacy
+    // activation was rejected for capacity or an invalid name.
+    const unretained = try serializePrefix(gpa, &messages);
+    defer gpa.free(unretained);
+    try std.testing.expect(std.mem.indexOf(u8, unretained, "FULL INLINE INSTRUCTIONS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unretained, "skill_context metadata") == null);
+    const unretained_first = std.mem.indexOf(u8, unretained, "FULL TOOL INSTRUCTIONS").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, unretained, unretained_first + 1, "FULL TOOL INSTRUCTIONS") != null);
+
+    // A saved activation with a different body cannot replace this history.
+    skills.clear(gpa);
+    _ = try skills.activate(gpa, "how", "Different body");
+    const mismatched = try serializePrefixWithSkills(gpa, &messages, &skills);
+    defer gpa.free(mismatched);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched, "FULL INLINE INSTRUCTIONS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched, "skill_context metadata") == null);
 }

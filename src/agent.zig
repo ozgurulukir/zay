@@ -18,6 +18,7 @@ const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const skill_context_mod = @import("context/skill_context.zig");
+const skill_history = @import("context/skill_history.zig");
 const stream_parser = @import("ai/stream_parser.zig");
 const text_tool_call = @import("ai/text_tool_call.zig");
 const tools = @import("tools.zig");
@@ -433,7 +434,15 @@ pub const Agent = struct {
     }
 
     pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {
+        const mark = self.skill_context.entries.items.len;
+        errdefer self.skill_context.rollbackTo(self.gpa, mark);
+        const history = try self.gpa.alloc(ai.ChatMessage, self.messages().len + 1);
+        defer self.gpa.free(history);
+        @memcpy(history[0..self.messages().len], self.messages());
+        history[history.len - 1] = message;
+        try skill_history.rebuild(&self.skill_context, self.gpa, history, self.skills);
         try self.context_manager.appendUnpersisted(message);
+        if (self.skill_context.entries.items.len != mark) self.skill_context_dirty = true;
     }
 
     /// Drop every non-system message, freeing it. Keeps the system prompt(s) in
@@ -593,12 +602,13 @@ pub const Agent = struct {
                 .listener = l,
             };
             defer stream_context.deinit();
-            const prompt_messages = try context_assembly.pruneHistoricalToolResultsViewsCached(
+            const prompt_messages = try context_assembly.pruneHistoricalToolResultsViewsWithSkills(
                 self.gpa,
                 &self.tool_view_cache,
                 self.messages(),
                 self.compaction_settings.keep_recent_tool_turns,
                 self.compaction_settings.historical_tool_cap_bytes,
+                &self.skill_context,
             );
             defer context_assembly.freePrunedViews(self.gpa, prompt_messages);
             // #122: evict images from OLDER user messages into re-mention
@@ -1321,13 +1331,17 @@ pub const Agent = struct {
             assert(r.call_id.value.len > 0);
             const skill_count = self.skill_context.entries.items.len;
             errdefer self.skill_context.rollbackTo(self.gpa, skill_count);
-            if (!r.failed and std.mem.eql(u8, r.name, "skill")) {
+            if (std.mem.eql(u8, r.name, "skill")) {
                 if (try self.skillForResult(r)) |loaded| {
-                    const activation = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
-                    if (activation == .already_loaded) {
-                        const notice = try self.gpa.dupe(u8, skill_context_mod.loaded_notice);
-                        self.gpa.free(r.content);
-                        r.content = notice;
+                    const already_loaded = self.skill_context.contains(loaded.name);
+                    if (!r.failed or already_loaded) {
+                        const activation = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
+                        if (activation == .already_loaded) {
+                            const notice = try self.gpa.dupe(u8, skill_context_mod.loaded_notice);
+                            self.gpa.free(r.content);
+                            r.content = notice;
+                            r.failed = false;
+                        }
                     }
                 }
             }
@@ -1355,7 +1369,7 @@ pub const Agent = struct {
         }
     }
 
-    fn skillForResult(self: *Agent, result: *const executor_mod.ToolResult) !?*const skill_mod.Skill {
+    fn skillForResult(self: *Agent, result: *const executor_mod.ToolResult) !?skill_context_mod.SkillContext.Entry {
         var index = self.messages().len;
         while (index > 0) {
             index -= 1;
@@ -1371,7 +1385,11 @@ pub const Agent = struct {
                     return null;
                 };
                 defer args.deinit(self.gpa);
-                return skill_mod.find(self.skills, args.name);
+                for (self.skill_context.entries.items) |entry| {
+                    if (std.ascii.eqlIgnoreCase(entry.name, args.name)) return entry;
+                }
+                if (skill_mod.find(self.skills, args.name)) |source| return .{ .name = source.name, .body = source.body };
+                return null;
             }
             return null;
         }
@@ -1420,23 +1438,25 @@ pub const Agent = struct {
 
     fn estimateTrailingTokensCb(ctx: *anyopaque, anchor_count: u32) u32 {
         const self: *Agent = @ptrCast(@alignCast(ctx));
-        return context_assembly.estimatePrunedTokensRange(
+        return context_assembly.estimatePrunedTokensRangeWithSkills(
             self.context_manager.items(),
             anchor_count,
             self.compaction_settings.keep_recent_tool_turns,
             self.compaction_settings.historical_tool_cap_bytes,
             self.compaction_settings.evict_history_images,
+            &self.skill_context,
         );
     }
 
     fn estimateAllTokensCb(ctx: *anyopaque) u32 {
         const self: *Agent = @ptrCast(@alignCast(ctx));
-        return context_assembly.estimatePrunedTokensRange(
+        return context_assembly.estimatePrunedTokensRangeWithSkills(
             self.context_manager.items(),
             0,
             self.compaction_settings.keep_recent_tool_turns,
             self.compaction_settings.historical_tool_cap_bytes,
             self.compaction_settings.evict_history_images,
+            &self.skill_context,
         );
     }
 
@@ -1525,13 +1545,15 @@ pub const Agent = struct {
     /// Consume both projections on success. Reservation happens before either
     /// live owner is discarded, so an allocation failure preserves both.
     pub fn replaceConversation(self: *Agent, projected: *session_mod.SessionWriter.Conversation) !void {
+        const prior_count = projected.skill_context.entries.items.len;
+        try skill_history.rebuild(&projected.skill_context, self.gpa, projected.messages, self.skills);
         try self.context_manager.replaceConversation(projected.messages);
         self.gpa.free(projected.messages);
         projected.messages = &.{};
         self.skill_context.deinit(self.gpa);
         self.skill_context = projected.skill_context;
         projected.skill_context = .{};
-        self.skill_context_dirty = false;
+        self.skill_context_dirty = self.skill_context.entries.items.len != prior_count;
         self.tool_view_cache.clear(self.gpa);
     }
 };
@@ -3549,4 +3571,64 @@ test "I3: setWorkspace/effectiveCwd round-trip under the test allocator" {
     agent.setWorkspace(null);
     try std.testing.expectEqualStrings(".", agent.effectiveCwd());
     try std.testing.expect(agent.workspaceBorrow() == null);
+}
+
+test "skill context missing source repeat returns one successful protocol result" {
+    const gpa = std.testing.allocator;
+    var client = try ai.scripted_client.Client.init(gpa, std.testing.io, "skill-test");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.toolCall("skill", "{\"name\":\"HOW\"}"),
+        ai.scripted_client.step.text("done", .stop),
+    });
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    _ = try agent.skill_context.activate(gpa, "how", "Saved instructions");
+    try agent.addUser("Use the saved skill");
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+    var count: usize = 0;
+    for (agent.messages()) |message| {
+        if (message != .tool) continue;
+        count += 1;
+        try std.testing.expect(!message.tool.failed);
+        try std.testing.expectEqualStrings(skill_context_mod.loaded_notice, message.text());
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings("Saved instructions", agent.skill_context.body("how").?);
+}
+
+test "skill context canceled result preserves call pairing without activating" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    const fixture: skill_mod.Skill = .{
+        .name = @constCast("how"),
+        .description = @constCast("Test"),
+        .path = @constCast("/missing/SKILL.md"),
+        .base_dir = @constCast("/missing"),
+        .body = @constCast("Instructions"),
+    };
+    agent.skills = &.{fixture};
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .tool_call = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "canceled-call") },
+        .name = try gpa.dupe(u8, "skill"),
+        .arguments = try gpa.dupe(u8, "{\"name\":\"how\"}"),
+    } };
+    try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+    var results = [_]executor_mod.ToolResult{try executor_mod.ToolResult.init(gpa, .{
+        .call_id = "canceled-call",
+        .name = "skill",
+        .failed = true,
+        .content = try gpa.dupe(u8, "Tool canceled"),
+        .display = .{ .label = try gpa.dupe(u8, "skill how") },
+        .display_body = try gpa.dupe(u8, "Tool canceled"),
+    })};
+    try agent.takeToolResults(&results);
+    try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
+    try std.testing.expect(agent.messages()[1].tool.failed);
+    try std.testing.expectEqualStrings("canceled-call", agent.messages()[1].tool.call_id.slice());
+    try std.testing.expect(!agent.skill_context.contains("how"));
 }

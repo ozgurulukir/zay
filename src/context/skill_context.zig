@@ -8,7 +8,9 @@ pub const SkillContext = struct {
 
     pub const Entry = struct { name: []const u8, body: []const u8 };
     pub const Activation = enum { inserted, already_loaded };
-    pub const bytes_max = 8 * 1024 * 1024;
+    // Keep one worst-case escaped snapshot inside the remote 16 MiB response
+    // envelope, including its second JSON encoding as a database cell.
+    pub const bytes_max = 1024 * 1024;
     pub const body_bytes_max = 256 * 1024;
     pub const entries_max = 256;
     // JSON escaping can expand each input byte into six bytes.
@@ -160,12 +162,13 @@ test "skill context rejects capacity without evicting instructions" {
     defer gpa.free(large);
     @memset(large, 'x');
     var name_buffer: [64]u8 = undefined;
-    for (0..31) |index| {
+    const count = SkillContext.bytes_max / (SkillContext.body_bytes_max + 64);
+    for (0..count) |index| {
         const name = try std.fmt.bufPrint(&name_buffer, "skill-{d}", .{index});
         _ = try ledger.activate(gpa, name, large);
     }
     try std.testing.expectError(error.SkillContextFull, ledger.activate(gpa, "overflow", large));
-    try std.testing.expectEqual(@as(usize, 31), ledger.entries.items.len);
+    try std.testing.expectEqual(count, ledger.entries.items.len);
     try std.testing.expectEqualStrings(large, ledger.body("skill-0").?);
 }
 

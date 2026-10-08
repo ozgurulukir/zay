@@ -10,6 +10,7 @@ const transcript_mod = @import("../transcript.zig");
 const runtime_mod = @import("../runtime.zig");
 const search_mod = @import("../search.zig");
 const skill_mod = @import("../skill.zig");
+const skill_rows = @import("skill_rows.zig");
 const lifecycle = @import("lifecycle.zig");
 const lane_recovery = @import("lanes/recovery.zig");
 
@@ -134,11 +135,7 @@ pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
                 for (injected) |n| app.gpa.free(n);
                 app.gpa.free(injected);
             }
-            for (injected) |name| {
-                const title = try std.fmt.allocPrint(app.gpa, "[SKILL] {s}", .{name});
-                defer app.gpa.free(title);
-                _ = try lane.transcript.append(app.gpa, .skill, title, "");
-            }
+            for (injected) |name| try skill_rows.appendOnce(app.gpa, &lane.transcript, name);
         } else if (message.role() == .assistant) {
             for (message.assistant.content) |block| {
                 switch (block) {
@@ -157,6 +154,9 @@ pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
             _ = try lane.transcript.appendTool(app.gpa, title, text, message.tool.failed);
         }
     }
+    // Rebuilding happens at an idle turn boundary; restore the inventory even
+    // when compaction removed the original inline activation messages.
+    for (agent.skill_context.entries.items) |entry| try skill_rows.appendOnce(app.gpa, &lane.transcript, entry.name);
     if (lane.transcript.messages.items.len > 0) lane.transcript.selected = @intCast(lane.transcript.messages.items.len - 1);
 }
 
