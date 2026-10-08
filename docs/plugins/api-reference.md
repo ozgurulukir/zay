@@ -189,8 +189,8 @@ Run all registered test suites. Returns `true` if all tests pass.
 | `zay.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, truncated, full_size, language, mime_type}` | Read file with metadata (`truncated`/`full_size` are set when the read cap clipped the body) |
 | `zay.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write (temp + rename) |
 | `zay.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence); refuses files over the 1 MB read cap (`nil, "…FileTooLarge…"`-class error) |
-| `zay.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content search (grep); `max_results` default 50, hard cap 200 |
-| `zay.find_files(root, pattern, opts?)` | `root`, `pattern`, `opts.max_results` | `{root, total_matches, truncated, results}` | Recursive filename glob (`**`, `*`, `?`); `max_results` default 100, hard cap 200; dotfile entries are skipped |
+| `zay.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Literal content search of an exact file or recursive directory; include globs (`*`, `**`, `?`) match basenames or root-relative paths; `max_results` default 50, hard cap 200 |
+| `zay.find_files(root, pattern, opts?)` | `root`, `pattern`, `opts.max_results` | `{root, total_matches, truncated, results}` | Filename glob (`**`, `*`, `?`) of an exact file basename or recursive directory; `max_results` default 100, hard cap 200; discovered dotfile entries are skipped |
 | `zay.list_dir(path)` | `path` | `{path, files, directories, total_items}` | Directory listing |
 | `zay.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
 | `zay.mkdir(path)` | `path` | `true` or `nil` | Create directory recursively |

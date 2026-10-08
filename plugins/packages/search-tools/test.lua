@@ -8,8 +8,10 @@
 --   2. Backend routing. Substring (default) must use Zay's built-in
 --      search_files (self-contained, no rg); only regex=true shells out to rg.
 --
--- The `zay` bridge is mocked so the handler runs without a live Zay runtime.
+-- Command and error tests mock the bridge. Integration tests below restore
+-- the real bridge and exercise the handler against temporary fixture files.
 local test = test_runner
+local real_zay = zay
 
 -- ── Mock the zay bridge, then load the plugin ──────────────────────
 local registered = {}
@@ -23,6 +25,7 @@ local search_reply = nil
 local file_info_types = {}
 
 zay = {
+  json_decode = real_zay.json_decode,
   register_tool = function(tool)
     registered[tool.name] = tool
   end,
@@ -71,6 +74,11 @@ f:close()
 assert(load(src))()
 
 local grep = registered.grep
+local function rg_line(file, line, content)
+  return assert(real_zay.json_encode({type="match", data={
+    path={text=file}, line_number=line, lines={text=content .. "\n"},
+  }})) .. "\n"
+end
 
 local function reset()
   last_bash = nil
@@ -162,7 +170,7 @@ test.describe("grep regex output handling", function()
   test.it("groups rg output by file", function()
     reset()
     bash_reply = {
-      stdout = "src/a.zig:10:hello\nsrc/a.zig:20:world\nsrc/b.zig:5:hello\n",
+      stdout = rg_line("src/a.zig", 10, "hello") .. rg_line("src/a.zig", 20, "world") .. rg_line("src/b.zig", 5, "hello"),
       stderr = "",
       code = 0,
     }
@@ -175,7 +183,7 @@ test.describe("grep regex output handling", function()
 
   test.it("keeps content that contains colons intact", function()
     reset()
-    bash_reply = { stdout = "src/a.zig:3:map: key: value\n", stderr = "", code = 0 }
+    bash_reply = { stdout = rg_line("src/a.zig", 3, "map: key: value"), stderr = "", code = 0 }
     local out = grep.handler({ pattern = "map", regex = true })
     test.assert.contains("Line 3: map: key: value", out)
   end)
@@ -191,18 +199,18 @@ test.describe("grep regex output handling", function()
     reset()
     bash_reply = { stdout = "", stderr = "regex parse error", code = 2 }
     local _, out = grep.handler({ pattern = "(", regex = true })
-    test.assert.contains("invalid regex", out)
+    test.assert.contains("invalid regex or unreadable path", out)
   end)
 
   test.it("caps output at max_results with a truncation marker", function()
     reset()
     local lines = {}
     for i = 1, 10 do
-      table.insert(lines, "f.zig:" .. i .. ":match")
+      table.insert(lines, rg_line("f.zig", i, "match"))
     end
     bash_reply = { stdout = table.concat(lines, "\n") .. "\n", stderr = "", code = 0 }
     local out = grep.handler({ pattern = "match", regex = true, max_results = 3 })
-    test.assert.contains("Found 10 matches (showing first 3", out)
+    test.assert.contains("Found at least 4 matches (showing first 3", out)
   end)
 
   test.it("reports regex needs rg when rg is missing (exit 127)", function()
@@ -265,10 +273,9 @@ test.describe("grep substring output handling", function()
     test.assert.contains("could not search", out)
   end)
 
-  test.it("scopes a file-path `path` to that single file via the restriction", function()
+  test.it("passes an exact file root to the native bridge", function()
     reset()
-    -- The mock reports "src/skill.zig" as a file, so resolve_search_root must
-    -- descend to "src" and pass "skill.zig" as the file restriction.
+    -- An explicit file remains the root; the bridge searches it directly.
     file_info_types["src/skill.zig"] = "file"
     search_reply = {
       query = "deinit",
@@ -277,9 +284,9 @@ test.describe("grep substring output handling", function()
       results = { { file = "src/skill.zig", line = 18, content = "deinit" } },
     }
     local out = grep.handler({ pattern = "deinit", path = "src/skill.zig" })
-    -- Walk happened in the parent dir, restricted to the single file.
-    test.assert.equal("src", last_search.root)
-    test.assert.equal("skill.zig", last_search.opts.file_pattern)
+    -- Preserve the original file and any caller-supplied include filter.
+    test.assert.equal("src/skill.zig", last_search.root)
+    test.assert.equal(nil, last_search.opts.file_pattern)
     test.assert.contains("src/skill.zig:", out)
   end)
 
@@ -335,49 +342,173 @@ test.describe("glob file-path gating", function()
   end)
 end)
 
-test.describe("resolve_search_root gating", function()
-  -- resolve_search_root is a local helper; its behavior is exercised through
-  -- the grep/glob handlers above (file -> parent dir + basename restriction,
-  -- directory -> unchanged, file_info error -> path preserved). These three
-  -- cases mirror those handler tests at the unit level.
-  test.it("scopes a file path to (parent dir, basename) via the grep handler", function()
+test.describe("grep portable regex behavior", function()
+  test.it("reports an exact-file include check failure", function()
     reset()
-    file_info_types["src/skill.zig"] = "file"
-    search_reply = {
-      query = "deinit",
-      total_matches = 1,
-      truncated = false,
-      results = { { file = "src/skill.zig", line = 18, content = "deinit" } },
-    }
-    grep.handler({ pattern = "deinit", path = "src/skill.zig" })
-    test.assert.equal("src", last_search.root)
-    test.assert.equal("skill.zig", last_search.opts.file_pattern)
+    local original_find = zay.find_files
+    file_info_types["target.zig"] = "file"
+    zay.find_files = function() return nil, "PathTraversal" end
+    local out, err = grep.handler({pattern="needle", path="target.zig", include="*.zig", regex=true})
+    zay.find_files = original_find
+    test.assert.equal(nil, out)
+    test.assert.equal(nil, last_bash)
+    test.assert.contains("PathTraversal", err)
   end)
-
-  test.it("preserves a directory path (no restriction) via the grep handler", function()
-    reset()
-    search_reply = {
-      query = "x",
-      total_matches = 1,
-      truncated = false,
-      results = { { file = "src/a.zig", line = 1, content = "x" } },
-    }
-    grep.handler({ pattern = "x", path = "src" })
-    test.assert.equal("src", last_search.root)
-    test.assert.equal(nil, last_search.opts.file_pattern)
+  test.it("keeps Windows drive letters and colons in file paths", function()
+    bash_reply = {stdout=rg_line("C:/repo/src/a:b.zig", 7, "value: needle"), stderr="", code=0}
+    local out = assert(grep.handler({pattern="needle", regex=true}))
+    test.assert.contains("C:/repo/src/a:b.zig:", out)
+    test.assert.contains("Line 7: value: needle", out)
   end)
-
-  test.it("falls back to the path unchanged when file_info errors", function()
+  test.it("passes relative file paths once without changing cwd", function()
+    bash_reply = {stdout="", stderr="", code=1}
+    grep.handler({pattern="needle", path="src/skill.zig", regex=true})
+    test.assert.contains("-- 'src/skill.zig'", last_bash.cmd)
+    test.assert.equal(nil, last_bash.opts.cwd)
+  end)
+  test.it("does not report empty stdout as success on a shell failure", function()
+    bash_reply = {stdout="", stderr="access denied", code=126}
+    local out, err = grep.handler({pattern="needle", regex=true})
+    test.assert.equal(nil, out)
+    test.assert.contains("exit 126", err)
+  end)
+  test.it("bounds long Unicode match lines without splitting UTF-8", function()
+    bash_reply = {stdout=rg_line("src/ü.zig", 1, string.rep("a", 199) .. "ü tail"), stderr="", code=0}
+    local out = assert(grep.handler({pattern="a", regex=true}))
+    test.assert.contains("src/ü.zig:", out)
+    test.assert.is_true(utf8.len(out) ~= nil)
+    test.assert.contains(string.rep("a", 199) .. "…", out)
+  end)
+  test.it("reports malformed ripgrep output instead of no matches", function()
+    bash_reply = {stdout="{broken", stderr="", code=0}
+    local out, err = grep.handler({pattern="needle", regex=true})
+    test.assert.equal(nil, out)
+    test.assert.contains("decode ripgrep", err)
+  end)
+  test.it("surfaces PowerShell's exit-1 mapping of ripgrep errors", function()
+    bash_reply = {stdout="", stderr="regex parse error", code=1}
+    local out, err = grep.handler({pattern="(", regex=true})
+    test.assert.equal(nil, out)
+    test.assert.contains("regex parse error", err)
+  end)
+  test.it("rejects a path before spawning the shell when file_info fails", function()
     reset()
-    local orig = zay.file_info
-    zay.file_info = function() error("boom") end
-    -- With file_info throwing, the pcall guard keeps the file path as root and
-    -- does NOT add a restriction (handler must still not crash).
-    local ok, _ = pcall(function()
-      grep.handler({ pattern = "x", path = "src/skill.zig" })
+    local original_info = zay.file_info
+    zay.file_info = function() return nil, "PathOutsideCwd" end
+    local out, err = grep.handler({pattern="needle", path="../outside", regex=true})
+    zay.file_info = original_info
+    test.assert.equal(nil, out)
+    test.assert.equal(nil, last_bash)
+    test.assert.contains("PathOutsideCwd", err)
+  end)
+  test.it("matches the quote dialect to the selected runner", function()
+    local original_quote, original_shell = zay.shell_quote, zay.run_shell
+    local dialect
+    zay.shell_quote = function(s, d) dialect=d; return original_quote(s, d) end
+    bash_reply = {stdout="", stderr="", code=1}
+    grep.handler({pattern="needle", regex=true})
+    test.assert.equal("native", dialect)
+    zay.run_shell = nil
+    grep.handler({pattern="needle", regex=true})
+    zay.run_shell, zay.shell_quote = original_shell, original_quote
+    test.assert.equal("posix", dialect)
+  end)
+end)
+
+-- Only registration is intercepted: every filesystem, quoting, shell and JSON
+-- operation below uses the actual Zay bridge. Clean up even after an assertion.
+local function with_fixture(fn)
+  local mocked = zay
+  zay = real_zay
+  local root = ".grep-test-" .. os.time() .. "-" .. math.random(1000000)
+  local ok, err = pcall(function()
+    assert(zay.mkdir(root .. "/src/nested"))
+    assert(zay.write_file(root .. "/src/target.zig", "needle\nUPPER\n"))
+    assert(zay.write_file(root .. "/src/nested/target.zig", "needle sibling\n"))
+    assert(zay.write_file(root .. "/src/prefix-target.zig", "needle prefix\n"))
+    assert(zay.write_file(root .. "/src/space ' file.txt", "needle quoted\n"))
+    fn(root)
+  end)
+  local cleaned, cleanup_err = zay.delete_path(root, {recursive=true})
+  zay = mocked
+  assert(ok, err)
+  assert(cleaned, cleanup_err)
+end
+
+test.describe("grep real Zay bridge integration", function()
+  test.it("searches only the requested file, including include intersection", function()
+    with_fixture(function(root)
+      local out = assert(grep.handler({pattern="needle", path=root .. "/src/target.zig"}))
+      test.assert.contains("Found 1 matches:", out)
+      test.assert.is_false(out:find("sibling", 1, true))
+      test.assert.is_false(out:find("prefix", 1, true))
+      out = assert(grep.handler({pattern="needle", path=root .. "/src/target.zig", include="*.lua"}))
+      test.assert.contains("No matches", out)
+      local excluded = assert(zay.find_files(root .. "/src/target.zig", "*.lua"))
+      test.assert.equal(0, excluded.total_matches)
+      local included = assert(zay.find_files(root .. "/src/target.zig", "**/target.?ig"))
+      test.assert.equal(1, included.total_matches)
     end)
-    zay.file_info = orig
-    test.assert.is_true(ok)
+  end)
+  test.it("supports basename and recursive relative path globs", function()
+    with_fixture(function(root)
+      for _, include in ipairs({"**/*.zig", "target.?ig", "nested/*.zig"}) do
+        local out = assert(grep.handler({pattern="needle", path=root .. "/src", include=include}))
+        test.assert.contains("Line 1: needle sibling", out)
+        test.assert.is_false(out:find("quoted", 1, true))
+      end
+      local out = assert(grep.handler({pattern="needle", path=root .. "/src", include="nested/*.zig"}))
+      test.assert.contains("Found 1 matches:", out)
+    end)
+  end)
+  test.it("handles case sensitivity, result caps and missing roots", function()
+    with_fixture(function(root)
+      local out = assert(grep.handler({pattern="upper", path=root .. "/src/target.zig"}))
+      test.assert.contains("Line 2: UPPER", out)
+      out = assert(grep.handler({pattern="upper", path=root .. "/src/target.zig", case_sensitive=true}))
+      test.assert.contains("No matches", out)
+      out = assert(grep.handler({pattern="needle", path=root .. "/src", max_results=1}))
+      test.assert.contains("showing first 1", out)
+      local clamped = zay.search_files(root .. "/src/target.zig", "needle", {max_results=9223372036854775807})
+      test.assert.equal(1, clamped.total_matches)
+      local result, err = grep.handler({pattern="needle", path=root .. "/missing"})
+      test.assert.equal(nil, result)
+      test.assert.contains("could not search", err)
+      result, err = grep.handler({pattern="needle", path="../", regex=true})
+      test.assert.equal(nil, result)
+      test.assert.contains("PathTraversal", err)
+    end)
+  end)
+  test.it("runs regex searches on relative directories and quoted file paths", function()
+    with_fixture(function(root)
+      local availability = zay.run_shell("rg --version")
+      if not availability or availability.code ~= 0 then
+        local out, err = grep.handler({pattern="needle", path=root .. "/src", regex=true})
+        test.assert.equal(nil, out)
+        test.assert.is_true(err ~= nil)
+        print("ripgrep unavailable: verified error; live regex checks skipped")
+        return
+      end
+      for _, path in ipairs({root .. "/src", root .. "/src/target.zig", root .. "/src/space ' file.txt"}) do
+        local out = assert(grep.handler({pattern="need(le|less)", path=path, regex=true}))
+        test.assert.contains("Line 1: needle", out)
+        if path ~= root .. "/src" then test.assert.contains("Found 1 matches:", out) end
+      end
+      for _, include in ipairs({"*.lua", "nested/*.zig"}) do
+        local out = assert(grep.handler({pattern="needle", path=root .. "/src/target.zig", include=include, regex=true}))
+        test.assert.contains("No matches", out)
+      end
+      for _, include in ipairs({"*.zig", "**/target.?ig"}) do
+        local out = assert(grep.handler({pattern="needle", path=root .. "/src/target.zig", include=include, regex=true}))
+        test.assert.contains("Found 1 matches:", out)
+      end
+      local out, err = grep.handler({pattern="needle", path=root .. "/missing", regex=true})
+      test.assert.equal(nil, out)
+      test.assert.contains("unreadable path", err)
+      out, err = grep.handler({pattern="(", path=root .. "/src", regex=true})
+      test.assert.equal(nil, out)
+      test.assert.contains("invalid regex", err)
+    end)
   end)
 end)
 

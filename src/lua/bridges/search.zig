@@ -57,7 +57,7 @@ pub fn searchFiles(L: ?*c.lua_State) callconv(.c) c_int {
     if (state.getTop() >= 3 and state.isTable(3)) {
         if (bridge.getTableString(&state, 3, "file_pattern")) |v| file_pattern = v;
         if (bridge.getTableBoolean(&state, 3, "case_sensitive")) |v| case_sensitive = v;
-        if (bridge.getTableInteger(&state, 3, "max_results")) |v| max_results = @min(@as(u32, @intCast(@max(v, 1))), max_search_results);
+        if (bridge.getTableInteger(&state, 3, "max_results")) |v| max_results = @intCast(std.math.clamp(v, 1, max_search_results));
     }
 
     const clean_root = sanitizePath(io, root) catch |err| {
@@ -94,8 +94,8 @@ pub fn searchFiles(L: ?*c.lua_State) callconv(.c) c_int {
 
 /// ── zay.find_files(root, pattern, opts?) ───────────────────────────
 ///
-/// Recursively walk `root` and return every file whose **path relative to
-/// root** matches a glob `pattern`.
+/// Match an exact file's basename or recursively return files whose paths
+/// relative to `root` match a glob `pattern`.
 pub fn findFiles(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
@@ -160,6 +160,24 @@ pub const FindCtx = struct {
 
 /// Walk a directory recursively, matching each file's relative path against pattern.
 pub fn walkAndMatch(io: std.Io, dir_path: []const u8, pattern: []const u8, ctx: *FindCtx) !void {
+    // An exact root uses the same basename glob contract as search_files.
+    if (dir_path.len == ctx.root_len) {
+        const stat = try std.Io.Dir.cwd().statFile(io, dir_path, .{});
+        if (stat.kind == .file) {
+            const name = std.fs.path.basename(dir_path);
+            if (!matchGlob(name, pattern)) return;
+            ctx.total = 1;
+            ctx.result_count = 1;
+            var state = State{ .handle = ctx.L orelse return };
+            state.newTable();
+            state.pushString(dir_path);
+            _ = c.lua_setfield(ctx.L.?, -2, "path");
+            state.pushString(name);
+            _ = c.lua_setfield(ctx.L.?, -2, "name");
+            _ = c.lua_rawseti(ctx.L.?, -2, 1);
+            return;
+        }
+    }
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
@@ -291,7 +309,20 @@ pub fn fileNameMatches(name: []const u8, file_pattern: []const u8) bool {
     return std.mem.endsWith(u8, name, suffix);
 }
 
-/// Walk directory recursively and search for pattern.
+/// One search request, shared by the walk and exact-file path.
+const SearchCtx = struct {
+    root: []const u8,
+    file_pattern: ?[]const u8,
+    pattern: []const u8,
+    case_sensitive: bool,
+    max_results: u32,
+    total: *u32,
+    result_count: *u32,
+    L: *c.lua_State,
+};
+
+/// Search an exact file or recursively search a directory. The root stays
+/// fixed across recursion so path globs are relative to the requested root.
 pub fn walkAndSearch(
     io: std.Io,
     dir_path: []const u8,
@@ -303,71 +334,89 @@ pub fn walkAndSearch(
     result_count: *u32,
     L: ?*c.lua_State,
 ) !void {
-    const L_ptr = L orelse return;
+    var ctx: SearchCtx = .{
+        .root = dir_path,
+        .file_pattern = file_pattern,
+        .pattern = pattern,
+        .case_sensitive = case_sensitive,
+        .max_results = max_results,
+        .total = total,
+        .result_count = result_count,
+        .L = L orelse return,
+    };
+    const stat = try std.Io.Dir.cwd().statFile(io, dir_path, .{});
+    if (stat.kind == .file) {
+        try searchFile(io, dir_path, &ctx);
+    } else {
+        try walkSearchDirectory(io, dir_path, &ctx);
+    }
+}
+
+fn walkSearchDirectory(io: std.Io, dir_path: []const u8, ctx: *SearchCtx) !void {
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
-
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
-        if (entry.name.len == 0) continue;
-        if (entry.name[0] == '.') continue;
-
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
         const full_path = try std.fs.path.join(std.heap.page_allocator, &.{ dir_path, entry.name });
         defer std.heap.page_allocator.free(full_path);
-
         switch (entry.kind) {
-            .directory => {
-                try walkAndSearch(io, full_path, file_pattern, pattern, case_sensitive, max_results, total, result_count, L);
-            },
-            .file => {
-                if (file_pattern) |fp| {
-                    if (!fileNameMatches(entry.name, fp)) continue;
-                }
-
-                var file = std.Io.Dir.openFileAbsolute(io, full_path, .{}) catch continue;
-                defer file.close(io);
-
-                var reader = file.reader(io, &.{});
-                const content = reader.interface.allocRemaining(std.heap.page_allocator, .limited(max_read_size)) catch continue;
-                defer std.heap.page_allocator.free(content);
-
-                var line_num: u32 = 0;
-                var pos: usize = 0;
-                while (pos < content.len) {
-                    const next_newline = std.mem.indexOfScalarPos(u8, content, pos, '\n') orelse content.len;
-                    const line = content[pos..next_newline];
-                    pos = next_newline + 1;
-                    line_num += 1;
-
-                    const found = if (case_sensitive)
-                        std.mem.indexOf(u8, line, pattern) != null
-                    else
-                        std.ascii.indexOfIgnoreCase(line, pattern) != null;
-
-                    if (found) {
-                        total.* += 1;
-                        if (result_count.* < max_results) {
-                            result_count.* += 1;
-                            var st = State{ .handle = L_ptr };
-                            st.newTable();
-                            st.pushString(full_path);
-                            _ = c.lua_setfield(L_ptr, -2, "file");
-                            st.pushInteger(@as(i64, @intCast(line_num)));
-                            _ = c.lua_setfield(L_ptr, -2, "line");
-                            const truncated = if (line.len > search_line_truncate_bytes) line[0..search_line_truncate_bytes] else line;
-                            st.pushString(truncated);
-                            _ = c.lua_setfield(L_ptr, -2, "content");
-                            _ = c.lua_rawseti(L_ptr, -2, @as(c_int, @intCast(result_count.*)));
-                        }
-                    }
-                }
-            },
+            .directory => try walkSearchDirectory(io, full_path, ctx),
+            // Preserve the walker's skip-unreadable policy for discovered files.
+            // An explicitly requested file instead reports read errors above.
+            .file => searchFile(io, full_path, ctx) catch continue,
             else => {},
         }
     }
 }
 
-// ── Unit Tests ───────────────────────────────────────────────────────
+fn searchFile(io: std.Io, full_path: []const u8, ctx: *SearchCtx) !void {
+    if (ctx.file_pattern) |fp| {
+        const name = std.fs.path.basename(full_path);
+        var relative = full_path[ctx.root.len..];
+        if (relative.len > 0 and isPathSep(relative[0])) relative = relative[1..];
+        if (relative.len == 0) relative = name;
+        if (!matchGlob(relative, fp) and !matchGlob(name, fp)) return;
+    }
+    const L_ptr = ctx.L;
+    var file = try std.Io.Dir.openFileAbsolute(io, full_path, .{});
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    const content = try reader.interface.allocRemaining(std.heap.page_allocator, .limited(max_read_size));
+    defer std.heap.page_allocator.free(content);
+
+    var line_num: u32 = 0;
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const next_newline = std.mem.indexOfScalarPos(u8, content, pos, '\n') orelse content.len;
+        const line = content[pos..next_newline];
+        pos = next_newline + 1;
+        line_num += 1;
+
+        const found = if (ctx.case_sensitive)
+            std.mem.indexOf(u8, line, ctx.pattern) != null
+        else
+            std.ascii.indexOfIgnoreCase(line, ctx.pattern) != null;
+
+        if (found) {
+            ctx.total.* += 1;
+            if (ctx.result_count.* < ctx.max_results) {
+                ctx.result_count.* += 1;
+                var st = State{ .handle = L_ptr };
+                st.newTable();
+                st.pushString(full_path);
+                _ = c.lua_setfield(L_ptr, -2, "file");
+                st.pushInteger(@as(i64, @intCast(line_num)));
+                _ = c.lua_setfield(L_ptr, -2, "line");
+                const truncated = if (line.len > search_line_truncate_bytes) line[0..search_line_truncate_bytes] else line;
+                st.pushString(truncated);
+                _ = c.lua_setfield(L_ptr, -2, "content");
+                _ = c.lua_rawseti(L_ptr, -2, @as(c_int, @intCast(ctx.result_count.*)));
+            }
+        }
+    }
+}
 
 test "matchGlob_returnsTrue_whenPatternIsEmpty" {
     // Arrange & Act & Assert
