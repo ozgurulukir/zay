@@ -1385,6 +1385,7 @@ pub const Agent = struct {
                     return null;
                 };
                 defer args.deinit(self.gpa);
+                if (args.resource != null) return null;
                 for (self.skill_context.entries.items) |entry| {
                     if (std.ascii.eqlIgnoreCase(entry.name, args.name)) return entry;
                 }

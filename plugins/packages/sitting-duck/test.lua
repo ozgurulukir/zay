@@ -179,6 +179,31 @@ local function outline(params)
   return registered.ast_outline.handler(params)
 end
 
+test.describe("AST field report diagnostics", function()
+  test.it("preserves the missing column error and explains peek versus source", function()
+    fresh()
+    ready_session()
+    table.remove(query_q, 1)
+    table.insert(query_q, { code = 1, stderr = 'Binder Error: Referenced column "text" not found\nCandidate bindings: "depth", "peek"\n\nLINE 1: SELECT text FROM read_ast(...)\n               ^' })
+    local out, err = registered.ast_query.handler({ sql = "SELECT text FROM read_ast('src/*.zig') LIMIT 10" })
+    test.assert.is_true(out == nil)
+    test.assert.contains('Referenced column "text" not found', err)
+    test.assert.contains("peek (not text)", err)
+    test.assert.contains("ast_get_source", err)
+  end)
+
+  test.it("explains unmatched comma-separated glob input without rewriting it", function()
+    fresh()
+    ready_session()
+    table.remove(query_q, 1)
+    table.insert(query_q, { code = 1, stderr = "IO Error: read_ast needs at least one file to read" })
+    local out, err = outline({ glob = "src/a.zig,src/b.zig" })
+    test.assert.is_true(out == nil)
+    test.assert.contains("one path or glob per call", err)
+    test.assert.contains("comma-separated", err)
+  end)
+end)
+
 -- ── Registration ────────────────────────────────────────────────────
 
 test.describe("registration", function()

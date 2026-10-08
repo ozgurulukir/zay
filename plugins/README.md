@@ -43,3 +43,15 @@ plugin package and URLs must be HTTP(S). The checked-in catalog also has a
 URLs are saved globally in `plugin-stores.json` under Zay's platform config
 directory. The checked-in packages are store sources, not the install
 destination.
+
+To check pinned package sizes and SHA-256 values, run
+`python3 scripts/sync-plugin-catalog.py`. To repair stale metadata, run
+`python3 scripts/sync-plugin-catalog.py --write`; without `--write` it checks
+against the committed bytes at each URL's pinned revision. Local installs use
+`sourceDir` and need no catalog hash update after package edits. Before publishing
+the catalog, first publish the package commit, then run
+`python3 scripts/sync-plugin-catalog.py --write --ref <full-commit-SHA>` and
+publish that catalog update. The remote URLs must point to the commit whose
+bytes match the recorded hashes; updating hashes alone does not publish files.
+The checker requires those commit objects in the local Git clone; fetch missing
+revisions before checking a shallow clone.

@@ -307,6 +307,9 @@ end
 -- mutating handlers can surface a failed write instead of reporting success
 -- while nothing was persisted (persist-before-cache doctrine).
 local function save_todos(tasks)
+  -- Preparing the sidecar directory also creates the task file's parent.
+  local made, mkdir_err = zay.mkdir(PLANS_DIR)
+  if not made then return nil, "could not create todo directory: " .. tostring(mkdir_err or "unknown error") end
   local lines = {}
   for _, t in ipairs(tasks) do
     local line = render_line(t)

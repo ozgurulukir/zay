@@ -55,12 +55,16 @@ pub fn runMcpTool(
     const key: *McpToolKey = @ptrCast(@alignCast(env.userdata));
     const manager = env.ctx.mcp_manager orelse
         return tools_common.fail(gpa, "no MCP manager is configured", 1);
+    const server_args = normalizeArguments(gpa, key.schema, args) catch |err| {
+        return tools_common.failFmt(gpa, 1, "Invalid MCP arguments: {s}", .{@errorName(err)});
+    };
+    defer gpa.free(server_args);
 
     const result_text = blk: {
         for (manager.clients.items) |*client| {
             if (client.status() != .connected) continue;
             if (!std.mem.eql(u8, client.name, key.server_name)) continue;
-            break :blk client.callTool(io, key.tool_name, args) catch |err| {
+            break :blk client.callTool(io, key.tool_name, server_args) catch |err| {
                 return tools_common.failFmt(gpa, 1, "MCP tool '{s}' failed: {s}", .{ key.tool_name, @errorName(err) });
             };
         }
@@ -80,6 +84,38 @@ pub fn runMcpTool(
     errdefer gpa.free(stdout);
     const stderr = try gpa.alloc(u8, 0);
     return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
+}
+
+/// Undo the provider's optional-null encoding only for non-nullable server fields.
+fn normalizeArguments(gpa: std.mem.Allocator, schema: tools_common.Schema, args: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, args, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    for (schema.properties) |prop| {
+        const value = parsed.value.object.get(prop.name) orelse continue;
+        if (value != .null or prop.nullable) continue;
+        if (prop.required) return error.RequiredArgumentNull;
+        _ = parsed.value.object.swapRemove(prop.name);
+    }
+    return std.json.Stringify.valueAlloc(gpa, parsed.value, .{});
+}
+
+test "MCP arguments omit optional non-nullable nulls and preserve server nulls" {
+    const gpa = std.testing.allocator;
+    const schema: tools_common.Schema = .{ .properties = &.{
+        .{ .name = "repo", .kind = .string, .description = "", .required = false },
+        .{ .name = "nullable", .kind = .string, .description = "", .required = false, .nullable = true },
+        .{ .name = "query", .kind = .string, .description = "", .required = true },
+    } };
+    const args = try normalizeArguments(gpa, schema, "{\"repo\":null,\"nullable\":null,\"query\":\"hello\",\"extra\":null}");
+    defer gpa.free(args);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, args, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.contains("repo"));
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("nullable").?);
+    try std.testing.expect(parsed.value.object.contains("extra"));
+    try std.testing.expectEqualStrings("hello", parsed.value.object.get("query").?.string);
+    try std.testing.expectError(error.RequiredArgumentNull, normalizeArguments(gpa, schema, "{\"query\":null}"));
 }
 
 /// Human display metadata for an MCP tool: the bare tool name, plus the

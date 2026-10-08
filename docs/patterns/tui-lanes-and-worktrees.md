@@ -56,6 +56,16 @@ Unify static builtin `config_mod.Provider`, dynamic `modelsdev.Provider`, and us
 
 ### Lane workspace boundary
 
+Model lane operations derive their activity snapshot from `Thread` on the UI
+thread. `running` means an active turn, `cancelling` includes asynchronous
+cancel teardown, and `finishing` means the terminal turn event arrived but the
+spawned worker still owns its runtime or future. `idle` is reported only after
+that ownership has ended. Runtime attachment and completion delivery are
+separate fields: an idle user lane can retain its runtime, and a parked worker
+can have a pending, consumed, or delivered completion. `list`, `read`, `resume`,
+`steer`, and `await` use the same derived snapshot. `await` does not acknowledge
+a finishing worker; repeated completed awaits return the retained result.
+
 The model-facing `lane` tool is orchestration-only: the primary driver
 supervises workers with `spawn`, `read`, `await`, `steer`, `cancel`, `merge`,
 and `delete`. Internal workspace state (`Agent.workspace` and executor

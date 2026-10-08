@@ -61,6 +61,11 @@ Builtin and MCP tool schemas are serialized with OpenAI strict-mode semantics (o
 - Optional fields carry `nullable: true` and emit `["<type>", "null"]` union arrays
 - Nested free-form objects like `env` keep `additionalProperties: true`
 
+Before MCP dispatch, Zay removes provider-encoded nulls only from optional
+fields that the server's schema does not declare nullable. Explicit server
+nullability is preserved separately during schema conversion; required
+non-nullable nulls are rejected rather than silently removed.
+
 The full strict-mode design, its gateway-incompatibility caveats, and its persistence rules live in the [Tool schema strict-mode pattern](PATTERNS.md#tool-schema-strict-mode-pattern) in Patterns.
 
 ## Steering

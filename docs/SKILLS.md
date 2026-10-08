@@ -30,6 +30,12 @@ An invalid skill is skipped with a log warning; it never aborts loading. Reasons
 
 - `$name` injects the skill body on its first activation in the active conversation branch (case-insensitive; a 256 KB per-turn inline budget applies). Later mentions keep the user prompt without injecting the body again.
 - The model calls the `skill` tool with `{"name": "…"}` when the task matches a description.
+- References and other text resources can be read with `{"name":"…","resource":"references/rubric.md"}`.
+  The path is relative to that discovered skill's directory, including global
+  skills outside the workspace. Reads accept regular files and are limited to
+  256 KiB of UTF-8 text;
+  absolute paths, parent traversal, and symlinks escaping the skill directory
+  are rejected. Resource reads do not activate or replace retained instructions.
 - Successful model `skill` calls register the same activation. Repeated calls still receive a protocol result, with a short already-loaded notice.
 - Full activated instructions survive ordinary tool-result pruning, compaction, branch reload, and resume, even when the original skill file is missing. The first admitted body wins; changing a file does not replace an active body.
 - Branch-scoped `skill_context` session entries store owned bodies. Old sessions recover complete generated inline blocks and successful results correlated with explicit `skill` calls; ambiguous or incomplete history is ignored.

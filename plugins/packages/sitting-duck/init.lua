@@ -568,8 +568,17 @@ local function run_query(sql)
         .. " 'src/**/*.zig' instead of 'src/**'). Detail:"
         .. " " .. stderr_tail(res.stderr, 2)
     end
-      return nil, "Error: duckdb query failed: " .. stderr_tail(res.stderr, 3)
-      .. query_artifact_note()
+    local detail = stderr_tail(res.stderr, 8)
+    local hint = ""
+    if tostring(res.stderr or ""):find("Candidate bindings", 1, true) then
+      hint = " Use read_ast columns such as node_id, type, name, file_path,"
+        .. " start_line, end_line and peek (not text). peek is a preview;"
+        .. " use ast_get_source for full source."
+    elseif tostring(res.stderr or ""):find("read_ast needs at least one file", 1, true) then
+      hint = " No source files matched. Pass one path or glob per call;"
+        .. " comma-separated paths are not a glob list."
+    end
+    return nil, "Error: duckdb query failed: " .. detail .. hint .. query_artifact_note()
   end
   local rows = zay.json_decode(res.stdout or "")
   if type(rows) ~= "table" then
@@ -728,7 +737,7 @@ zay.register_tool({
   parameters = {
     glob = {
       type = "string",
-      description = "File path or glob, e.g. 'src/**/*.zig' or 'src/main.zig'",
+      description = "One file path or glob, e.g. 'src/**/*.zig' or 'src/main.zig'. For multiple patterns make separate calls; comma-separated paths are not supported.",
     },
     kinds = {
       type = "string",
