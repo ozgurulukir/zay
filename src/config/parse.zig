@@ -1659,17 +1659,20 @@ pub fn removeProjectPlugin(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, 
         }
     }
     const index = found_index orelse return;
-    const remaining = try gpa.alloc(PluginConfig, current.plugins.len - 1);
-    var initialized: usize = 0;
-    errdefer {
-        for (remaining[0..initialized]) |*plugin| plugin.deinit(gpa);
-        if (remaining.len > 0) gpa.free(remaining);
-    }
-    for (current.plugins, 0..) |plugin, source_index| {
-        if (source_index == index) continue;
-        remaining[initialized] = try plugin.clone(gpa);
-        initialized += 1;
-    }
+    const remaining = remaining: {
+        const entries = try gpa.alloc(PluginConfig, current.plugins.len - 1);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |*plugin| plugin.deinit(gpa);
+            if (entries.len > 0) gpa.free(entries);
+        }
+        for (current.plugins, 0..) |plugin, source_index| {
+            if (source_index == index) continue;
+            entries[initialized] = try plugin.clone(gpa);
+            initialized += 1;
+        }
+        break :remaining entries;
+    };
     for (current.plugins) |*plugin| plugin.deinit(gpa);
     if (current.plugins.len > 0) gpa.free(current.plugins);
     current.plugins = remaining;
@@ -4196,6 +4199,22 @@ test "removeProjectPlugin removes only the named override and is idempotent" {
     var project_config: Config = .{ .plugins = try plugin_list.toOwnedSlice(gpa) };
     defer project_config.deinit(gpa);
     try writeProject(gpa, io, project_dir, project_config);
+
+    // Occupy the atomic writer's temporary path to force a save failure.
+    const config_path = try projectConfigPath(gpa, project_dir);
+    defer gpa.free(config_path);
+    const blocked_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{config_path});
+    defer gpa.free(blocked_path);
+    try std.Io.Dir.createDirPath(.cwd(), io, blocked_path);
+    if (removeProjectPlugin(gpa, io, project_dir, "remove-me")) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    var unchanged = try readProject(gpa, io, project_dir);
+    defer unchanged.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), unchanged.plugins.len);
+    try std.testing.expectEqualStrings("remove-me", unchanged.plugins[0].name);
+    try std.testing.expectEqualStrings("keep-me", unchanged.plugins[1].name);
+    try std.Io.Dir.deleteDir(.cwd(), io, blocked_path);
 
     try removeProjectPlugin(gpa, io, project_dir, "remove-me");
     var after_remove = try readProject(gpa, io, project_dir);

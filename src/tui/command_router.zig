@@ -847,7 +847,10 @@ const PluginsMode = struct {
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches('x', .{})) {
             if (try selectedInstalledPlugin(app)) |plugin| {
-                if (plugin_store_job.configuredEnabled(&app.cached_config, plugin.name)) {
+                if (plugin.path.len == 0) {
+                    plugin_store_job.forgetMissingPlugin(app, plugin.name);
+                    app.pickers.plugins.reset();
+                } else if (plugin_store_job.configuredEnabled(&app.cached_config, plugin.name)) {
                     app.pickers.plugins.confirming_uninstall = false;
                     app.uninstallPlugin(plugin.path);
                 } else if (app.plugin_manager.get(plugin.name) != null) {
