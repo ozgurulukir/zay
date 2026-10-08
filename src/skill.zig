@@ -220,14 +220,30 @@ pub fn filterNames(gpa: std.mem.Allocator, skills: []const Skill, query: []const
 }
 
 pub fn promptPrefix(gpa: std.mem.Allocator, skills: []const Skill, prompt: []const u8) ![]u8 {
+    return promptPrefixExcluding(gpa, skills, prompt, &.{});
+}
+
+pub fn promptPrefixExcluding(gpa: std.mem.Allocator, skills: []const Skill, prompt: []const u8, already_loaded: []const []const u8) ![]u8 {
+    const prefix = try promptPrefixWithNames(gpa, skills, prompt, already_loaded);
+    gpa.free(prefix.names);
+    return prefix.text;
+}
+
+pub const PromptPrefix = struct { text: []u8, names: []const []const u8 };
+
+/// Names reference the discovered skills and include only completed injections.
+pub fn promptPrefixWithNames(gpa: std.mem.Allocator, skills: []const Skill, prompt: []const u8, already_loaded: []const []const u8) !PromptPrefix {
     const names = try collectInvocations(gpa, skills, prompt);
     defer gpa.free(names);
-    if (names.len == 0) return gpa.dupe(u8, "");
+
+    var injected: std.ArrayList([]const u8) = .empty;
+    errdefer injected.deinit(gpa);
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     var remaining: usize = max_total_invocation_bytes;
     for (names) |name| {
+        if (contains(already_loaded, name)) continue;
         const skill = find(skills, name) orelse continue;
         appendSkillBlock(&out.writer, skill, &remaining) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -236,8 +252,11 @@ pub fn promptPrefix(gpa: std.mem.Allocator, skills: []const Skill, prompt: []con
             continue;
         };
         try out.writer.writeAll("\n\n");
+        try injected.append(gpa, skill.name);
     }
-    return out.toOwnedSlice();
+    const text = try out.toOwnedSlice();
+    errdefer gpa.free(text);
+    return .{ .text = text, .names = try injected.toOwnedSlice(gpa) };
 }
 
 /// Extract skill names from `<skill name="…"` markers previously injected by

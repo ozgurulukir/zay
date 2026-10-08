@@ -320,9 +320,7 @@ pub const AgentRuntime = struct {
         try target.agent.addSystem(owned_system_prompt);
 
         if (session_id != null) {
-            const messages = try target.session_writer.session.messages(gpa);
-            defer gpa.free(messages);
-            for (messages) |message| try target.agent.takeMessage(message);
+            try target.reloadMessages();
         }
 
         // When resuming a session, try to restore the model used in that
@@ -549,10 +547,7 @@ pub const AgentRuntime = struct {
     pub fn reloadMessages(self: *AgentRuntime) !void {
         // Project first, swap second: a failed reprojection leaves the live
         // cache intact instead of stranded with only the system prompt (TD-5).
-        const messages = try self.session_writer.messages(self.gpa);
-        defer self.gpa.free(messages);
-        self.agent.clearNonSystemMessages();
-        for (messages) |message| try self.agent.takeMessage(message);
+        try self.agent.reloadFromSession();
         // The conversation is now a different branch; the usage anchor no
         // longer refers to these messages.
         self.agent.resetContextUsage();

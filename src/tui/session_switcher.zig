@@ -295,6 +295,7 @@ pub fn navigateToEntry(app: *App, entry_id: []const u8) !void {
     // after the leaf moves it would corrupt (shared ancestor) or pollute
     // (dead boundary) the new branch. Discard it before switching (TD-2).
     rt.agent.drainBackgroundCompaction();
+    try rt.agent.persistSkillContext();
     try rt.session_writer.navigate(entry_id);
     try rt.reloadMessages();
     try app.rebuildTranscriptFromAgent();

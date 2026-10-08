@@ -17,6 +17,7 @@ const lua_mod = @import("lua/root.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
+const skill_context_mod = @import("context/skill_context.zig");
 const stream_parser = @import("ai/stream_parser.zig");
 const text_tool_call = @import("ai/text_tool_call.zig");
 const tools = @import("tools.zig");
@@ -112,6 +113,8 @@ pub const Agent = struct {
     tool_access: enum { full, none } = .full,
     context_manager: context_mod.ContextManager,
     skills: []const skill_mod.Skill = &.{},
+    skill_context: skill_context_mod.SkillContext = .{},
+    skill_context_dirty: bool = false,
     /// Context window of the connected model, in tokens. Set by the runtime
     /// when a client is attached. 0 means unknown — compaction is disabled.
     context_window_tokens: u32 = 0,
@@ -261,6 +264,7 @@ pub const Agent = struct {
         // reads (the client), then release its result.
         self.drainBackgroundCompaction();
         self.context_manager.deinit();
+        self.skill_context.deinit(self.gpa);
         if (self.message_queue_mutex.lock(self.io)) |_| {
             defer self.message_queue_mutex.unlock(self.io);
             while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
@@ -342,8 +346,14 @@ pub const Agent = struct {
             for (blocks) |*block| block.deinit(self.gpa);
             self.gpa.free(blocks);
         }
+        const skill_count = self.skill_context.entries.items.len;
+        errdefer self.skill_context.rollbackTo(self.gpa, skill_count);
         try self.prependSkillBlocks(prompt, blocks);
         try self.context_manager.appendPersisted(.{ .user = .{ .content = blocks } });
+        if (self.skill_context.entries.items.len != skill_count) {
+            self.skill_context_dirty = true;
+            self.persistSkillContext() catch |err| log.warn("session skill context write failed: {s}", .{@errorName(err)});
+        }
     }
 
     /// Result text recorded for a tool call the user interrupted before it
@@ -404,12 +414,20 @@ pub const Agent = struct {
     fn prependSkillBlocks(self: *Agent, prompt: []const u8, blocks: []ai.ContentBlock) !void {
         assert(blocks.len > 0);
         assert(blocks[0] == .text);
-        const prefix = try skill_mod.promptPrefix(self.gpa, self.skills, prompt);
-        defer self.gpa.free(prefix);
-        if (prefix.len == 0) return;
+        var loaded_names: [skill_context_mod.SkillContext.entries_max][]const u8 = undefined;
+        for (self.skill_context.entries.items, 0..) |entry, index| loaded_names[index] = entry.name;
+        const prefix = try skill_mod.promptPrefixWithNames(self.gpa, self.skills, prompt, loaded_names[0..self.skill_context.entries.items.len]);
+        defer self.gpa.free(prefix.text);
+        defer self.gpa.free(prefix.names);
+        if (prefix.text.len == 0) return;
+
+        for (prefix.names) |name| {
+            const loaded = skill_mod.find(self.skills, name) orelse continue;
+            _ = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
+        }
 
         const old_text = blocks[0].text.text;
-        const new_text = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ prefix, old_text });
+        const new_text = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ prefix.text, old_text });
         self.gpa.free(old_text);
         blocks[0].text.text = new_text;
     }
@@ -425,6 +443,8 @@ pub const Agent = struct {
     pub fn clearNonSystemMessages(self: *Agent) void {
         self.tool_view_cache.clear(self.gpa);
         self.context_manager.clearNonSystem();
+        self.skill_context.clear(self.gpa);
+        self.skill_context_dirty = false;
     }
 
     /// The tagged union the agent emits to describe what is happening.
@@ -566,6 +586,7 @@ pub const Agent = struct {
             _ = turn_arena.reset(.retain_capacity);
             const turn_allocator = turn_arena.allocator();
 
+            try self.persistSkillContext();
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
                 .agent = self,
@@ -1298,6 +1319,18 @@ pub const Agent = struct {
         }
         for (results) |*r| {
             assert(r.call_id.value.len > 0);
+            const skill_count = self.skill_context.entries.items.len;
+            errdefer self.skill_context.rollbackTo(self.gpa, skill_count);
+            if (!r.failed and std.mem.eql(u8, r.name, "skill")) {
+                if (try self.skillForResult(r)) |loaded| {
+                    const activation = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
+                    if (activation == .already_loaded) {
+                        const notice = try self.gpa.dupe(u8, skill_context_mod.loaded_notice);
+                        self.gpa.free(r.content);
+                        r.content = notice;
+                    }
+                }
+            }
             const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
             errdefer self.gpa.free(blocks);
             blocks[0] = .{ .text = .{ .text = r.content } };
@@ -1315,7 +1348,40 @@ pub const Agent = struct {
             if (r.stderr) |s| self.gpa.free(s);
             r.* = undefined;
             moved += 1;
+            if (self.skill_context.entries.items.len != skill_count) {
+                self.skill_context_dirty = true;
+                self.persistSkillContext() catch |err| log.warn("session skill context write failed: {s}", .{@errorName(err)});
+            }
         }
+    }
+
+    fn skillForResult(self: *Agent, result: *const executor_mod.ToolResult) !?*const skill_mod.Skill {
+        var index = self.messages().len;
+        while (index > 0) {
+            index -= 1;
+            const message = self.messages()[index];
+            if (message != .assistant) continue;
+            for (message.assistant.content) |block| {
+                if (block != .tool_call) continue;
+                const call = block.tool_call;
+                if (!std.mem.eql(u8, call.call_id.slice(), result.call_id.slice())) continue;
+                if (!std.mem.eql(u8, call.name, "skill")) return null;
+                var args = @import("tools/skill.zig").parseArgs(self.gpa, call.arguments) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    return null;
+                };
+                defer args.deinit(self.gpa);
+                return skill_mod.find(self.skills, args.name);
+            }
+            return null;
+        }
+        return null;
+    }
+
+    pub fn persistSkillContext(self: *Agent) !void {
+        if (!self.skill_context_dirty) return;
+        if (self.context_manager.session_writer) |writer| try writer.appendSkillContext(&self.skill_context);
+        self.skill_context_dirty = false;
     }
 
     /// Keep the prompt within the model's window using a background summarizer,
@@ -1381,6 +1447,7 @@ pub const Agent = struct {
     fn swapHistory(ctx: *anyopaque, first_kept_id: []const u8, stored_summary: []const u8) anyerror!void {
         const self: *Agent = @ptrCast(@alignCast(ctx));
         const session_writer = self.context_manager.session_writer orelse return error.NoSessionWriter;
+        try self.persistSkillContext();
         try session_writer.appendCompaction(first_kept_id, stored_summary);
         try self.reloadFromSession();
     }
@@ -1445,14 +1512,26 @@ pub const Agent = struct {
     /// compaction boundary was written — the swap. Keeps the system prompt.
     /// Called between turn iterations, where every message is already
     /// persisted and no stream is active; never mid-stream.
-    fn reloadFromSession(self: *Agent) !void {
+    pub fn reloadFromSession(self: *Agent) !void {
         const session_writer = self.context_manager.session_writer orelse return;
+        if (self.skill_context_dirty) return error.SkillContextNotPersisted;
         // Project first, swap second: a failed reprojection leaves the live
         // cache intact instead of stranded with only the system prompt (TD-5).
-        const projected = try session_writer.messages(self.gpa);
-        defer self.gpa.free(projected);
-        errdefer for (projected) |*message| message.deinit(self.gpa);
-        try self.context_manager.replaceConversation(projected);
+        var projected = try session_writer.conversation(self.gpa);
+        defer projected.deinit(self.gpa);
+        try self.replaceConversation(&projected);
+    }
+
+    /// Consume both projections on success. Reservation happens before either
+    /// live owner is discarded, so an allocation failure preserves both.
+    pub fn replaceConversation(self: *Agent, projected: *session_mod.SessionWriter.Conversation) !void {
+        try self.context_manager.replaceConversation(projected.messages);
+        self.gpa.free(projected.messages);
+        projected.messages = &.{};
+        self.skill_context.deinit(self.gpa);
+        self.skill_context = projected.skill_context;
+        projected.skill_context = .{};
+        self.skill_context_dirty = false;
         self.tool_view_cache.clear(self.gpa);
     }
 };
@@ -1752,6 +1831,160 @@ test "queued user messages wait for completed assistant turn" {
     try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
     try std.testing.expectEqualStrings("queued", agent.messages()[1].text());
+}
+
+test "skill context repeated inline and model activation preserves protocol results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture: skill_mod.Skill = .{
+        .name = @constCast("how"),
+        .description = @constCast("Test instructions"),
+        .path = @constCast("/missing/how/SKILL.md"),
+        .base_dir = @constCast("/missing/how"),
+        .body = @constCast("Full skill instructions."),
+    };
+    var client = try ai.scripted_client.Client.init(gpa, io, "skill-test");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.toolCall("skill", "{\"name\":\"how\"}"),
+        ai.scripted_client.step.toolCall("skill", "{\"name\":\"HOW\"}"),
+        ai.scripted_client.step.text("done", .stop),
+    });
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    agent.skills = &.{fixture};
+    try agent.addUser("load the skill");
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+    try std.testing.expectEqual(@as(usize, 1), agent.skill_context.entries.items.len);
+    var result_count: usize = 0;
+    for (agent.messages()) |message| {
+        if (message != .tool) continue;
+        if (result_count == 0) {
+            try std.testing.expectEqualStrings(fixture.body, message.text());
+        } else {
+            try std.testing.expectEqualStrings(skill_context_mod.loaded_notice, message.text());
+        }
+        try std.testing.expect(!message.tool.failed);
+        result_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), result_count);
+    try agent.addUserPrompt("$how $HOW");
+    try std.testing.expectEqualStrings("$how $HOW", agent.messages()[agent.messages().len - 1].text());
+    agent.clearNonSystemMessages();
+    try agent.addUserPrompt("$how $HOW");
+    const injected_names = try skill_mod.collectInjectedSkillNames(gpa, agent.messages()[0].text());
+    defer {
+        for (injected_names) |name| gpa.free(name);
+        gpa.free(injected_names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), injected_names.len);
+    try agent.addUserPrompt("again $HOW");
+    try std.testing.expectEqualStrings("again $HOW", agent.messages()[1].text());
+    try std.testing.expectEqual(@as(usize, 1), agent.skill_context.entries.items.len);
+}
+
+test "skill context metadata enqueue failure retains admitted activation and retries" {
+    const gpa = std.testing.allocator;
+    var manager = try session_mod.SessionManager.init(gpa, std.testing.io, ":memory:");
+    const session = try manager.create("/tmp/zay", .{});
+    var writer: session_mod.SessionWriter = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .manager = manager,
+        .session = session,
+        .queue = try gpa.alloc(session_mod.QueuedEntry, 4),
+    };
+    writer.session.manager = &writer.manager;
+    defer writer.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+    try agent.addUser("admitted message");
+    _ = try agent.skill_context.activate(gpa, "how", "admitted instructions");
+    agent.skill_context_dirty = true;
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    writer.gpa = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, agent.persistSkillContext());
+    writer.gpa = gpa;
+    try std.testing.expect(agent.skill_context_dirty);
+    try std.testing.expectEqualStrings("admitted instructions", agent.skill_context.body("how").?);
+    try std.testing.expectEqualStrings("admitted message", agent.messages()[0].text());
+    try std.testing.expectError(error.SkillContextNotPersisted, agent.reloadFromSession());
+    try agent.persistSkillContext();
+    try std.testing.expect(!agent.skill_context_dirty);
+    try agent.reloadFromSession();
+    try std.testing.expectEqualStrings("admitted instructions", agent.skill_context.body("how").?);
+    try std.testing.expectEqualStrings("admitted message", agent.messages()[0].text());
+}
+
+test "skill context inline admission OOM never falsely activates a skill" {
+    const gpa = std.testing.allocator;
+    const fixture: skill_mod.Skill = .{
+        .name = @constCast("how"),
+        .description = @constCast("Test"),
+        .path = @constCast("/missing/how/SKILL.md"),
+        .base_dir = @constCast("/missing/how"),
+        .body = @constCast("Instructions"),
+    };
+    var reached_success = false;
+    for (0..64) |fail_index| {
+        var agent = Agent.init(gpa, std.testing.io, ".", .none);
+        defer agent.deinit();
+        agent.skills = &.{fixture};
+        var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        agent.gpa = failing.allocator();
+        agent.context_manager.gpa = failing.allocator();
+        const result = agent.addUserPrompt("$how");
+        agent.gpa = gpa;
+        agent.context_manager.gpa = gpa;
+        if (result) |_| {
+            try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+            if (agent.skill_context.contains("how")) {
+                reached_success = true;
+                break;
+            }
+            try std.testing.expect(std.mem.indexOf(u8, agent.messages()[0].text(), "could not be loaded") != null);
+        } else |err| {
+            // Allocating writers translate allocation failure to WriteFailed.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
+            try std.testing.expectEqual(@as(usize, 0), agent.skill_context.entries.items.len);
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "skill context conversation swap is atomic on OOM and restores persisted bodies" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    try agent.addSystem("system");
+    try agent.addUser("original message");
+    _ = try agent.skill_context.activate(gpa, "original", "original instructions");
+    const projected_messages = try gpa.alloc(ai.ChatMessage, 32);
+    for (projected_messages) |*message| message.* = .{ .user = .{ .content = &.{} } };
+    var projected: session_mod.SessionWriter.Conversation = .{ .messages = projected_messages, .skill_context = .{} };
+    defer projected.deinit(gpa);
+    _ = try projected.skill_context.activate(gpa, "missing-source", "persisted instructions");
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    agent.context_manager.gpa = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, agent.replaceConversation(&projected));
+    agent.context_manager.gpa = gpa;
+    try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
+    try std.testing.expectEqualStrings("original message", agent.messages()[1].text());
+    try std.testing.expectEqualStrings("original instructions", agent.skill_context.body("original").?);
+    try std.testing.expectEqual(@as(usize, 32), projected.messages.len);
+    try agent.replaceConversation(&projected);
+    try std.testing.expectEqual(@as(usize, 33), agent.messages().len);
+    try std.testing.expectEqualStrings("system", agent.messages()[0].text());
+    try std.testing.expect(!agent.skill_context.contains("original"));
+    try std.testing.expectEqualStrings("persisted instructions", agent.skill_context.body("missing-source").?);
+    try std.testing.expectEqual(@as(usize, 0), projected.messages.len);
+    agent.clearNonSystemMessages();
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expectEqual(@as(usize, 0), agent.skill_context.entries.items.len);
 }
 
 test "interrupted tool calls get synthetic cancelled results" {
