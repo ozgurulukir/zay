@@ -10,3 +10,6 @@ Engineering patterns are organized as a DokuWiki-style namespace with one landin
 - [Runtime, observability, and portability](patterns/runtime-observability-and-portability.md)
 
 The former monolithic content remains in this compatibility page during migration; the namespace pages define the intended canonical ownership.
+
+
+- [Durable skill context](patterns/plugins-mcp-and-skills.md#durable-skill-context) — activation, branch metadata, request retention, and capacity contracts.

@@ -547,7 +547,10 @@ pub const AgentRuntime = struct {
     pub fn reloadMessages(self: *AgentRuntime) !void {
         // Project first, swap second: a failed reprojection leaves the live
         // cache intact instead of stranded with only the system prompt (TD-5).
-        try self.agent.reloadFromSession();
+        if (self.agent.skill_context_dirty) return error.SkillContextNotPersisted;
+        var projected = try self.session_writer.conversation(self.gpa);
+        defer projected.deinit(self.gpa);
+        try self.agent.replaceConversation(&projected);
         // The conversation is now a different branch; the usage anchor no
         // longer refers to these messages.
         self.agent.resetContextUsage();

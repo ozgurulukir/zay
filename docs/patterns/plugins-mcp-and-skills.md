@@ -91,3 +91,14 @@ There is exactly **one** mid-session exception: a guarded cross-project `/resume
 Global plugins (loaded from `~/.config/zay/plugins/` or `%APPDATA%/zay/plugins/`) are never touched during a repoint — their Lua states, event subscriptions, and `require` caches survive the switch. New-project plugins that share a name with a global override the global (mirroring `loadAll` semantics).
 
 Known limitation (narrowed 2026-09-24): live lane clients keep their spawn-time `tools_json` until rebuilt — the cross-project switch now rebuilds all turn-free lanes via `refreshAllLaneTools` (see § Cross-project session resume pattern), but mid-session MCP/plugin changes still reach only newly-created or live-viewed clients.
+
+
+## Durable skill context
+
+`Agent.skill_context` owns the first admitted body for each case-insensitive skill name. Inline expansion and correlated successful model tool results activate it only alongside message admission; allocation/admission failure rolls back prepared additions. Repeated model calls retain one result per call and return `loaded_notice`.
+
+`skill_context` session entries are complete versioned snapshots on the active branch path, including ancestors before a compaction boundary. They never project as chat messages. `SessionWriter.conversation` quiesces once to project messages and metadata together; `Agent.replaceConversation` reconstructs unambiguous legacy activations and reserves message capacity before replacing either live owner. Reconstructed entries are marked dirty for persistence. Metadata enqueue failure preserves admitted history and the dirty ledger for retry; compaction and branch navigation flush metadata before changing the active path.
+
+`context/skill_history.zig` recognizes generated inline prefixes and successful results correlated with explicit skill calls. Historical successful results remain authoritative when the current skill file changes. Request assembly retains full skill results with their original call IDs and adds missing ledger bodies before conversation history, preserving call/result adjacency. The ledger-aware estimator counts those same bodies and rendered pruning markers. Summarizer serialization replaces full instructions with activation notices only when the persisted branch metadata contains an exact copy; unretained bodies keep their ordinary summarizer representation. Ordinary tool pruning and provider message schemas retain their existing behavior.
+
+The ledger rejects additions exceeding 256 entries, 256 KiB per body, or 1 MiB aggregate instruction bytes. It never evicts active instructions. JSON decoding is transactional and bounded for worst-case escaping. UI activation rows deduplicate against UI-owned transcript state; idle transcript reconstruction restores the branch inventory without reading worker-owned state during queued submission.

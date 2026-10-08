@@ -133,3 +133,5 @@ A theme is rejected (and skipped) if it fails validation parity with the builtin
 
 > [!NOTE]
 > **`tui.customThemesDir` replaces the default scan.** When set, only that directory is scanned for custom themes; `~/.config/zay/themes/` and `.zay/themes/` are ignored. An explicitly-set path means "use this location", not "also scan the defaults".
+
+Activated skill instructions are retained in full independently of `keepRecentToolTurns` and `historicalToolCapBytes`. Compaction summarizes activation notices and keeps the full bodies in branch-scoped session metadata; request assembly supplies those bodies after the original messages are removed. These bytes are included in context estimates. Repeated skill mentions and calls do not add another full body.

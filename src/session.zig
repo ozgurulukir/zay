@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const compaction = @import("context/compaction.zig");
+const SkillContext = @import("context/skill_context.zig").SkillContext;
 const db = @import("db.zig");
 
 const assert = std.debug.assert;
@@ -1091,16 +1092,7 @@ pub const Session = struct {
             for (path) |*entry| entry.deinit(gpa);
             gpa.free(path);
         }
-        var context: @import("context/skill_context.zig").SkillContext = .{};
-        errdefer context.deinit(gpa);
-        for (path) |entry| {
-            if (!std.mem.eql(u8, entry.kind, "skill_context")) continue;
-            context.replaceFromJson(gpa, entry.payload_json) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                std.log.scoped(.session).warn("session skill context skipped: {s}", .{@errorName(err)});
-            };
-        }
-        return context;
+        return skillContextFromPath(gpa, path);
     }
 
     /// Compute where to cut the active branch for compaction: the entry that
@@ -1354,6 +1346,19 @@ fn indexOfEntry(path: []const EntryRecord, id: []const u8) ?u32 {
     return null;
 }
 
+fn skillContextFromPath(gpa: std.mem.Allocator, path: []const EntryRecord) Error!SkillContext {
+    var context: SkillContext = .{};
+    errdefer context.deinit(gpa);
+    for (path) |entry| {
+        if (!std.mem.eql(u8, entry.kind, "skill_context")) continue;
+        context.replaceFromJson(gpa, entry.payload_json) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            std.log.scoped(.session).warn("session skill context skipped: {s}", .{@errorName(err)});
+        };
+    }
+    return context;
+}
+
 /// Render the text handed to the summarizer: any prior summary (folded in so
 /// repeated compactions stay cumulative) followed by the rendered prefix
 /// messages. Caller owns the result.
@@ -1368,7 +1373,9 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
         const inner = compaction.stripSummaryFraming(prev_summary);
         try out.writer.print("{s}\n", .{inner});
     }
-    const rendered = try compaction.serializePrefix(gpa, prefix_msgs);
+    var skills = try skillContextFromPath(gpa, path);
+    defer skills.deinit(gpa);
+    const rendered = try compaction.serializePrefixWithSkills(gpa, prefix_msgs, &skills);
     defer gpa.free(rendered);
     try out.writer.writeAll(rendered);
     return out.toOwnedSlice();
@@ -1993,6 +2000,29 @@ test "compaction cut returns null when the budget covers the branch" {
     try appendTextEntry(&session, gpa, .user, "small", &id_only);
     const result = try session.compactionCut(gpa, 100_000);
     try std.testing.expect(result == null);
+}
+
+test "skill context compaction cut omits only bodies persisted on this branch" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{});
+    const inline_text = "<skill name=\"how\" location=\"/gone/SKILL.md\">\nReferences are relative to /gone.\n\nSaved instructions\n</skill>\n\nContinue";
+    var id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, inline_text, &id);
+    try appendTextEntry(&session, gpa, .assistant, "reply", &id);
+    try appendTextEntry(&session, gpa, .user, "latest", &id);
+    const unretained = (try session.compactionCut(gpa, 1)).?;
+    defer gpa.free(unretained.prefix_text);
+    try std.testing.expect(std.mem.indexOf(u8, unretained.prefix_text, "Saved instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unretained.prefix_text, "skill_context metadata") == null);
+
+    // Metadata can follow the kept message; inspect the entire active path.
+    try session.appendPayload("skill_context", null, "{\"skills\":[{\"name\":\"how\",\"body\":\"Saved instructions\"}]}", &id);
+    const retained = (try session.compactionCut(gpa, 1)).?;
+    defer gpa.free(retained.prefix_text);
+    try std.testing.expect(std.mem.indexOf(u8, retained.prefix_text, "Saved instructions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, retained.prefix_text, "skill_context metadata") != null);
 }
 
 test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {

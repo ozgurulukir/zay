@@ -19,6 +19,8 @@ const os = @import("../os.zig");
 const paths = @import("../paths.zig");
 const plugin_prompt = @import("../plugin_prompt.zig");
 const skill_mod = @import("../skill.zig");
+const SkillContext = @import("skill_context.zig").SkillContext;
+const skill_history = @import("skill_history.zig");
 const vcs = @import("../vcs.zig");
 
 const assert = std.debug.assert;
@@ -435,6 +437,17 @@ pub fn pruneHistoricalToolResultsViewsCached(
     keep_recent_tool_turns: u32,
     historical_tool_cap_bytes: u32,
 ) ![]ai.MessageView {
+    return pruneHistoricalToolResultsViewsWithSkills(gpa, cache, messages, keep_recent_tool_turns, historical_tool_cap_bytes, null);
+}
+
+pub fn pruneHistoricalToolResultsViewsWithSkills(
+    gpa: std.mem.Allocator,
+    cache: ?*PrunedToolCache,
+    messages: []const ai.ChatMessage,
+    keep_recent_tool_turns: u32,
+    historical_tool_cap_bytes: u32,
+    skills: ?*const SkillContext,
+) ![]ai.MessageView {
     if (cache) |c| {
         if (c.cached_cap_bytes != historical_tool_cap_bytes) {
             c.clear(gpa);
@@ -442,7 +455,12 @@ pub fn pruneHistoricalToolResultsViewsCached(
         }
     }
 
-    const views = try gpa.alloc(ai.MessageView, messages.len);
+    const missing = if (skills) |context| try skill_history.formatMissing(context, gpa, messages) else null;
+    var missing_transferred = false;
+    errdefer if (!missing_transferred) {
+        if (missing) |text| gpa.free(text);
+    };
+    const views = try gpa.alloc(ai.MessageView, messages.len + @as(usize, @intFromBool(missing != null)));
     var built: usize = 0;
     errdefer {
         for (views[0..built]) |*view| switch (view.*) {
@@ -457,7 +475,8 @@ pub fn pruneHistoricalToolResultsViewsCached(
     const cutoff_index = maybe_cutoff orelse 0;
 
     for (messages, 0..) |*msg, idx| {
-        if (pruning_active and idx < cutoff_index and msg.* == .tool) {
+        const retained = if (skills) |context| skill_history.retainedTool(context, messages, idx) else false;
+        if (pruning_active and idx < cutoff_index and msg.* == .tool and !retained) {
             if (cache) |c| {
                 if (c.entries.get(idx)) |cached_ptr| {
                     views[idx] = .{ .borrowed = cached_ptr };
@@ -470,11 +489,7 @@ pub fn pruneHistoricalToolResultsViewsCached(
                     errdefer gpa.destroy(msg_ptr);
                     msg_ptr.* = pruned_owned;
 
-                    c.entries.put(gpa, idx, msg_ptr) catch |err| {
-                        msg_ptr.deinit(gpa);
-                        gpa.destroy(msg_ptr);
-                        return err;
-                    };
+                    try c.entries.put(gpa, idx, msg_ptr);
                     views[idx] = .{ .borrowed = msg_ptr };
                 }
             } else {
@@ -484,6 +499,18 @@ pub fn pruneHistoricalToolResultsViewsCached(
             views[idx] = .{ .borrowed = msg };
         }
         built = idx + 1;
+    }
+    if (missing) |text| {
+        const blocks = try gpa.alloc(ai.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        // Insert before conversation messages, preserving call/result adjacency
+        // and the newest real user message's image-retention window.
+        var insertion: usize = 0;
+        while (insertion < messages.len and messages[insertion] == .system) insertion += 1;
+        std.mem.copyBackwards(ai.MessageView, views[insertion + 1 ..], views[insertion..messages.len]);
+        views[insertion] = .{ .owned = .{ .user = .{ .content = blocks } } };
+        missing_transferred = true;
+        built += 1;
     }
     return views;
 }
@@ -648,6 +675,17 @@ pub fn estimatePrunedTokensRange(
     historical_tool_cap_bytes: u32,
     evict_history_images: bool,
 ) u32 {
+    return estimatePrunedTokensRangeWithSkills(messages, from_index, keep_recent_tool_turns, historical_tool_cap_bytes, evict_history_images, null);
+}
+
+pub fn estimatePrunedTokensRangeWithSkills(
+    messages: []const ai.ChatMessage,
+    from_index: usize,
+    keep_recent_tool_turns: u32,
+    historical_tool_cap_bytes: u32,
+    evict_history_images: bool,
+    skills: ?*const SkillContext,
+) u32 {
     assert(from_index <= messages.len);
     const maybe_cutoff = computeCutoff(messages, keep_recent_tool_turns);
     const pruning_active = maybe_cutoff != null;
@@ -664,14 +702,21 @@ pub fn estimatePrunedTokensRange(
     var index: usize = from_index;
     while (index < messages.len) : (index += 1) {
         const message = messages[index];
-        if (pruning_active and index < cutoff_index and message == .tool) {
-            total +|= compaction.estimateMessageTokensCapped(message, historical_tool_cap_bytes);
+        const retained = if (skills) |context| skill_history.retainedTool(context, messages, index) else false;
+        if (pruning_active and index < cutoff_index and message == .tool and !retained) {
+            total +|= if (skills != null) estimateRenderedToolTokens(message, historical_tool_cap_bytes) else compaction.estimateMessageTokensCapped(message, historical_tool_cap_bytes);
         } else if (evict_history_images and message == .user and
             newest_user != null and index < newest_user.? and userMessageHasImage(message))
         {
             total +|= estimateUserMessageWithEvictedImages(message);
         } else {
             total +|= compaction.estimateMessageTokens(message);
+        }
+    }
+    if (from_index == 0) {
+        if (skills) |context| {
+            const bytes: u32 = @intCast(skill_history.missingBytes(context, messages));
+            total +|= std.math.divCeil(u32, bytes, 4) catch unreachable;
         }
     }
     return total;
@@ -689,6 +734,50 @@ fn estimateUserMessageWithEvictedImages(message: ai.ChatMessage) u32 {
             compaction.estimateBlockTokens(block);
     }
     return tokens;
+}
+
+test "skill context retains old tool bodies and estimator matches request views" {
+    const gpa = std.testing.allocator;
+    const instructions = try gpa.alloc(u8, 4096);
+    defer gpa.free(instructions);
+    @memset(instructions, 'x');
+    var ledger: SkillContext = .{};
+    defer ledger.deinit(gpa);
+    _ = try ledger.activate(gpa, "how", instructions);
+    var call_blocks = [_]ai.ContentBlock{.{ .tool_call = .{
+        .call_id = .{ .value = @constCast("skill-call") },
+        .name = @constCast("skill"),
+        .arguments = @constCast("{\"name\":\"how\"}"),
+    } }};
+    var body_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = instructions } }};
+    var normal_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = instructions } }};
+    const messages = [_]ai.ChatMessage{
+        .{ .assistant = .{ .content = &call_blocks } },
+        .{ .tool = .{ .call_id = .{ .value = @constCast("skill-call") }, .content = &body_blocks } },
+        .{ .tool = .{ .call_id = .{ .value = @constCast("ordinary") }, .content = &normal_blocks } },
+    };
+    var cache: PrunedToolCache = .{};
+    defer cache.deinit(gpa);
+    for ([_]?*PrunedToolCache{ null, &cache }) |maybe_cache| {
+        const views = try pruneHistoricalToolResultsViewsWithSkills(gpa, maybe_cache, &messages, 0, 64, &ledger);
+        defer freePrunedViews(gpa, views);
+        try std.testing.expectEqual(@as(usize, 3), views.len);
+        try std.testing.expectEqualStrings(instructions, views[1].message().text());
+        try std.testing.expectEqualStrings("skill-call", views[1].message().tool.call_id.slice());
+        try std.testing.expect(views[2].message().text().len < instructions.len);
+        var estimate: u32 = 0;
+        for (views) |view| estimate += compaction.estimateMessageTokens(view.message().*);
+        try std.testing.expectEqual(estimate, estimatePrunedTokensRangeWithSkills(&messages, 0, 0, 64, false, &ledger));
+        try std.testing.expectEqualStrings(instructions, messages[2].text());
+    }
+    const compacted = [_]ai.ChatMessage{.{ .user = .{ .content = &.{} } }};
+    const resumed = try pruneHistoricalToolResultsViewsWithSkills(gpa, &cache, &compacted, 0, 64, &ledger);
+    defer freePrunedViews(gpa, resumed);
+    try std.testing.expectEqual(@as(usize, 2), resumed.len);
+    try std.testing.expect(std.mem.indexOf(u8, resumed[0].message().text(), instructions) != null);
+    var estimate: u32 = 0;
+    for (resumed) |view| estimate += compaction.estimateMessageTokens(view.message().*);
+    try std.testing.expectEqual(estimate, estimatePrunedTokensRangeWithSkills(&compacted, 0, 0, 64, false, &ledger));
 }
 
 test "estimatePrunedTokensRange matches the bytes the pruned request sends" {
@@ -1997,4 +2086,50 @@ test "estimatePrunedTokensRange counts evicted images as stub tokens" {
     // instead of a full image estimate.
     try std.testing.expectEqual(keeping - compaction.estimateMessageTokens(messages[0]) + evicted_image_stub_tokens, evicting);
     try std.testing.expect(evicting < keeping);
+}
+
+// Count the exact head/tail elision marker without allocating request text.
+fn estimateRenderedToolTokens(message: ai.ChatMessage, cap: u32) u32 {
+    var total: u32 = 0;
+    for (message.tool.content) |block| {
+        if (block != .text or block.text.text.len <= cap) {
+            total +|= compaction.estimateBlockTokens(block);
+            continue;
+        }
+        var buffer: [128]u8 = undefined;
+        const marker = std.fmt.bufPrint(&buffer, "\n\n[... {d} of {d} bytes elided to save context ...]\n\n", .{ block.text.text.len - cap, block.text.text.len }) catch unreachable;
+        total +|= std.math.divCeil(u32, cap + @as(u32, @intCast(marker.len)), 4) catch unreachable;
+    }
+    return total;
+}
+
+test "skill context retained request OOM preserves history and ledger" {
+    const gpa = std.testing.allocator;
+    var ledger: SkillContext = .{};
+    defer ledger.deinit(gpa);
+    _ = try ledger.activate(gpa, "how", "Retained missing instructions");
+    var blocks = [_]ai.ContentBlock{.{ .text = .{ .text = @constCast("ordinary output " ** 64) } }};
+    const messages = [_]ai.ChatMessage{.{ .tool = .{
+        .call_id = .{ .value = @constCast("ordinary") },
+        .content = &blocks,
+    } }};
+    for ([_]bool{ false, true }) |cached| {
+        var succeeded = false;
+        for (0..64) |fail_index| {
+            var cache: PrunedToolCache = .{};
+            defer cache.deinit(gpa);
+            var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+            const result = pruneHistoricalToolResultsViewsWithSkills(failing.allocator(), if (cached) &cache else null, &messages, 0, 64, &ledger);
+            if (result) |views| {
+                freePrunedViews(gpa, views);
+                succeeded = true;
+                break;
+            } else |err| {
+                try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            }
+            try std.testing.expectEqualStrings("Retained missing instructions", ledger.body("how").?);
+            try std.testing.expectEqualStrings("ordinary output " ** 64, messages[0].text());
+        }
+        try std.testing.expect(succeeded);
+    }
 }

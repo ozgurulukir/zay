@@ -5,6 +5,7 @@ const std = @import("std");
 
 const tui = @import("../tui.zig");
 const skill_mod = @import("../skill.zig");
+const skill_rows = @import("skill_rows.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -19,11 +20,7 @@ pub fn appendSkillInvocationsToTranscript(app: *App, lane: *Thread, prompt: []co
     const runtime = lane.liveRuntime() orelse return;
     const names = try skill_mod.collectInvocations(app.gpa, runtime.skills, prompt);
     defer app.gpa.free(names);
-    var title_buf: [128]u8 = undefined;
-    for (names) |name| {
-        const title = try std.fmt.bufPrint(&title_buf, "[SKILL] {s}", .{name});
-        _ = try lane.transcript.append(app.gpa, .skill, title, "");
-    }
+    for (names) |name| try skill_rows.appendOnce(app.gpa, &lane.transcript, name);
 }
 
 pub fn enqueueSubmit(app: *App) !bool {
