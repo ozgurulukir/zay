@@ -12,6 +12,7 @@ const ai = @import("../ai.zig");
 
 const session_type = @import("types.zig");
 const serialize = @import("serialize.zig");
+const SkillContext = @import("../context/skill_context.zig").SkillContext;
 
 const entry_id_len = session_type.entry_id_len;
 const Error = session_type.Error;
@@ -186,6 +187,12 @@ pub const SessionWriter = struct {
         try self.enqueue(.{ .kind = "compaction", .role = null, .payload_json = payload });
     }
 
+    pub fn appendSkillContext(self: *SessionWriter, context: *const SkillContext) Error!void {
+        const payload = try context.toJson(self.gpa);
+        errdefer self.gpa.free(payload);
+        try self.enqueue(.{ .kind = "skill_context", .role = null, .payload_json = payload });
+    }
+
     /// Bind a git snapshot id to the current leaf entry, race-free. Flushes
     /// queued writes first so the leaf reflects the entries the turn just wrote,
     /// then annotates that entry. No-op if the session has no leaf yet.
@@ -251,6 +258,31 @@ pub const SessionWriter = struct {
         try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.messages(gpa);
+    }
+
+    pub const Conversation = struct {
+        messages: []ai.ChatMessage,
+        skill_context: SkillContext,
+
+        pub fn deinit(self: *Conversation, gpa: std.mem.Allocator) void {
+            for (self.messages) |*message| message.deinit(gpa);
+            gpa.free(self.messages);
+            self.skill_context.deinit(gpa);
+            self.* = undefined;
+        }
+    };
+
+    /// Keep the writer stopped until both projections have been constructed.
+    /// Callers own the result and swap it only after all fallible work succeeds.
+    pub fn conversation(self: *SessionWriter, gpa: std.mem.Allocator) Error!Conversation {
+        try self.quiesce();
+        defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
+        const projected = try self.session.messages(gpa);
+        errdefer {
+            for (projected) |*message| message.deinit(gpa);
+            gpa.free(projected);
+        }
+        return .{ .messages = projected, .skill_context = try self.session.skillContext(gpa) };
     }
 
     /// Race-free `Session.compactionCut`: flushes queued writes so the cut is
@@ -401,6 +433,37 @@ fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
     writer.mutex.lockUncancelable(writer.io);
     defer writer.mutex.unlock(writer.io);
     return writer.entry_queue.pop(writer.queue);
+}
+
+test "session writer skill context projection and failed admission preserve state" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    const session = try manager.create("/tmp/zay", .{});
+    var writer: SessionWriter = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .manager = manager,
+        .session = session,
+        .queue = try gpa.alloc(QueuedEntry, 4),
+    };
+    writer.session.manager = &writer.manager;
+    defer writer.deinit();
+    var ledger: SkillContext = .{};
+    defer ledger.deinit(gpa);
+    _ = try ledger.activate(gpa, "how", "durable instructions");
+    try writer.appendSkillContext(&ledger);
+    var projected = try writer.conversation(gpa);
+    defer projected.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), projected.messages.len);
+    try std.testing.expectEqualStrings("durable instructions", projected.skill_context.body("how").?);
+    try writer.quiesce();
+    writer.write_failure = error.Sqlite;
+    const leaf_before = writer.session.leaf_entry_id;
+    try std.testing.expectError(error.Sqlite, writer.appendSkillContext(&ledger));
+    try std.testing.expectError(error.Sqlite, writer.conversation(gpa));
+    try std.testing.expectEqual(leaf_before, writer.session.leaf_entry_id);
+    try std.testing.expectEqual(@as(u32, 0), writer.entry_queue.len());
+    writer.write_failure = null;
 }
 
 test "session writer failure preserves ordering and refuses incomplete reprojection" {
