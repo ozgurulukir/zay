@@ -1083,6 +1083,26 @@ pub const Session = struct {
         return messages_list.toOwnedSlice(gpa);
     }
 
+    /// Metadata follows ancestry, including ancestors hidden by compaction.
+    /// A malformed snapshot falls back to the preceding valid snapshot.
+    pub fn skillContext(self: *Session, gpa: std.mem.Allocator) Error!@import("context/skill_context.zig").SkillContext {
+        const path = try self.loadBranch(gpa);
+        defer {
+            for (path) |*entry| entry.deinit(gpa);
+            gpa.free(path);
+        }
+        var context: @import("context/skill_context.zig").SkillContext = .{};
+        errdefer context.deinit(gpa);
+        for (path) |entry| {
+            if (!std.mem.eql(u8, entry.kind, "skill_context")) continue;
+            context.replaceFromJson(gpa, entry.payload_json) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.log.scoped(.session).warn("session skill context skipped: {s}", .{@errorName(err)});
+            };
+        }
+        return context;
+    }
+
     /// Compute where to cut the active branch for compaction: the entry that
     /// becomes the first kept message, plus the rendered text of everything
     /// before it (including any prior summary, folded in). Works in tree-space
@@ -1681,6 +1701,45 @@ fn freeToolCalls(gpa: std.mem.Allocator, calls: []const ai.ToolCall) void {
         owned.deinit(gpa);
     }
     gpa.free(calls);
+}
+
+test "session skill context follows branch ancestry through compaction" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{});
+    var root_id: [entry_id_len]u8 = undefined;
+    var left_id: [entry_id_len]u8 = undefined;
+    var right_id: [entry_id_len]u8 = undefined;
+    var kept_id: [entry_id_len]u8 = undefined;
+    var compact_id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "root", &root_id);
+    try session.appendPayload("skill_context", null, "{\"skills\":[{\"name\":\"left\",\"body\":\"persisted source\"}]}", &left_id);
+    try appendTextEntry(&session, gpa, .user, "keep", &kept_id);
+    try session.appendCompaction(&kept_id, "summary", &compact_id);
+    var left = try session.skillContext(gpa);
+    defer left.deinit(gpa);
+    try std.testing.expectEqualStrings("persisted source", left.body("left").?);
+    try session.branch(&root_id, null, null);
+    var empty = try session.skillContext(gpa);
+    defer empty.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), empty.entries.items.len);
+    try session.appendPayload("skill_context", null, "{\"skills\":[{\"name\":\"right\",\"body\":\"other branch\"}]}", &right_id);
+    var right = try session.skillContext(gpa);
+    defer right.deinit(gpa);
+    try std.testing.expect(right.contains("right"));
+    try std.testing.expect(!right.contains("left"));
+    try session.appendPayload("skill_context", null, "{broken", &right_id);
+    var fallback = try session.skillContext(gpa);
+    defer fallback.deinit(gpa);
+    try std.testing.expect(fallback.contains("right"));
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("root", messages[0].text());
 }
 
 test "session persists and loads messages" {
