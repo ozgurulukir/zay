@@ -16,6 +16,7 @@ pub const compaction = @import("context/compaction.zig");
 pub const config = @import("config/config.zig");
 pub const context = @import("context/manager.zig");
 pub const context_assembly = @import("context/assembly.zig");
+pub const skill_context = @import("context/skill_context.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const image_resize = @import("image_resize.zig");
