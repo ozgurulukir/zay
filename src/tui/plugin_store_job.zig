@@ -231,6 +231,84 @@ pub fn uninstall(app: *App, name: []const u8) void {
     };
 }
 
+/// Missing packages have no physical identity to send to the uninstaller.
+/// Forget only this project's saved override; global preferences remain owned
+/// by the global configuration layer.
+pub fn forgetMissingPlugin(app: *App, name: []const u8) void {
+    const runtime = app.liveRuntime() orelse app.templateRuntime() orelse {
+        setNotice(app, "Could not remove plugin preference: no active project.");
+        return;
+    };
+    forgetMissingPluginConfig(app.gpa, app.io, runtime.cwd, runtime.home_dir, &app.cached_config, name) catch |err| {
+        if (err == error.GlobalPluginPreference) {
+            setNotice(app, "Package is missing; remove its saved preference from global config.json.");
+        } else {
+            setErrorNotice(app, "Could not remove plugin preference", err);
+        }
+        return;
+    };
+    setNotice(app, "Removed saved plugin preference; package was already missing.");
+}
+
+fn forgetMissingPluginConfig(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, home_dir: []const u8, cached: *config_mod.Config, name: []const u8) !void {
+    if (cwd.len == 0) return error.ProjectPathUnavailable;
+    var global = try config_mod.readGlobal(gpa, io, home_dir);
+    defer global.deinit(gpa);
+    for (global.plugins) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return error.GlobalPluginPreference;
+    }
+    var next: std.ArrayList(config_mod.PluginConfig) = .empty;
+    errdefer {
+        for (next.items) |*entry| entry.deinit(gpa);
+        next.deinit(gpa);
+    }
+    for (cached.plugins) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) continue;
+        var copy = try entry.clone(gpa);
+        errdefer copy.deinit(gpa);
+        try next.append(gpa, copy);
+    }
+    const plugins = try next.toOwnedSlice(gpa);
+    errdefer deinitPluginConfigs(gpa, plugins);
+    try config_mod.removeProjectPlugin(gpa, io, cwd, name);
+    deinitPluginConfigs(gpa, cached.plugins);
+    cached.plugins = plugins;
+}
+
+test "missing plugin removal clears disk and cached preferences and preserves other plugins" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const project = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(project);
+    const home = try std.fs.path.join(gpa, &.{ project, "home" });
+    defer gpa.free(home);
+    var entries = [_]config_mod.PluginConfig{
+        .{ .name = @constCast("missing"), .enabled = false },
+        .{ .name = @constCast("keep"), .enabled = true },
+    };
+    const original: config_mod.Config = .{ .plugins = &entries };
+    try config_mod.writeProject(gpa, io, project, original);
+    var cached = try original.clone(gpa);
+    defer cached.deinit(gpa);
+    try config_mod.writeGlobal(gpa, io, home, original);
+    try std.testing.expectError(error.GlobalPluginPreference, forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing"));
+    try std.testing.expectEqual(@as(usize, 2), cached.plugins.len);
+    try config_mod.writeGlobal(gpa, io, home, .{});
+    try forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing");
+    try std.testing.expectEqual(@as(usize, 1), cached.plugins.len);
+    try std.testing.expectEqualStrings("keep", cached.plugins[0].name);
+    var disk = try config_mod.readProject(gpa, io, project);
+    defer disk.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), disk.plugins.len);
+    try std.testing.expectEqualStrings("keep", disk.plugins[0].name);
+    try forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing");
+    try std.testing.expectEqual(@as(usize, 1), cached.plugins.len);
+}
+
 pub fn startUninstall(app: *App, selected_path: []const u8) !void {
     if (app.plugin_store.operation != .idle) return error.PluginOperationBusy;
     var selected: ?*const package.Package = null;

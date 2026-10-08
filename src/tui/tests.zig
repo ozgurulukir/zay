@@ -171,6 +171,32 @@ test "root layout reserves a row for the queued-message line" {
     try std.testing.expectEqual(plain.input_height + 1, queued.input_height);
 }
 
+test "missing plugin row removal does not start a disk uninstall or confirmation" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    const previous_plugins = app.cached_config.plugins;
+    app.cached_config.plugins = try gpa.alloc(config_mod.PluginConfig, 1);
+    defer {
+        for (app.cached_config.plugins) |*entry| entry.deinit(gpa);
+        gpa.free(app.cached_config.plugins);
+        app.cached_config.plugins = previous_plugins;
+    }
+    app.cached_config.plugins[0] = .{ .name = try gpa.dupe(u8, "missing"), .enabled = false };
+    app.plugin_store.inventory.deinit(gpa);
+    app.plugin_store.inventory = .{};
+    app.mode = .plugins;
+    app.pickers.plugins = .{ .view = .installed };
+    try std.testing.expect(try app.handleCommandKey(.{ .codepoint = 'x' }));
+    try std.testing.expect(!app.pickers.plugins.confirming_uninstall);
+    try std.testing.expect(app.plugin_store.operation == .idle);
+    // A headless App has no runtime. The preference path reports that fact
+    // rather than sending the row's empty path to the disk uninstaller.
+    try std.testing.expectEqualStrings("Could not remove plugin preference: no active project.", app.plugin_store.notice.?);
+}
+
 test "input text rows track the line count" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
