@@ -324,13 +324,14 @@ pub const ToolCall = struct {
 
 pub const ContentBlock = union(enum) {
     text: TextBlock,
+    refusal: TextBlock,
     image: ImageBlock,
     reasoning: ReasoningBlock,
     tool_call: ToolCall,
 
     pub fn deinit(self: *ContentBlock, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .text => |*block| block.deinit(gpa),
+            .text, .refusal => |*block| block.deinit(gpa),
             .image => |*block| block.deinit(gpa),
             .reasoning => |*block| block.deinit(gpa),
             .tool_call => |*block| block.deinit(gpa),
@@ -350,8 +351,8 @@ pub const ContentBlock = union(enum) {
     /// the version envelope across both halves.
     pub fn writeJson(self: ContentBlock, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
-            .text => |text| {
-                try writer.writeAll("{\"type\":\"text\",\"text\":");
+            .text, .refusal => |text| {
+                try writer.writeAll(if (self == .refusal) "{\"type\":\"refusal\",\"text\":" else "{\"type\":\"text\",\"text\":");
                 try std.json.Stringify.value(@as([]const u8, text.text), .{}, writer);
                 if (text.responses_item_id) |id| {
                     try writer.writeAll(",\"responses_item_id\":");
@@ -399,7 +400,7 @@ pub const ContentBlock = union(enum) {
         if (value != .object) return error.CorruptPayload;
         const kind = value.object.get("type") orelse return error.CorruptPayload;
         if (kind != .string) return error.CorruptPayload;
-        if (std.mem.eql(u8, kind.string, "text")) {
+        if (std.mem.eql(u8, kind.string, "text") or std.mem.eql(u8, kind.string, "refusal")) {
             const text = value.object.get("text") orelse return error.CorruptPayload;
             const text_str = if (text == .string)
                 try gpa.dupe(u8, text.string)
@@ -408,11 +409,12 @@ pub const ContentBlock = union(enum) {
             else
                 return error.CorruptPayload;
 
-            return .{ .text = .{
+            const block: TextBlock = .{
                 .text = text_str,
                 .responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id"),
                 .responses_phase = try jsonOptionalString(gpa, value, "responses_phase"),
-            } };
+            };
+            return if (std.mem.eql(u8, kind.string, "refusal")) .{ .refusal = block } else .{ .text = block };
         }
         if (std.mem.eql(u8, kind.string, "image")) {
             const mime = value.object.get("mime_type") orelse return error.CorruptPayload;
@@ -479,6 +481,7 @@ test "ContentBlock JSON round-trips every variant" {
     const gpa = std.testing.allocator;
     var blocks = [_]ContentBlock{
         .{ .text = .{ .text = try gpa.dupe(u8, "hello"), .responses_item_id = try gpa.dupe(u8, "id1"), .responses_phase = try gpa.dupe(u8, "final") } },
+        .{ .refusal = .{ .text = try gpa.dupe(u8, "declined"), .responses_item_id = try gpa.dupe(u8, "id2") } },
         .{ .image = .{ .mime_type = try gpa.dupe(u8, "image/png"), .data_base64 = try gpa.dupe(u8, "AAAA") } },
         .{ .reasoning = .{ .text = try gpa.dupe(u8, "thinking"), .responses_item_json = try gpa.dupe(u8, "{}") } },
         .{ .tool_call = .{ .call_id = .{ .value = try gpa.dupe(u8, "c1") }, .name = try gpa.dupe(u8, "bash"), .arguments = try gpa.dupe(u8, "{}") } },
@@ -538,16 +541,17 @@ pub const ChatMessage = union(enum) {
         failed: bool = false,
     },
 
-    /// The first text block in the message's content. Returns "" when
+    /// The first text or refusal block in the message's content. Returns "" when
     /// the message is non-text (e.g. all tool calls or images).
     pub fn text(self: ChatMessage) []const u8 {
         const content: []const ContentBlock = switch (self) {
             inline .system, .user, .assistant => |m| m.content,
             .tool => |t| t.content,
         };
-        for (content) |block| {
-            if (block == .text) return block.text.text;
-        }
+        for (content) |block| switch (block) {
+            .text, .refusal => |part| return part.text,
+            else => {},
+        };
         return "";
     }
 
@@ -583,6 +587,18 @@ pub const ChatMessage = union(enum) {
         gpa.free(blocks);
     }
 };
+
+test "ChatMessage text reads refusal payload and preserves first text order" {
+    const gpa = std.testing.allocator;
+    const blocks = try gpa.alloc(ContentBlock, 2);
+    blocks[0] = .{ .refusal = .{ .text = try gpa.dupe(u8, "Declined") } };
+    blocks[1] = .{ .text = .{ .text = try gpa.dupe(u8, "Alternative") } };
+    var message: ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer message.deinit(gpa);
+    try std.testing.expectEqualStrings("Declined", message.text());
+    std.mem.swap(ContentBlock, &blocks[0], &blocks[1]);
+    try std.testing.expectEqualStrings("Alternative", message.text());
+}
 
 /// A read-only view of one message destined for the model request.
 ///

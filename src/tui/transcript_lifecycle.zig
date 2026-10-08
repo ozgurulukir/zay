@@ -139,7 +139,7 @@ pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
         } else if (message.role() == .assistant) {
             for (message.assistant.content) |block| {
                 switch (block) {
-                    .text => |part| {
+                    .text, .refusal => |part| {
                         if (part.text.len > 0) _ = try lane.transcript.append(app.gpa, .agent, "agent", part.text);
                     },
                     .reasoning => |part| {

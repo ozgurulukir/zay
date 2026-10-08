@@ -218,7 +218,7 @@ pub fn estimateMessageTokensCapped(message: ai.ChatMessage, cap_bytes: u32) u32 
 
 pub fn estimateBlockTokens(block: ai.ContentBlock) u32 {
     return switch (block) {
-        .text => |text| divCeil(saturatingLen(text.text), tokens_per_char_divisor),
+        .text, .refusal => |text| divCeil(saturatingLen(text.text), tokens_per_char_divisor),
         .reasoning => |reasoning| divCeil(saturatingLen(reasoning.text), tokens_per_char_divisor),
         .image => image_estimate_tokens,
         .tool_call => |call| divCeil(saturatingLen(call.name) +| saturatingLen(call.arguments), tokens_per_char_divisor),
@@ -227,7 +227,7 @@ pub fn estimateBlockTokens(block: ai.ContentBlock) u32 {
 
 fn blockTokensCapped(block: ai.ContentBlock, cap_bytes: u32) u32 {
     return switch (block) {
-        .text => |text| divCeil(@min(saturatingLen(text.text), cap_bytes), tokens_per_char_divisor),
+        .text, .refusal => |text| divCeil(@min(saturatingLen(text.text), cap_bytes), tokens_per_char_divisor),
         .reasoning => |reasoning| divCeil(@min(saturatingLen(reasoning.text), cap_bytes), tokens_per_char_divisor),
         .image => image_estimate_tokens,
         .tool_call => |call| divCeil(saturatingLen(call.name) +| saturatingLen(call.arguments), tokens_per_char_divisor),
@@ -340,7 +340,7 @@ fn writeMessage(gpa: std.mem.Allocator, out: *std.Io.Writer, message: ai.ChatMes
             };
             for (m.content) |block| {
                 switch (block) {
-                    .text => |text| {
+                    .text, .refusal => |text| {
                         const rendered = if (message == .user) try skill_history.writeInlineNotices(out, text.text, skills) else text.text;
                         try out.print("[{s}]: {s}\n", .{ label, rendered });
                     },

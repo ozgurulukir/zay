@@ -1034,6 +1034,7 @@ fn pruneSingleToolMessage(gpa: std.mem.Allocator, msg: ai.ChatMessage, cap_bytes
 fn cloneContentBlock(gpa: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
     return switch (block) {
         .text => |t| .{ .text = .{ .text = try gpa.dupe(u8, t.text) } },
+        .refusal => |t| .{ .refusal = .{ .text = try gpa.dupe(u8, t.text) } },
         .reasoning => |r| .{ .reasoning = .{ .text = try gpa.dupe(u8, r.text) } },
         .image => |img| {
             const mime = try gpa.dupe(u8, img.mime_type);

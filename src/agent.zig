@@ -1147,7 +1147,7 @@ pub const Agent = struct {
     /// empty content with no tool_calls — rejected by strict providers.
     fn hasWireContent(message: ai.ChatMessage) bool {
         for (message.assistant.content) |block| switch (block) {
-            .text => |t| if (t.text.len > 0) return true,
+            .text, .refusal => |t| if (t.text.len > 0) return true,
             .tool_call => return true,
             .reasoning, .image => {},
         };
