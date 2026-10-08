@@ -159,6 +159,14 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
                 break :blk tools_common.Schema.Kind.string;
             }
 
+            if (prop_obj.get("type")) |types| {
+                if (types == .array) {
+                    for (types.array.items) |item| {
+                        if (item == .string and !std.mem.eql(u8, item.string, "null"))
+                            break :blk kindFromString(item.string);
+                    }
+                }
+            }
             const type_str = if (prop_obj.get("type")) |t|
                 (if (t == .string) t.string else "string")
             else
@@ -275,6 +283,7 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
             .kind = kind,
             .description = p_desc.?,
             .required = required_set.contains(prop_name),
+            .nullable = schemaAllowsNull(prop_val),
             .enum_values = p_enum,
             .default_value = p_default,
         });
@@ -290,6 +299,34 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         .properties = try props.toOwnedSlice(gpa),
         .allow_extra_properties = allow_extra_properties,
     };
+}
+
+// Keep server nullability separate from the provider's optional-null encoding.
+// Preserve null when unsupported schema constraints leave nullability unknown.
+// Only known non-nullable types/unions justify optional-null omission.
+fn schemaAllowsNull(value: std.json.Value) bool {
+    if (value != .object) return true;
+    if (value.object.get("type")) |kind| {
+        if (kind == .string) return std.mem.eql(u8, kind.string, "null");
+        if (kind == .array) {
+            for (kind.array.items) |item| {
+                if (item == .string and std.mem.eql(u8, item.string, "null")) return true;
+            }
+            return false;
+        }
+    }
+    for ([_][]const u8{ "anyOf", "oneOf" }) |name| {
+        if (value.object.get(name)) |branches| {
+            if (branches != .array) return true;
+            for (branches.array.items) |branch| {
+                if (branch != .object) return true;
+                const kind = branch.object.get("type") orelse return true;
+                if (kind != .string or std.mem.eql(u8, kind.string, "null")) return true;
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Convert a std.json.Value to a raw JSON fragment string suitable for
@@ -515,11 +552,43 @@ test "schemaFromJsonSchema resolves nullable primitive unions (type:null branch 
 
     try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
     for (schema.properties) |prop| {
+        try std.testing.expect(prop.nullable);
         if (std.mem.eql(u8, prop.name, "count"))
             try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
         if (std.mem.eql(u8, prop.name, "name"))
             try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
     }
+}
+
+test "MCP schema preserves explicit nullability separately from optionality" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"type":"object","properties":{"repo":{"type":"string"},"count":{"type":["integer","null"]}},"required":["count"]}
+    , .{});
+    defer parsed.deinit();
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+    for (schema.properties) |prop| {
+        if (std.mem.eql(u8, prop.name, "repo")) {
+            try std.testing.expect(!prop.required);
+            try std.testing.expect(!prop.nullable);
+        } else {
+            try std.testing.expect(prop.required);
+            try std.testing.expect(prop.nullable);
+            try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
+        }
+    }
+}
+
+test "MCP schema preserves null when a property's constraints are unknown" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"properties":{"anything":{},"reference":{"$ref":"#/definitions/Item"}}}
+    , .{});
+    defer parsed.deinit();
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+    for (schema.properties) |prop| try std.testing.expect(prop.nullable);
 }
 
 test "schemaFromJsonSchema falls back to string for $ref properties" {

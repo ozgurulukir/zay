@@ -131,6 +131,36 @@ const worker_last_message_cap_bytes: u32 = 2048;
 const review_diff_max_bytes: u32 = 128 * 1024;
 const review_report_max_bytes: usize = 32 * 1024;
 
+/// Derived on the UI thread while servicing a request; never cached separately.
+const LaneSnapshot = struct {
+    phase: enum { idle, running, cancelling, finishing },
+    runtime_attached: bool,
+    completion: enum { none, pending, consumed, delivered },
+
+    fn of(lane: *const Thread) LaneSnapshot {
+        const phase: @FieldType(LaneSnapshot, "phase") = if (lane.cancel_job != null or lane.turn.state == .interrupting)
+            .cancelling
+        else if (lane.turn.state == .active)
+            .running
+        else if (lane.turn_future != null or (lane.spawned_by_generation != null and lane.engine == .live))
+            .finishing
+        else
+            .idle;
+        return .{
+            .phase = phase,
+            .runtime_attached = lane.engine == .live,
+            .completion = if (lane.spawned_by_generation == null) .none else if (lane.completion_delivered) .delivered else if (lane.acknowledged) .consumed else .pending,
+        };
+    }
+};
+
+fn laneOperationUnavailable(app: *App, lane: *const Thread, id: []const u8, operation: []const u8) Resp {
+    const snapshot = LaneSnapshot.of(lane);
+    return failResp(app.gpa, "lane: {s} unavailable for lane {s}: {s}status={s} runtime={s} completion={s}; use `lane await {s}` before resuming, or `lane steer {s}` during an active turn.\n", .{
+        operation, id, if (std.mem.eql(u8, operation, "steer")) "nothing to steer; " else "", @tagName(snapshot.phase), if (snapshot.runtime_attached) "attached" else "parked", @tagName(snapshot.completion), id, id,
+    });
+}
+
 /// Whether `lane`'s active turn has produced no event for at least
 /// `worker_stall_ms` — the signal an orchestrator uses to stop polling and act
 /// (`lane cancel` / `lane steer`). `last_activity_ms == 0` means no baseline
@@ -149,15 +179,16 @@ fn laneStalled(lane: *const Thread, now_ms: i64) bool {
 /// means nothing. Owned; the caller frees it.
 fn laneStatus(app: *App, lane: *Thread) []u8 {
     const now_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
-    switch (lane.turn.state) {
+    const snapshot = LaneSnapshot.of(lane);
+    switch (snapshot.phase) {
         .idle => {
-            if (lane.turn_tool_calls > 0) {
-                return std.fmt.allocPrint(app.gpa, "idle — {d} tool calls", .{lane.turn_tool_calls}) catch unreachable;
-            }
-            return app.gpa.dupe(u8, "idle") catch unreachable;
+            return std.fmt.allocPrint(app.gpa, "idle — {d} tool calls; runtime={s} completion={s}", .{
+                lane.turn_tool_calls, if (snapshot.runtime_attached) "attached" else "parked", @tagName(snapshot.completion),
+            }) catch unreachable;
         },
-        .interrupting => return app.gpa.dupe(u8, "cancelling") catch unreachable,
-        .active => {},
+        .cancelling => return app.gpa.dupe(u8, "cancelling — worker teardown pending") catch unreachable,
+        .finishing => return app.gpa.dupe(u8, "finishing — turn ended, worker teardown pending; await before resume") catch unreachable,
+        .running => {},
     }
     // A worker blocked on a tool approval is waiting on the human, not stuck —
     // report it before the stall check so the orchestrator gets an honest
@@ -923,8 +954,8 @@ fn resumeLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Th
     const task = req.task orelse return failResp(app.gpa, "lane: resume needs a `task` describing the continuation\n", .{});
     if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — resume is for worker lanes.\n", .{});
     const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
-    if (target.engine != .idle) return failResp(app.gpa, "lane: lane {s} is already running — resume requires an idle lane\n", .{id});
-    if (target.turn.isActive()) return failResp(app.gpa, "lane: lane {s} is still shutting down — wait before resuming\n", .{id});
+    const snapshot = LaneSnapshot.of(target);
+    if (snapshot.phase != .idle or snapshot.runtime_attached) return laneOperationUnavailable(app, target, id, "resume");
     const session_id = if (target.id) |*sid| sid.slice() else return failResp(app.gpa, "lane: lane {s} has no linked session to resume; use spawn for a fresh task\n", .{id});
     const spawner = requester_lane orelse return failResp(app.gpa, "lane: no spawner lane\n", .{});
     const context = captureLaneContext(app, spawner, tui.lane_naming_context_max) catch @as([][]u8, &.{});
@@ -1135,7 +1166,7 @@ fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
             null,
         );
     }
-    if (target.turn.state != .idle) return null; // poll again next tick
+    if (LaneSnapshot.of(target).phase != .idle) return null; // poll again next tick
     target.acknowledged = true; // M2: the result was consumed
     const tail = transcriptTail(app, target, 12);
     defer app.gpa.free(tail);
@@ -1154,8 +1185,8 @@ fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const text = req.steer orelse return failResp(app.gpa, "lane: steer needs a `steer` message\n", .{});
     if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — steer is for running background worker agents.\n", .{});
     const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
-    const agent = target.agent orelse return failResp(app.gpa, "lane: lane {s} is not running — nothing to steer\n", .{id});
-    if (target.turn.state != .active) return failResp(app.gpa, "lane: lane {s} is not mid-turn\n", .{id});
+    if (LaneSnapshot.of(target).phase != .running) return laneOperationUnavailable(app, target, id, "steer");
+    const agent = target.agent orelse return laneOperationUnavailable(app, target, id, "steer");
     agent.enqueueSteer(text) catch |err| switch (err) {
         error.QueueFull => return failResp(app.gpa, "lane: steer queue full\n", .{}),
         else => return failResp(app.gpa, "lane: steer failed: {s}\n", .{@errorName(err)}),
@@ -2815,6 +2846,53 @@ test "laneStatus reports waiting-for-approval before stall" {
     defer app.gpa.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "waiting for approval") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "STALLED") == null);
+}
+
+test "lane terminal transition reports finishing consistently until parked" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+    const lane = try addFakeWorkingLane(gpa, &app, "abc123");
+    const identity = lane.engine.idle;
+    lane.engine = .{ .live = .{ .lane = identity, .runtime = undefined, .owns = false } };
+    defer lane.engine = .{ .idle = identity };
+    lane.spawned_by_generation = app.thread.generation;
+    _ = try lane.transcript.append(gpa, .agent, "worker", "review complete");
+
+    var req: lane_bridge.Request = .{
+        .op = .@"resume",
+        .lane = try gpa.dupe(u8, "abc123"),
+        .task = try gpa.dupe(u8, "continue"),
+        .steer = try gpa.dupe(u8, "check again"),
+        .requester = &agent,
+    };
+    defer req.deinit(gpa);
+    for (0..2) |_| {
+        const resume_result = resumeLaneOp(&app, &req, app.thread).?;
+        defer gpa.free(resume_result.text);
+        const steer_result = steerLaneOp(&app, &req).?;
+        defer gpa.free(steer_result.text);
+        try std.testing.expect(std.mem.indexOf(u8, resume_result.text, "status=finishing") != null);
+        try std.testing.expect(std.mem.indexOf(u8, steer_result.text, "status=finishing") != null);
+        try std.testing.expect(awaitLaneOp(&app, &req) == null);
+        try std.testing.expect(!lane.acknowledged);
+    }
+    const status = laneStatus(&app, lane);
+    defer gpa.free(status);
+    try std.testing.expect(std.mem.startsWith(u8, status, "finishing"));
+
+    lane.engine = .{ .idle = identity };
+    const result = awaitLaneOp(&app, &req).?;
+    defer gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(lane.acknowledged);
+    try std.testing.expectEqual(LaneSnapshot.of(lane).completion, .consumed);
+    const repeated = awaitLaneOp(&app, &req).?;
+    defer gpa.free(repeated.text);
+    try std.testing.expectEqualStrings(result.text, repeated.text);
 }
 
 // ---------------------------------------------------------------------------

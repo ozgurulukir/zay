@@ -8,8 +8,16 @@ Pass `name` naming the skill to load:
 {"name": "tigerstyle"}
 ```
 
-The `arguments` object must contain exactly one property: `name`. Do NOT use
-`command`, `description`, or any other key — the tool rejects them.
+To read a reference, script, or other text resource inside a discovered skill:
+
+```json
+{"name": "pr-review", "resource": "references/review-rubric.md"}
+```
+
+`resource` is relative to the registered skill directory, read-only, and limited
+to 256 KiB of UTF-8 text. Absolute paths and paths escaping that directory are
+rejected. Resource reads do not activate or replace the skill instructions.
+Only `name` and optional `resource` are accepted; do not use `command` or `description`.
 
 ## Rules & Best Practices
 

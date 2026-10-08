@@ -1160,16 +1160,41 @@ test "plugin_store official catalog pins one revision and verifies every file" {
             _ = try std.fmt.hexToBytes(&commit_bytes, tail[0..separator]);
             if (revision) |expected| {
                 try std.testing.expectEqualStrings(expected, tail[0..separator]);
-            } else revision = tail[0..separator];
-            const actual_path = try std.fs.path.join(gpa, &.{ "plugins/packages", plugin.id, file.path });
-            defer gpa.free(actual_path);
+            } else {
+                revision = tail[0..separator];
+                // Source archives and shallow clones may lack the published
+                // revision. The catalog checker requires it explicitly.
+                const probe = std.process.run(gpa, io, .{
+                    .argv = &.{ "git", "cat-file", "-e", revision.? },
+                    .stdout_limit = .limited(4096),
+                    .stderr_limit = .limited(4096),
+                }) catch |err| {
+                    if (err == error.FileNotFound) return error.SkipZigTest;
+                    return err;
+                };
+                defer gpa.free(probe.stdout);
+                defer gpa.free(probe.stderr);
+                if (probe.term == .exited and probe.term.exited != 0) return error.SkipZigTest;
+                try std.testing.expect(probe.term == .exited);
+            }
             // URL paths always use '/', including when the test runs on Windows.
             const url_path = try std.fmt.allocPrint(gpa, "plugins/packages/{s}/{s}", .{ plugin.id, file.path });
             defer gpa.free(url_path);
             try std.testing.expectEqualStrings(url_path, tail[separator + 1 ..]);
-            const contents = try readFile(gpa, io, actual_path, plugin_file_max_bytes);
-            defer gpa.free(contents);
-            try verifyFile(&file, contents);
+            // Checkout packages may contain unpublished edits; remote integrity
+            // is defined by the committed bytes at the URL's pin.
+            const blob = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ tail[0..separator], url_path });
+            defer gpa.free(blob);
+            const result = try std.process.run(gpa, io, .{
+                .argv = &.{ "git", "show", blob },
+                .stdout_limit = .limited(plugin_file_max_bytes),
+                .stderr_limit = .limited(4096),
+            });
+            defer gpa.free(result.stdout);
+            defer gpa.free(result.stderr);
+            try std.testing.expect(result.term == .exited);
+            try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+            try verifyFile(&file, result.stdout);
             count += 1;
         }
     }

@@ -19,6 +19,8 @@ local metadata_content = nil
 local write_reply = true
 local last_write = nil
 local last_metadata_write = nil
+local directories = {}
+local mkdir_error = nil
 
 zay = {
   register_tool = function(tool)
@@ -40,6 +42,7 @@ zay = {
     return nil
   end,
   write_file = function(path, content)
+    if not directories[".zay/todos"] then return nil, "FileNotFound" end
     if path == ".zay/todos.txt" then
       last_write = { path = path, content = content }
       todos_content = content
@@ -51,7 +54,11 @@ zay = {
     end
     return write_reply
   end,
-  mkdir = function() return true end,
+  mkdir = function(path)
+    if mkdir_error then return nil, mkdir_error end
+    directories[path] = true
+    return true
+  end,
   json_decode = function(s)
     -- Decode the small JSON fixtures used in these tests (object/scalar).
     if s == "42" then return 42 end
@@ -94,7 +101,33 @@ local function reset(todos, plans, metadata)
   write_reply = true
   last_write = nil
   last_metadata_write = nil
+  directories = {}
+  mkdir_error = nil
 end
+
+test.describe("todo workspace initialization", function()
+  test.it("creates missing parents before the first task write and reloads it", function()
+    reset()
+    local out, err = todo_add.handler({ text = "first task" })
+    test.assert.is_true(out ~= nil, err)
+    test.assert.is_true(directories[".zay/todos"] == true)
+    test.assert.contains("first task", todo_list.handler({}))
+    out, err = todo_add.handler({ text = "second task" })
+    test.assert.is_true(out ~= nil, err)
+    test.assert.contains("second task", todo_list.handler({}))
+  end)
+
+  test.it("reports parent creation failure without writing tasks or metadata", function()
+    reset()
+    mkdir_error = "AccessDenied"
+    local out, err = todo_add.handler({ text = "first task" })
+    test.assert.is_true(out == nil)
+    test.assert.contains("could not create todo directory: AccessDenied", err)
+    test.assert.is_true(last_write == nil)
+    test.assert.is_true(last_metadata_write == nil)
+    reset()
+  end)
+end)
 
 -- ── B1: parse_line off-by-one ───────────────────────────────────────
 

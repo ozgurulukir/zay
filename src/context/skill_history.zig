@@ -68,6 +68,7 @@ pub fn rebuild(context: *SkillContext, gpa: std.mem.Allocator, messages: []const
                 continue;
             };
             defer args.deinit(gpa);
+            if (args.resource != null) continue;
             if (context.contains(args.name)) continue;
             if (message.tool.content.len != 1 or message.tool.content[0] != .text) continue;
             const instructions = message.text();
@@ -174,6 +175,10 @@ test "skill context legacy tool reconstruction requires a successful correlated 
     try rebuild(&ledger, gpa, &messages, &.{});
     try std.testing.expectEqual(@as(usize, 0), ledger.entries.items.len);
     messages[1].tool.failed = false;
+    calls[0].tool_call.arguments = @constCast("{\"name\":\"how\",\"resource\":\"references/rubric.md\"}");
+    try rebuild(&ledger, gpa, &messages, &.{});
+    try std.testing.expectEqual(@as(usize, 0), ledger.entries.items.len);
+    calls[0].tool_call.arguments = @constCast("{\"name\":\"how\"}");
     const changed_source = [_]skill.Skill{.{
         .name = @constCast("how"),
         .description = @constCast(""),
