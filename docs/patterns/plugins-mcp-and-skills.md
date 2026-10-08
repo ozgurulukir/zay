@@ -24,6 +24,29 @@
 
 - **Glob/pattern slicing:** Never unconditionally slice byte 0 off a user-supplied pattern (`fp[1..]`). When the pattern is empty, `fp[1..0]` is an out-of-bounds slice → Zig panic → `SIGABRT`. Lua treats `""` as truthy, so a plugin forwarding `file_pattern = ""` reaches this path directly. Extract suffix logic into a pure `fileNameMatches(name, pattern)` helper that handles empty (match-all), `"*x"` (strip leading star), and bare-suffix cases, and unit-test the empty case explicitly.
 
+### Search-tools grep path and output contracts (2026-10-08)
+
+`plugins/packages/search-tools` passes the original file/directory root to both
+backends. Native `search_files` stats the sanitized root: exact files are read
+once, directories share a fixed root across recursion for relative include
+globs. Do not emulate a file search with a recursive basename filter: duplicate
+and suffix filenames leak into results, and the filter can overwrite `include`.
+Regex mode validates the target via `file_info`, then runs from the active
+workspace with the target as an argument. Changing cwd to a relative root while
+also passing that root to rg resolves it twice. Parse `rg --json` rather than
+colon-delimited output (Windows drive letters and colon filenames). A nonempty
+stderr on exit 1 is an error: the PowerShell bridge can map native failures to 1.
+Ripgrep ignores include globs on explicit files, so regex mode checks these
+targets with `find_files` first. Its exact-file path uses the same basename glob
+matcher as native content search, without reading or walking sibling files.
+Decode only through the first overflow match and report a lower-bound count.
+
+The package's `test.lua` retains mocked command/error tests and exercises actual
+Zay filesystem, shell, quoting and JSON bridges against temporary fixtures. Keep
+these integration checks: mocked results previously hid path resolution, exact
+file isolation and include-glob failures. Live regex checks require rg; without
+it they verify the failure response and print that the live checks were skipped.
+
 ### Skill subsystem pattern
 
 `src/skill.zig` owns project/global skill discovery, system-prompt publication, and `$name` invocation expansion. `loadProject(gpa, io, home_dir, cwd)` scans two roots — `<home>/.agents/skills` (global, optional) then `<cwd>/.agents/skills` (project) — each via `loadFromDir` (depth-capped at `max_skill_depth = 8`). A project skill with the same name displaces its global counterpart (`shadowDuplicates`, mirroring `plugin_prompt.replaceOrAppend`); two same-name project (or two global) skills both load, first-wins for `find`, and are surfaced by `warnDuplicateNames`.

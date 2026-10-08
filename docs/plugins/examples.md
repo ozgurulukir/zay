@@ -276,7 +276,7 @@ Key points:
 Registers `grep` (content search) and `glob` (filename search via
 `zay.find_files`). `grep` has two backends: literal substring search through
 Zay's built-in `zay.search_files` — self-contained, no external binary —
-and, with `regex = true`, ripgrep via `zay.run_bash`, because
+and, with `regex = true`, ripgrep via `zay.run_shell` (or `zay.run_bash` fallback), because
 `search_files` is substring-only and Lua patterns are not PCRE.
 
 ### init.lua (excerpt — `grep`)
@@ -287,7 +287,7 @@ zay.register_tool({
   description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). ...",
   parameters = {
     pattern = { type = "string", description = "Text pattern to search for" },
-    path = { type = "string", description = "Root directory to search in (default: active workspace)", optional = true },
+    path = { type = "string", description = "File or root directory to search in (default: active workspace)", optional = true },
     include = { type = "string", description = "File glob filter (e.g. '*.zig', '*.lua')", optional = true },
     regex = { type = "boolean", description = "Treat pattern as a regex via ripgrep (default false = literal substring via built-in search)", optional = true },
     case_sensitive = { type = "boolean", description = "Case-sensitive search (default false)", optional = true },
@@ -304,6 +304,13 @@ Key points:
   injection defense
 - Scope differs by backend: ripgrep honors `.gitignore`; the native walker
   skips dotfiles but scans gitignored dirs (`vendor/`, `zig-cache/`)
+- Both backends accept an exact file path; `include` remains an additional filter.
+  Native filters support `*`, `**`, and `?` against basenames or root-relative paths.
+- Regex output uses ripgrep JSON, preserving Windows drive letters and colons in
+  filenames. Lua decoding stops after one overflow match; truncated counts are
+  lower bounds. Errors on stderr are surfaced even if PowerShell maps the exit to 1.
+- Native directory searches skip unreadable files and files larger than 1 MB;
+  explicitly requested files report read errors. Use regex mode for larger files.
 
 ## Testing Your Plugin
 

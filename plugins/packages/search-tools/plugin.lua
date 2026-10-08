@@ -1,7 +1,7 @@
 -- plugin.lua — Search Tools manifest
 return {
   name = "search-tools",
-  version = "1.0.0",
+  version = "1.0.1",
   author = "Zay",
   description = "Grep file contents and glob for files by name",
   license = "MIT",
