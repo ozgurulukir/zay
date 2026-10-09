@@ -63,8 +63,12 @@ spawned worker still owns its runtime or future. `idle` is reported only after
 that ownership has ended. Runtime attachment and completion delivery are
 separate fields: an idle user lane can retain its runtime, and a parked worker
 can have a pending, consumed, or delivered completion. `list`, `read`, `resume`,
-`steer`, and `await` use the same derived snapshot. `await` does not acknowledge
-a finishing worker; repeated completed awaits return the retained result.
+`steer`, and `await` use the same derived snapshot. `await` returns and
+acknowledges the result as soon as the terminal turn event arrives, even while
+worker teardown is finishing; its result envelope carries `status`, `result_id`,
+`result_available`, and `cleanup_pending`. A true cleanup flag means the worker
+still owns its runtime or future; repeated completed awaits return the retained
+result while teardown proceeds.
 
 The model-facing `lane` tool is orchestration-only: the primary driver
 supervises workers with `spawn`, `read`, `await`, `steer`, `cancel`, `merge`,

@@ -216,6 +216,69 @@ fn laneStatus(app: *App, lane: *Thread) []u8 {
     ) catch unreachable;
 }
 
+const LaneResultMessage = struct {
+    index: usize,
+    body: []const u8,
+};
+
+/// The latest assistant response after the most recent user turn. This keeps
+/// a previous task's answer from being reported as the result of a new task.
+fn laneResultMessage(lane: *const Thread) ?LaneResultMessage {
+    const messages = lane.transcript.messages.items;
+    var latest_user: ?usize = null;
+    for (messages, 0..) |message, index| {
+        if (message == .user) latest_user = index;
+    }
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        if (latest_user != null and index <= latest_user.?) continue;
+        const message = messages[index];
+        if (message == .agent and message.agent.body.len > 0) {
+            return .{ .index = index, .body = message.agent.body };
+        }
+    }
+    return null;
+}
+
+fn laneResultStatus(lane: *const Thread, phase: @FieldType(LaneSnapshot, "phase")) []const u8 {
+    if (phase == .running or phase == .cancelling) return @tagName(phase);
+    if (lane.turn_failed != null) return "failed";
+    if (phase == .finishing or laneResultMessage(lane) != null) return "completed";
+    return "idle";
+}
+
+/// A stable machine-readable result envelope followed by the final answer and
+/// a short transcript tail. The lane ID is also the key for `lane read`.
+fn laneResultReport(app: *App, lane: *Thread, id: []const u8, transcript_limit: usize) ![]u8 {
+    const snapshot = LaneSnapshot.of(lane);
+    const result = laneResultMessage(lane);
+    const terminal = snapshot.phase == .finishing or snapshot.phase == .idle;
+    const result_available = terminal and result != null;
+    const result_truncated = result_available and result.?.body.len > @as(usize, worker_last_message_cap_bytes);
+    const cleanup_pending = snapshot.phase == .finishing or snapshot.phase == .cancelling;
+    const empty_label = if (lane.transcript.messages.items.len == 0) "(no turn yet)" else "(none)";
+    // Keep oversized answers retrievable through the transcript tail even
+    // though the prominent result block is bounded for tool/model contexts.
+    const tail = transcriptTailExcluding(app, lane, transcript_limit, if (result_available and !result_truncated) result.?.index else null);
+    defer app.gpa.free(tail);
+
+    if (result_available) {
+        const pruned = try tools_common.pruneToolText(app.gpa, result.?.body, worker_last_message_cap_bytes);
+        defer app.gpa.free(pruned);
+        return try std.fmt.allocPrint(
+            app.gpa,
+            "status={s} result_id={s} result_available=true result_truncated={s} cleanup_pending={s}\nFinal result:\n{s}\nRecent transcript:\n{s}",
+            .{ laneResultStatus(lane, snapshot.phase), id, if (result_truncated) "true" else "false", if (cleanup_pending) "true" else "false", pruned, if (tail.len == 0) empty_label else tail },
+        );
+    }
+    return try std.fmt.allocPrint(
+        app.gpa,
+        "status={s} result_id={s} result_available=false result_truncated=false cleanup_pending={s}\nRecent transcript:\n{s}",
+        .{ laneResultStatus(lane, snapshot.phase), id, if (cleanup_pending) "true" else "false", if (tail.len == 0) empty_label else tail },
+    );
+}
+
 /// Service the in-flight `lane` bridge request, if any. Called every UI tick
 /// (see `handleTick`); a worker lane is blocked on the bridge until this
 /// resolves it.
@@ -642,7 +705,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         const path = working.path;
         const branch = working.branch;
 
-        const framed = workerPrompt(app.gpa, id, branch, path, repo, task) catch {
+        const framed = workerPrompt(app.gpa, id, branch, path, repo, task, target.liveRuntime().?.agent.tool_call_limit_per_turn) catch {
             // Rollback: re-park the lane to idle (frees the runtime we just
             // attached). `context` is owned by `lane.parent_context` now;
             // `parkFinishedWorker` leaves the lane idle and does not touch
@@ -811,7 +874,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     // so a task that mentions the main tree's absolute path — e.g. the driver's
     // own cwd — doesn't steer the worker into `cd`-ing there. The bash
     // containment guard is the mechanical backstop (L2).
-    const framed = workerPrompt(app.gpa, id, wt_branch, wt_dest, repo, task) catch {
+    const framed = workerPrompt(app.gpa, id, wt_branch, wt_dest, repo, task, runtime.agent.tool_call_limit_per_turn) catch {
         removeFailedSpawn(app, lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
@@ -857,11 +920,17 @@ fn workerPrompt(
     path: []const u8,
     repo: []const u8,
     task: []const u8,
+    tool_call_budget: u32,
 ) ![]u8 {
+    const budget = if (tool_call_budget == 0)
+        "Reviewer has no tool access; use only the supplied task context and do not claim checks were run."
+    else
+        try std.fmt.allocPrint(gpa, "You have a hard budget of {d} individual tool calls for this turn; each call in a parallel batch counts. For PR reviews, gather metadata, diff, comments, and checks together up front when available, avoid redundant status/list calls, and report key findings plus any incomplete checks.", .{tool_call_budget});
+    defer if (tool_call_budget != 0) gpa.free(budget);
     return std.fmt.allocPrint(
         gpa,
-        "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees.\n\n{s}",
-        .{ id, branch, path, repo, task },
+        "You are a worker agent in lane {s} on branch {s}. Your working directory is {s} — an isolated git worktree of the repo at {s}; work ONLY with relative paths inside it. The main tree is off-limits. Complete this task and report the result concisely. You cannot create lanes or worktrees. {s}\n\n{s}",
+        .{ id, branch, path, repo, budget, task },
     );
 }
 
@@ -939,13 +1008,13 @@ fn readLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     const status = laneStatus(app, target);
     defer app.gpa.free(status);
-    const tail = transcriptTail(app, target, 8);
-    defer app.gpa.free(tail);
+    const report = laneResultReport(app, target, id, 8) catch return failResp(app.gpa, "lane: out of memory\n", .{});
+    defer app.gpa.free(report);
     // M2: only an idle (finished) read consumes the result — peeking at a
     // running worker (the poll-until-done pattern) must not suppress its
     // eventual completion delivery.
     if (target.turn.state == .idle) target.acknowledged = true;
-    return resp(app.gpa, "Lane {s} ({s}): {s}\n", .{ id, status, tail }, id, null);
+    return resp(app.gpa, "Lane {s} ({s}): {s}\n", .{ id, status, report }, id, null);
 }
 
 /// Resume an idle worker's linked session without loading its history into the driver.
@@ -969,7 +1038,7 @@ fn resumeLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Th
     };
     target.spawned_by_generation = spawner.generation;
     const working = lanes_util.workingLaneOf(target).?;
-    const framed = workerPrompt(app.gpa, id, working.branch, working.path, repo, task) catch {
+    const framed = workerPrompt(app.gpa, id, working.branch, working.path, repo, task, target.liveRuntime().?.agent.tool_call_limit_per_turn) catch {
         target.spawned_by_generation = null;
         parkFinishedWorker(app, target);
         return failResp(app.gpa, "lane: out of memory\n", .{});
@@ -1051,7 +1120,7 @@ fn reviewLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Th
         .{ snapshot.base.slice(), snapshot.head.slice(), task, snapshot.diff },
     ) catch |err| return failReviewStart(app, target, &manager.connection, run_id_slice, err);
     defer app.gpa.free(review_prompt);
-    const framed = workerPrompt(app.gpa, lane_id, working.branch, working.path, repo, review_prompt) catch |err| return failReviewStart(app, target, &manager.connection, run_id_slice, err);
+    const framed = workerPrompt(app.gpa, lane_id, working.branch, working.path, repo, review_prompt, 0) catch |err| return failReviewStart(app, target, &manager.connection, run_id_slice, err);
     defer app.gpa.free(framed);
     startTurnForLane(app, target, framed, "review") catch |err| return failReviewStart(app, target, &manager.connection, run_id_slice, err);
     return resp(app.gpa, "Started isolated review {s} for lane {s} at {s}. The reviewer has no tools; results arrive as a driver message.\n", .{ run_id_slice, lane_id, snapshot.head.slice() }, lane_id, working.path);
@@ -1093,6 +1162,10 @@ fn failReviewStart(app: *App, lane: *Thread, conn: *@import("../db.zig").Connect
 /// Tail of a lane's transcript (last `max` user/agent bodies, oldest first).
 /// Always returns an owned slice — the caller frees it.
 fn transcriptTail(app: *App, lane: *Thread, max: usize) []u8 {
+    return transcriptTailExcluding(app, lane, max, null);
+}
+
+fn transcriptTailExcluding(app: *App, lane: *Thread, max: usize, exclude_index: ?usize) []u8 {
     const messages = lane.transcript.messages.items;
     var bodies: std.ArrayList([]const u8) = .empty;
     defer bodies.deinit(app.gpa); // borrows the transcript's bodies
@@ -1101,6 +1174,7 @@ fn transcriptTail(app: *App, lane: *Thread, max: usize) []u8 {
     var i = messages.len;
     while (i > 0 and bodies.items.len < max) {
         i -= 1;
+        if (exclude_index != null and i == exclude_index.?) continue;
         const m = messages[i];
         // Include tool titles (and lane notices) alongside user/agent text:
         // a worker whose tail would otherwise be just its initial prompt
@@ -1144,12 +1218,11 @@ fn cancelLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
 /// semantics).
 const cancelLaneTurn = turn_lifecycle.cancelLaneTurn;
 
-/// `lane await {lane}`: resolve once the target lane's turn is idle (or the
-/// lane is rested — S11's park is transparent). Returns null while the target
-/// is still running; the tick stays alive because the awaiting orchestrator's
-/// own turn is active. A worker silent past the stall window resolves ONCE
-/// with a stall notice (latched by `stall_warned`) so the orchestrator can
-/// cancel/steer instead of blocking here forever.
+/// `lane await {lane}`: return the terminal result as soon as the turn ends,
+/// including while worker teardown is finishing. Returns null while the target
+/// is still running or cancelling. A worker silent past the stall window
+/// resolves ONCE with a stall notice (latched by `stall_warned`) so the
+/// orchestrator can cancel/steer instead of blocking here forever.
 fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const id = req.lane orelse return failResp(app.gpa, "lane: await needs a `lane` field — the hex id shown by `lane list`\n", .{});
     if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — await is for spawned background worker lanes.\n", .{});
@@ -1166,14 +1239,12 @@ fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
             null,
         );
     }
-    if (LaneSnapshot.of(target).phase != .idle) return null; // poll again next tick
+    const phase = LaneSnapshot.of(target).phase;
+    if (phase == .running or phase == .cancelling) return null; // poll again next tick
     target.acknowledged = true; // M2: the result was consumed
-    const tail = transcriptTail(app, target, 12);
-    defer app.gpa.free(tail);
-    if (tail.len == 0) {
-        return resp(app.gpa, "Lane {s}: (no turn yet)\n", .{id}, id, null);
-    }
-    return resp(app.gpa, "Lane {s}: {s}\n", .{ id, tail }, id, null);
+    const report = laneResultReport(app, target, id, 12) catch return failResp(app.gpa, "lane: out of memory\n", .{});
+    defer app.gpa.free(report);
+    return resp(app.gpa, "Lane {s}: {s}\n", .{ id, report }, id, null);
 }
 
 /// `lane steer {lane} {text}`: inject a short message into a running worker
@@ -1956,6 +2027,7 @@ test "lane read returns the transcript tail and marks the lane acknowledged" {
     _ = try lane.transcript.append(gpa, .user, "you", "first user line");
     _ = try lane.transcript.append(gpa, .agent, "agent", "first agent line");
     _ = try lane.transcript.append(gpa, .user, "you", "second user line");
+    _ = try lane.transcript.append(gpa, .agent, "agent", "final answer");
 
     var req = lane_bridge.Request{ .op = .read, .lane = try gpa.dupe(u8, "readme"), .requester = &agent };
     defer req.deinit(gpa);
@@ -1964,6 +2036,10 @@ test "lane read returns the transcript tail and marks the lane acknowledged" {
     try std.testing.expectEqual(@as(u8, 0), result.code);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "first user line") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "second user line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "status=completed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "result_id=readme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "result_available=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Final result:\nfinal answer") != null);
     // The tail is oldest-first.
     const first = std.mem.indexOf(u8, result.text, "first user line").?;
     const second = std.mem.indexOf(u8, result.text, "second user line").?;
@@ -2877,8 +2953,14 @@ test "lane terminal transition reports finishing consistently until parked" {
         defer gpa.free(steer_result.text);
         try std.testing.expect(std.mem.indexOf(u8, resume_result.text, "status=finishing") != null);
         try std.testing.expect(std.mem.indexOf(u8, steer_result.text, "status=finishing") != null);
-        try std.testing.expect(awaitLaneOp(&app, &req) == null);
-        try std.testing.expect(!lane.acknowledged);
+        const await_result = awaitLaneOp(&app, &req).?;
+        defer gpa.free(await_result.text);
+        try std.testing.expect(std.mem.indexOf(u8, await_result.text, "status=completed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, await_result.text, "result_id=abc123") != null);
+        try std.testing.expect(std.mem.indexOf(u8, await_result.text, "result_available=true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, await_result.text, "cleanup_pending=true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, await_result.text, "Final result:\nreview complete") != null);
+        try std.testing.expect(lane.acknowledged);
     }
     const status = laneStatus(&app, lane);
     defer gpa.free(status);
@@ -2889,6 +2971,7 @@ test "lane terminal transition reports finishing consistently until parked" {
     defer gpa.free(result.text);
     try std.testing.expectEqual(@as(u8, 0), result.code);
     try std.testing.expect(lane.acknowledged);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "cleanup_pending=false") != null);
     try std.testing.expectEqual(LaneSnapshot.of(lane).completion, .consumed);
     const repeated = awaitLaneOp(&app, &req).?;
     defer gpa.free(repeated.text);
