@@ -1,5 +1,6 @@
 //! The `skill` builtin tool — enables the model to read instructions for
-//! specialized skills loaded into the agent's runtime.
+//! specialized skills loaded into the agent's runtime, read bundled text,
+//! and execute commands from their registered directories.
 //! Reaches the active skill set through `Tool.Env.ctx` (the executor-owned
 //! runtime context).
 
@@ -8,6 +9,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const skill_mod = @import("../skill.zig");
 const paths = @import("../paths.zig");
+const shell = if (@import("../os.zig").is_windows) @import("pwsh.zig") else @import("bash.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.skill_tool);
@@ -24,6 +26,8 @@ pub const tool: common.Tool = .{
                 .required = true,
             },
             .{ .name = "resource", .kind = .string, .description = "Optional relative resource path inside this skill, e.g. references/review-rubric.md. Omit to load the skill instructions.", .required = false },
+            .{ .name = "command", .kind = .string, .description = "Shell command to run from the registered skill directory, e.g. python3 scripts/check.py. Mutually exclusive with resource. Uses the host shell and normal command safety approval.", .required = false },
+            .{ .name = "timeout", .kind = .integer, .description = "Command timeout in seconds (default 30, maximum 3600). Only valid with command.", .required = false },
         },
     },
     .run = runTool,
@@ -33,10 +37,13 @@ pub const tool: common.Tool = .{
 pub const Args = struct {
     name: []u8,
     resource: ?[]u8 = null,
+    command: ?[]u8 = null,
+    timeout_seconds: ?u32 = null,
 
     pub fn deinit(self: *Args, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
         if (self.resource) |resource| gpa.free(resource);
+        if (self.command) |command| gpa.free(command);
         self.* = undefined;
     }
 };
@@ -44,6 +51,8 @@ pub const Args = struct {
 const JsonArgs = struct {
     name: ?[]const u8 = null,
     resource: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    timeout: ?u32 = null,
 };
 
 pub const ParseError = error{ InvalidArguments, OutOfMemory };
@@ -58,6 +67,15 @@ pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args 
     const raw_name = parsed.value.name orelse return error.InvalidArguments;
     const trimmed = std.mem.trim(u8, raw_name, " \t\r\n$");
     if (trimmed.len == 0) return error.InvalidArguments;
+    if (parsed.value.command != null and parsed.value.resource != null) return error.InvalidArguments;
+    if (parsed.value.timeout != null and parsed.value.command == null) return error.InvalidArguments;
+    if (parsed.value.command) |command| {
+        if (std.mem.trim(u8, command, " \t\r\n").len == 0) return error.InvalidArguments;
+        if (std.mem.indexOfScalar(u8, command, 0) != null) return error.InvalidArguments;
+    }
+    if (parsed.value.timeout) |timeout| {
+        if (timeout == 0 or timeout > shell.Backend.exec.timeout_seconds_max) return error.InvalidArguments;
+    }
 
     const owned_name = try gpa.dupe(u8, trimmed);
     errdefer gpa.free(owned_name);
@@ -65,7 +83,9 @@ pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args 
         if (value.len == 0) return error.InvalidArguments;
         break :blk try gpa.dupe(u8, value);
     } else null;
-    return .{ .name = owned_name, .resource = resource };
+    errdefer if (resource) |value| gpa.free(value);
+    const command = if (parsed.value.command) |value| try gpa.dupe(u8, value) else null;
+    return .{ .name = owned_name, .resource = resource, .command = command, .timeout_seconds = parsed.value.timeout };
 }
 
 const resource_bytes_max = 256 * 1024;
@@ -111,7 +131,6 @@ pub fn runTool(
     arguments: []const u8,
     env: common.Env,
 ) common.Error!common.Output {
-    _ = cwd;
     _ = env.userdata;
 
     const skills = env.ctx.skills;
@@ -119,11 +138,27 @@ pub fn runTool(
 
     var args = parseArgs(gpa, arguments) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidArguments => return common.failFmt(gpa, 2, "Invalid arguments: 'name' is required (e.g. {{\"name\":\"tigerstyle\"}}).\n", .{}),
+        error.InvalidArguments => return common.failFmt(gpa, 2, "Invalid skill arguments: name is required; resource and command are mutually exclusive; timeout requires command and must be 1–3600 seconds.\n", .{}),
     };
     defer args.deinit(gpa);
 
     if (skill_mod.find(skills, args.name)) |skill| {
+        if (args.command) |command| {
+            const root = std.Io.Dir.realPathFileAlloc(.cwd(), io, skill.base_dir, gpa) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return common.failFmt(gpa, 1, "Could not open skill '{s}' directory: {s}\n", .{ args.name, @errorName(err) });
+            };
+            defer gpa.free(root);
+            const workspace = std.fs.path.resolve(gpa, &.{cwd}) catch return error.OutOfMemory;
+            defer gpa.free(workspace);
+            const shell_args = try std.json.Stringify.valueAlloc(gpa, .{
+                .command = command,
+                .timeout = args.timeout_seconds,
+                .env = .{ .ZAY_WORKSPACE_CWD = workspace },
+            }, .{});
+            defer gpa.free(shell_args);
+            return shell.runContainedWithCancellation(gpa, io, root, shell_args, null, env.ctx.cancel_requested);
+        }
         const stdout = if (args.resource) |resource|
             readResource(gpa, io, skill, resource) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -164,11 +199,7 @@ pub fn display(
     env: common.Env,
 ) std.mem.Allocator.Error!common.ToolDisplay {
     _ = env;
-    const JsonArgsDisplay = struct {
-        name: ?[]const u8 = null,
-        resource: ?[]const u8 = null,
-    };
-    const parsed = std.json.parseFromSlice(JsonArgsDisplay, gpa, arguments, .{ .ignore_unknown_fields = false }) catch return .{
+    const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = false }) catch return .{
         .label = try gpa.dupe(u8, "skill"),
     };
     defer parsed.deinit();
@@ -177,9 +208,11 @@ pub fn display(
     const trimmed = std.mem.trim(u8, target_name, " \t\r\n$");
     const display_name = if (trimmed.len > 0) trimmed else "skill";
 
-    const label = try std.fmt.allocPrint(gpa, "Read {s} skill", .{display_name});
+    const label = try std.fmt.allocPrint(gpa, "{s} {s} skill", .{ if (parsed.value.command != null) "Run" else "Read", display_name });
     errdefer gpa.free(label);
-    const expanded_label = if (parsed.value.resource) |resource|
+    const expanded_label = if (parsed.value.command) |command|
+        try std.fmt.allocPrint(gpa, "skill: {s} command: {s}", .{ display_name, command })
+    else if (parsed.value.resource) |resource|
         try std.fmt.allocPrint(gpa, "skill: {s} resource: {s}", .{ display_name, resource })
     else
         try std.fmt.allocPrint(gpa, "skill: {s}", .{display_name});
@@ -195,6 +228,95 @@ test "skill tool parseArgs accepts standard name parameter" {
     var args = try parseArgs(gpa, "{\"name\":\"tigerstyle\"}");
     defer args.deinit(gpa);
     try std.testing.expectEqualStrings("tigerstyle", args.name);
+}
+
+test "skill command rejects ambiguous modes and invalid timeout" {
+    const gpa = std.testing.allocator;
+    var args = try parseArgs(gpa, "{\"name\":\"review\",\"command\":\"python3 scripts/check.py\",\"timeout\":120}");
+    defer args.deinit(gpa);
+    try std.testing.expectEqualStrings("python3 scripts/check.py", args.command.?);
+    try std.testing.expectEqual(@as(u32, 120), args.timeout_seconds.?);
+    const invalid = [_][]const u8{
+        "{\"name\":\"review\",\"command\":\" \"}",
+        "{\"name\":\"review\",\"command\":\"echo\\u0000bad\"}",
+        "{\"name\":\"review\",\"command\":\"echo ok\",\"resource\":\"x.md\"}",
+        "{\"name\":\"review\",\"timeout\":1}",
+        "{\"name\":\"review\",\"command\":\"echo ok\",\"timeout\":0}",
+        "{\"name\":\"review\",\"command\":\"echo ok\",\"timeout\":3601}",
+        "{\"name\":\"review\",\"command\":\"echo ok\",\"cwd\":\"/tmp\"}",
+    };
+    for (invalid) |json| try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, json));
+}
+
+test "skill command executes a script and assets from its registered cwd" {
+    const windows = @import("../os.zig").is_windows;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skill with spaces/scripts");
+    try tmp.dir.createDirPath(io, "skill with spaces/assets");
+    try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skill with spaces/assets/value.txt", .data = "asset-content-from-skill\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = if (windows) "skill with spaces/scripts/check.ps1" else "skill with spaces/scripts/check.sh",
+        .data = if (windows)
+            "Get-Content assets/value.txt\nWrite-Output $env:ZAY_WORKSPACE_CWD\nWrite-Output ('argument=[' + $args[0] + ']')\n"
+        else
+            "cat assets/value.txt\nprintf '%s\\n' \"$ZAY_WORKSPACE_CWD\"\nprintf 'argument=[%s]\\n' \"$1\"\n",
+    });
+    var skill_dir = try tmp.dir.openDir(io, "skill with spaces", .{});
+    defer skill_dir.close(io);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try skill_dir.realPath(io, &root_buf);
+    var workspace_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var workspace_dir = try tmp.dir.openDir(io, "workspace", .{});
+    defer workspace_dir.close(io);
+    const workspace_len = try workspace_dir.realPath(io, &workspace_buf);
+    const workspace = workspace_buf[0..workspace_len];
+    const skills = [_]skill_mod.Skill{.{
+        .name = @constCast("review"),
+        .description = @constCast(""),
+        .path = @constCast(""),
+        .base_dir = root_buf[0..root_len],
+        .body = @constCast("Instructions"),
+    }};
+    var ctx: common.ToolContext = .{ .skills = &skills };
+    const command = if (windows) "& ./scripts/check.ps1 'argument with spaces'" else "bash scripts/check.sh 'argument with spaces'";
+    const json = try std.json.Stringify.valueAlloc(gpa, .{ .name = "review", .command = command }, .{});
+    defer gpa.free(json);
+    var output = try runTool(gpa, io, workspace, json, .{ .ctx = &ctx });
+    defer output.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "asset-content-from-skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, workspace) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "argument=[argument with spaces]") != null);
+    var shown = try display(gpa, json, .{ .ctx = &ctx });
+    defer shown.deinit(gpa);
+    try std.testing.expectEqualStrings("Run review skill", shown.label);
+    const escape_json = try std.json.Stringify.valueAlloc(gpa, .{
+        .name = "review",
+        .command = if (windows) "Set-Location $env:ZAY_WORKSPACE_CWD" else "cd \"$ZAY_WORKSPACE_CWD\"",
+    }, .{});
+    defer gpa.free(escape_json);
+    var escaped = try runTool(gpa, io, workspace, escape_json, .{ .ctx = &ctx });
+    defer escaped.deinit(gpa);
+    try std.testing.expect(escaped.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, escaped.stdout, "escapes the workspace root") != null);
+
+    var failed = try runTool(gpa, io, workspace, "{\"name\":\"review\",\"command\":\"exit 7\"}", .{ .ctx = &ctx });
+    defer failed.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 7), failed.code);
+    var timed_out = try runTool(gpa, io, workspace, if (windows)
+        "{\"name\":\"review\",\"command\":\"Start-Sleep -Seconds 10\",\"timeout\":1}"
+    else
+        "{\"name\":\"review\",\"command\":\"sleep 10\",\"timeout\":1}", .{ .ctx = &ctx });
+    defer timed_out.deinit(gpa);
+    try std.testing.expect(timed_out.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "timed out") != null);
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    ctx.cancel_requested = &cancelled;
+    try std.testing.expectError(error.Canceled, runTool(gpa, io, workspace, json, .{ .ctx = &ctx }));
 }
 
 test "skill resource reads a registered root and rejects paths outside it" {
