@@ -16,9 +16,11 @@ The `context` object controls context window management and automatic summarizat
 | `context.compaction.auto`             | `boolean` | `true`   | Enable automatic context compaction before reaching limits.                                                                                                  |
 | `context.compaction.threshold`        | `number`  | `0.75`   | Fraction of context window that triggers background summarization. Accepted when `0.1 ≤ t ≤ 1.0`; anything above `0.90` is clamped down to the `0.90` ceiling at parse time, and values outside the accepted band are **dropped** so the `0.75` default is used. The swap watermark is derived as `threshold + 0.20` (capped at 0.95), so clamping keeps it from falling below the start watermark. |
 | `context.compaction.keepRecentTokens` | `integer` | `8000`   | Recent conversation tokens retained verbatim alongside the generated summary. Scaled down proportionally for small-context models (35% of window, min 1000). When real provider usage outruns the chars/4 estimate (CJK text), the budget is shrunk by the measured ratio so compaction still lands below the swap watermark. |
-| `context.compaction.keepRecentToolTurns` | `integer` | `4`   | Number of most recent tool-result turns kept in full when assembling each prompt. Older tool results are pruned to `historicalToolCapBytes` with a `[... N of M bytes elided to save context ...]` notice. Raise this when an agentic turn needs earlier tool outputs in full (e.g. multi-phase skills like `tci-bfg` that fire dozens of commands). Minimum 1 — a value of 0 would prune every tool result and break tool-calling. |
-| `context.compaction.historicalToolCapBytes` | `integer` | `1024` | Byte cap applied to tool results older than `keepRecentToolTurns` — a head+tail sandwich (first half + last half of the budget, joined by `common.elideMiddle`) keeps both the start and the load-bearing conclusion (errors, results, status) of a command output. Raise for large command outputs the model must re-read later in the same turn. |
+| `context.compaction.keepRecentToolTurns` | `integer` | `12` | Number of recent tool-result turns left alone by historical pruning. New results larger than `toolOutputCapBytes` already reach the model as bounded previews; this setting mainly affects older full results in existing session history. Minimum 1. |
+| `context.compaction.toolOutputCapBytes` | `integer` | `8192` | Shared byte cap for model-facing outputs from every tool and for old tool results assembled into prompts. Larger outputs are saved in the active session and sent as a head+tail preview with retrieval instructions. Minimum 4096 so a bounded `read_tool_result` window and its continuation instructions fit. |
 | `context.compaction.evictHistoryImages` | `boolean` | `true` | Replace image blocks in OLDER user messages with a deterministic re-mention stub (`[image: photo.png (2.4 MB) — shown in an earlier turn; mention @photo.png to view it again]`) when assembling each request — only the newest user message keeps its images. Chat-completions APIs are stateless, so without eviction every historical image re-uploads its base64 on every follow-up turn; eviction removes that while keeping re-examination one `@`-mention away. Disable when every image must stay attached every turn (or for providers that hold server-side image state). |
+
+For compatibility, the parser still accepts `historicalToolCapBytes` as an alias for `toolOutputCapBytes`. Config validation and serialization use the new name.
 
 **Example — local Ollama with aggressive compaction and lenient tool-result pruning:**
 
@@ -31,7 +33,7 @@ The `context` object controls context window management and automatic summarizat
       "threshold": 0.6,
       "keepRecentTokens": 3000,
       "keepRecentToolTurns": 12,
-      "historicalToolCapBytes": 8192
+      "toolOutputCapBytes": 8192
     }
   }
 }
@@ -134,4 +136,4 @@ A theme is rejected (and skipped) if it fails validation parity with the builtin
 > [!NOTE]
 > **`tui.customThemesDir` replaces the default scan.** When set, only that directory is scanned for custom themes; `~/.config/zay/themes/` and `.zay/themes/` are ignored. An explicitly-set path means "use this location", not "also scan the defaults".
 
-Activated skill instructions are retained in full independently of `keepRecentToolTurns` and `historicalToolCapBytes`. Compaction summarizes activation notices and keeps the full bodies in branch-scoped session metadata; request assembly supplies those bodies after the original messages are removed. These bytes are included in context estimates. Repeated skill mentions and calls do not add another full body.
+Activated skill instructions are retained in full independently of `keepRecentToolTurns` and `toolOutputCapBytes`. Compaction summarizes activation notices and keeps the full bodies in branch-scoped session metadata; request assembly supplies those bodies after the original messages are removed. These bytes are included in context estimates. Repeated skill mentions and calls do not add another full body.

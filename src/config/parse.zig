@@ -277,7 +277,10 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
     if (updates.compaction.keep_recent_tokens != d.keep_recent_tokens) target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
     if (updates.compaction.keep_recent_tool_turns != d.keep_recent_tool_turns) target.compaction.keep_recent_tool_turns = updates.compaction.keep_recent_tool_turns;
-    if (updates.compaction.historical_tool_cap_bytes != d.historical_tool_cap_bytes) target.compaction.historical_tool_cap_bytes = updates.compaction.historical_tool_cap_bytes;
+    if (updates.compaction.tool_output_cap_bytes_is_set or updates.compaction.tool_output_cap_bytes != d.tool_output_cap_bytes) {
+        target.compaction.tool_output_cap_bytes = updates.compaction.tool_output_cap_bytes;
+        target.compaction.tool_output_cap_bytes_is_set = true;
+    }
     if (updates.compaction.evict_history_images != d.evict_history_images) target.compaction.evict_history_images = updates.compaction.evict_history_images;
 }
 
@@ -906,13 +909,16 @@ fn parseCompaction(value: std.json.Value) CompactionSettings {
         comp.keep_recent_tokens = v;
     }
     if (u32field(value, "keepRecentToolTurns")) |v| {
-        // Minimum 1: 0 would prune every tool result immediately and break
-        // tool-calling (the model would never see a result in full).
+        // Minimum 1: keep at least the most recent tool-result turn outside
+        // historical pruning.
         if (v >= 1) comp.keep_recent_tool_turns = v;
     }
-    if (u32field(value, "historicalToolCapBytes")) |v| {
-        // Minimum 1: a 0 cap would render every pruned result empty.
-        if (v >= 1) comp.historical_tool_cap_bytes = v;
+    const output_cap = u32field(value, "toolOutputCapBytes") orelse u32field(value, "historicalToolCapBytes");
+    if (output_cap) |v| {
+        if (v >= @import("../tools/output_policy.zig").minimum_tool_output_cap_bytes) {
+            comp.tool_output_cap_bytes = v;
+            comp.tool_output_cap_bytes_is_set = true;
+        }
     }
     if (boolFieldCompat(value, "evictHistoryImages", "evict_history_images")) |b| comp.evict_history_images = b;
     return comp;
@@ -1971,7 +1977,8 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
     if (ctx.compaction.keep_recent_tool_turns != d.compaction.keep_recent_tool_turns) return true;
-    if (ctx.compaction.historical_tool_cap_bytes != d.compaction.historical_tool_cap_bytes) return true;
+    if (ctx.compaction.tool_output_cap_bytes != d.compaction.tool_output_cap_bytes) return true;
+    if (ctx.compaction.tool_output_cap_bytes_is_set) return true;
     return false;
 }
 
@@ -2040,9 +2047,9 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
         try writeKeyNoIndent(writer, "keepRecentToolTurns", &wrote_any);
         try writer.print("{d}", .{comp.keep_recent_tool_turns});
     }
-    if (comp.historical_tool_cap_bytes != d.historical_tool_cap_bytes) {
-        try writeKeyNoIndent(writer, "historicalToolCapBytes", &wrote_any);
-        try writer.print("{d}", .{comp.historical_tool_cap_bytes});
+    if (comp.tool_output_cap_bytes_is_set or comp.tool_output_cap_bytes != d.tool_output_cap_bytes) {
+        try writeKeyNoIndent(writer, "toolOutputCapBytes", &wrote_any);
+        try writer.print("{d}", .{comp.tool_output_cap_bytes});
     }
     if (!comp.evict_history_images) {
         try writeKeyNoIndent(writer, "evictHistoryImages", &wrote_any);
@@ -2639,6 +2646,31 @@ test "mergeLayers: later layers win for scalar fields" {
 
     try std.testing.expectEqual(Provider.openai, merged.providerFromName().?);
     try std.testing.expectEqualStrings("https://env", merged.base_url.?);
+}
+
+test "mergeLayers lets a later layer reset tool output cap to default" {
+    const gpa = std.testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(gpa);
+    var global = try parseFile(gpa, "<global>", "{\"context\":{\"compaction\":{\"toolOutputCapBytes\":4096}}}", &diagnostics);
+    defer global.deinit(gpa);
+    var project = try parseFile(gpa, "<project>", "{\"context\":{\"compaction\":{\"toolOutputCapBytes\":8192}}}", &diagnostics);
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 8_192), merged.context.compaction.tool_output_cap_bytes);
+
+    var encoded: std.Io.Writer.Allocating = .init(gpa);
+    defer encoded.deinit();
+    try serialize(gpa, &encoded.writer, merged);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.written(), "\"toolOutputCapBytes\":8192") != null);
+
+    var roundtrip = try parseFile(gpa, "<roundtrip>", encoded.written(), &diagnostics);
+    defer roundtrip.deinit(gpa);
+    var resolved = try mergeLayers(gpa, &.{roundtrip});
+    defer resolved.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 8_192), resolved.context.compaction.tool_output_cap_bytes);
 }
 
 test "mergeLayers: active model is hydrated from the merged provider list" {
@@ -3443,7 +3475,7 @@ test "parseObject: context with compaction settings" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.80), cfg.context.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 5_000), cfg.context.compaction.keep_recent_tokens);
     try std.testing.expectEqual(@as(u32, 8), cfg.context.compaction.keep_recent_tool_turns);
-    try std.testing.expectEqual(@as(u32, 8_192), cfg.context.compaction.historical_tool_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 8_192), cfg.context.compaction.tool_output_cap_bytes);
 }
 
 test "parseObject: context defaults when absent" {
@@ -3458,27 +3490,26 @@ test "parseObject: context defaults when absent" {
     try std.testing.expectEqual(true, cfg.context.compaction.auto);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), cfg.context.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 8_000), cfg.context.compaction.keep_recent_tokens);
-    try std.testing.expectEqual(@as(u32, 4), cfg.context.compaction.keep_recent_tool_turns);
-    try std.testing.expectEqual(@as(u32, 1_024), cfg.context.compaction.historical_tool_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 12), cfg.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 8_192), cfg.context.compaction.tool_output_cap_bytes);
 }
 
-test "parseCompaction clamps pruning knobs to their minimum" {
+test "parseCompaction keeps defaults below minimum and accepts minimum values" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
 
-    // Below minimum (0): keep the defaults — 0 turns would prune every tool
-    // result and a 0-byte cap would render pruned results empty.
+    // Below minimum (0): keep the defaults.
     var zero = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"keepRecentToolTurns\":0,\"historicalToolCapBytes\":0}}}", &sink);
     defer zero.deinit(gpa);
-    try std.testing.expectEqual(@as(u32, 4), zero.context.compaction.keep_recent_tool_turns);
-    try std.testing.expectEqual(@as(u32, 1_024), zero.context.compaction.historical_tool_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 12), zero.context.compaction.keep_recent_tool_turns);
+    try std.testing.expectEqual(@as(u32, 8_192), zero.context.compaction.tool_output_cap_bytes);
 
-    // Minimum 1 passes through.
-    var min = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"keepRecentToolTurns\":1,\"historicalToolCapBytes\":1}}}", &sink);
+    // Minimum accepted output cap and tool-result turn count pass through.
+    var min = try parseFile(gpa, "<test>", "{\"context\":{\"compaction\":{\"keepRecentToolTurns\":1,\"toolOutputCapBytes\":4096}}}", &sink);
     defer min.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 1), min.context.compaction.keep_recent_tool_turns);
-    try std.testing.expectEqual(@as(u32, 1), min.context.compaction.historical_tool_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 4_096), min.context.compaction.tool_output_cap_bytes);
 }
 
 test "parseContext clamps maxConcurrentRequests to its minimum" {
@@ -3582,7 +3613,7 @@ test "serialize then parse roundtrips with camelCase and context" {
         .context = .{
             .override_context_window = 16_000,
             .max_concurrent_requests = 3,
-            .compaction = .{ .auto = false, .keep_recent_tokens = 4_000, .keep_recent_tool_turns = 6, .historical_tool_cap_bytes = 4_096 },
+            .compaction = .{ .auto = false, .keep_recent_tokens = 4_000, .keep_recent_tool_turns = 6, .tool_output_cap_bytes = 4_096 },
         },
     };
     defer original.deinit(gpa);
@@ -3606,7 +3637,9 @@ test "serialize then parse roundtrips with camelCase and context" {
     try std.testing.expectEqual(false, roundtrip.context.compaction.auto);
     try std.testing.expectEqual(@as(u32, 4_000), roundtrip.context.compaction.keep_recent_tokens);
     try std.testing.expectEqual(@as(u32, 6), roundtrip.context.compaction.keep_recent_tool_turns);
-    try std.testing.expectEqual(@as(u32, 4_096), roundtrip.context.compaction.historical_tool_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 4_096), roundtrip.context.compaction.tool_output_cap_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "toolOutputCapBytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "historicalToolCapBytes") == null);
 }
 
 test "parseSemverMajor extracts major from various formats" {
@@ -3727,14 +3760,14 @@ test "applyContextOverlay merges non-default values" {
     const updates: ContextSettings = .{
         .override_context_window = 64_000,
         .max_concurrent_requests = 4,
-        .compaction = .{ .threshold = 0.90, .keep_recent_tool_turns = 10, .historical_tool_cap_bytes = 16_384 },
+        .compaction = .{ .threshold = 0.90, .keep_recent_tool_turns = 10, .tool_output_cap_bytes = 16_384 },
     };
     applyContextOverlay(&target, updates);
     try std.testing.expectEqual(@as(u32, 64_000), target.override_context_window.?);
     try std.testing.expectEqual(@as(u32, 4), target.max_concurrent_requests.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.90), target.compaction.threshold, 0.001);
     try std.testing.expectEqual(@as(u32, 10), target.compaction.keep_recent_tool_turns);
-    try std.testing.expectEqual(@as(u32, 16_384), target.compaction.historical_tool_cap_bytes);
+    try std.testing.expectEqual(@as(u32, 16_384), target.compaction.tool_output_cap_bytes);
     // Defaults preserved for fields not in updates.
     try std.testing.expectEqual(true, target.compaction.auto);
     try std.testing.expectEqual(@as(u32, 8_000), target.compaction.keep_recent_tokens);

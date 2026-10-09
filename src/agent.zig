@@ -615,7 +615,7 @@ pub const Agent = struct {
                 &self.tool_view_cache,
                 self.messages(),
                 self.compaction_settings.keep_recent_tool_turns,
-                self.compaction_settings.historical_tool_cap_bytes,
+                self.compaction_settings.tool_output_cap_bytes,
                 &self.skill_context,
             );
             defer context_assembly.freePrunedViews(self.gpa, prompt_messages);
@@ -834,6 +834,7 @@ pub const Agent = struct {
                 null,
             .mcp_manager = self.mcp_manager,
             .tool_registry = self.tool_registry,
+            .tool_output_cap_bytes = self.compaction_settings.tool_output_cap_bytes,
             .plugin_manager = self.plugin_manager,
             .lane_bridge = self.lane_bridge,
             .lane_requester = self,
@@ -1463,7 +1464,7 @@ pub const Agent = struct {
             self.context_manager.items(),
             anchor_count,
             self.compaction_settings.keep_recent_tool_turns,
-            self.compaction_settings.historical_tool_cap_bytes,
+            self.compaction_settings.tool_output_cap_bytes,
             self.compaction_settings.evict_history_images,
             &self.skill_context,
         );
@@ -1475,7 +1476,7 @@ pub const Agent = struct {
             self.context_manager.items(),
             0,
             self.compaction_settings.keep_recent_tool_turns,
-            self.compaction_settings.historical_tool_cap_bytes,
+            self.compaction_settings.tool_output_cap_bytes,
             self.compaction_settings.evict_history_images,
             &self.skill_context,
         );

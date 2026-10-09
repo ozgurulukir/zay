@@ -341,14 +341,14 @@
         "keepRecentToolTurns": {
           "type": "integer",
           "minimum": 1,
-          "default": 4,
-          "description": "Number of most recent tool-result turns kept in full when assembling each prompt. Older tool results are pruned to historicalToolCapBytes with a '[... N of M bytes elided to save context ...]' notice. Raise this when an agentic turn needs earlier tool outputs in full (e.g. multi-phase skills). Minimum 1 — a value of 0 would prune every tool result and break tool-calling."
+          "default": 12,
+          "description": "Number of recent tool-result turns left alone by historical pruning. New outputs are already bounded by toolOutputCapBytes; this controls older full results retained in existing history. Minimum 1."
         },
-        "historicalToolCapBytes": {
+        "toolOutputCapBytes": {
           "type": "integer",
-          "minimum": 1,
-          "default": 1024,
-          "description": "Byte cap applied to tool results older than keepRecentToolTurns — a head+tail sandwich (first half + last half, joined by common.elideMiddle) keeps both the start and the load-bearing conclusion (errors, results, status) of a command output, with a '[... N of M bytes elided to save context ...]' notice. Raise for large command outputs the model must re-read later in the same turn."
+          "minimum": 4096,
+          "default": 8192,
+          "description": "Shared byte cap for model-facing tool output and historical pruning. Larger results from built-in, shell, database, plugin, and MCP tools are saved in the active session and returned as head+tail previews with retrieval instructions. Full saved results can be read in bounded windows with database action=read_tool_result."
         }
       },
       "additionalProperties": false
