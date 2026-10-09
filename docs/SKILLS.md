@@ -36,6 +36,16 @@ An invalid skill is skipped with a log warning; it never aborts loading. Reasons
   256 KiB of UTF-8 text;
   absolute paths, parent traversal, and symlinks escaping the skill directory
   are rejected. Resource reads do not activate or replace retained instructions.
+- Bundled scripts run with `{"name":"…","command":"python3 scripts/check.py","timeout":120}`.
+  Commands start in the registered skill directory, including global skills outside
+  the workspace, using bash on POSIX and PowerShell on Windows. `ZAY_WORKSPACE_CWD`
+  exposes the current lane/session workspace without changing the agent's cwd.
+  Normal shell safety classification/approval, cancellation, capture limits, and
+  timeout handling apply (default 30 seconds, range 1–3600). Shell location changes
+  are guarded against leaving the skill root; this is defense in depth, not an OS
+  sandbox. Commands may read/write files just as ordinary shell commands do.
+  `command` and `resource` are mutually exclusive; `timeout` requires `command`.
+  Command results never activate skills or replace retained instructions.
 - Successful model `skill` calls register the same activation. Repeated calls still receive a protocol result, with a short already-loaded notice.
 - Full activated instructions survive ordinary tool-result pruning, compaction, branch reload, and resume, even when the original skill file is missing. The first admitted body wins; changing a file does not replace an active body.
 - Branch-scoped `skill_context` session entries store owned bodies. Old sessions recover complete generated inline blocks and successful results correlated with explicit `skill` calls; ambiguous or incomplete history is ignored.

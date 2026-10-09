@@ -1385,7 +1385,7 @@ pub const Agent = struct {
                     return null;
                 };
                 defer args.deinit(self.gpa);
-                if (args.resource != null) return null;
+                if (args.resource != null or args.command != null) return null;
                 for (self.skill_context.entries.items) |entry| {
                     if (std.ascii.eqlIgnoreCase(entry.name, args.name)) return entry;
                 }
@@ -3632,4 +3632,40 @@ test "skill context canceled result preserves call pairing without activating" {
     try std.testing.expect(agent.messages()[1].tool.failed);
     try std.testing.expectEqualStrings("canceled-call", agent.messages()[1].tool.call_id.slice());
     try std.testing.expect(!agent.skill_context.contains("how"));
+}
+
+test "skill command results neither activate instructions nor become loaded notices" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |already_active| {
+        var agent = Agent.init(gpa, std.testing.io, ".", .none);
+        defer agent.deinit();
+        const fixture: skill_mod.Skill = .{
+            .name = @constCast("how"),
+            .description = @constCast("Test"),
+            .path = @constCast("/missing/SKILL.md"),
+            .base_dir = @constCast("/missing"),
+            .body = @constCast("Retained instructions"),
+        };
+        agent.skills = &.{fixture};
+        if (already_active) _ = try agent.skill_context.activate(gpa, fixture.name, fixture.body);
+        const blocks = try gpa.alloc(ai.ContentBlock, 1);
+        blocks[0] = .{ .tool_call = .{
+            .call_id = .{ .value = try gpa.dupe(u8, "script-call") },
+            .name = try gpa.dupe(u8, "skill"),
+            .arguments = try gpa.dupe(u8, "{\"name\":\"how\",\"command\":\"python3 scripts/check.py\"}"),
+        } };
+        try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+        var results = [_]executor_mod.ToolResult{try executor_mod.ToolResult.init(gpa, .{
+            .call_id = "script-call",
+            .name = "skill",
+            .failed = false,
+            .content = try gpa.dupe(u8, "Script result"),
+            .display = .{ .label = try gpa.dupe(u8, "Run how skill") },
+            .display_body = try gpa.dupe(u8, "Script result"),
+        })};
+        try agent.takeToolResults(&results);
+        try std.testing.expectEqualStrings("Script result", agent.messages()[1].text());
+        try std.testing.expectEqual(already_active, agent.skill_context.contains("how"));
+        if (already_active) try std.testing.expectEqualStrings(fixture.body, agent.skill_context.body("how").?);
+    }
 }

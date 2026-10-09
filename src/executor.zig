@@ -313,6 +313,27 @@ pub const ExecutorService = struct {
     }
 
     fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
+        if (std.mem.eql(u8, call.name, "skill")) {
+            // Safety must inspect the same numeric coercions that dispatch accepts.
+            var validation_info = try executor_validation.validateAndCoerceCallArgs(self.scratch_allocator, @import("tools/skill.zig").tool.schema, call);
+            defer validation_info.deinit(self.scratch_allocator);
+            if (!validation_info.validation.isValid()) return false;
+            var effective = call;
+            effective.arguments = validation_info.args;
+            var args = @import("tools/skill.zig").parseArgs(self.gpa, effective.arguments) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return false;
+            };
+            defer args.deinit(self.gpa);
+            if (args.command == null) return false;
+            const skill = skill_mod.find(self.ctx.skills, args.name) orelse return false;
+            const root = std.Io.Dir.realPathFileAlloc(.cwd(), self.io, skill.base_dir, self.gpa) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return false;
+            };
+            defer self.gpa.free(root);
+            return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.ctx.bash_classifier_url, root, effective, observer);
+        }
         return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.ctx.bash_classifier_url, self.cwd, call, observer);
     }
 
@@ -712,6 +733,76 @@ test "ExecutorService shouldRejectUnsafeShell consults the approval hook" {
     // 3. Same unsafe call, but the observer approves => allowed.
     ctx.should_approve = true;
     try std.testing.expect(!(try executor.shouldRejectUnsafeShell(unsafe_call, observer)));
+}
+
+test "skill command uses shell approvals and preserves the lane workspace" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const workspace = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(workspace);
+    const skills = [_]skill_mod.Skill{.{
+        .name = @constCast("review"),
+        .description = @constCast(""),
+        .path = @constCast(""),
+        .base_dir = root_buf[0..root_len],
+        .body = @constCast("Review instructions"),
+    }};
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = workspace, .contained = true, .skills = &skills });
+    const Approval = struct {
+        approved: bool = false,
+        calls: usize = 0,
+        fn started(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        fn finished(_: *@This(), _: *const ToolResult) anyerror!void {}
+        fn approve(ctx: *@This(), call: ai.ToolCall, command: []const u8) anyerror!bool {
+            try std.testing.expectEqualStrings("skill", call.name);
+            try std.testing.expectEqualStrings("rm -rf /", command);
+            ctx.calls += 1;
+            return ctx.approved;
+        }
+    };
+    var approval: Approval = .{};
+    const observer: ToolCallObserver(Approval) = .{
+        .ctx = &approval,
+        .on_started = Approval.started,
+        .on_finished = Approval.finished,
+        .approve_unsafe_bash = Approval.approve,
+    };
+    var unsafe_call = try makeCall(gpa, "unsafe", "skill", "{\"name\":\"review\",\"command\":\"rm -rf /\"}");
+    defer unsafe_call.deinit(gpa);
+    const denied = try executor.runAll(&.{unsafe_call}, observer);
+    defer {
+        for (denied) |*result| result.deinit(gpa);
+        gpa.free(denied);
+    }
+    try std.testing.expect(denied[0].failed);
+    try std.testing.expect(std.mem.indexOf(u8, denied[0].content, "rejected by the user") != null);
+    try std.testing.expectEqual(@as(usize, 1), approval.calls);
+    var coerced_call = try makeCall(gpa, "coerced", "skill", "{\"name\":\"review\",\"command\":\"rm -rf /\",\"timeout\":\"30\"}");
+    defer coerced_call.deinit(gpa);
+    // Check the safety gate directly so a regression cannot execute this command.
+    try std.testing.expect(try executor.shouldRejectUnsafeShell(coerced_call, observer));
+    try std.testing.expectEqual(@as(usize, 2), approval.calls);
+    approval.approved = true;
+    // Verify approval without dispatching a destructive command.
+    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(unsafe_call, observer)));
+    var safe_call = try makeCall(gpa, "safe", "skill", "{\"name\":\"review\",\"command\":\"echo skill-command-executed\"}");
+    defer safe_call.deinit(gpa);
+    const safe = try executor.runAll(&.{safe_call}, observer);
+    defer {
+        for (safe) |*result| result.deinit(gpa);
+        gpa.free(safe);
+    }
+    try std.testing.expect(!safe[0].failed);
+    try std.testing.expect(std.mem.indexOf(u8, safe[0].content, "skill-command-executed") != null);
+    try std.testing.expectEqualStrings(workspace, executor.cwd);
+    var read_call = try makeCall(gpa, "read", "skill", "{\"name\":\"review\"}");
+    defer read_call.deinit(gpa);
+    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(read_call, observer)));
+    try std.testing.expectEqual(@as(usize, 3), approval.calls);
 }
 
 test "ExecutorService.runAll errdefer cleanup exists" {

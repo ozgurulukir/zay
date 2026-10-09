@@ -21,7 +21,7 @@ pub fn shouldRejectUnsafeShell(
     call: ai.ToolCall,
     observer: anytype,
 ) !bool {
-    if (!std.mem.eql(u8, call.name, tools.shell_tool.name)) return false;
+    if (!std.mem.eql(u8, call.name, tools.shell_tool.name) and !std.mem.eql(u8, call.name, "skill")) return false;
     const command = shell_safety.commandFromArguments(gpa, call.arguments) catch return false;
     defer gpa.free(command);
     // The optional URL is threaded straight through: with a classifier set it

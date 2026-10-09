@@ -1,6 +1,6 @@
 # Command Safety & External Classifier Guide
 
-Zay Agent uses a defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution.
+Zay Agent uses a defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) and `skill` command mode before execution. Skill commands are classified with the registered skill directory as their cwd and use the same interactive approval hook.
 
 ---
 
