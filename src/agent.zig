@@ -157,11 +157,10 @@ pub const Agent = struct {
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
     compaction_settings: config_mod.CompactionSettings = .{},
-    /// Per-turn bound on LLM→tool iterations (one assistant batch of tool
-    /// calls = one iteration). Set by the runtime from
-    /// `config.context.tool_call_limit_per_turn`; the default matches
-    /// `config_mod.default_tool_call_limit_per_turn` so agents created
-    /// without a config (tests) stay bounded.
+    /// Per-turn hard cap on individual tool calls. Model-response iterations
+    /// are also capped by this value so queued continuations remain bounded.
+    /// Set by the runtime from `config.context.tool_call_limit_per_turn`;
+    /// the default matches `config_mod.default_tool_call_limit_per_turn`.
     tool_call_limit_per_turn: u32 = config_mod.default_tool_call_limit_per_turn,
     /// When true, exhausting `tool_call_limit_per_turn` ends the turn
     /// gracefully (drain + hint + typed event) instead of failing with
@@ -360,12 +359,19 @@ pub const Agent = struct {
     /// Result text recorded for a tool call the user interrupted before it
     /// finished — surfaced to the model so it knows the call was cancelled.
     const interrupted_tool_result = "The user interrupted the turn before this tool call completed; it produced no result.";
+    const budget_skipped_tool_result = "This tool call was not run because the per-turn tool-call budget was exhausted.";
 
     /// Append a synthetic, failed tool result for every `tool_call` on the active
     /// branch that has no matching result yet. Runs before a new user message so
     /// the dangling calls (from a mid-batch interrupt) don't break the next turn.
     /// A no-op when every call already has a result.
     fn reconcileInterruptedToolCalls(self: *Agent) !void {
+        try self.reconcileUnresolvedToolCalls(interrupted_tool_result, "cancelled");
+    }
+
+    /// Pair unresolved assistant tool calls with an explicit result when work
+    /// was not dispatched, keeping the provider conversation protocol valid.
+    fn reconcileUnresolvedToolCalls(self: *Agent, result_text: []const u8, display_label: []const u8) !void {
         const history = self.context_manager.items();
 
         var resolved = std.StringHashMap(void).init(self.gpa);
@@ -400,12 +406,12 @@ pub const Agent = struct {
         for (missing.items) |id| {
             const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
             errdefer self.gpa.free(blocks);
-            blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, interrupted_tool_result) } };
+            blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, result_text) } };
             try self.context_manager.appendPersisted(.{
                 .tool = .{
                     .content = blocks,
                     .call_id = .{ .value = try self.gpa.dupe(u8, id) },
-                    .display_label = try self.gpa.dupe(u8, "cancelled"),
+                    .display_label = try self.gpa.dupe(u8, display_label),
                     .failed = true,
                 },
             });
@@ -579,7 +585,8 @@ pub const Agent = struct {
         const L = Agent.Listener(Ctx);
         const l: L = listener;
         try l.emit(.turn_started);
-        var calls: u32 = 0;
+        var tool_calls_executed: u32 = 0;
+        var iterations: u32 = 0;
         // One-shot guard: a single automatic length-cut continuation per run,
         // so a pathologically capping endpoint cannot loop extra billed
         // requests (the C2 `downgrade_done` idiom from the wire client).
@@ -591,7 +598,8 @@ pub const Agent = struct {
         var turn_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer turn_arena.deinit();
 
-        while (calls < self.tool_call_limit_per_turn) : (calls += 1) {
+        while (iterations < self.tool_call_limit_per_turn and tool_calls_executed < self.tool_call_limit_per_turn) {
+            iterations += 1;
             _ = turn_arena.reset(.retain_capacity);
             const turn_allocator = turn_arena.allocator();
 
@@ -740,7 +748,17 @@ pub const Agent = struct {
                 return;
             }
             if (self.tool_access == .none) return error.ToolAccessDenied;
-            if (try Agent.runToolBatch(L, self, tool_calls, &stream_context, l, turn_allocator)) return;
+            const calls_remaining: usize = @intCast(self.tool_call_limit_per_turn - tool_calls_executed);
+            const calls_to_dispatch = @min(tool_calls.len, calls_remaining);
+            const batch_exceeds_budget = calls_to_dispatch < tool_calls.len;
+            const end_turn = try Agent.runToolBatch(L, self, tool_calls[0..calls_to_dispatch], &stream_context, l, turn_allocator);
+            tool_calls_executed += @intCast(calls_to_dispatch);
+            if (batch_exceeds_budget) {
+                try self.reconcileUnresolvedToolCalls(budget_skipped_tool_result, "budget");
+                if (self.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, tool_calls_executed, iterations);
+                return error.ToolCallLimit;
+            }
+            if (end_turn) return;
             // Mid-turn we only inject messages explicitly marked to steer, and
             // only from the front so FIFO order holds — a default-queued
             // message ahead of a steer one keeps it waiting for turn end.
@@ -750,7 +768,7 @@ pub const Agent = struct {
         }
         // Budget exhausted: soft stop ends the turn gracefully (drain + hint +
         // event); hard stop keeps the historical error contract byte-for-byte.
-        if (self.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, calls);
+        if (self.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, tool_calls_executed, iterations);
         return error.ToolCallLimit;
     }
 
@@ -760,8 +778,8 @@ pub const Agent = struct {
     /// the stop through the event stream. Always terminates the run — no
     /// auto-resume, so the budget stays a per-run bound (TD-6: continuation
     /// is the user's next submit).
-    fn softStopOnBudget(self: *Agent, listener: anytype, calls: u32) !void {
-        log.warn("tool-call budget exhausted after {d} iterations (limit {d}); soft-stopping turn", .{ calls, self.tool_call_limit_per_turn });
+    fn softStopOnBudget(self: *Agent, listener: anytype, tool_calls_executed: u32, iterations: u32) !void {
+        log.warn("turn budget reached after {d} tool calls in {d} model iterations (limit {d}); soft-stopping", .{ tool_calls_executed, iterations, self.tool_call_limit_per_turn });
         const drained = try self.drainAllQueuedToHistory();
         if (drained > 0) try listener.emit(.{ .queued_messages_flushed = drained });
         try self.addUser(tool_budget_continuation_hint);
@@ -2379,7 +2397,7 @@ test "softStopOnBudget drains queue, appends hint, emits events" {
     defer seen.deinit(gpa);
     const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
 
-    try agent.softStopOnBudget(listener, 7);
+    try agent.softStopOnBudget(listener, 7, 7);
 
     // Everything queued landed in history in FIFO order, and the trailing
     // continuation hint is the last message — a `.user` machine message so
@@ -2407,7 +2425,7 @@ test "softStopOnBudget with empty queue emits only the budget event" {
     defer seen.deinit(gpa);
     const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
 
-    try agent.softStopOnBudget(listener, agent.tool_call_limit_per_turn);
+    try agent.softStopOnBudget(listener, 0, agent.tool_call_limit_per_turn);
 
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[zay] This turn stopped"));
@@ -2792,6 +2810,54 @@ test "run executes a synced MCP tool through the registry (scripted, socket-free
     try std.testing.expect(tool_result != null);
     try std.testing.expect(std.mem.indexOf(u8, tool_result.?, "unknown tool") == null);
     try std.testing.expect(std.mem.indexOf(u8, tool_result.?, "MCP tool 'search' failed") != null);
+}
+
+test "tool-call budget caps parallel batches by individual calls" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.toolCalls(&.{
+            .{ .name = "missing_first", .arguments = "{}" },
+            .{ .name = "missing_second", .arguments = "{}" },
+        }),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    agent.tool_call_limit_per_turn = 1;
+    try agent.addUser("run exactly one tool call");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    try std.testing.expectEqual(@as(u32, 1), client.prompts_answered);
+    var tool_results: usize = 0;
+    var first_call_was_dispatched = false;
+    var second_call_was_rejected = false;
+    for (agent.messages()) |message| {
+        if (message != .tool) continue;
+        tool_results += 1;
+        const body = message.text();
+        if (std.mem.indexOf(u8, body, "unknown tool") != null) first_call_was_dispatched = true;
+        if (std.mem.indexOf(u8, body, "tool-call budget") != null) second_call_was_rejected = true;
+    }
+    try std.testing.expectEqual(@as(usize, 2), tool_results);
+    try std.testing.expect(first_call_was_dispatched);
+    try std.testing.expect(second_call_was_rejected);
+
+    var exhausted_events: usize = 0;
+    for (seen.events.items) |event| switch (event) {
+        .tool_budget_exhausted => |limit| {
+            try std.testing.expectEqual(@as(u32, 1), limit);
+            exhausted_events += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), exhausted_events);
 }
 
 test "run ends the turn when tool-call arguments truncate on the retry too" {
