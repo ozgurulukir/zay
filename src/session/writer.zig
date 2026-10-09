@@ -12,6 +12,7 @@ const ai = @import("../ai.zig");
 
 const session_type = @import("types.zig");
 const serialize = @import("serialize.zig");
+const tool_results = @import("tool_results.zig");
 const SkillContext = @import("../context/skill_context.zig").SkillContext;
 
 const entry_id_len = session_type.entry_id_len;
@@ -128,6 +129,9 @@ pub const SessionWriter = struct {
         };
         target.session.manager = &target.manager;
         target.title_written = try target.session.hasTitle();
+        tool_results.maintain(&target.manager.backend, io, tool_results.nowMs(io)) catch |err| {
+            log.warn("tool result maintenance failed err={s}", .{@errorName(err)});
+        };
         target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
     }
 
@@ -191,6 +195,29 @@ pub const SessionWriter = struct {
         const payload = try context.toJson(self.gpa);
         errdefer self.gpa.free(payload);
         try self.enqueue(.{ .kind = "skill_context", .role = null, .payload_json = payload });
+    }
+
+    /// Persist a large tool result while this writer exclusively owns the
+    /// session backend connection.
+    pub fn storeToolResult(
+        self: *SessionWriter,
+        result_id: []const u8,
+        tool_name: []const u8,
+        exit_code: u8,
+        content: []const u8,
+    ) !tool_results.Metadata {
+        try self.quiesce();
+        defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
+        return tool_results.store(
+            self.gpa,
+            self.io,
+            &self.manager.backend,
+            self.session.id.slice(),
+            result_id,
+            tool_name,
+            exit_code,
+            content,
+        );
     }
 
     /// Bind a git snapshot id to the current leaf entry, race-free. Flushes

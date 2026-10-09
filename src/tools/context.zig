@@ -44,6 +44,8 @@ pub const ToolContext = struct {
     database_auth_token: ?[]const u8 = null,
     /// Active session backend (local embedded SQLite or remote service).
     session_backend: ?*@import("../session/backend.zig").SessionBackend = null,
+    /// Active session identity used to scope durable tool-result artifacts.
+    session_id: ?[]const u8 = null,
     /// MCP dispatch: resolved at dispatch time through the manager so
     /// registry records survive client reconnects.
     mcp_manager: ?*mcp_mod.McpManager = null,

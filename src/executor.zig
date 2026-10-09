@@ -5,6 +5,7 @@ const std = @import("std");
 const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const background = @import("background.zig");
+const db = @import("db.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
 const lane_tool = @import("tools/lane.zig");
 const lua_mod = @import("lua/root.zig");
@@ -13,6 +14,11 @@ const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
 const os = @import("os.zig");
 const result_cache_mod = @import("tools/result_cache.zig");
+const tool_results = @import("session/tool_results.zig");
+const session_writer_mod = @import("session/writer.zig");
+const migration = @import("session/migration.zig");
+const SessionBackend = @import("session/backend.zig").SessionBackend;
+const tool_common = @import("tools/common.zig");
 const schema_mod = @import("tools/schema.zig");
 const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
@@ -178,6 +184,8 @@ pub const ExecutorService = struct {
     /// Session-scoped result cache (#5), borrowed from the Agent. null
     /// disables caching entirely.
     result_cache: ?*result_cache_mod.ResultCache = null,
+    /// Active session writer, used to serialize artifact writes with history.
+    session_writer: ?*session_writer_mod.SessionWriter = null,
     /// Per-turn or per-batch scratch allocator (e.g. TurnArena) for temporary JSON
     /// parsing, schema validation, and argument coercion. Defaults to gpa when unspecified.
     scratch_allocator: std.mem.Allocator,
@@ -198,6 +206,8 @@ pub const ExecutorService = struct {
         database_server_url: ?[]const u8 = null,
         database_auth_token: ?[]const u8 = null,
         session_backend: ?*@import("session/backend.zig").SessionBackend = null,
+        session_id: ?[]const u8 = null,
+        session_writer: ?*session_writer_mod.SessionWriter = null,
         background: ?BackgroundStart = null,
         mcp_manager: ?*mcp_mod.McpManager = null,
         tool_registry: ?*tools.ToolRegistry = null,
@@ -222,12 +232,14 @@ pub const ExecutorService = struct {
             .contained = options.contained,
             .tool_registry = options.tool_registry,
             .result_cache = options.result_cache,
+            .session_writer = options.session_writer,
             .ctx = .{
                 .cancel_requested = options.cancel_requested,
                 .bash_classifier_url = options.bash_classifier_url,
                 .database_server_url = options.database_server_url,
                 .database_auth_token = options.database_auth_token,
                 .session_backend = options.session_backend,
+                .session_id = options.session_id,
                 .background_manager = if (options.background) |bg| bg.manager else null,
                 .owner_generation = if (options.background) |bg| bg.owner_generation else 1,
                 .mcp_manager = options.mcp_manager,
@@ -384,16 +396,34 @@ pub const ExecutorService = struct {
         };
         defer output.deinit(self.gpa);
 
-        const content = try tool_display.formatLlmObservation(self.gpa, output);
+        var content = try tool_display.formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
+        const has_large_result = content.len > tool_results.inline_limit_bytes;
+        if (has_large_result) {
+            const bounded = try self.persistOrBoundLargeResult(call, output, content);
+            self.gpa.free(content);
+            content = bounded;
+        }
         const looked_up = if (self.tool_registry) |r|
             r.lookup(call.name)
         else
             tools.lookupIn(tools.builtinRegistry(), call.name);
         var display = try tool_display.lookupDisplay(self.gpa, looked_up, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
-        const display_body = try tool_display.makeDisplayBody(self.gpa, output);
+        var display_body = try tool_display.makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
+        if (has_large_result and display_body.len > tool_results.inline_limit_bytes) {
+            const bounded = try tool_common.pruneToolText(self.gpa, display_body, @intCast(tool_results.inline_limit_bytes));
+            self.gpa.free(display_body);
+            display_body = bounded;
+        }
+
+        var stderr_preview: ?[]u8 = null;
+        defer if (stderr_preview) |text| self.gpa.free(text);
+        const stderr = if (output.stderr.len == 0) null else if (has_large_result and output.stderr.len > tool_results.inline_limit_bytes) blk: {
+            stderr_preview = try tool_common.pruneToolText(self.gpa, output.stderr, @intCast(tool_results.inline_limit_bytes));
+            break :blk stderr_preview.?;
+        } else output.stderr;
 
         // `ToolResult.init` dupes call_id/name/stderr and adopts the moved
         // fields above on success; the errdefers clean up only on error.
@@ -403,7 +433,7 @@ pub const ExecutorService = struct {
             .content = content,
             .display = display,
             .display_body = display_body,
-            .stderr = if (output.stderr.len > 0) output.stderr else null,
+            .stderr = stderr,
             .display_kind = switch (output.display) {
                 .diff => .diff,
                 .text, .none => .text,
@@ -411,6 +441,89 @@ pub const ExecutorService = struct {
             .failed = output.code != 0,
             .end_turn = output.end_turn,
         });
+    }
+
+    fn persistOrBoundLargeResult(self: *ExecutorService, call: ai.ToolCall, output: tools.Output, content: []const u8) ![]u8 {
+        var full_source: ?[]u8 = null;
+        defer if (full_source) |bytes| self.gpa.free(bytes);
+        var source = content;
+        var source_error: ?[]const u8 = null;
+
+        if (output.observation) |observation| switch (observation) {
+            .complete => {},
+            .truncated_tail => |tail| {
+                full_source = tool_common.readFileBytes(
+                    self.gpa,
+                    self.io,
+                    tail.full_output_path,
+                    tool_results.max_result_bytes + 1,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => blk: {
+                        source_error = "the full shell output file could not be read";
+                        break :blk null;
+                    },
+                };
+                if (full_source) |bytes| source = bytes;
+            },
+        };
+
+        var metadata: ?tool_results.Metadata = null;
+        if (source_error == null) {
+            if (self.session_writer) |writer| {
+                metadata = writer.storeToolResult(
+                    call.call_id.slice(),
+                    call.name,
+                    output.code,
+                    source,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => blk: {
+                        source_error = @errorName(err);
+                        break :blk null;
+                    },
+                };
+            } else if (self.ctx.session_backend) |backend| {
+                if (self.ctx.session_id) |session_id| {
+                    metadata = tool_results.store(
+                        self.gpa,
+                        self.io,
+                        backend,
+                        session_id,
+                        call.call_id.slice(),
+                        call.name,
+                        output.code,
+                        source,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => blk: {
+                            source_error = @errorName(err);
+                            break :blk null;
+                        },
+                    };
+                } else {
+                    source_error = "there is no active session identity";
+                }
+            } else {
+                source_error = "there is no active session database";
+            }
+        }
+
+        const footer = if (metadata) |saved|
+            try std.fmt.allocPrint(
+                self.gpa,
+                "[Full result saved in the active session database. Use database action=read_tool_result with result_id=\"{s}\", chunk=0, offset=0, limit={d}. chunks={d}; bytes={d}; lines={d}. Read later chunks by increasing chunk, or continue within one chunk by increasing offset.]",
+                .{ call.call_id.slice(), tool_results.default_read_chars, saved.chunk_count, saved.byte_length, saved.line_count },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.gpa,
+                "[Full result was not saved ({s}); this is a bounded excerpt. Narrow the command and rerun if more detail is needed.]",
+                .{source_error orelse "storage unavailable"},
+            );
+        defer self.gpa.free(footer);
+
+        return makeLargeResultPreview(self.gpa, source, footer);
     }
 
     /// Source the tool's `Output`, routing a `run_in_background` bash call to
@@ -535,6 +648,17 @@ pub const ExecutorService = struct {
         });
     }
 };
+
+fn makeLargeResultPreview(gpa: std.mem.Allocator, source: []const u8, footer: []const u8) ![]u8 {
+    const footer_block = try std.fmt.allocPrint(gpa, "\n\n{s}", .{footer});
+    defer gpa.free(footer_block);
+    if (footer_block.len >= tool_results.inline_limit_bytes) return error.ResultFooterTooLarge;
+
+    const excerpt_limit: u32 = @intCast(tool_results.inline_limit_bytes - footer_block.len);
+    const excerpt = try tool_common.pruneToolText(gpa, source, excerpt_limit);
+    defer gpa.free(excerpt);
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ excerpt, footer_block });
+}
 
 test "ExecutorService runs bash and returns both channels" {
     // Bash-syntax spawn test — runs only on bash hosts (POSIX). On Windows the
@@ -920,6 +1044,32 @@ const test_failed_run: *const fn (
     }
 }.run;
 
+const test_large_result_run: *const fn (
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    args: []const u8,
+    env: tools.Env,
+) tools.Error!tools.Output = struct {
+    fn run(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        args: []const u8,
+        env: tools.Env,
+    ) tools.Error!tools.Output {
+        _ = io;
+        _ = cwd;
+        _ = args;
+        _ = env;
+        const stdout = try gpa.alloc(u8, tool_results.inline_limit_bytes + 32);
+        @memset(stdout, 'R');
+        @memcpy(stdout[stdout.len - 4 ..], "TAIL");
+        const stderr = try gpa.alloc(u8, 0);
+        return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
+    }
+}.run;
+
 const test_dummy_display: *const fn (
     gpa: std.mem.Allocator,
     args: []const u8,
@@ -1031,6 +1181,60 @@ test "executor marks a non-zero plugin output as failed" {
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "handler diagnostic") != null);
+}
+
+test "executor stores oversized output and database tool retrieves it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    const connection = try db.Connection.open(":memory:", .{});
+    var backend = try SessionBackend.openLocal(gpa, connection, "test-host", ":memory:");
+    defer backend.deinit();
+    if (backend.local) |*local| try migration.migrate(local, io);
+    try backend.exec(io, "insert into sessions(id, cwd, project_key, created_at_ms, updated_at_ms) values (?, ?, ?, 1, 1)", &.{ .{ .text = "session-large" }, .{ .text = cwd }, .{ .text = "project-large" } });
+
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer registry.deinit(gpa);
+    const large_name = try gpa.dupe(u8, "lua__p__large");
+    const large_description = try gpa.dupe(u8, "large result test tool");
+    registry.addPluginTool(gpa, .{
+        .name = large_name,
+        .description = large_description,
+        .schema = .{ .properties = &.{} },
+        .run = test_large_result_run,
+        .display = test_dummy_display,
+        .userdata = undefined,
+        .userdata_free = test_dummy_free,
+    }) catch |err| {
+        gpa.free(large_name);
+        gpa.free(large_description);
+        return err;
+    };
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = io,
+        .cwd = cwd,
+        .tool_registry = &registry,
+        .session_backend = &backend,
+        .session_id = "session-large",
+    });
+    const call = try makeCall(gpa, "large-result-call", "lua__p__large", "{}");
+    defer freeCall(gpa, call);
+    var stored = try executor.runOne(call);
+    defer stored.deinit(gpa);
+    try std.testing.expect(stored.content.len <= tool_results.inline_limit_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, stored.content, "read_tool_result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored.content, "large-result-call") != null);
+
+    const read_call = try makeCall(gpa, "read-large-result", "database", "{\"action\":\"read_tool_result\",\"result_id\":\"large-result-call\",\"offset\":24604,\"limit\":8}");
+    defer freeCall(gpa, read_call);
+    var retrieved = try executor.runOne(read_call);
+    defer retrieved.deinit(gpa);
+    try std.testing.expect(!retrieved.failed);
+    try std.testing.expect(std.mem.indexOf(u8, retrieved.content, "TAIL") != null);
 }
 
 test "executor propagates a real Lua plugin failure to completion observers" {

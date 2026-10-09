@@ -80,24 +80,54 @@ pub const Error = error{
     OutOfMemory,
 } || std.Io.Cancelable || std.Io.UnexpectedError;
 
-/// The single shared implementation of tool-result truncation: a head+tail
-/// sandwich. Keeps the start of the output (head — file-read preamble,
-/// command banner) and the conclusion (tail — errors, results, status) with
-/// an elision marker, so neither compaction nor historical pruning discards
-/// the load-bearing part of a command result. Head-only truncation dropped
-/// the tail, forcing the model to re-run commands to rediscover their
-/// conclusions. The bash spill `Full output:` footer sits at the very end
-/// and survives naturally inside the tail. Caller owns the result; always
-/// allocates a fresh buffer (never returns an input slice).
+/// Shared tool-result truncation: a byte-bounded head+tail sandwich. Keeps
+/// the start of the output and its conclusion while reserving space for the
+/// elision marker. Small caps use a compact marker so recovery handles in the
+/// tail still fit. Caller owns the result; always allocates a fresh buffer.
 pub fn pruneToolText(gpa: std.mem.Allocator, text: []const u8, cap_bytes: u32) ![]u8 {
     if (text.len <= cap_bytes) return gpa.dupe(u8, text);
-    const half = cap_bytes / 2;
-    // Head = first half of the budget; tail = last half. They are disjoint,
-    // leaving a middle gap the elision marker reports. head_kept guards tiny
-    // caps (cap < 2) so head and tail never overlap.
-    const head_kept = @min(half, text.len);
-    const tail_start = text.len - (cap_bytes - half);
-    return elideMiddle(gpa, text[0..head_kept], text[tail_start..], text.len);
+    var selected_bytes: usize = cap_bytes;
+    var attempts: u8 = 0;
+    while (selected_bytes > 0 and attempts < 64) : (attempts += 1) {
+        const head_budget = selected_bytes / 2;
+        const tail_budget = selected_bytes - head_budget;
+        const head_end = utf8BoundaryBefore(text, head_budget);
+        const tail_start = utf8BoundaryAfter(text, text.len - tail_budget);
+        if (head_end > tail_start) break;
+
+        const candidate = if (cap_bytes < 112)
+            try elideMiddleCompact(gpa, text[0..head_end], text[tail_start..])
+        else
+            try elideMiddle(gpa, text[0..head_end], text[tail_start..], text.len);
+        if (candidate.len <= cap_bytes) return candidate;
+
+        const excess = candidate.len - cap_bytes;
+        gpa.free(candidate);
+        if (excess >= selected_bytes) break;
+        selected_bytes -= excess;
+    }
+
+    // Very small caps cannot fit a descriptive marker. Keep a valid UTF-8
+    // suffix so tiny limits still obey their byte budget and preserve the
+    // conclusion of the result.
+    const suffix_start = utf8BoundaryAfter(text, text.len - @min(text.len, cap_bytes));
+    return gpa.dupe(u8, text[suffix_start..]);
+}
+
+fn elideMiddleCompact(gpa: std.mem.Allocator, head: []const u8, tail: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}\n[...]\n{s}", .{ head, tail });
+}
+
+fn utf8BoundaryBefore(text: []const u8, index: usize) usize {
+    var boundary = @min(index, text.len);
+    while (boundary > 0 and boundary < text.len and text[boundary] & 0xc0 == 0x80) boundary -= 1;
+    return boundary;
+}
+
+fn utf8BoundaryAfter(text: []const u8, index: usize) usize {
+    var boundary = @min(index, text.len);
+    while (boundary < text.len and text[boundary] & 0xc0 == 0x80) boundary += 1;
+    return boundary;
 }
 
 /// Join a head and tail slice with an elision marker reporting the skipped
@@ -160,8 +190,9 @@ test "pruneToolText returns a fresh dupe when text fits the cap" {
 test "pruneToolText sandwiches head and tail when text exceeds cap" {
     const gpa = std.testing.allocator;
     const text = "HEAD_BODY" ++ ("x" ** 200) ++ "TAIL_BODY";
-    const pruned = try pruneToolText(gpa, text, 20);
+    const pruned = try pruneToolText(gpa, text, 120);
     defer gpa.free(pruned);
+    try std.testing.expect(pruned.len <= 120);
     try std.testing.expect(std.mem.indexOf(u8, pruned, "HEAD_BODY") != null);
     try std.testing.expect(std.mem.indexOf(u8, pruned, "TAIL_BODY") != null);
     try std.testing.expect(std.mem.indexOf(u8, pruned, "elided to save context") != null);
@@ -174,17 +205,35 @@ test "pruneToolText handles empty text" {
     try std.testing.expectEqualStrings("", pruned);
 }
 
-test "pruneToolText with cap of 1 keeps only the last byte" {
+test "pruneToolText with cap of 1 keeps only the last byte and respects the cap" {
     const gpa = std.testing.allocator;
-    // 'X'/'Y'/'Z' don't appear in the elision marker, so we can assert
-    // head bytes vanish and the tail byte survives.
     const pruned = try pruneToolText(gpa, "XYZ", 1);
     defer gpa.free(pruned);
-    // half = 0 → empty head, 1-byte tail (the last char 'Z').
-    try std.testing.expect(std.mem.indexOf(u8, pruned, "Z") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pruned, "elided to save context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pruned, "X") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pruned, "Y") == null);
+    try std.testing.expectEqualStrings("Z", pruned);
+    try std.testing.expectEqual(@as(usize, 1), pruned.len);
+}
+
+test "pruneToolText uses a compact marker to retain a short recovery footer" {
+    const gpa = std.testing.allocator;
+    const spill_path = "/tmp/zay-bash-0123456789abcdef.log";
+    const source = try std.fmt.allocPrint(gpa, "{s}\nFull output: {s}]", .{ "a" ** 400, spill_path });
+    defer gpa.free(source);
+
+    const pruned = try pruneToolText(gpa, source, 100);
+    defer gpa.free(pruned);
+    try std.testing.expect(pruned.len <= 100);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, spill_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned, "[...]") != null);
+}
+
+test "pruneToolText respects byte caps without splitting UTF-8" {
+    const gpa = std.testing.allocator;
+    const text = "head" ++ ("界" ** 80) ++ "尾tail";
+    const pruned = try pruneToolText(gpa, text, 128);
+    defer gpa.free(pruned);
+    try std.testing.expect(pruned.len <= 128);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(pruned));
+    try std.testing.expect(std.mem.endsWith(u8, pruned, "尾tail"));
 }
 
 test "elideMiddle reports the elided byte count" {

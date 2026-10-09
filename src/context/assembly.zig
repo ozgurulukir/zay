@@ -1434,7 +1434,7 @@ test "pruneHistoricalToolResultsViews caps old tool outputs while preserving rec
     // Historical tool 1 (index 1) should be owned and truncated
     try std.testing.expect(pruned[1] == .owned);
     const t1_text = pruned[1].owned.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, t1_text, "elided to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t1_text, "[...]") != null);
     try std.testing.expect(t1_text.len < 300);
 
     // Recent tool 1 (index 5) should be borrowed and kept in full
@@ -1471,7 +1471,7 @@ test "pruneHistoricalToolResultsViews preserves the bash spill recovery footer" 
     const text = pruned[0].owned.tool.content[0].text.text;
     // The recovery handle survives the head-truncation.
     try std.testing.expect(std.mem.indexOf(u8, text, spill_path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "elided to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[...]") != null);
     // The head is still bounded.
     try std.testing.expect(text.len < 400);
 }
@@ -1529,7 +1529,7 @@ test "pruneHistoricalToolResultsViews borrows unchanged messages without copying
     // Historical tool message → owned, pruned.
     try std.testing.expect(views[0] == .owned);
     const pruned_text = views[0].owned.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "elided to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned_text, "[...]") != null);
 
     // Image user message → borrowed with pointer identity: no copy was made.
     try std.testing.expect(views[1] == .borrowed);
@@ -1562,7 +1562,7 @@ test "PrunedToolCache caches owned messages across iterations with pointer stabi
     try std.testing.expect(views1[1] == .borrowed);
     const ptr1 = views1[1].borrowed;
     const pruned_text1 = ptr1.tool.content[0].text.text;
-    try std.testing.expect(std.mem.indexOf(u8, pruned_text1, "elided to save context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pruned_text1, "[...]") != null);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 
     // Iteration 2: same messages, same cache -> must return the EXACT same pointer (0 new message allocations)
@@ -2089,7 +2089,9 @@ test "estimatePrunedTokensRange counts evicted images as stub tokens" {
     try std.testing.expect(evicting < keeping);
 }
 
-// Count the exact head/tail elision marker without allocating request text.
+// Historical tool pruning reserves marker space inside the byte cap, so its
+// rendered text is at most `cap` bytes and the token estimate uses that same
+// bound.
 fn estimateRenderedToolTokens(message: ai.ChatMessage, cap: u32) u32 {
     var total: u32 = 0;
     for (message.tool.content) |block| {
@@ -2097,9 +2099,7 @@ fn estimateRenderedToolTokens(message: ai.ChatMessage, cap: u32) u32 {
             total +|= compaction.estimateBlockTokens(block);
             continue;
         }
-        var buffer: [128]u8 = undefined;
-        const marker = std.fmt.bufPrint(&buffer, "\n\n[... {d} of {d} bytes elided to save context ...]\n\n", .{ block.text.text.len - cap, block.text.text.len }) catch unreachable;
-        total +|= std.math.divCeil(u32, cap + @as(u32, @intCast(marker.len)), 4) catch unreachable;
+        total +|= std.math.divCeil(u32, cap, 4) catch unreachable;
     }
     return total;
 }

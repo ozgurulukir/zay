@@ -37,6 +37,7 @@ pub const ResumeResolution = session_type.ResumeResolution;
 pub const project_key_len = session_type.project_key_len;
 pub const lane_manifest = @import("session/lane_manifest.zig");
 pub const review_runs = @import("session/review_runs.zig");
+pub const tool_results = @import("session/tool_results.zig");
 pub const EntryRecord = session_type.EntryRecord;
 pub const UserEntryRef = session_type.UserEntryRef;
 pub const CompactionBoundary = session_type.CompactionBoundary;
@@ -769,17 +770,20 @@ pub const SessionManager = struct {
     /// the `on delete cascade` foreign key). Safe to call on a non-existent
     /// id — the statement simply matches no rows.
     pub fn deleteSession(self: *SessionManager, session_id: []const u8) Error!void {
-        if (self.backend.kind != .local_sqlite) {
-            const params = [_]backend_mod.SqlParam{.{ .text = session_id }};
-            const statements = [_]db.service.BatchStatement{
-                .{ .sql = "delete from prompt_history where session_id = ?", .params = &params },
-                .{ .sql = "delete from session_entries where session_id = ?", .params = &params },
-                .{ .sql = "delete from sessions where id = ?", .params = &params },
-            };
-            return self.backend.execBatch(self.io, &statements);
+        const params = [_]backend_mod.SqlParam{.{ .text = session_id }};
+        const statements = [_]db.service.BatchStatement{
+            .{ .sql = "delete from tool_result_chunks where session_id = ?", .params = &params },
+            .{ .sql = "delete from tool_results where session_id = ?", .params = &params },
+            .{ .sql = "delete from prompt_history where session_id = ?", .params = &params },
+            .{ .sql = "delete from session_entries where session_id = ?", .params = &params },
+            .{ .sql = "delete from sessions where id = ?", .params = &params },
+        };
+        if (self.backend.kind == .local_sqlite) {
+            for (statements[0..2]) |statement| try self.backend.exec(self.io, statement.sql, statement.params);
+            try self.backend.exec(self.io, statements[4].sql, statements[4].params);
+        } else {
+            try self.backend.execBatch(self.io, &statements);
         }
-        const sql = "delete from sessions where id = ?";
-        try self.backend.exec(self.io, sql, &.{.{ .text = session_id }});
     }
 
     /// Rename a session by id. The title is overwritten (or set if null).
@@ -2244,6 +2248,11 @@ test "list treats corrupt leaf_entry_id as null instead of crashing" {
     var id: [entry_id_len]u8 = undefined;
     try appendTextEntry(&session, gpa, .user, "hello", &id);
 
+    const large_result = try gpa.alloc(u8, tool_results.inline_limit_bytes + 1);
+    defer gpa.free(large_result);
+    @memset(large_result, 'x');
+    _ = try tool_results.store(gpa, manager.io, &manager.backend, session.id.slice(), "call-large", "bash", 0, large_result);
+
     // Corrupt session: mimic the production write order (insert session with
     // null leaf, insert entry, then update leaf) but end with a wrong-length
     // leaf_entry_id, simulating stale test data or an older-schema leftover.
@@ -2306,6 +2315,13 @@ test "deleteSession removes a session and its entries" {
 
     // Delete it.
     try manager.deleteSession("a" ** session_id_len);
+
+    var artifacts = try manager.backend.query(manager.io, "select count(*) from tool_results where session_id = ?", &.{.{ .text = session.id.slice() }});
+    defer artifacts.deinit();
+    try std.testing.expectEqual(@as(i64, 0), switch (artifacts.rows[0][0]) {
+        .int => |value| value,
+        else => -1,
+    });
 
     // The list is now empty.
     {

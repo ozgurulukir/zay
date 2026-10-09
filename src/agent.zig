@@ -841,6 +841,8 @@ pub const Agent = struct {
             .database_server_url = self.database_server_url,
             .database_auth_token = self.database_auth_token,
             .session_backend = if (self.context_manager.session_writer) |sw| &sw.manager.backend else null,
+            .session_id = if (self.context_manager.session_writer) |sw| sw.session.id.slice() else null,
+            .session_writer = if (self.context_manager.session_writer) |sw| sw else null,
             .cancel_requested = self.cancel_requested,
             .result_cache = &self.result_cache,
         });
