@@ -7,7 +7,7 @@ const paths = @import("../paths.zig");
 const assert = std.debug.assert;
 
 /// Current schema version for the sessions database.
-pub const schema_version: u32 = 9;
+pub const schema_version: u32 = 10;
 
 const backend_mod = @import("backend.zig");
 
@@ -101,6 +101,13 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     try connection.exec("create index if not exists sessions_project_updated on sessions(project_key, updated_at_ms)");
     try connection.exec("create index if not exists project_locations_lookup on project_locations(project_key, host_id, updated_at_ms)");
     try connection.exec("create index if not exists project_locations_host_cwd on project_locations(host_id, cwd_key, updated_at_ms)");
+
+    // Schema v10: large tool observations live in bounded, session-owned
+    // artifacts. Chunks keep remote writes small and let the model retrieve a
+    // narrow slice without sending the entire result back through the backend.
+    try connection.exec("create table if not exists tool_results(id text not null, session_id text not null, project_key text not null, tool_name text not null, created_at_ms integer not null, byte_length integer not null, line_count integer not null, chunk_count integer not null, exit_code integer not null, complete integer not null, primary key(session_id, id))");
+    try connection.exec("create table if not exists tool_result_chunks(session_id text not null, result_id text not null, ordinal integer not null, content text not null, primary key(session_id, result_id, ordinal))");
+    try connection.exec("create index if not exists tool_results_project_created on tool_results(project_key, created_at_ms, id)");
 
     var statement = try connection.prepare("insert or ignore into schema_migrations(version, applied_at_ms) values (?, ?)");
     defer statement.finalize();
@@ -256,6 +263,19 @@ const remote_migrations = [_]RemoteMigration{
         },
         .column_guards = &.{
             .{ .table = "sessions", .column = "project_key", .ddl = "alter table sessions add column project_key text" },
+        },
+    },
+    .{
+        .version = 10,
+        .sqlite_sql = &.{
+            "create table if not exists tool_results(id text not null, session_id text not null, project_key text not null, tool_name text not null, created_at_ms bigint not null, byte_length bigint not null, line_count bigint not null, chunk_count bigint not null, exit_code integer not null, complete integer not null, primary key(session_id, id))",
+            "create table if not exists tool_result_chunks(session_id text not null, result_id text not null, ordinal integer not null, content text not null, primary key(session_id, result_id, ordinal))",
+            "create index if not exists tool_results_project_created on tool_results(project_key, created_at_ms, id)",
+        },
+        .postgres_sql = &.{
+            "create table if not exists tool_results(id text not null, session_id text not null, project_key text not null, tool_name text not null, created_at_ms bigint not null, byte_length bigint not null, line_count bigint not null, chunk_count bigint not null, exit_code integer not null, complete integer not null, primary key(session_id, id))",
+            "create table if not exists tool_result_chunks(session_id text not null, result_id text not null, ordinal integer not null, content text not null, primary key(session_id, result_id, ordinal))",
+            "create index if not exists tool_results_project_created on tool_results(project_key, created_at_ms, id)",
         },
     },
 };
@@ -520,9 +540,9 @@ test "remote migrations build a fresh schema, then skip history on restart" {
     defer conn.close();
     var target = SqliteTarget{ .conn = &conn };
 
-    // Fresh database: the full sequence applies and records v8.
+    // Fresh database: the full sequence applies and records the current version.
     try migrateRemote(&target, std.testing.allocator, io, false);
-    try std.testing.expectEqual(@as(?u32, 9), try recordedVersion(&target, io));
+    try std.testing.expectEqual(@as(?u32, schema_version), try recordedVersion(&target, io));
 
     // Restart: exactly ONE read query (the version probe) — history is never
     // re-executed on a healthy database.
@@ -552,7 +572,7 @@ test "remote migrations heal a legacy database with unrecorded versions" {
     try std.testing.expect(try remoteColumnExists(&target, io, "sessions", "host_id", false));
     try std.testing.expect(try remoteColumnExists(&target, io, "sessions", "reasoning_effort", false));
     try std.testing.expect(try remoteColumnExists(&target, io, "lanes", "host_id", false));
-    try std.testing.expectEqual(@as(?u32, 9), try recordedVersion(&target, io));
+    try std.testing.expectEqual(@as(?u32, schema_version), try recordedVersion(&target, io));
 }
 
 /// A target whose batch fails whenever a statement contains `fail_marker` —
@@ -591,7 +611,7 @@ test "a failed migration unit is not recorded and retries safely" {
 
     // After the "network" recovers, a restart completes the sequence.
     try migrateRemote(&target, std.testing.allocator, io, false);
-    try std.testing.expectEqual(@as(?u32, 9), try recordedVersion(&target, io));
+    try std.testing.expectEqual(@as(?u32, schema_version), try recordedVersion(&target, io));
 }
 
 /// Simulates the concurrent-client race on the version row: the injected
@@ -630,7 +650,7 @@ test "concurrent version-row recording is tolerated via recheck" {
     var racing = RacingVersionTarget{ .inner = &target };
     try migrateRemote(&racing, std.testing.allocator, io, false);
     try std.testing.expect(racing.raced);
-    try std.testing.expectEqual(@as(?u32, 9), try recordedVersion(&target, io));
+    try std.testing.expectEqual(@as(?u32, schema_version), try recordedVersion(&target, io));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -718,7 +738,7 @@ test "concurrent v9 column application is tolerated via guard recheck" {
     try migrateRemote(&racing, std.testing.allocator, io, false);
     try std.testing.expect(racing.raced);
     try std.testing.expect(try remoteColumnExists(&target, io, "sessions", "project_key", false));
-    try std.testing.expectEqual(@as(?u32, 9), try recordedVersion(&target, io));
+    try std.testing.expectEqual(@as(?u32, schema_version), try recordedVersion(&target, io));
 }
 
 test "a failed v9 unit stays at v8 and heals on retry" {
@@ -745,8 +765,8 @@ test "a failed v9 unit stays at v8 and heals on retry" {
     // ...and the batch rolled back: no partial project_locations table.
     try std.testing.expect(!(try remoteColumnExists(&target, io, "sessions", "project_key", false)));
 
-    // Retry after the "network" recovers: v9 lands completely.
+    // Retry after the "network" recovers: v9 and later units land completely.
     try migrateRemote(&target, std.testing.allocator, io, false);
-    try std.testing.expectEqual(@as(?u32, 9), try recordedVersion(&target, io));
+    try std.testing.expectEqual(@as(?u32, schema_version), try recordedVersion(&target, io));
     try std.testing.expect(try remoteColumnExists(&target, io, "sessions", "project_key", false));
 }
