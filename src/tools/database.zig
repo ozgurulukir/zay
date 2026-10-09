@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const common = @import("common.zig");
+const output_policy = @import("output_policy.zig");
 const db = @import("../db.zig");
 const tool_results = @import("../session/tool_results.zig");
 const SessionBackend = @import("../session/backend.zig").SessionBackend;
@@ -21,13 +22,13 @@ pub const tool: common.Tool = .{
             .{
                 .name = "action",
                 .kind = .string,
-                .description = "The database action: 'query', 'exec', 'schema', 'health', or 'read_tool_result' to retrieve a saved large tool result.",
+                .description = "The database action: 'query', 'exec', 'schema', 'health', 'search_tool_result' to find literal text in a saved result, or 'read_tool_result' to inspect it by chunk and character offset.",
                 .required = true,
             },
             .{
                 .name = "sql",
                 .kind = .string,
-                .description = "SQL query or statement to execute (required for 'query' and 'exec').",
+                .description = "SQL query or statement (required for 'query' and 'exec'). For large datasets, select needed columns and use LIMIT or keyset pagination.",
                 .required = false,
             },
             .{
@@ -39,25 +40,43 @@ pub const tool: common.Tool = .{
             .{
                 .name = "result_id",
                 .kind = .string,
-                .description = "Result id supplied in a large tool result's database retrieval instructions.",
+                .description = "Result id from the large tool result's retrieval instructions; use with action='search_tool_result' or 'read_tool_result'.",
+                .required = false,
+            },
+            .{
+                .name = "needle",
+                .kind = .string,
+                .description = "Non-empty, case-sensitive literal to find in a saved result; required for 'search_tool_result'.",
+                .required = false,
+            },
+            .{
+                .name = "match_offset",
+                .kind = .integer,
+                .description = "Zero-based match to start from when continuing a search (default 0).",
+                .required = false,
+            },
+            .{
+                .name = "match_limit",
+                .kind = .integer,
+                .description = "Maximum match locations to return (default 5, hard maximum 8).",
                 .required = false,
             },
             .{
                 .name = "chunk",
                 .kind = .integer,
-                .description = "Zero-based result chunk to read (default 0).",
+                .description = "Zero-based chunk in the saved text (default 0); follow the returned continuation instruction.",
                 .required = false,
             },
             .{
                 .name = "offset",
                 .kind = .integer,
-                .description = "Character offset within the selected chunk (default 0).",
+                .description = "Character offset, not byte offset, within the selected chunk (default 0).",
                 .required = false,
             },
             .{
                 .name = "limit",
                 .kind = .integer,
-                .description = "Maximum characters to return (default 2048; maximum 4096).",
+                .description = "Maximum characters to return (default 2048; hard maximum 4096). The active tool-output byte budget may lower this so the retrieval instructions remain visible.",
                 .required = false,
             },
         },
@@ -71,6 +90,7 @@ pub const Action = enum {
     exec,
     schema,
     health,
+    search_tool_result,
     read_tool_result,
 
     pub fn fromString(str: []const u8) ?Action {
@@ -78,6 +98,7 @@ pub const Action = enum {
         if (std.ascii.eqlIgnoreCase(str, "exec")) return .exec;
         if (std.ascii.eqlIgnoreCase(str, "schema")) return .schema;
         if (std.ascii.eqlIgnoreCase(str, "health")) return .health;
+        if (std.ascii.eqlIgnoreCase(str, "search_tool_result")) return .search_tool_result;
         if (std.ascii.eqlIgnoreCase(str, "read_tool_result")) return .read_tool_result;
         return null;
     }
@@ -88,14 +109,18 @@ pub const Args = struct {
     sql: ?[]u8 = null,
     table: ?[]u8 = null,
     result_id: ?[]u8 = null,
+    needle: ?[]u8 = null,
     chunk: ?u64 = null,
     offset: ?u64 = null,
     limit: ?u64 = null,
+    match_offset: ?u64 = null,
+    match_limit: ?u64 = null,
 
     pub fn deinit(self: *Args, gpa: std.mem.Allocator) void {
         if (self.sql) |s| gpa.free(s);
         if (self.table) |t| gpa.free(t);
         if (self.result_id) |id| gpa.free(id);
+        if (self.needle) |needle| gpa.free(needle);
         self.* = undefined;
     }
 };
@@ -105,9 +130,12 @@ const JsonArgs = struct {
     sql: ?[]const u8 = null,
     table: ?[]const u8 = null,
     result_id: ?[]const u8 = null,
+    needle: ?[]const u8 = null,
     chunk: ?u64 = null,
     offset: ?u64 = null,
     limit: ?u64 = null,
+    match_offset: ?u64 = null,
+    match_limit: ?u64 = null,
 };
 
 pub const ParseError = error{ InvalidArguments, OutOfMemory };
@@ -142,16 +170,26 @@ pub fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args 
         if (trimmed.len > 0) result_id = try gpa.dupe(u8, trimmed);
     }
     errdefer if (result_id) |id| gpa.free(id);
-    if (action == .read_tool_result and result_id == null) return error.InvalidArguments;
+    if ((action == .read_tool_result or action == .search_tool_result) and result_id == null) return error.InvalidArguments;
+
+    var needle: ?[]u8 = null;
+    if (parsed.value.needle) |value| {
+        if (value.len > 0) needle = try gpa.dupe(u8, value);
+    }
+    errdefer if (needle) |value| gpa.free(value);
+    if (action == .search_tool_result and needle == null) return error.InvalidArguments;
 
     return Args{
         .action = action,
         .sql = sql,
         .table = table,
         .result_id = result_id,
+        .needle = needle,
         .chunk = parsed.value.chunk,
         .offset = parsed.value.offset,
         .limit = parsed.value.limit,
+        .match_offset = parsed.value.match_offset,
+        .match_limit = parsed.value.match_limit,
     };
 }
 
@@ -758,13 +796,74 @@ fn renderToolResultSlice(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
+fn renderToolResultSearch(
+    gpa: std.mem.Allocator,
+    result: *const tool_results.SearchResult,
+    result_id: []const u8,
+    requested_offset: u64,
+) common.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try writeFmt(&out, "Saved result search: {s}\n", .{result_id});
+    try writeFmt(&out, "Tool: {s}; original exit code: {d}; bytes: {d}. Search uses case-sensitive literal text.\n", .{ result.tool_name, result.exit_code, result.byte_length });
+    if (result.matches.len == 0) {
+        try writeStr(&out, "No further matches.\n");
+    } else {
+        for (result.matches, 0..) |hit, index| {
+            try writeFmt(&out, "Match {d}: chunk={d}, character offset={d}. Read this location with database action=read_tool_result, result_id=\"{s}\", chunk={d}, offset={d}, limit={d}.\n", .{
+                requested_offset + @as(u64, @intCast(index)),
+                hit.chunk_index,
+                hit.offset_characters,
+                result_id,
+                hit.chunk_index,
+                hit.offset_characters,
+                tool_results.default_read_chars,
+            });
+        }
+    }
+    if (result.has_more) {
+        const next_offset = requested_offset + @as(u64, @intCast(result.matches.len));
+        try writeFmt(&out, "More matches exist. Continue with database action=search_tool_result using the same needle and result_id=\"{s}\", match_offset={d}.\n", .{ result_id, next_offset });
+    }
+
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn runSearchToolResult(gpa: std.mem.Allocator, io: std.Io, args: Args, ctx: *const common.ToolContext) common.Error!common.Output {
+    const backend = ctx.session_backend orelse return common.failFmt(gpa, 2, "Searching saved tool results requires an active session database.\n", .{});
+    const session_id = ctx.session_id orelse return common.failFmt(gpa, 2, "Searching saved tool results requires an active session.\n", .{});
+    const result_id = args.result_id orelse return common.failFmt(gpa, 2, "Invalid arguments: 'result_id' is required for 'search_tool_result'.\n", .{});
+    const needle = args.needle orelse return common.failFmt(gpa, 2, "Invalid arguments: 'needle' is required for 'search_tool_result'.\n", .{});
+    const match_offset = args.match_offset orelse 0;
+    const match_limit = @min(args.match_limit orelse tool_results.default_search_matches, tool_results.max_search_matches);
+    if (match_limit == 0) return common.failFmt(gpa, 2, "Invalid arguments: 'match_limit' must be at least 1.\n", .{});
+
+    var prepared = switch (try prepareBackend(gpa, backend)) {
+        .ready => |value| value,
+        .failed => |output| return output,
+    };
+    defer prepared.deinit();
+
+    var result = tool_results.search(gpa, io, &prepared.backend, session_id, result_id, needle, match_offset, match_limit, tool_results.nowMs(io)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSearchQuery => return common.failFmt(gpa, 2, "Search query must be non-empty, valid UTF-8, and at most 1024 bytes.\n", .{}),
+        error.InvalidSearchLimit => return common.failFmt(gpa, 2, "Search match limit must be between 1 and {d}.\n", .{tool_results.max_search_matches}),
+        else => return common.failFmt(gpa, 1, "Saved tool result could not be searched: {s}. Check the result id; expired results are removed automatically.\n", .{@errorName(err)}),
+    };
+    defer result.deinit(gpa);
+
+    return common.ok(gpa, try renderToolResultSearch(gpa, &result, result_id, match_offset));
+}
+
 fn runReadToolResult(gpa: std.mem.Allocator, io: std.Io, args: Args, ctx: *const common.ToolContext) common.Error!common.Output {
     const backend = ctx.session_backend orelse return common.failFmt(gpa, 2, "Reading saved tool results requires an active session database.\n", .{});
     const session_id = ctx.session_id orelse return common.failFmt(gpa, 2, "Reading saved tool results requires an active session.\n", .{});
     const result_id = args.result_id orelse return common.failFmt(gpa, 2, "Invalid arguments: 'result_id' is required for 'read_tool_result'.\n", .{});
     const chunk = args.chunk orelse 0;
     const offset = args.offset orelse 0;
-    const limit = args.limit orelse tool_results.default_read_chars;
+    const requested_limit = args.limit orelse tool_results.default_read_chars;
+    const limit = output_policy.readWindowLimitChars(ctx.tool_output_cap_bytes, requested_limit);
 
     var prepared = switch (try prepareBackend(gpa, backend)) {
         .ready => |value| value,
@@ -921,13 +1020,14 @@ pub fn runTool(
         error.InvalidArguments => return common.failFmt(
             gpa,
             2,
-            "Invalid arguments: 'action' is required ('query', 'exec', 'schema', 'health', or 'read_tool_result').\n",
+            "Invalid arguments: 'action' is required ('query', 'exec', 'schema', 'health', 'search_tool_result', or 'read_tool_result').\n",
             .{},
         ),
     };
     defer args.deinit(gpa);
 
     if (args.action == .read_tool_result) return runReadToolResult(gpa, io, args, env.ctx);
+    if (args.action == .search_tool_result) return runSearchToolResult(gpa, io, args, env.ctx);
 
     if (args.action == .query) {
         if (args.sql) |sql| {
@@ -935,7 +1035,7 @@ pub fn runTool(
                 return common.failFmt(gpa, 2, "Database query must be a SELECT statement.\n", .{});
             }
             if (try containsProtectedResultTable(gpa, sql)) {
-                return common.failFmt(gpa, 2, "Large tool-result tables are private; use action='read_tool_result' with the result id from the tool output.\n", .{});
+                return common.failFmt(gpa, 2, "Large tool-result tables are private; use action='search_tool_result' or 'read_tool_result' with the result id from the tool output.\n", .{});
             }
         }
     } else if (args.action == .exec) {
@@ -955,6 +1055,7 @@ pub fn runTool(
             .query => runQuery(gpa, io, args, target),
             .exec => runExec(gpa, io, args, target),
             .schema => runSchema(gpa, io, args, target),
+            .search_tool_result => unreachable,
             .read_tool_result => unreachable,
         };
     } else if (env.ctx.session_backend) |backend| {
@@ -969,6 +1070,7 @@ pub fn runTool(
             .query => runQuery(gpa, io, args, target),
             .exec => runExec(gpa, io, args, target),
             .schema => runSchema(gpa, io, args, target),
+            .search_tool_result => unreachable,
             .read_tool_result => unreachable,
         };
     } else {
@@ -1039,9 +1141,17 @@ test "database tool parseArgs validates actions" {
     try std.testing.expectEqual(@as(u64, 12), args3.offset.?);
     try std.testing.expectEqual(@as(u64, 256), args3.limit.?);
 
+    var args4 = try parseArgs(gpa, "{\"action\":\"search_tool_result\",\"result_id\":\"call-1\",\"needle\":\"permission denied\",\"match_offset\":3,\"match_limit\":2}");
+    defer args4.deinit(gpa);
+    try std.testing.expectEqual(Action.search_tool_result, args4.action);
+    try std.testing.expectEqualStrings("permission denied", args4.needle.?);
+    try std.testing.expectEqual(@as(u64, 3), args4.match_offset.?);
+    try std.testing.expectEqual(@as(u64, 2), args4.match_limit.?);
+
     try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{\"action\":\"unknown\"}"));
     try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{}"));
     try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{\"action\":\"read_tool_result\"}"));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, "{\"action\":\"search_tool_result\",\"result_id\":\"call-1\"}"));
 }
 
 test "private result table guard matches table references" {
@@ -1082,6 +1192,7 @@ test "database tool reads large results through the current session scope" {
     const full_text = try gpa.alloc(u8, tool_results.inline_limit_bytes + 32);
     defer gpa.free(full_text);
     @memset(full_text, 'R');
+    @memcpy(full_text[full_text.len - 4 ..], "TAIL");
     _ = try tool_results.store(gpa, io, &backend, "session-a", "call-large", "bash", 0, full_text);
 
     var ctx: common.ToolContext = .{ .session_backend = &backend, .session_id = "session-a" };
@@ -1091,6 +1202,19 @@ test "database tool reads large results through the current session scope" {
     try std.testing.expectEqual(@as(u8, 0), first.code);
     try std.testing.expect(std.mem.indexOf(u8, first.stdout, "RRRRRRRR") != null);
     try std.testing.expect(std.mem.indexOf(u8, first.stdout, "offset=8") != null);
+
+    var found = try runTool(gpa, io, ".", "{\"action\":\"search_tool_result\",\"result_id\":\"call-large\",\"needle\":\"TAIL\",\"match_limit\":1}", env);
+    defer found.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 0), found.code);
+    try std.testing.expect(std.mem.indexOf(u8, found.stdout, "chunk=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.stdout, "offset=8220") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.stdout, "action=read_tool_result") != null);
+
+    var continued = try runTool(gpa, io, ".", "{\"action\":\"search_tool_result\",\"result_id\":\"call-large\",\"needle\":\"R\",\"match_limit\":1}", env);
+    defer continued.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 0), continued.code);
+    try std.testing.expect(std.mem.indexOf(u8, continued.stdout, "same needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, continued.stdout, "match_offset=1") != null);
 
     var denied = try runTool(gpa, io, ".", "{\"action\":\"query\",\"sql\":\"SELECT * FROM Tool_Results\"}", env);
     defer denied.deinit(gpa);

@@ -9,6 +9,7 @@
 //! nothing here is freed by the tools.
 
 const std = @import("std");
+const output_policy = @import("output_policy.zig");
 
 const lane_bridge = @import("lane_bridge.zig");
 const background = @import("../background.zig");
@@ -46,6 +47,9 @@ pub const ToolContext = struct {
     session_backend: ?*@import("../session/backend.zig").SessionBackend = null,
     /// Active session identity used to scope durable tool-result artifacts.
     session_id: ?[]const u8 = null,
+    /// Byte budget shared by executor previews, history pruning, and saved
+    /// result reads. Set by the Agent's compaction configuration.
+    tool_output_cap_bytes: u32 = output_policy.default_tool_output_cap_bytes,
     /// MCP dispatch: resolved at dispatch time through the manager so
     /// registry records survive client reconnects.
     mcp_manager: ?*mcp_mod.McpManager = null,

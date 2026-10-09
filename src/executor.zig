@@ -15,6 +15,7 @@ const mcp_mod = @import("mcp/manager.zig");
 const os = @import("os.zig");
 const result_cache_mod = @import("tools/result_cache.zig");
 const tool_results = @import("session/tool_results.zig");
+const output_policy = @import("tools/output_policy.zig");
 const session_writer_mod = @import("session/writer.zig");
 const migration = @import("session/migration.zig");
 const SessionBackend = @import("session/backend.zig").SessionBackend;
@@ -186,6 +187,9 @@ pub const ExecutorService = struct {
     result_cache: ?*result_cache_mod.ResultCache = null,
     /// Active session writer, used to serialize artifact writes with history.
     session_writer: ?*session_writer_mod.SessionWriter = null,
+    /// Maximum bytes returned in one model-facing tool result, shared with
+    /// context-history pruning and saved-result retrieval windows.
+    tool_output_cap_bytes: u32 = output_policy.default_tool_output_cap_bytes,
     /// Per-turn or per-batch scratch allocator (e.g. TurnArena) for temporary JSON
     /// parsing, schema validation, and argument coercion. Defaults to gpa when unspecified.
     scratch_allocator: std.mem.Allocator,
@@ -208,6 +212,7 @@ pub const ExecutorService = struct {
         session_backend: ?*@import("session/backend.zig").SessionBackend = null,
         session_id: ?[]const u8 = null,
         session_writer: ?*session_writer_mod.SessionWriter = null,
+        tool_output_cap_bytes: u32 = output_policy.default_tool_output_cap_bytes,
         background: ?BackgroundStart = null,
         mcp_manager: ?*mcp_mod.McpManager = null,
         tool_registry: ?*tools.ToolRegistry = null,
@@ -223,6 +228,7 @@ pub const ExecutorService = struct {
 
     pub fn init(options: InitOptions) ExecutorService {
         assert(options.cwd.len > 0);
+        assert(options.tool_output_cap_bytes >= output_policy.minimum_tool_output_cap_bytes);
         if (options.bash_classifier_url) |url| assert(url.len > 0);
         return .{
             .gpa = options.gpa,
@@ -233,6 +239,7 @@ pub const ExecutorService = struct {
             .tool_registry = options.tool_registry,
             .result_cache = options.result_cache,
             .session_writer = options.session_writer,
+            .tool_output_cap_bytes = options.tool_output_cap_bytes,
             .ctx = .{
                 .cancel_requested = options.cancel_requested,
                 .bash_classifier_url = options.bash_classifier_url,
@@ -240,6 +247,7 @@ pub const ExecutorService = struct {
                 .database_auth_token = options.database_auth_token,
                 .session_backend = options.session_backend,
                 .session_id = options.session_id,
+                .tool_output_cap_bytes = options.tool_output_cap_bytes,
                 .background_manager = if (options.background) |bg| bg.manager else null,
                 .owner_generation = if (options.background) |bg| bg.owner_generation else 1,
                 .mcp_manager = options.mcp_manager,
@@ -398,9 +406,13 @@ pub const ExecutorService = struct {
 
         var content = try tool_display.formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
-        const has_large_result = content.len > tool_results.inline_limit_bytes;
+        const has_truncated_observation = if (output.observation) |observation| switch (observation) {
+            .complete => false,
+            .truncated_tail => true,
+        } else false;
+        const has_large_result = content.len > self.tool_output_cap_bytes or has_truncated_observation;
         if (has_large_result) {
-            const bounded = try self.persistOrBoundLargeResult(call, output, content);
+            const bounded = try self.persistOrBoundLargeResult(call, output, content, has_truncated_observation);
             self.gpa.free(content);
             content = bounded;
         }
@@ -412,16 +424,16 @@ pub const ExecutorService = struct {
         errdefer display.deinit(self.gpa);
         var display_body = try tool_display.makeDisplayBody(self.gpa, output);
         errdefer self.gpa.free(display_body);
-        if (has_large_result and display_body.len > tool_results.inline_limit_bytes) {
-            const bounded = try tool_common.pruneToolText(self.gpa, display_body, @intCast(tool_results.inline_limit_bytes));
+        if (has_large_result and display_body.len > self.tool_output_cap_bytes) {
+            const bounded = try tool_common.pruneToolText(self.gpa, display_body, self.tool_output_cap_bytes);
             self.gpa.free(display_body);
             display_body = bounded;
         }
 
         var stderr_preview: ?[]u8 = null;
         defer if (stderr_preview) |text| self.gpa.free(text);
-        const stderr = if (output.stderr.len == 0) null else if (has_large_result and output.stderr.len > tool_results.inline_limit_bytes) blk: {
-            stderr_preview = try tool_common.pruneToolText(self.gpa, output.stderr, @intCast(tool_results.inline_limit_bytes));
+        const stderr = if (output.stderr.len == 0) null else if (has_large_result and output.stderr.len > self.tool_output_cap_bytes) blk: {
+            stderr_preview = try tool_common.pruneToolText(self.gpa, output.stderr, self.tool_output_cap_bytes);
             break :blk stderr_preview.?;
         } else output.stderr;
 
@@ -443,7 +455,7 @@ pub const ExecutorService = struct {
         });
     }
 
-    fn persistOrBoundLargeResult(self: *ExecutorService, call: ai.ToolCall, output: tools.Output, content: []const u8) ![]u8 {
+    fn persistOrBoundLargeResult(self: *ExecutorService, call: ai.ToolCall, output: tools.Output, content: []const u8, has_truncated_observation: bool) ![]u8 {
         var full_source: ?[]u8 = null;
         defer if (full_source) |bytes| self.gpa.free(bytes);
         var source = content;
@@ -470,12 +482,17 @@ pub const ExecutorService = struct {
 
         var metadata: ?tool_results.Metadata = null;
         if (source_error == null) {
+            const inline_limit: usize = if (has_truncated_observation)
+                0
+            else
+                @intCast(self.tool_output_cap_bytes);
             if (self.session_writer) |writer| {
                 metadata = writer.storeToolResult(
                     call.call_id.slice(),
                     call.name,
                     output.code,
                     source,
+                    inline_limit,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => blk: {
@@ -485,7 +502,7 @@ pub const ExecutorService = struct {
                 };
             } else if (self.ctx.session_backend) |backend| {
                 if (self.ctx.session_id) |session_id| {
-                    metadata = tool_results.store(
+                    metadata = tool_results.storeWithLimit(
                         self.gpa,
                         self.io,
                         backend,
@@ -494,6 +511,7 @@ pub const ExecutorService = struct {
                         call.name,
                         output.code,
                         source,
+                        inline_limit,
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => blk: {
@@ -523,7 +541,7 @@ pub const ExecutorService = struct {
             );
         defer self.gpa.free(footer);
 
-        return makeLargeResultPreview(self.gpa, source, footer);
+        return makeLargeResultPreview(self.gpa, source, footer, self.tool_output_cap_bytes);
     }
 
     /// Source the tool's `Output`, routing a `run_in_background` bash call to
@@ -596,17 +614,27 @@ pub const ExecutorService = struct {
         const detail = try validation.formatMessage(self.scratch_allocator);
         defer self.scratch_allocator.free(detail);
         const content = try std.fmt.allocPrint(self.gpa, "Invalid arguments for tool '{s}': {s}", .{ call.name, detail });
-        errdefer self.gpa.free(content);
+        return self.runErrorResult(call, content);
+    }
+
+    fn runErrorResult(self: *ExecutorService, call: ai.ToolCall, content: []u8) !ToolResult {
+        var bounded_content = content;
+        errdefer self.gpa.free(bounded_content);
+        if (content.len > self.tool_output_cap_bytes) {
+            const pruned = try tool_common.pruneToolText(self.gpa, content, self.tool_output_cap_bytes);
+            self.gpa.free(content);
+            bounded_content = pruned;
+        }
 
         var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
-        const display_body = try self.gpa.dupe(u8, content);
+        const display_body = try self.gpa.dupe(u8, bounded_content);
         errdefer self.gpa.free(display_body);
 
         return try ToolResult.init(self.gpa, .{
             .call_id = call.call_id.slice(),
             .name = call.name,
-            .content = content,
+            .content = bounded_content,
             .display = display,
             .display_body = display_body,
             .failed = true,
@@ -614,20 +642,8 @@ pub const ExecutorService = struct {
     }
 
     fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
-        var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
-        errdefer display.deinit(self.gpa);
         const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, errorDescription(err) });
-        errdefer self.gpa.free(content);
-        const display_body = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(display_body);
-        return try ToolResult.init(self.gpa, .{
-            .call_id = call.call_id.slice(),
-            .name = call.name,
-            .content = content,
-            .display = display,
-            .display_body = display_body,
-            .failed = true,
-        });
+        return self.runErrorResult(call, content);
     }
 
     fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
@@ -649,12 +665,12 @@ pub const ExecutorService = struct {
     }
 };
 
-fn makeLargeResultPreview(gpa: std.mem.Allocator, source: []const u8, footer: []const u8) ![]u8 {
+fn makeLargeResultPreview(gpa: std.mem.Allocator, source: []const u8, footer: []const u8, cap_bytes: u32) ![]u8 {
     const footer_block = try std.fmt.allocPrint(gpa, "\n\n{s}", .{footer});
     defer gpa.free(footer_block);
-    if (footer_block.len >= tool_results.inline_limit_bytes) return error.ResultFooterTooLarge;
+    if (footer_block.len >= cap_bytes) return error.ResultFooterTooLarge;
 
-    const excerpt_limit: u32 = @intCast(tool_results.inline_limit_bytes - footer_block.len);
+    const excerpt_limit = cap_bytes - @as(u32, @intCast(footer_block.len));
     const excerpt = try tool_common.pruneToolText(gpa, source, excerpt_limit);
     defer gpa.free(excerpt);
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ excerpt, footer_block });
@@ -752,6 +768,44 @@ test "executor converts a tool execution error into a failed result" {
     try std.testing.expectEqualStrings("search", result.display_label);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "failed to execute") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Unexpected") != null);
+}
+
+test "executor caps validation and execution failure results" {
+    const gpa = std.testing.allocator;
+    const cap = output_policy.minimum_tool_output_cap_bytes;
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = "/tmp",
+        .tool_output_cap_bytes = cap,
+    });
+    const name = try gpa.alloc(u8, cap + 64);
+    @memset(name, 'x');
+    const call: ai.ToolCall = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_large_error") },
+        .name = name,
+        .arguments = try gpa.dupe(u8, "{}"),
+    };
+    defer freeCall(gpa, call);
+
+    var validation: schema_mod.ValidationResult = .{};
+    defer validation.deinit(gpa);
+    try validation.violations.append(gpa, .{
+        .path = try gpa.dupe(u8, "field"),
+        .expected = try gpa.dupe(u8, "is required"),
+    });
+
+    var invalid = try executor.runValidationError(call, &validation);
+    defer invalid.deinit(gpa);
+    try std.testing.expect(invalid.failed);
+    try std.testing.expect(invalid.content.len <= cap);
+    try std.testing.expect(invalid.display_body.len <= cap);
+
+    var failed = try executor.runFailure(call, error.Unexpected);
+    defer failed.deinit(gpa);
+    try std.testing.expect(failed.failed);
+    try std.testing.expect(failed.content.len <= cap);
+    try std.testing.expect(failed.display_body.len <= cap);
 }
 
 test "executor rejected shell result is failed and model-facing" {
@@ -1220,21 +1274,39 @@ test "executor stores oversized output and database tool retrieves it" {
         .tool_registry = &registry,
         .session_backend = &backend,
         .session_id = "session-large",
+        .tool_output_cap_bytes = output_policy.minimum_tool_output_cap_bytes,
     });
     const call = try makeCall(gpa, "large-result-call", "lua__p__large", "{}");
     defer freeCall(gpa, call);
     var stored = try executor.runOne(call);
     defer stored.deinit(gpa);
-    try std.testing.expect(stored.content.len <= tool_results.inline_limit_bytes);
+    try std.testing.expect(stored.content.len <= output_policy.minimum_tool_output_cap_bytes);
     try std.testing.expect(std.mem.indexOf(u8, stored.content, "read_tool_result") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored.content, "large-result-call") != null);
 
-    const read_call = try makeCall(gpa, "read-large-result", "database", "{\"action\":\"read_tool_result\",\"result_id\":\"large-result-call\",\"offset\":24604,\"limit\":8}");
+    const read_call = try makeCall(gpa, "read-large-result", "database", "{\"action\":\"read_tool_result\",\"result_id\":\"large-result-call\",\"offset\":8216,\"limit\":8}");
     defer freeCall(gpa, read_call);
     var retrieved = try executor.runOne(read_call);
     defer retrieved.deinit(gpa);
     try std.testing.expect(!retrieved.failed);
     try std.testing.expect(std.mem.indexOf(u8, retrieved.content, "TAIL") != null);
+
+    const shell_command = if (os.is_windows) "Write-Output ('x' * 9000)" else "printf '%09000d' 0";
+    const shell_args = try std.fmt.allocPrint(gpa, "{{\"command\":\"{s}\",\"description\":\"emit a large test result\"}}", .{shell_command});
+    defer gpa.free(shell_args);
+    const shell_call = try makeCall(gpa, "shell-large-call", tools.shell_tool.name, shell_args);
+    defer freeCall(gpa, shell_call);
+    var shell_result = try executor.runOne(shell_call);
+    defer shell_result.deinit(gpa);
+    try std.testing.expect(shell_result.content.len <= output_policy.minimum_tool_output_cap_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, shell_result.content, "read_tool_result") != null);
+
+    const shell_read_call = try makeCall(gpa, "read-shell-result", "database", "{\"action\":\"read_tool_result\",\"result_id\":\"shell-large-call\",\"offset\":8500,\"limit\":16}");
+    defer freeCall(gpa, shell_read_call);
+    var shell_retrieved = try executor.runOne(shell_read_call);
+    defer shell_retrieved.deinit(gpa);
+    try std.testing.expect(!shell_retrieved.failed);
+    try std.testing.expect(std.mem.indexOf(u8, shell_retrieved.content, "00000000") != null or std.mem.indexOf(u8, shell_retrieved.content, "xxxxxxxx") != null);
 }
 
 test "executor propagates a real Lua plugin failure to completion observers" {

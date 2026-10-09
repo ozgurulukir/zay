@@ -205,10 +205,11 @@ pub const SessionWriter = struct {
         tool_name: []const u8,
         exit_code: u8,
         content: []const u8,
+        inline_limit: usize,
     ) !tool_results.Metadata {
         try self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
-        return tool_results.store(
+        return tool_results.storeWithLimit(
             self.gpa,
             self.io,
             &self.manager.backend,
@@ -217,6 +218,7 @@ pub const SessionWriter = struct {
             tool_name,
             exit_code,
             content,
+            inline_limit,
         );
     }
 

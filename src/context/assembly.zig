@@ -14,6 +14,7 @@
 const std = @import("std");
 const ai = @import("../ai.zig");
 const tools_common = @import("../tools/common.zig");
+const output_policy = @import("../tools/output_policy.zig");
 const compaction = @import("compaction.zig");
 const os = @import("../os.zig");
 const paths = @import("../paths.zig");
@@ -75,13 +76,14 @@ fn unlockRuleFile(handle: windows_test.HANDLE) void {
     if (os.is_windows) _ = windows_test.CloseHandle(handle);
 }
 
-/// Default byte limit per historical tool result when pruned. Mirrored as the
-/// `config.CompactionSettings.historical_tool_cap_bytes` default (`context.compaction.historicalToolCapBytes`).
-pub const default_historical_tool_cap_bytes: u32 = 1024;
-/// Number of recent tool result turns kept in full before historical pruning kicks in.
+/// Shared tool-result byte limit used at the model boundary and by historical pruning.
+/// Mirrored as `config.CompactionSettings.tool_output_cap_bytes`
+/// (`context.compaction.toolOutputCapBytes`).
+pub const default_historical_tool_cap_bytes: u32 = output_policy.default_tool_output_cap_bytes;
+/// Number of recent tool result turns left alone by historical pruning.
 /// Mirrored as the `config.CompactionSettings.keep_recent_tool_turns` default
 /// (`context.compaction.keepRecentToolTurns`).
-pub const default_keep_recent_tool_turns: u32 = 4;
+pub const default_keep_recent_tool_turns: u32 = 12;
 
 /// Known project instruction files to automatically ingest if present in workspace root.
 const project_rule_filenames = [_][]const u8{

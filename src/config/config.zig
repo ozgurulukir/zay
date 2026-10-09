@@ -149,16 +149,17 @@ pub const CompactionSettings = struct {
     threshold: f64 = 0.75,
     /// Recent conversation tokens retained verbatim alongside the summary.
     keep_recent_tokens: u32 = 8_000,
-    /// Number of most recent tool-result turns kept in full when assembling
-    /// each prompt. Older tool results are pruned to `historical_tool_cap_bytes`
-    /// (see `context/assembly.zig`). Minimum 1.
+    /// Number of recent tool-result turns left alone by historical pruning.
+    /// New outputs are already bounded by `tool_output_cap_bytes`; older full
+    /// results from existing history are pruned to that same cap. Minimum 1.
     keep_recent_tool_turns: u32 = context_assembly.default_keep_recent_tool_turns,
-    /// Byte cap applied to tool results older than `keep_recent_tool_turns` —
-    /// a head+tail sandwich (first half + last half, joined with
-    /// `common.elideMiddle`) keeps both the start and the conclusion, with a
-    /// "[... N of M bytes elided to save context ...]" notice.
-    /// Defaults match the previous hardcoded constant in `context/assembly.zig`.
-    historical_tool_cap_bytes: u32 = context_assembly.default_historical_tool_cap_bytes,
+    /// Shared byte cap for model-facing tool output and historical tool-result
+    /// pruning. Larger results are saved in the active session and represented
+    /// by a head+tail preview with retrieval instructions. Minimum 4 KiB.
+    tool_output_cap_bytes: u32 = context_assembly.default_historical_tool_cap_bytes,
+    /// Tracks whether the config layer explicitly supplied this setting so it
+    /// can override an inherited value with the default.
+    tool_output_cap_bytes_is_set: bool = false,
     /// Replace image blocks in OLDER user messages with a deterministic
     /// re-mention stub when assembling each request (#122) — only the newest
     /// user message keeps its images. Saves the base64 re-upload every

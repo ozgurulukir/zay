@@ -29,8 +29,8 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
       "auto": true,
       "threshold": 0.75,
       "keepRecentTokens": 8000,
-      "keepRecentToolTurns": 4,
-      "historicalToolCapBytes": 1024
+      "keepRecentToolTurns": 12,
+      "toolOutputCapBytes": 8192
     }
   },
   "toast": {
