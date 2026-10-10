@@ -1672,7 +1672,7 @@ test "cloneContentBlock frees the mime type when the image data dupe fails" {
     try std.testing.expectError(error.OutOfMemory, cloneContentBlock(failing.allocator(), block));
 }
 
-test "assembleSystemPrompt keeps cross-tool lane policy without duplicating command contract" {
+test "assembleSystemPrompt keeps the Zay contract lean and tool details local" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const root = try std.process.currentPathAlloc(io, gpa);
@@ -1690,17 +1690,15 @@ test "assembleSystemPrompt keeps cross-tool lane policy without duplicating comm
     const prompt = try assembleSystemPrompt(gpa, io, template, "", cwd, &.{}, &.{});
     defer gpa.free(prompt);
 
-    // Cross-tool policy stays in the system prompt; command details belong to
-    // the lane tool description and are not duplicated here.
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Parallelism via Lanes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Only the primary driver manages workers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "classic, human-in-the-loop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "The active workspace is ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, cwd) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**`database`**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Parallelism via Lanes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Only the primary driver manages workers") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane spawn") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane merge") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lane delete") == null);
-    // Deprecated / removed directives are absent
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane create") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane enter") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "lane leave") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "The Decomposition Rule") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "anything is possible") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "read_file") == null);
@@ -1733,11 +1731,13 @@ test "prompt contract: POSIX and Windows system prompts satisfy core invariants"
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "**`lane`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "**`background`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "**`skill`**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "**`database`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, posix_prompt, "**`bash`**") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`lane`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`background`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`skill`**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`database`**") != null);
     try std.testing.expect(std.mem.indexOf(u8, windows_prompt, "**`pwsh`**") != null);
 
     // 5. Removed/over-broad directives stay absent.
