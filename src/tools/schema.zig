@@ -215,6 +215,7 @@ pub fn coerceNumericStrings(
     for (schema.properties) |prop| {
         const v = parsed.value.object.getPtr(prop.name) orelse continue;
         if (v.* != .string) continue;
+        if (prop.acceptsKind(.string)) continue;
         if (prop.kind == .integer or prop.kind == .number) {
             const num = coerceNumericString(v.string) orelse continue;
             v.* = num;
@@ -273,18 +274,19 @@ fn checkProperty(
     // Type check (TD-5): JSON integers satisfy both integer and number;
     // floats only number; a quoted "42" is neither.
     const kind_ok = switch (value) {
-        .string => prop.kind == .string,
-        // `.number_string` is a JSON number that overflows i64 — still a
-        // number token, so it satisfies integer and number like `.integer`.
-        .integer, .number_string => prop.kind == .integer or prop.kind == .number,
-        .float => prop.kind == .number,
-        .bool => prop.kind == .boolean,
-        .object => prop.kind == .object,
-        .array => prop.kind == .array,
+        .string => prop.acceptsKind(.string),
+        .integer, .number_string => prop.acceptsKind(.integer) or prop.acceptsKind(.number),
+        .float => prop.acceptsKind(.number),
+        .bool => prop.acceptsKind(.boolean),
+        .object => prop.acceptsKind(.object),
+        .array => prop.acceptsKind(.array),
         .null => unreachable,
     };
     if (!kind_ok) {
-        const expected = try std.fmt.allocPrint(gpa, "must be {s}", .{@tagName(prop.kind)});
+        const expected = if (prop.kind_alternatives.len == 0)
+            try std.fmt.allocPrint(gpa, "must be {s}", .{@tagName(prop.kind)})
+        else
+            try std.fmt.allocPrint(gpa, "must be one of {s} or alternatives", .{@tagName(prop.kind)});
         defer gpa.free(expected);
         const got = try valueShortRepr(gpa, value);
         defer gpa.free(got);
@@ -438,9 +440,18 @@ fn truncateDup(gpa: std.mem.Allocator, s: []const u8, max: usize) ![]u8 {
     return gpa.dupe(u8, truncate(s, max));
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+test "mixed union alternatives validate both JSON kinds" {
+    const gpa = std.testing.allocator;
+    const schema = tools_common.Schema{ .properties = &.{.{
+        .name = "field",
+        .kind = .array,
+        .description = "",
+        .required = true,
+        .kind_alternatives = &.{.string},
+    }} };
+    try expectValid(gpa, schema, "{\"field\":[\"x\"]}");
+    try expectValid(gpa, schema, "{\"field\":\"x\"}");
+}
 
 const test_schema = tools_common.Schema{
     .properties = &.{
@@ -719,6 +730,29 @@ test "coerceNumericStrings converts quoted integers for integer/number props" {
     var result = try validateArgs(gpa, test_schema, coerced.?);
     defer result.deinit(gpa);
     try std.testing.expect(result.isValid());
+}
+
+test "coerceNumericStrings preserves strings accepted by a union alternative" {
+    const gpa = std.testing.allocator;
+    const string_alternative = [_]tools_common.Schema.Kind{.string};
+    const schema = tools_common.Schema{
+        .properties = &.{.{
+            .name = "field",
+            .kind = .integer,
+            .kind_alternatives = &string_alternative,
+            .description = "",
+            .required = true,
+        }},
+    };
+    const original = "{\"field\":\"001\"}";
+
+    const coerced = try coerceNumericStrings(gpa, schema, original);
+    defer if (coerced) |value| gpa.free(value);
+    try std.testing.expect(coerced == null);
+
+    var validation = try validateArgs(gpa, schema, original);
+    defer validation.deinit(gpa);
+    try std.testing.expect(validation.isValid());
 }
 
 test "coerceNumericStrings leaves non-numeric strings and non-number props alone" {
