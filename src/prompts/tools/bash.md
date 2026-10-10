@@ -1,35 +1,20 @@
-Run a shell command.
+Run a shell command in the active workspace.
 
-- Set the working directory with the `cwd` parameter (fresh shell per call). `cwd` must be within the project root.
-- Pass multiline or complex values via `env: { NAME: "..." }`. Reference them as `"$NAME"`.
-- `description` is optional; provide it when a concise title adds useful context.
-- Quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"`.
-- Default timeout is 30 seconds. Raise with `timeout` when a command needs longer; a timed-out result explains how to retry.
-- Prefer targeted commands (`rg`, `find`, `git diff --stat`, `head`, `tail`) over dumping large files or full build logs.
-- Command outputs exceeding 50 KB or 2000 lines are truncated with a `[Showing last N of M lines (X of Y bytes). Full output: /path]` footer. Inspect that path or use a narrower command; never re-run the entire command just to see the tail. When no truncation notice is present, the output is complete.
-- The executor also caps every model-facing tool result at `context.compaction.toolOutputCapBytes` using a head+tail preview. If the result says it was saved and you know what text to find, use `database` with `action="search_tool_result"` and its `result_id`, then inspect a returned location with `action="read_tool_result"`. Use sequential windows only when the target is unknown; prefer narrowing the command over reading the whole saved output.
+- `command` is required. `cwd` starts a fresh shell and must stay within the
+  allowed project or lane root.
+- Pass multiline or complex values through `env: { NAME: "value" }`; quote
+  every expansion.
+- Set `timeout` explicitly when 30 seconds is not enough. Use
+  `run_in_background: true` for long-running or continuous commands; completion
+  is delivered automatically, so do not poll in a loop.
+- Prefer targeted reads (`rg`, `find`, `head`, `tail`, bounded `sed`) over
+  dumping whole files or logs. Use `set -euo pipefail` for multi-step commands
+  and non-interactive flags so commands do not wait for input.
+- Non-zero exit codes are returned in the result. Report them as failures unless
+  the command was intentionally allowed to fail.
+- Results over 50 KB or 2000 lines receive a bounded preview and a full-output
+  path. Inspect that path or narrow the command; do not rerun the whole output.
+  The executor may also save oversized results. If it provides a `result_id`, use
+  the `database` tool's `search_tool_result` or `read_tool_result` operation.
 
-The `arguments` object's required property is `command` — put the whole shell
-command string there. Do NOT use `name`; `name` is not a property of this tool
-(that key belongs to the `skill` tool).
-## Reading files (sliding window)
-
-Never dump a whole file into the transcript. Locate, read a bounded window, then slide:
-
-- Locate first: `rg -n "pattern" path` gives exact line numbers.
-- Read a bounded window: `sed -n 'START,ENDp' path`, or `rg -C 5 "pattern"` for context.
-- Slide as needed: `sed -n 'END,NEW_ENDp' path` continues below; `sed -n 'NEW_START,STARTp' path` looks above.
-- Full read only when necessary: `cat -n path` (line numbers keep later windows addressable). Use `head`/`tail` for boundary checks.
-
-## Long-running commands
-
-- For continuous processes or commands expected to outlast `timeout`, set `run_in_background: true`. The call returns immediately with a job id, pid, and log path.
-- Background process completion is delivered automatically as a message; do not poll in a busy loop.
-- Query status, read recent logs, or cancel running jobs using the `background` tool (`{"command":"status","id":<id>}`, `{"command":"tail","id":<id>}`, `{"command":"cancel","id":<id>}`).
-
-## Error handling
-
-- Non-zero exit codes are returned in the result. For multi-step commands, chain with `&&` or start scripts with `set -euo pipefail`.
-- Use non-interactive flags (`-y`, `--no-input`, `< /dev/null`) so commands never hang waiting for input.
-- Commands that may legitimately fail should end with `|| true` if later steps should still run.
-
+The required argument is `command`, not `name`.
