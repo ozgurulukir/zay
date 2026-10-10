@@ -13,9 +13,9 @@
   load with a warning and can never reach the wire.
 - **OAuth 2.1**: Remote servers requiring OAuth (`401` + `WWW-Authenticate`) are not yet
   supported. Use a server that accepts an API key in the URL or headers via `{env:VAR}`.
-- **JSON Schema composition in tool `inputSchema`**: `oneOf`/`anyOf` collapse to a single
-  property kind only when every branch is the same primitive
-  (`integer`/`number`/`boolean`/`string`); a nullable `{"type":"null"}` branch is ignored,
-  so `anyOf:[{integer},{null}]` resolves to `integer`. Mixed-type or object/array unions,
-  `$ref`, and the array-of-types nullable form (`"type":["string","null"]`) are not resolved
-  and fall back to `string`.
+- **JSON Schema composition in tool `inputSchema`**: simple `oneOf`/`anyOf` unions of primitive
+  types, objects, and arrays are preserved as multiple accepted kinds. A nullable `{"type":"null"}`
+  branch is ignored for kind selection while remaining visible through nullability. Branches with
+  validation keywords beyond `type` are not resolved, and overlapping `oneOf` branches are not
+  flattened because the internal schema cannot preserve their constraints or exact-one matching.
+  Those unions, `$ref`, and empty unions fall back to `string`.

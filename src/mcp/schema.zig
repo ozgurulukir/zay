@@ -90,8 +90,10 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
 
 /// Convert a JSON Schema object to a tools_common.Schema.
 /// Handles `properties`, `required`, `type`, `description`, `enum`,
-/// and `default`. Unsupported composition keywords ($ref, oneOf, anyOf, allOf)
-/// log a warning and fall back to string kind so the tool is still callable.
+/// and `default`. Simple JSON Schema unions preserve their primitive kinds
+/// instead of collapsing a mixed union to `string`. Unsupported composition
+/// keywords ($ref, allOf, or complex union branches) log a warning and fall
+/// back to string kind so the tool is still callable.
 pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_common.Schema {
     if (value != .object) return tools_common.Schema{ .properties = &.{} };
     const obj = value.object;
@@ -129,6 +131,7 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
                 gpa.free(ev);
             }
             if (p.default_value) |dv| gpa.free(dv);
+            if (p.kind_alternatives.len > 0) gpa.free(p.kind_alternatives);
         }
         props.deinit(gpa);
     }
@@ -140,20 +143,29 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         if (prop_val != .object) continue;
         const prop_obj = prop_val.object;
 
-        // Determine kind — handle unsupported composition keywords gracefully,
-        // with limited oneOf/anyOf support for simple primitive/type branches.
+        var kind_alternatives: []const tools_common.Schema.Kind = &.{};
+        var kind_alternatives_owned = false;
+        errdefer if (kind_alternatives_owned) gpa.free(kind_alternatives);
+
+        // Determine kind — preserve simple oneOf/anyOf primitive branches,
+        // including mixed unions such as seek's array-or-empty-string fields.
         const kind = blk: {
             if (prop_obj.get("$ref") != null) {
                 log.warn("MCP schema: $ref unsupported for '{s}', using string", .{prop_name});
                 break :blk tools_common.Schema.Kind.string;
             }
 
-            // Limited oneOf/anyOf support: collapse to a shared kind when every
-            // branch is the same primitive (nullable "null" branches are
-            // ignored). Mixed/complex unions fall back to string below.
-            if (prop_obj.get("oneOf") orelse prop_obj.get("anyOf")) |branches| {
-                if (branches == .array and branches.array.items.len > 0) {
-                    if (resolveUnionKind(branches.array.items)) |k| break :blk k;
+            const one_of = prop_obj.get("oneOf");
+            const any_of = prop_obj.get("anyOf");
+            if (one_of != null and any_of != null) {
+                log.warn("MCP schema: both oneOf and anyOf unsupported for '{s}', using string", .{prop_name});
+                break :blk tools_common.Schema.Kind.string;
+            }
+            if (one_of orelse any_of) |branches| {
+                if (try resolveUnionKinds(gpa, &branches, one_of != null)) |parsed_union| {
+                    kind_alternatives = parsed_union.alternatives;
+                    kind_alternatives_owned = parsed_union.owned;
+                    break :blk parsed_union.primary;
                 }
                 log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
                 break :blk tools_common.Schema.Kind.string;
@@ -283,9 +295,10 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
             .kind = kind,
             .description = p_desc.?,
             .required = required_set.contains(prop_name),
-            .nullable = schemaAllowsNull(prop_val),
+            .nullable = schemaAllowsNull(&prop_val),
             .enum_values = p_enum,
             .default_value = p_default,
+            .kind_alternatives = kind_alternatives,
         });
         // Ownership transferred to `props`; null the locals so a later
         // iteration's error doesn't double-free them via this errdefer.
@@ -293,6 +306,8 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         p_desc = null;
         p_enum = null;
         p_default = null;
+        kind_alternatives = &.{};
+        kind_alternatives_owned = false;
     }
 
     return .{
@@ -304,8 +319,8 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
 // Keep server nullability separate from the provider's optional-null encoding.
 // Preserve null when unsupported schema constraints leave nullability unknown.
 // Only known non-nullable types/unions justify optional-null omission.
-fn schemaAllowsNull(value: std.json.Value) bool {
-    if (value != .object) return true;
+fn schemaAllowsNull(value: *const std.json.Value) bool {
+    if (value.* != .object) return true;
     if (value.object.get("type")) |kind| {
         if (kind == .string) return std.mem.eql(u8, kind.string, "null");
         if (kind == .array) {
@@ -315,16 +330,39 @@ fn schemaAllowsNull(value: std.json.Value) bool {
             return false;
         }
     }
-    for ([_][]const u8{ "anyOf", "oneOf" }) |name| {
-        if (value.object.get(name)) |branches| {
-            if (branches != .array) return true;
-            for (branches.array.items) |branch| {
-                if (branch != .object) return true;
-                const kind = branch.object.get("type") orelse return true;
-                if (kind != .string or std.mem.eql(u8, kind.string, "null")) return true;
+    if (value.object.get("oneOf")) |branches| {
+        if (branches != .array) return true;
+        var null_matching_branches: usize = 0;
+        for (branches.array.items) |branch| {
+            if (branch != .object) return true;
+            const kind = branch.object.get("type") orelse return true;
+            if (kind == .string) {
+                if (std.mem.eql(u8, kind.string, "null")) null_matching_branches += 1;
+                continue;
             }
-            return false;
+            if (kind != .array) return true;
+            var branch_accepts_null = false;
+            for (kind.array.items) |item| {
+                if (item != .string) return true;
+                if (std.mem.eql(u8, item.string, "null")) branch_accepts_null = true;
+            }
+            if (branch_accepts_null) null_matching_branches += 1;
         }
+        return null_matching_branches == 1;
+    }
+    if (value.object.get("anyOf")) |branches| {
+        if (branches != .array) return true;
+        for (branches.array.items) |branch| {
+            if (branch != .object) return true;
+            const kind = branch.object.get("type") orelse return true;
+            if (kind == .string and std.mem.eql(u8, kind.string, "null")) return true;
+            if (kind == .array) {
+                for (kind.array.items) |item| {
+                    if (item == .string and std.mem.eql(u8, item.string, "null")) return true;
+                }
+            }
+        }
+        return false;
     }
     return true;
 }
@@ -357,34 +395,145 @@ fn kindFromString(kind: []const u8) tools_common.Schema.Kind {
     return .string;
 }
 
-/// Resolve a simple oneOf/anyOf array to a shared kind if every branch maps to
-/// the same primitive/type. Returns null when the branches are mixed, contain
-/// an unsupported object/array kind, or are otherwise complex, so the caller
-/// can fall back to string. A `{"type":"null"}` branch is treated as a nullable
-/// marker and skipped.
-fn resolveUnionKind(items: []const std.json.Value) ?tools_common.Schema.Kind {
-    var resolved: ?tools_common.Schema.Kind = null;
-    for (items) |branch| {
-        if (branch != .object) return null;
-        const branch_type = branch.object.get("type") orelse return null;
-        if (branch_type != .string) return null;
+const ParsedUnion = struct {
+    primary: tools_common.Schema.Kind,
+    alternatives: []const tools_common.Schema.Kind,
+    owned: bool,
+};
 
-        // {"type":"null"} marks a nullable variant (OpenAPI 3.1 / JSON Schema
-        // 2020-12). Skip it so a nullable primitive resolves to its own kind
-        // instead of colliding with the string fallback.
-        if (std.mem.eql(u8, branch_type.string, "null")) continue;
+fn resolveUnionKinds(gpa: std.mem.Allocator, value: *const std.json.Value, exclusive: bool) !?ParsedUnion {
+    if (value.* != .array or value.array.items.len == 0) return null;
+    var kinds: std.ArrayList(tools_common.Schema.Kind) = .empty;
+    errdefer kinds.deinit(gpa);
 
-        const kind = kindFromString(branch_type.string);
-        if (kind == .object) return null;
-        if (kind == .array) return null;
+    var has_null_branch = false;
+    const supported = blk: {
+        for (value.array.items) |branch| {
+            if (branch != .object) break :blk false;
+            if (!unionBranchHasOnlyTypeAndAnnotations(&branch.object)) break :blk false;
+            const type_value = branch.object.get("type") orelse break :blk false;
+            const branch_kinds = unionBranchKinds(&type_value) orelse break :blk false;
 
-        if (resolved) |*r| {
-            if (r.* != kind) return null;
-        } else {
-            resolved = kind;
+            if (exclusive) {
+                if (has_null_branch and branch_kinds.has_null) break :blk false;
+                if (unionKindsOverlap(kinds.items, branch_kinds.kinds())) break :blk false;
+            }
+            has_null_branch = has_null_branch or branch_kinds.has_null;
+
+            for (branch_kinds.kinds()) |kind| {
+                var already_present = false;
+                for (kinds.items) |existing| {
+                    if (existing == kind) {
+                        already_present = true;
+                        break;
+                    }
+                }
+                if (!already_present) try kinds.append(gpa, kind);
+            }
+        }
+        break :blk true;
+    };
+    if (!supported) {
+        kinds.deinit(gpa);
+        return null;
+    }
+    if (kinds.items.len == 0) return null;
+    const primary = kinds.items[0];
+    if (kinds.items.len == 1) {
+        kinds.deinit(gpa);
+        return .{ .primary = primary, .alternatives = &.{}, .owned = false };
+    }
+    const alternatives = try gpa.alloc(tools_common.Schema.Kind, kinds.items.len - 1);
+    @memcpy(alternatives, kinds.items[1..]);
+    kinds.deinit(gpa);
+    return .{ .primary = primary, .alternatives = alternatives, .owned = true };
+}
+
+const UnionBranchKinds = struct {
+    items: [6]tools_common.Schema.Kind = undefined,
+    len: usize = 0,
+    has_null: bool = false,
+
+    fn kinds(self: *const UnionBranchKinds) []const tools_common.Schema.Kind {
+        return self.items[0..self.len];
+    }
+
+    fn append(self: *UnionBranchKinds, kind: tools_common.Schema.Kind) bool {
+        for (self.kinds()) |existing| {
+            if (existing == kind) return true;
+        }
+        if (self.len == self.items.len) return false;
+        self.items[self.len] = kind;
+        self.len += 1;
+        return true;
+    }
+};
+
+fn unionBranchHasOnlyTypeAndAnnotations(branch: *const std.json.ObjectMap) bool {
+    var iterator = branch.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "type")) continue;
+        if (std.mem.eql(u8, key, "title")) continue;
+        if (std.mem.eql(u8, key, "description")) continue;
+        if (std.mem.eql(u8, key, "default")) continue;
+        if (std.mem.eql(u8, key, "examples")) continue;
+        if (std.mem.eql(u8, key, "$comment")) continue;
+        if (std.mem.eql(u8, key, "deprecated")) continue;
+        if (std.mem.eql(u8, key, "readOnly")) continue;
+        if (std.mem.eql(u8, key, "writeOnly")) continue;
+        return false;
+    }
+    return true;
+}
+
+fn unionBranchKinds(value: *const std.json.Value) ?UnionBranchKinds {
+    var branch: UnionBranchKinds = .{};
+    switch (value.*) {
+        .string => |type_name| {
+            if (std.mem.eql(u8, type_name, "null")) {
+                branch.has_null = true;
+            } else {
+                const kind = supportedUnionKind(type_name) orelse return null;
+                if (!branch.append(kind)) return null;
+            }
+        },
+        .array => |type_names| {
+            if (type_names.items.len == 0) return null;
+            for (type_names.items) |item| {
+                if (item != .string) return null;
+                if (std.mem.eql(u8, item.string, "null")) {
+                    branch.has_null = true;
+                } else {
+                    const kind = supportedUnionKind(item.string) orelse return null;
+                    if (!branch.append(kind)) return null;
+                }
+            }
+        },
+        else => return null,
+    }
+    return branch;
+}
+
+fn supportedUnionKind(type_name: []const u8) ?tools_common.Schema.Kind {
+    if (std.mem.eql(u8, type_name, "string")) return .string;
+    if (std.mem.eql(u8, type_name, "integer")) return .integer;
+    if (std.mem.eql(u8, type_name, "number")) return .number;
+    if (std.mem.eql(u8, type_name, "object")) return .object;
+    if (std.mem.eql(u8, type_name, "array")) return .array;
+    if (std.mem.eql(u8, type_name, "boolean")) return .boolean;
+    return null;
+}
+
+fn unionKindsOverlap(left: []const tools_common.Schema.Kind, right: []const tools_common.Schema.Kind) bool {
+    for (left) |left_kind| {
+        for (right) |right_kind| {
+            if (left_kind == right_kind) return true;
+            if (left_kind == .integer and right_kind == .number) return true;
+            if (left_kind == .number and right_kind == .integer) return true;
         }
     }
-    return resolved;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -505,14 +654,14 @@ test "schemaFromJsonSchema extracts default value" {
     try std.testing.expectEqualStrings("3", count_default);
 }
 
-test "schemaFromJsonSchema resolves simple homogeneous oneOf/anyOf to shared kind" {
+test "schemaFromJsonSchema resolves simple homogeneous anyOf to shared kind" {
     const gpa = std.testing.allocator;
     // Non-string primitives prove the resolver actually ran: the fallback is
     // also .string, so a string/string union would be indistinguishable from it.
     const schema_json =
         \\{"type":"object","properties":{
         \\  "limit":{"anyOf":[{"type":"integer"},{"type":"integer"}],"description":"Max results"},
-        \\  "ratio":{"oneOf":[{"type":"number"},{"type":"number"}],"description":"Ratio"},
+        \\  "ratio":{"anyOf":[{"type":"number"},{"type":"number"}],"description":"Ratio"},
         \\  "enabled":{"anyOf":[{"type":"boolean"},{"type":"boolean"}],"description":"Flag"}
         \\}}
     ;
@@ -648,13 +797,43 @@ test "schemaFromJsonSchema leaks no per-property fields on a mid-iteration OOM" 
     try std.testing.expect(succeeded);
 }
 
-test "schemaFromJsonSchema falls back to string for mixed or complex oneOf/anyOf" {
+test "schemaFromJsonSchema preserves mixed primitive union alternatives" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"type":"object","properties":{"field":{"anyOf":[{"type":["null","array"]},{"type":"string"}]}}}
+    , .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+    try std.testing.expectEqual(tools_common.Schema.Kind.array, schema.properties[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), schema.properties[0].kind_alternatives.len);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind_alternatives[0]);
+    try std.testing.expect(schema.properties[0].nullable);
+}
+
+test "schemaFromJsonSchema preserves disjoint oneOf alternatives" {
     const gpa = std.testing.allocator;
     const schema_json =
-        \\{"type":"object","properties":{
-        \\  "mixed":{"oneOf":[{"type":"string"},{"type":"integer"}]},
-        \\  "complex":{"anyOf":[{"type":"object"},{"type":"array"}]},
-        \\  "empty":{"oneOf":[]}
+        \\{"type":"object","properties":{"field":{"oneOf":[{"type":"integer"},{"type":"string"}]}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+    try std.testing.expectEqual(tools_common.Schema.Kind.integer, schema.properties[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), schema.properties[0].kind_alternatives.len);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind_alternatives[0]);
+}
+
+test "schemaFromJsonSchema falls back for constrained or overlapping unions" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","required":["duplicate_null"],"properties":{
+        \\  "constrained":{"anyOf":[{"type":"integer","minimum":5},{"type":"string","pattern":"^x"}]},
+        \\  "overlapping":{"oneOf":[{"type":"integer"},{"type":"number"}]},
+        \\  "duplicate_null":{"oneOf":[{"type":"null"},{"type":"null"}]}
         \\}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
@@ -663,10 +842,83 @@ test "schemaFromJsonSchema falls back to string for mixed or complex oneOf/anyOf
     var schema = try schemaFromJsonSchema(gpa, parsed.value);
     defer schema.deinit(gpa);
 
-    try std.testing.expectEqual(@as(usize, 3), schema.properties.len);
+    var found_constrained = false;
+    var found_overlapping = false;
+    var found_duplicate_null = false;
     for (schema.properties) |prop| {
-        try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+        if (std.mem.eql(u8, prop.name, "constrained")) {
+            found_constrained = true;
+            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+            try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
+        }
+        if (std.mem.eql(u8, prop.name, "overlapping")) {
+            found_overlapping = true;
+            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+            try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
+        }
+        if (std.mem.eql(u8, prop.name, "duplicate_null")) {
+            found_duplicate_null = true;
+            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+            try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
+            try std.testing.expect(!prop.nullable);
+        }
     }
+    try std.testing.expect(found_constrained);
+    try std.testing.expect(found_overlapping);
+    try std.testing.expect(found_duplicate_null);
+
+    const tools_schema = @import("../tools/schema.zig");
+    var constrained_validation = try tools_schema.validateArgs(
+        gpa,
+        schema,
+        "{\"constrained\":4,\"duplicate_null\":\"present\"}",
+    );
+    defer constrained_validation.deinit(gpa);
+    try std.testing.expect(!constrained_validation.isValid());
+
+    var overlapping_validation = try tools_schema.validateArgs(
+        gpa,
+        schema,
+        "{\"overlapping\":1,\"duplicate_null\":\"present\"}",
+    );
+    defer overlapping_validation.deinit(gpa);
+    try std.testing.expect(!overlapping_validation.isValid());
+
+    var duplicate_null_validation = try tools_schema.validateArgs(
+        gpa,
+        schema,
+        "{\"duplicate_null\":null}",
+    );
+    defer duplicate_null_validation.deinit(gpa);
+    try std.testing.expect(!duplicate_null_validation.isValid());
+}
+
+test "schemaFromJsonSchema falls back to string for empty unions" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{"empty":{"oneOf":[]}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind);
+}
+
+test "schemaFromJsonSchema preserves object and array union alternatives" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{"value":{"anyOf":[{"type":"object"},{"type":"array"}]}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+    try std.testing.expectEqual(tools_common.Schema.Kind.object, schema.properties[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), schema.properties[0].kind_alternatives.len);
+    try std.testing.expectEqual(tools_common.Schema.Kind.array, schema.properties[0].kind_alternatives[0]);
 }
 
 test "parseResponse extracts result from a JSON-RPC response" {

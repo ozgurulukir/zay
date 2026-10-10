@@ -149,7 +149,16 @@ fn writeParameters(
         try wire_json.writeString(writer, gpa, prop.name);
         try writer.writeAll(":{\"type\":");
         const kind_str = kindName(prop.kind);
-        if (prop.acceptsNull()) {
+        if (prop.kind_alternatives.len > 0) {
+            try writer.writeByte('[');
+            try std.json.Stringify.value(kind_str, .{}, writer);
+            for (prop.kind_alternatives) |alternative| {
+                try writer.writeByte(',');
+                try std.json.Stringify.value(kindName(alternative), .{}, writer);
+            }
+            if (prop.acceptsNull()) try writer.writeAll(",\"null\"");
+            try writer.writeByte(']');
+        } else if (prop.acceptsNull()) {
             try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
         } else {
             try std.json.Stringify.value(kind_str, .{}, writer);
@@ -214,9 +223,24 @@ fn kindName(kind: tools_common.Schema.Kind) []const u8 {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+test "tool schema emits mixed union types" {
+    const gpa = std.testing.allocator;
+    const props = [_]tools_common.Schema.Property{.{
+        .name = "field",
+        .kind = .array,
+        .description = "Mixed field",
+        .required = false,
+        .kind_alternatives = &.{.string},
+    }};
+    const schema = tools_common.Schema{ .properties = &props };
+    const json = try buildToolsJson(gpa, &.{.{
+        .name = "union",
+        .description = "Union",
+        .schema = schema,
+    }}, false, .completions);
+    defer gpa.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":{\"type\":[\"array\",\"string\",\"null\"]") != null);
+}
 
 const test_tools = [_]tools_common.Tool{
     .{
@@ -416,7 +440,7 @@ test "tool schema repairs invalid UTF-8 in provider strings" {
                 .kind = .string,
                 .description = "argument description\xff",
                 .required = true,
-                .enum_values = &.{ "value\xff" },
+                .enum_values = &.{"value\xff"},
             }},
         },
     }};

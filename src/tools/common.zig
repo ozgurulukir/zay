@@ -377,6 +377,17 @@ pub const Schema = struct {
         /// `"true"`, `"\"auto\""`). When present, serialized as
         /// `"default": <value>` in the tool definition JSON.
         default_value: ?[]const u8 = null,
+        /// Additional JSON kinds accepted by a simple oneOf/anyOf union.
+        /// Empty for ordinary properties; `kind` remains the primary branch.
+        kind_alternatives: []const Kind = &.{},
+
+        pub fn acceptsKind(self: Property, kind: Kind) bool {
+            if (self.kind == kind) return true;
+            for (self.kind_alternatives) |alternative| {
+                if (alternative == kind) return true;
+            }
+            return false;
+        }
 
         /// Optional fields are represented as nullable on the wire in strict
         /// mode, where providers require every property to be present. Accept
@@ -414,6 +425,7 @@ pub const Schema = struct {
                     gpa.free(ev);
                 }
                 if (prop.default_value) |dv| gpa.free(dv);
+                if (prop.kind_alternatives.len > 0) gpa.free(prop.kind_alternatives);
             }
         }
         for (self.properties, 0..) |prop, i| {
@@ -426,6 +438,12 @@ pub const Schema = struct {
                 for (values) |value| gpa.free(value);
                 gpa.free(values);
             };
+            const kind_alternatives = if (prop.kind_alternatives.len == 0) &.{} else blk: {
+                const copy = try gpa.alloc(Kind, prop.kind_alternatives.len);
+                @memcpy(copy, prop.kind_alternatives);
+                break :blk copy;
+            };
+            errdefer if (kind_alternatives.len > 0) gpa.free(kind_alternatives);
             props[i] = .{
                 .name = name,
                 .kind = prop.kind,
@@ -435,6 +453,7 @@ pub const Schema = struct {
                 .object_value_kind = prop.object_value_kind,
                 .enum_values = enum_values,
                 .default_value = if (prop.default_value) |dv| try gpa.dupe(u8, dv) else null,
+                .kind_alternatives = kind_alternatives,
             };
             built = i + 1;
         }
@@ -505,6 +524,7 @@ pub const Schema = struct {
                 gpa.free(ev);
             }
             if (prop.default_value) |dv| gpa.free(dv);
+            if (prop.kind_alternatives.len > 0) gpa.free(prop.kind_alternatives);
         }
         if (self.properties.len > 0) gpa.free(self.properties);
         for (self.requirements) |requirement| freeRequirement(gpa, requirement);
