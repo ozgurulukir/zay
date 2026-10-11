@@ -45,38 +45,57 @@ pub const Active = sigil_query.Token;
 
 /// The active `@`-mention token ending at the cursor, given the text *before*
 /// the cursor. The token starts right after an `@` that sits at the start of
-/// the text or just after whitespace, and runs to the cursor with no
-/// intervening whitespace. Returns null when there is no such token (e.g. the
-/// cursor is mid-word, after a space, or the `@` is embedded like an email).
+/// the text or just after whitespace. Quoted tokens may contain whitespace;
+/// unquoted tokens stop at whitespace.
 pub fn activeQuery(before_cursor: []const u8) ?Active {
     return sigil_query.activeQuery(before_cursor, '@');
 }
 
-/// Every distinct `@<path>` mention in `prompt`, in first-seen order. The
-/// returned slices borrow from `prompt`; only the outer array is owned.
-pub fn collectMentions(gpa: std.mem.Allocator, prompt: []const u8) ![][]const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer list.deinit(gpa);
+/// Every distinct `@<path>` mention in `prompt`, in first-seen order.
+/// Returned paths are owned by the caller, including paths decoded from the
+/// picker’s quoted form (`@"path with spaces"`).
+pub fn collectMentions(gpa: std.mem.Allocator, prompt: []const u8) ![][]u8 {
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |path| gpa.free(path);
+        list.deinit(gpa);
+    }
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(gpa);
 
     var i: usize = 0;
     while (i < prompt.len) {
-        const at_boundary = i == 0 or isBoundary(prompt[i - 1]);
-        if (prompt[i] == '@' and at_boundary) {
-            var j = i + 1;
-            while (j < prompt.len and !isBoundary(prompt[j])) j += 1;
-            const path = trimTrailingPunctuation(prompt[i + 1 .. j]);
-            if (path.len > 0) {
-                const gop = try seen.getOrPut(gpa, path);
-                if (!gop.found_existing) {
-                    try list.append(gpa, path);
-                }
-            }
-            i = j;
-        } else {
+        if (prompt[i] != '@' or (i > 0 and !isBoundary(prompt[i - 1]))) {
             i += 1;
+            continue;
         }
+        const parsed = sigil_query.parseTokenAt(prompt, i, '@') orelse {
+            i += 1;
+            continue;
+        };
+        if (!parsed.closed) {
+            i = parsed.end;
+            continue;
+        }
+        const path = sigil_query.decodeQuery(gpa, parsed.token) catch |err| return err;
+        if (path.len == 0) {
+            gpa.free(path);
+            i = parsed.end;
+            continue;
+        }
+        const gop = seen.getOrPut(gpa, path) catch |err| {
+            gpa.free(path);
+            return err;
+        };
+        if (gop.found_existing) {
+            gpa.free(path);
+        } else {
+            list.append(gpa, path) catch |err| {
+                gpa.free(path);
+                return err;
+            };
+        }
+        i = parsed.end;
     }
     return list.toOwnedSlice(gpa);
 }
@@ -275,7 +294,10 @@ fn assemble(
     blocks_out: ?*std.ArrayList(ai.ContentBlock),
 ) ![]u8 {
     const mentions = try collectMentions(gpa, prompt);
-    defer gpa.free(mentions);
+    defer {
+        for (mentions) |path| gpa.free(path);
+        gpa.free(mentions);
+    }
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -428,7 +450,6 @@ fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
 
-// Shared sigil-token boundary/punctuation rules (see sigil_query.zig) so the
+// Shared sigil-token boundary rules (see sigil_query.zig) so the
 // autocomplete scan and collectMentions can never drift apart.
 const isBoundary = sigil_query.isBoundary;
-const trimTrailingPunctuation = sigil_query.trimTrailingPunctuation;

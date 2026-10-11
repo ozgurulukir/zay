@@ -7,6 +7,7 @@ const tui = @import("../tui.zig");
 const at_mention = @import("../at_mention.zig");
 const search_mod = @import("../search.zig");
 const skill_mod = @import("../skill.zig");
+const sigil_query = @import("../sigil_query.zig");
 
 const App = tui.App;
 
@@ -274,7 +275,7 @@ pub fn acceptAtSelection(app: *App) !void {
     };
     const value = o.results.items[o.selection];
     const sigil: u8 = if (o.kind == .file) '@' else '$';
-    const insert = try std.fmt.allocPrint(app.gpa, "{c}{s} ", .{ sigil, value });
+    const insert = try sigil_query.formatToken(app.gpa, sigil, value);
     defer app.gpa.free(insert);
     // `active_start` points at the sigil itself. Remove the sigil and typed
     // query before inserting the selected value with its replacement sigil.
