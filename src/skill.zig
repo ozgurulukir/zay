@@ -197,7 +197,7 @@ pub fn formatSkillsList(gpa: std.mem.Allocator, skills: []const Skill) ![]u8 {
 }
 
 /// The active `$skill` token ending at the cursor, given the text *before*
-/// the cursor. Shared backward-scan rules with `@`-mentions (sigil_query.zig).
+/// the cursor. Shared scan rules with `@`-mentions (sigil_query.zig).
 pub fn activeQuery(before_cursor: []const u8) ?sigil_query.Token {
     return sigil_query.activeQuery(before_cursor, '$');
 }
@@ -287,18 +287,24 @@ pub fn collectInvocations(gpa: std.mem.Allocator, skills: []const Skill, prompt:
 
     var index: usize = 0;
     while (index < prompt.len) {
-        const at_boundary = index == 0 or isBoundary(prompt[index - 1]);
-        if (prompt[index] == '$' and at_boundary) {
-            var end = index + 1;
-            while (end < prompt.len and !isBoundary(prompt[end])) end += 1;
-            const name = trimTrailingPunctuation(prompt[index + 1 .. end]);
-            if (name.len > 0 and find(skills, name) != null and !contains(names.items, name)) {
-                try names.append(gpa, name);
-            }
-            index = end;
-        } else {
+        if (prompt[index] != '$' or (index > 0 and !isBoundary(prompt[index - 1]))) {
             index += 1;
+            continue;
         }
+        const parsed = sigil_query.parseTokenAt(prompt, index, '$') orelse {
+            index += 1;
+            continue;
+        };
+        if (!parsed.closed) {
+            index = parsed.end;
+            continue;
+        }
+        const name = parsed.token.query;
+        const lookup_name = if (parsed.token.quoted) name else sigil_query.trimTrailingPunctuation(name);
+        if (lookup_name.len > 0 and find(skills, lookup_name) != null and !contains(names.items, lookup_name)) {
+            try names.append(gpa, lookup_name);
+        }
+        index = parsed.end;
     }
     return names.toOwnedSlice(gpa);
 }
@@ -617,6 +623,19 @@ test "collectInvocations finds known skills only" {
     defer gpa.free(names);
     try std.testing.expectEqual(@as(usize, 1), names.len);
     try std.testing.expectEqualStrings("how", names[0]);
+}
+
+test "collectInvocations trims trailing punctuation from unquoted names" {
+    const gpa = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = @constCast("how"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast("."), .body = @constCast("") },
+        .{ .name = @constCast("why"), .description = @constCast("d"), .path = @constCast("p"), .base_dir = @constCast("."), .body = @constCast("") },
+    };
+    const names = try collectInvocations(gpa, &skills, "$how, and $why.");
+    defer gpa.free(names);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("how", names[0]);
+    try std.testing.expectEqualStrings("why", names[1]);
 }
 
 test "collectInvocations matches skill names case-insensitively" {

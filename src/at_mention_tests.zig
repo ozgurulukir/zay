@@ -38,10 +38,44 @@ test "activeQuery rejects an embedded @ (email-like)" {
 test "collectMentions dedupes and strips trailing punctuation" {
     const gpa = std.testing.allocator;
     const mentions = try collectMentions(gpa, "see @src/a.zig and @src/a.zig. plus @b.png");
-    defer gpa.free(mentions);
+    defer {
+        for (mentions) |path| gpa.free(path);
+        gpa.free(mentions);
+    }
     try std.testing.expectEqual(@as(usize, 2), mentions.len);
     try std.testing.expectEqualStrings("src/a.zig", mentions[0]);
     try std.testing.expectEqualStrings("b.png", mentions[1]);
+}
+
+test "collectMentions accepts punctuation after a quoted picker path" {
+    const gpa = std.testing.allocator;
+    const mentions = try collectMentions(gpa, "please open @\"notes from picker.txt\".");
+    defer {
+        for (mentions) |path| gpa.free(path);
+        gpa.free(mentions);
+    }
+    try std.testing.expectEqual(@as(usize, 1), mentions.len);
+    try std.testing.expectEqualStrings("notes from picker.txt", mentions[0]);
+}
+
+test "collectMentions decodes picker paths with spaces and escaped bytes" {
+    const gpa = std.testing.allocator;
+    const mentions = try collectMentions(gpa, "see @\"Screenshot From 2026-10-11 11-02-09.png\" and @src/a.zig");
+    defer {
+        for (mentions) |path| gpa.free(path);
+        gpa.free(mentions);
+    }
+    try std.testing.expectEqual(@as(usize, 2), mentions.len);
+    try std.testing.expectEqualStrings("Screenshot From 2026-10-11 11-02-09.png", mentions[0]);
+    try std.testing.expectEqualStrings("src/a.zig", mentions[1]);
+
+    const escaped = try collectMentions(gpa, "@\"a\\\\b\\\"c.txt\"");
+    defer {
+        for (escaped) |path| gpa.free(path);
+        gpa.free(escaped);
+    }
+    try std.testing.expectEqual(@as(usize, 1), escaped.len);
+    try std.testing.expectEqualStrings("a\\b\"c.txt", escaped[0]);
 }
 
 test "mimeForPath maps image extensions case-insensitively" {
@@ -135,6 +169,33 @@ test "buildUserMessage embeds text files and attaches images" {
     try std.testing.expect(blocks[0] == .text);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "<file src=\"note.txt\">\nhello from file\n</file>") != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "<image src=\"pixel.png\" />") != null);
+    try std.testing.expect(blocks[1] == .image);
+    try std.testing.expectEqualStrings("image/png", blocks[1].image.mime_type);
+}
+
+test "buildUserMessage embeds and attaches picker paths with spaces" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/at-mention-space-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel_dir);
+    try writeTestFile(io, rel_dir ++ "/Screenshot From 2026-10-11 11-02-09.png", "\x89PNG\r\n\x1a\n");
+    try writeTestFile(io, rel_dir ++ "/notes from picker.txt", "hello from picker");
+
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
+    defer gpa.free(cwd);
+
+    const blocks = try buildUserMessage(gpa, io, cwd, "see @\"Screenshot From 2026-10-11 11-02-09.png\" and @\"notes from picker.txt\"");
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "<image src=\"Screenshot From 2026-10-11 11-02-09.png\" />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].text.text, "<file src=\"notes from picker.txt\">\nhello from picker\n</file>") != null);
     try std.testing.expect(blocks[1] == .image);
     try std.testing.expectEqualStrings("image/png", blocks[1].image.mime_type);
 }

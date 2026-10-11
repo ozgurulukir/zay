@@ -273,6 +273,26 @@ test "skill picker selection replaces the active mention without corrupting inpu
     try std.testing.expectEqualStrings("run $tigerstyle ", input);
 }
 
+test "file picker quotes a selected path containing spaces" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("open @Screenshot");
+    const query = try gpa.dupe(u8, "Screenshot");
+    app.at_search = .{ .open = .{ .kind = .file, .query = query } };
+    try app.at_search.open.results.append(gpa, try gpa.dupe(u8, "Screenshot From 2026-10-11 11-02-09.png"));
+
+    try app.acceptAtSelection();
+
+    const input = try app.peekInput();
+    defer gpa.free(input);
+    try std.testing.expectEqualStrings("open @\"Screenshot From 2026-10-11 11-02-09.png\" ", input);
+}
+
 test "file picker starts its deferred search after debounce expires" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
