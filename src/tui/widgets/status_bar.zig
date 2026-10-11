@@ -154,11 +154,15 @@ pub fn layoutStatusBar(
     };
 }
 
+/// A status-bar view model. Skill inventory text is rendered as a separate
+/// status segment so metadata never changes transcript geometry or selection.
 pub const StatusBarWidget = struct {
     status_text: []const u8 = "no model",
     meter_text: []const u8 = "",
     meter_style: ?vaxis.Style = null,
     velocity_text: []const u8 = "",
+    /// Active durable skill names, when the TUI config opts into showing them.
+    skill_inventory: []const []const u8 = &.{},
 
     pub fn widget(self: *StatusBarWidget) vxfw.Widget {
         return .{
@@ -173,13 +177,28 @@ pub const StatusBarWidget = struct {
         const p = tui_style.activePalette();
 
         const available_width = max_width -| 2;
+        var status = self.status_text;
+        var inventory: std.ArrayList(u8) = .empty;
+        defer inventory.deinit(ctx.arena);
+        if (self.skill_inventory.len > 0) {
+            if (self.status_text.len > 0) {
+                try inventory.appendSlice(ctx.arena, self.status_text);
+                try inventory.appendSlice(ctx.arena, " · ");
+            }
+            try inventory.appendSlice(ctx.arena, "skills: ");
+            for (self.skill_inventory, 0..) |name, index| {
+                if (index > 0) try inventory.appendSlice(ctx.arena, ", ");
+                try inventory.appendSlice(ctx.arena, name);
+            }
+            status = inventory.items;
+        }
         const layout = layoutStatusBar(
             ctx.arena,
             available_width,
             self.velocity_text,
             self.meter_text,
             self.meter_style orelse p.model_status,
-            self.status_text,
+            status,
             p.model_status,
         );
 
@@ -415,6 +434,25 @@ test "status bar rightmost segment lands at max_width - 3" {
     // Rightmost segment's last cell = origin + width - 1 = max_width - 3.
     const rightmost_cell = flex_origin + surface.children[0].surface.size.width - 1;
     try std.testing.expectEqual(max_width -| 3, rightmost_cell);
+}
+
+test "StatusBarWidget keeps skill inventory opt-in at the view-model boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var hidden: StatusBarWidget = .{ .status_text = "model", .skill_inventory = &.{} };
+    const hidden_ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const hidden_surface = try hidden.widget().draw(hidden_ctx);
+    try std.testing.expect(hidden_surface.children.len > 0);
+
+    var shown: StatusBarWidget = .{ .status_text = "model", .skill_inventory = &.{"how"} };
+    const shown_surface = try shown.widget().draw(hidden_ctx);
+    try std.testing.expect(shown_surface.children.len > 0);
 }
 
 test "StatusBarWidget renders velocity during thinking activity" {

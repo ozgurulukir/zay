@@ -116,6 +116,10 @@ pub const Agent = struct {
     skills: []const skill_mod.Skill = &.{},
     skill_context: skill_context_mod.SkillContext = .{},
     skill_context_dirty: bool = false,
+    /// True until the next listener event carries the complete current skill
+    /// inventory. This is separate from persistence dirtiness: the writer may
+    /// flush metadata before the UI has received its snapshot.
+    skill_context_changed_pending: bool = false,
     /// Context window of the connected model, in tokens. Set by the runtime
     /// when a client is attached. 0 means unknown — compaction is disabled.
     context_window_tokens: u32 = 0,
@@ -352,6 +356,7 @@ pub const Agent = struct {
         try self.context_manager.appendPersisted(.{ .user = .{ .content = blocks } });
         if (self.skill_context.entries.items.len != skill_count) {
             self.skill_context_dirty = true;
+            self.skill_context_changed_pending = true;
             self.persistSkillContext() catch |err| log.warn("session skill context write failed: {s}", .{@errorName(err)});
         }
     }
@@ -448,7 +453,10 @@ pub const Agent = struct {
         history[history.len - 1] = message;
         try skill_history.rebuild(&self.skill_context, self.gpa, history, self.skills);
         try self.context_manager.appendUnpersisted(message);
-        if (self.skill_context.entries.items.len != mark) self.skill_context_dirty = true;
+        if (self.skill_context.entries.items.len != mark) {
+            self.skill_context_dirty = true;
+            self.skill_context_changed_pending = true;
+        }
     }
 
     /// Drop every non-system message, freeing it. Keeps the system prompt(s) in
@@ -460,6 +468,7 @@ pub const Agent = struct {
         self.context_manager.clearNonSystem();
         self.skill_context.clear(self.gpa);
         self.skill_context_dirty = false;
+        self.skill_context_changed_pending = true;
     }
 
     /// The tagged union the agent emits to describe what is happening.
@@ -480,6 +489,9 @@ pub const Agent = struct {
         queued_messages_flushed: u32,
         turn_finished,
         turn_failed: []const u8,
+        /// The durable skill metadata changed on the worker and the UI should
+        /// refresh its separate lane inventory projection.
+        skill_inventory_changed: SkillInventory,
         history_compacted: HistoryCompacted,
         /// One-shot user-facing compaction notices (breaker tripped, stuck above
         /// the swap watermark with nothing to cut, overflow wait). The variant
@@ -502,6 +514,10 @@ pub const Agent = struct {
         /// The fixed notice kinds `maybeCompact` can emit while it degrades
         /// gracefully instead of looping into provider overflow errors.
         pub const CompactionNotice = auto_compactor_mod.CompactionNotice;
+
+        pub const SkillInventory = struct {
+            names: []u8,
+        };
 
         /// See the `length_cut` event.
         pub const LengthCut = enum {
@@ -540,6 +556,7 @@ pub const Agent = struct {
                     gpa.free(tool.display_body);
                     if (tool.stderr) |stderr| gpa.free(stderr);
                 },
+                .skill_inventory_changed => |inventory| gpa.free(inventory.names),
                 .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted, .compaction_notice, .tool_budget_exhausted, .length_cut => {},
             }
             self.* = undefined;
@@ -604,6 +621,7 @@ pub const Agent = struct {
             const turn_allocator = turn_arena.allocator();
 
             try self.persistSkillContext();
+            try self.emitPendingSkillInventory(L, l);
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
                 .agent = self,
@@ -708,6 +726,7 @@ pub const Agent = struct {
             self.recordUsage(usage);
 
             if (tool_calls.len == 0) {
+                try self.emitPendingSkillInventory(L, l);
                 // Turn would otherwise go idle: drain the front queued message
                 // (steer or not) and continue, so anything still waiting is
                 // handled at the natural turn end. The user's queued message
@@ -752,6 +771,7 @@ pub const Agent = struct {
             const calls_to_dispatch = @min(tool_calls.len, calls_remaining);
             const batch_exceeds_budget = calls_to_dispatch < tool_calls.len;
             const end_turn = try Agent.runToolBatch(L, self, tool_calls[0..calls_to_dispatch], &stream_context, l, turn_allocator);
+            try self.emitPendingSkillInventory(L, l);
             tool_calls_executed += @intCast(calls_to_dispatch);
             if (batch_exceeds_budget) {
                 try self.reconcileUnresolvedToolCalls(budget_skipped_tool_result, "budget");
@@ -877,6 +897,26 @@ pub const Agent = struct {
     fn snapshotAfterBatch(self: *Agent) void {
         if (self.snapshotter == null) self.snapshotter = .{ .gpa = self.gpa, .io = self.io };
         self.snapshotter.?.afterBatch(self.cwd, self.context_manager.session_writer);
+    }
+
+    fn skillInventorySnapshot(self: *Agent) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.gpa);
+        for (self.skill_context.entries.items, 0..) |entry, index| {
+            if (index > 0) try out.append(self.gpa, '\n');
+            try out.appendSlice(self.gpa, entry.name);
+        }
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    fn emitPendingSkillInventory(self: *Agent, comptime L: type, listener: L) !void {
+        if (!self.skill_context_changed_pending) return;
+        const names = try self.skillInventorySnapshot();
+        self.skill_context_changed_pending = false;
+        listener.emit(.{ .skill_inventory_changed = .{ .names = names } }) catch |err| {
+            self.skill_context_changed_pending = true;
+            return err;
+        };
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
@@ -1385,6 +1425,7 @@ pub const Agent = struct {
             moved += 1;
             if (self.skill_context.entries.items.len != skill_count) {
                 self.skill_context_dirty = true;
+                self.skill_context_changed_pending = true;
                 self.persistSkillContext() catch |err| log.warn("session skill context write failed: {s}", .{@errorName(err)});
             }
         }
@@ -1576,6 +1617,7 @@ pub const Agent = struct {
         self.skill_context = projected.skill_context;
         projected.skill_context = .{};
         self.skill_context_dirty = self.skill_context.entries.items.len != prior_count;
+        self.skill_context_changed_pending = true;
         self.tool_view_cache.clear(self.gpa);
     }
 };
@@ -1914,6 +1956,13 @@ test "skill context repeated inline and model activation preserves protocol resu
         result_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), result_count);
+    var inventory_events: usize = 0;
+    for (seen.events.items) |event| {
+        if (event != .skill_inventory_changed) continue;
+        inventory_events += 1;
+        try std.testing.expectEqualStrings("how", event.skill_inventory_changed.names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inventory_events);
     try agent.addUserPrompt("$how $HOW");
     try std.testing.expectEqualStrings("$how $HOW", agent.messages()[agent.messages().len - 1].text());
     agent.clearNonSystemMessages();

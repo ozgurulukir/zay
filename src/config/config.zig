@@ -220,6 +220,9 @@ pub const TuiSettings = struct {
     show_token_velocity: bool = true,
     /// Display the visual context window capacity progress bar in the status bar.
     show_context_meter: bool = true,
+    /// Show the durable skill inventory in the status bar. Disabled by default
+    /// because the inventory is also available through `/skills`.
+    show_skill_inventory: bool = false,
     /// EMA smoothing coefficient for token velocity.
     velocity_smoothing_alpha: f64 = 0.35,
     /// Context usage fraction that transitions the meter to amber warning.

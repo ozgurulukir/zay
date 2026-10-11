@@ -437,6 +437,11 @@
           "default": true,
           "description": "Display the visual context window capacity progress bar in the status bar."
         },
+        "showSkillInventory": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show durable skill names in the status bar."
+        },
         "velocitySmoothingAlpha": {
           "type": "number",
           "minimum": 0.05,

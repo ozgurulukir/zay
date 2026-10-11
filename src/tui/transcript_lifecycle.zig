@@ -49,9 +49,9 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
     app.thread.agent = &runtime.agent;
     app.thread.id = runtime.session_writer.session.id;
-    // Pin the driver's current session so a post-switch crash auto-resumes
-    // the session actually in use, not merely the most recently updated row
-    // (a busy lane's). No-op unless the installed lane is the driver.
+    try app.thread.syncSkillInventorySnapshot(app.gpa, "");
+    // Pin the driver's current session. This keeps crash recovery pointed at
+    // the session actually in use, not merely the most recently updated row.
     lane_recovery.syncDriverPin(app);
     // The label belongs to the departed session; the next first prompt
     // re-derives it.
@@ -154,9 +154,15 @@ pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
             _ = try lane.transcript.appendTool(app.gpa, title, text, message.tool.failed);
         }
     }
-    // Rebuilding happens at an idle turn boundary; restore the inventory even
-    // when compaction removed the original inline activation messages.
-    for (agent.skill_context.entries.items) |entry| try skill_rows.appendOnce(app.gpa, &lane.transcript, entry.name);
+    // Durable skill metadata belongs to the lane-owned inventory, not to the
+    // transcript. The runtime has already restored it before this rebuild.
+    lane.skill_inventory.deinit(app.gpa);
+    lane.skill_inventory = .empty;
+    if (lane.agent) |inventory_agent| {
+        for (inventory_agent.skill_context.entries.items) |entry| {
+            try lane.skill_inventory.append(app.gpa, try app.gpa.dupe(u8, entry.name));
+        }
+    }
     if (lane.transcript.messages.items.len > 0) lane.transcript.selected = @intCast(lane.transcript.messages.items.len - 1);
 }
 
