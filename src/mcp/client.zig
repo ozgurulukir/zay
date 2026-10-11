@@ -208,11 +208,7 @@ pub const McpTool = struct {
         gpa.free(self.name);
         gpa.free(self.full_name);
         gpa.free(self.description);
-        for (self.schema.properties) |*prop| {
-            gpa.free(prop.name);
-            gpa.free(prop.description);
-        }
-        if (self.schema.properties.len > 0) gpa.free(self.schema.properties);
+        self.schema.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -1389,6 +1385,24 @@ test "McpClient full handshake + tools/list" {
     try std.testing.expectEqualStrings("name", client.tools.items[0].schema.properties[0].name);
     try std.testing.expectEqual(tools_common.Schema.Kind.string, client.tools.items[0].schema.properties[0].kind);
     try std.testing.expect(client.tools.items[0].schema.properties[0].required);
+}
+
+test "McpTool deinit frees extended schema fields" {
+    const gpa = std.testing.allocator;
+    var client = try McpClient.init(gpa, "schema-server", "echo", &.{}, null);
+    defer client.deinit(std.testing.io);
+
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "time_range":{"anyOf":[{"type":"string","enum":["day","week"]},{"type":"null"}],"default":null},
+        \\  "value":{"anyOf":[{"type":"object"},{"type":"array"}]}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+    const schema = try schema_mod.schemaFromJsonSchema(gpa, parsed.value);
+
+    try client.addTool("search", "Search", schema);
 }
 
 test "McpClient initialize captures tools.listChanged capability" {
