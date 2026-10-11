@@ -91,9 +91,10 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
 /// Convert a JSON Schema object to a tools_common.Schema.
 /// Handles `properties`, `required`, `type`, `description`, `enum`,
 /// and `default`. Simple JSON Schema unions preserve their primitive kinds
-/// instead of collapsing a mixed union to `string`. Unsupported composition
-/// keywords ($ref, allOf, or complex union branches) log a warning and fall
-/// back to string kind so the tool is still callable.
+/// instead of collapsing a mixed union to `string`; nullable single-kind unions
+/// preserve their enum constraint as well. Unsupported composition keywords
+/// ($ref, allOf, or complex union branches) log a warning and fall back to
+/// string kind so the tool is still callable.
 pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_common.Schema {
     if (value != .object) return tools_common.Schema{ .properties = &.{} };
     const obj = value.object;
@@ -163,6 +164,13 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
             }
             if (one_of orelse any_of) |branches| {
                 if (try resolveUnionKinds(gpa, &branches, one_of != null)) |parsed_union| {
+                    if (unionHasEnumConstraint(&branches) and
+                        enumValueFromNullableUnion(&prop_val, parsed_union.primary, parsed_union.alternatives) == null)
+                    {
+                        if (parsed_union.owned) gpa.free(parsed_union.alternatives);
+                        log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
+                        break :blk tools_common.Schema.Kind.string;
+                    }
                     kind_alternatives = parsed_union.alternatives;
                     kind_alternatives_owned = parsed_union.owned;
                     break :blk parsed_union.primary;
@@ -219,7 +227,11 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
         // `p_enum` immediately so the errdefer owns it (and every partial
         // string) even when a mid-loop dupe fails — a bare `ev_list` local
         // would be unreachable from the errdefer and leak on partial failure.
-        if (prop_obj.get("enum")) |enum_val| {
+        const enum_value: ?std.json.Value = if (prop_obj.get("enum")) |enum_val|
+            enum_val
+        else
+            enumValueFromNullableUnion(&prop_val, kind, kind_alternatives);
+        if (enum_value) |enum_val| {
             if (enum_val == .array and enum_val.array.items.len > 0) {
                 const ev_list = try gpa.alloc([]const u8, enum_val.array.items.len);
                 p_enum = ev_list;
@@ -477,6 +489,7 @@ fn unionBranchHasOnlyTypeAndAnnotations(branch: *const std.json.ObjectMap) bool 
         if (std.mem.eql(u8, key, "title")) continue;
         if (std.mem.eql(u8, key, "description")) continue;
         if (std.mem.eql(u8, key, "default")) continue;
+        if (std.mem.eql(u8, key, "enum")) continue;
         if (std.mem.eql(u8, key, "examples")) continue;
         if (std.mem.eql(u8, key, "$comment")) continue;
         if (std.mem.eql(u8, key, "deprecated")) continue;
@@ -485,6 +498,50 @@ fn unionBranchHasOnlyTypeAndAnnotations(branch: *const std.json.ObjectMap) bool 
         return false;
     }
     return true;
+}
+
+fn unionHasEnumConstraint(branches: *const std.json.Value) bool {
+    if (branches.* != .array) return false;
+    for (branches.array.items) |branch| {
+        if (branch == .object and branch.object.get("enum") != null) return true;
+    }
+    return false;
+}
+
+/// Return the enum from a nullable union only when it describes the union's
+/// sole non-null branch. A branch-specific enum cannot be represented when
+/// multiple non-null kinds are accepted by `Schema.Property`.
+fn enumValueFromNullableUnion(
+    value: *const std.json.Value,
+    primary_kind: tools_common.Schema.Kind,
+    alternatives: []const tools_common.Schema.Kind,
+) ?std.json.Value {
+    if (alternatives.len > 0 or value.* != .object) return null;
+    const branches = value.object.get("oneOf") orelse value.object.get("anyOf") orelse return null;
+    if (branches != .array) return null;
+
+    var typed_branch: ?std.json.Value = null;
+    var typed_branch_count: usize = 0;
+    var has_null_branch = false;
+    for (branches.array.items) |branch| {
+        if (branch != .object) return null;
+        if (!unionBranchHasOnlyTypeAndAnnotations(&branch.object)) return null;
+        const type_value = branch.object.get("type") orelse return null;
+        const branch_kinds = unionBranchKinds(&type_value) orelse return null;
+        if (branch_kinds.has_null) has_null_branch = true;
+        if (branch_kinds.kinds().len == 0) {
+            if (!branch_kinds.has_null) return null;
+            continue;
+        }
+        if (branch_kinds.kinds().len != 1 or branch_kinds.kinds()[0] != primary_kind) return null;
+        typed_branch = branch;
+        typed_branch_count += 1;
+    }
+
+    if (typed_branch_count != 1 or !has_null_branch) return null;
+    const enum_value = typed_branch.?.object.get("enum") orelse return null;
+    if (enum_value != .array or enum_value.array.items.len == 0) return null;
+    return enum_value;
 }
 
 fn unionBranchKinds(value: *const std.json.Value) ?UnionBranchKinds {
@@ -680,6 +737,44 @@ test "schemaFromJsonSchema resolves simple homogeneous anyOf to shared kind" {
         if (std.mem.eql(u8, prop.name, "enabled"))
             try std.testing.expectEqual(tools_common.Schema.Kind.boolean, prop.kind);
     }
+}
+
+test "schemaFromJsonSchema preserves nullable enum unions" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "time_range":{"anyOf":[{"type":"string","enum":["day","week","month","year"]},{"type":"null"}]},
+        \\  "exact_match":{"anyOf":[{"type":"boolean"},{"type":"null"}]}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), schema.properties.len);
+    var found_time_range = false;
+    var found_exact_match = false;
+    for (schema.properties) |prop| {
+        try std.testing.expect(prop.nullable);
+        if (std.mem.eql(u8, prop.name, "time_range")) {
+            found_time_range = true;
+            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
+            try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
+            const enum_values = prop.enum_values orelse return error.MissingEnumValues;
+            try std.testing.expectEqual(@as(usize, 4), enum_values.len);
+            try std.testing.expectEqualStrings("day", enum_values[0]);
+            try std.testing.expectEqualStrings("week", enum_values[1]);
+            try std.testing.expectEqualStrings("month", enum_values[2]);
+            try std.testing.expectEqualStrings("year", enum_values[3]);
+        } else if (std.mem.eql(u8, prop.name, "exact_match")) {
+            found_exact_match = true;
+            try std.testing.expectEqual(tools_common.Schema.Kind.boolean, prop.kind);
+        }
+    }
+    try std.testing.expect(found_time_range);
+    try std.testing.expect(found_exact_match);
 }
 
 test "schemaFromJsonSchema resolves nullable primitive unions (type:null branch ignored)" {
