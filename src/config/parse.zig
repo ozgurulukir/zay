@@ -256,6 +256,7 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
     if (updates.highlight_focused_border != default_tui.highlight_focused_border) target.tui.highlight_focused_border = updates.highlight_focused_border;
     if (updates.show_token_velocity != default_tui.show_token_velocity) target.tui.show_token_velocity = updates.show_token_velocity;
     if (updates.show_context_meter != default_tui.show_context_meter) target.tui.show_context_meter = updates.show_context_meter;
+    if (updates.show_skill_inventory != default_tui.show_skill_inventory) target.tui.show_skill_inventory = updates.show_skill_inventory;
     if (updates.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) target.tui.velocity_smoothing_alpha = updates.velocity_smoothing_alpha;
     if (updates.context_threshold_warn != default_tui.context_threshold_warn) target.tui.context_threshold_warn = updates.context_threshold_warn;
     if (updates.context_threshold_alert != default_tui.context_threshold_alert) target.tui.context_threshold_alert = updates.context_threshold_alert;
@@ -980,6 +981,7 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
     if (boolField(value, "highlightFocusedBorder")) |b| tui.highlight_focused_border = b;
     if (boolField(value, "showTokenVelocity")) |b| tui.show_token_velocity = b;
     if (boolField(value, "showContextMeter")) |b| tui.show_context_meter = b;
+    if (boolField(value, "showSkillInventory")) |b| tui.show_skill_inventory = b;
     if (floatField(value, "velocitySmoothingAlpha")) |f| {
         if (f >= 0.05 and f <= 1.0) tui.velocity_smoothing_alpha = f;
     }
@@ -1902,6 +1904,7 @@ fn hasNonDefaultTui(tui: TuiSettings) bool {
     if (tui.highlight_focused_border != default_tui.highlight_focused_border) return true;
     if (tui.show_token_velocity != default_tui.show_token_velocity) return true;
     if (tui.show_context_meter != default_tui.show_context_meter) return true;
+    if (tui.show_skill_inventory != default_tui.show_skill_inventory) return true;
     if (tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) return true;
     if (tui.context_threshold_warn != default_tui.context_threshold_warn) return true;
     if (tui.context_threshold_alert != default_tui.context_threshold_alert) return true;
@@ -1946,6 +1949,10 @@ fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     if (tui.show_context_meter != default_tui.show_context_meter) {
         try writeKeyNoIndent(writer, "showContextMeter", &wrote_any);
         try writer.writeAll(if (tui.show_context_meter) "true" else "false");
+    }
+    if (tui.show_skill_inventory != default_tui.show_skill_inventory) {
+        try writeKeyNoIndent(writer, "showSkillInventory", &wrote_any);
+        try writer.writeAll(if (tui.show_skill_inventory) "true" else "false");
     }
     if (tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) {
         try writeKeyNoIndent(writer, "velocitySmoothingAlpha", &wrote_any);
@@ -3997,9 +4004,9 @@ test "applyTuiOverlay with default updates preserves stored non-default settings
     try std.testing.expectEqual(FuzzyHighlightStyle.underline, target.tui.fuzzy_highlight_style);
 }
 
-test "parseTui round-trips all eight layout + telemetry fields" {
+test "parseTui round-trips all nine layout + telemetry fields" {
     const json =
-        \\{"splitMode":"grid","minSplitWidth":200,"highlightFocusedBorder":false,"showTokenVelocity":false,"showContextMeter":false,"velocitySmoothingAlpha":0.6,"contextThresholdWarn":0.5,"contextThresholdAlert":0.9}
+        \\{"splitMode":"grid","minSplitWidth":200,"highlightFocusedBorder":false,"showTokenVelocity":false,"showContextMeter":false,"showSkillInventory":true,"velocitySmoothingAlpha":0.6,"contextThresholdWarn":0.5,"contextThresholdAlert":0.9}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
@@ -4009,6 +4016,7 @@ test "parseTui round-trips all eight layout + telemetry fields" {
     try std.testing.expect(!tui.highlight_focused_border);
     try std.testing.expect(!tui.show_token_velocity);
     try std.testing.expect(!tui.show_context_meter);
+    try std.testing.expect(tui.show_skill_inventory);
     try std.testing.expectEqual(@as(f64, 0.6), tui.velocity_smoothing_alpha);
     try std.testing.expectEqual(@as(f64, 0.5), tui.context_threshold_warn);
     try std.testing.expectEqual(@as(f64, 0.9), tui.context_threshold_alert);

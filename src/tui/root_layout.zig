@@ -120,6 +120,7 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
         .meter_style = meter_style,
         .velocity_text = velocity_text,
         .git_label = app.metrics.git_label,
+        .skill_inventory = if (tui_cfg.show_skill_inventory) app.thread.skill_inventory.items else &.{},
     };
 }
 

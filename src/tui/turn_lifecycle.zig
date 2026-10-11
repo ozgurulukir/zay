@@ -4,6 +4,7 @@
 const std = @import("std");
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const BoundedList = @import("bounded_list.zig").BoundedList;
 const agent_worker = @import("agent_worker.zig");
 const turn_cancel = @import("turn_cancel.zig");
 const lanes_util = @import("lanes.zig");
@@ -98,15 +99,40 @@ pub fn discardAbandonedTurn(app: *App, lane: *Thread) void {
         _ = future.cancel(app.getIo());
         lane.turn_future = null;
     }
-    discardStrandedEvents(lane);
+    discardStrandedEvents(app, lane);
     if (lane.turn.state == .interrupting) lane.turn.reset();
 }
 
 /// Free everything still sitting in a joined worker's event queue. The worker
 /// keeps pushing until the cancel lands, so this must only run after the
 /// worker is joined (cancel job done, or a synchronous `future.cancel`).
-fn discardStrandedEvents(lane: *Thread) void {
-    if (lane.worker_context) |*worker| worker.queue.discardAll(worker.io, worker.gpa);
+fn discardStrandedEvents(app: *App, lane: *Thread) void {
+    const worker = if (lane.worker_context) |*context| context else return;
+    while (true) {
+        var batch: BoundedList(*agent_mod.Agent.Event, agent_worker.event_batch_max) = .{};
+        worker.queue.drainIntoBounded(worker.io, &batch) catch |err| {
+            log.warn("interrupt: failed to drain stranded events: {s}", .{@errorName(err)});
+            worker.queue.discardAll(worker.io, worker.gpa);
+            return;
+        };
+        if (batch.len() == 0) return;
+
+        for (batch.slice()) |event_ptr| {
+            defer worker.gpa.destroy(event_ptr);
+            defer event_ptr.deinit(worker.gpa);
+            switch (event_ptr.*) {
+                // Skill inventory is durable lane state, independent of the
+                // interrupted turn's transcript. Preserve its latest queued
+                // snapshot while discarding the turn output below.
+                .skill_inventory_changed => |inventory| {
+                    lane.syncSkillInventorySnapshot(app.gpa, inventory.names) catch |err| {
+                        log.warn("interrupt: failed to apply stranded skill inventory snapshot: {s}", .{@errorName(err)});
+                    };
+                },
+                else => {},
+            }
+        }
+    }
 }
 
 /// Tick drain: converge every lane whose async interrupt teardown finished.
@@ -128,7 +154,7 @@ pub fn drainTurnCancels(app: *App) !bool {
         app.gpa.destroy(job);
         changed = true;
 
-        discardStrandedEvents(lane);
+        discardStrandedEvents(app, lane);
         if (lane.turn.state == .interrupting) {
             // The cancel gate dropped the worker's terminal event (the
             // machine never saw `turn_finished`) — close the window here.
@@ -426,6 +452,9 @@ pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !
     lane.stall_warned = false;
     switch (event) {
         .tool_call_finished => lane.turn_tool_calls += 1,
+        .skill_inventory_changed => |inventory| {
+            try lane.syncSkillInventorySnapshot(app.gpa, inventory.names);
+        },
         .turn_started => lane.turn_tool_calls = 0,
         .turn_failed => |message| {
             // Record why the turn failed (the same text lands in the
@@ -453,6 +482,7 @@ pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !
         return false;
     }
     var visible_change = try lane.turn_view.apply(app.gpa, &lane.transcript, event);
+    if (event == .skill_inventory_changed) visible_change = true;
     switch (event) {
         .queued_messages_flushed => |count| {
             if (count > 0 and lane.queued.items.len > 0) {

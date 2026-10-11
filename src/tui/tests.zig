@@ -2319,6 +2319,16 @@ test "interrupt with an in-flight worker converges asynchronously" {
     // Join the fold's real worker first so the noop-future overwrite below
     // replaces a null, not a live future (an orphaned future would leak).
     app.awaitTurnFor(app.thread);
+    // The event is queued but not drained, matching an inventory update that
+    // races with cancellation convergence.
+    {
+        const worker = &app.thread.worker_context.?;
+        const inventory_event = try gpa.create(agent_mod.Agent.Event);
+        errdefer gpa.destroy(inventory_event);
+        inventory_event.* = .{ .skill_inventory_changed = .{ .names = try gpa.dupe(u8, "search") } };
+        errdefer inventory_event.deinit(gpa);
+        try worker.queue.push(worker.io, gpa, inventory_event);
+    }
     // A real (already-finished) worker future so the interrupt takes the
     // async path: the UI thread must not block on the join, the machine
     // stays `.interrupting` until the drain converges.
@@ -2336,6 +2346,8 @@ test "interrupt with an in-flight worker converges asynchronously" {
     try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
     try std.testing.expect(!app.thread.turn.isActive());
     try std.testing.expect(!turn_lifecycle.turnCancelActive(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.thread.skill_inventory.items.len);
+    try std.testing.expectEqualStrings("search", app.thread.skill_inventory.items[0]);
 }
 
 test "cancelLaneTurn synchronously converges an active turn to idle" {
@@ -3621,6 +3633,30 @@ test "assistant classification restores every typed answer and reasoning block" 
     try std.testing.expectEqual(.agent, messages[2].kind());
     try std.testing.expectEqualStrings("First answer", messages[0].mirror().body);
     try std.testing.expectEqualStrings("Final answer", messages[2].mirror().body);
+}
+
+test "resumed skill metadata stays in lane inventory, not transcript" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try agent.addUser("hello");
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "answer") } };
+    try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+    _ = try agent.skill_context.activate(gpa, "how", "durable instructions");
+
+    try app.rebuildTranscriptFromAgent();
+
+    const messages = app.thread.transcript.messages.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqual(.user, messages[0].kind());
+    try std.testing.expectEqual(.agent, messages[1].kind());
+    try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.skill_inventory.items.len);
+    try std.testing.expectEqualStrings("how", app.thread.skill_inventory.items[0]);
 }
 
 test "resumed tool messages keep the tool icon" {

@@ -44,6 +44,10 @@ pub const Thread = @This();
 id: ?session.SessionId = null,
 /// One-line label, lazily derived from the first user message. Owned.
 title: ?[]u8 = null,
+/// Names of skills activated on this lane, owned by the UI projection.
+/// This inventory is deliberately separate from `transcript`: durable
+/// `Agent.skill_context` metadata is model state, not a chat message.
+skill_inventory: std.ArrayList([]u8) = .empty,
 /// Rendered history — present in every engine state, even archived.
 transcript: transcript_mod.Transcript = .{},
 /// Lifecycle of the in-progress turn (idle / active / interrupting).
@@ -190,6 +194,24 @@ pub fn liveRuntime(self: *const Thread) ?*runtime.AgentRuntime {
     };
 }
 
+/// Replace the UI-owned skill inventory from an owned worker snapshot. The
+/// snapshot is newline-separated because skill names cannot contain newlines.
+pub fn syncSkillInventorySnapshot(self: *Thread, gpa: std.mem.Allocator, snapshot: []const u8) !void {
+    var next: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (next.items) |name| gpa.free(name);
+        next.deinit(gpa);
+    }
+    var lines = std.mem.splitScalar(u8, snapshot, '\n');
+    while (lines.next()) |name| {
+        if (name.len == 0) continue;
+        try next.append(gpa, try gpa.dupe(u8, name));
+    }
+    for (self.skill_inventory.items) |name| gpa.free(name);
+    self.skill_inventory.deinit(gpa);
+    self.skill_inventory = next;
+}
+
 /// Free everything this thread owns. For `.live`, that includes tearing down and
 /// destroying the owned `AgentRuntime` — the lane is the runtime's owner.
 pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
@@ -197,6 +219,8 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     if (self.turn_failed) |reason| gpa.free(reason);
     for (self.parent_context) |message| gpa.free(message);
     if (self.parent_context.len > 0) gpa.free(self.parent_context);
+    for (self.skill_inventory.items) |name| gpa.free(name);
+    self.skill_inventory.deinit(gpa);
     self.transcript.deinit(gpa);
     self.turn_view.deinit(gpa);
     for (self.queued.items) |*message| gpa.free(message.text);

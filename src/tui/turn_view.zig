@@ -66,6 +66,7 @@ pub const TurnView = struct {
             .tool_call_finished => |tool| return try self.applyToolFinished(gpa, transcript, tool),
             .tool_batch_finished => return try self.applyToolBatchFinished(gpa, transcript),
             .queued_messages_flushed => return false,
+            .skill_inventory_changed => return false,
             .turn_failed => |message| return try self.applyTurnFailed(gpa, transcript, message),
             .turn_finished => return try self.applyTurnFinished(gpa, transcript),
             .history_compacted => |info| return try self.applyHistoryCompacted(gpa, transcript, info),

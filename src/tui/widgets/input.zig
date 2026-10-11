@@ -159,6 +159,8 @@ pub const InputProps = struct {
     /// Pink lanes chip: fullscreen (`.tab`) with other lanes open.
     show_lanes_chip: bool = false,
     lanes_count: usize = 0,
+    /// Active durable skill names shown in the status area, never as chat rows.
+    skill_inventory: []const []const u8 = &.{},
     // Render-ready status-line strings (precomputed by the frame build).
     status_text: []const u8 = "no model",
     meter_text: []const u8 = "",
@@ -586,6 +588,7 @@ pub const InputWidget = struct {
             .meter_text = self.props.meter_text,
             .meter_style = self.props.meter_style,
             .velocity_text = self.props.velocity_text,
+            .skill_inventory = self.props.skill_inventory,
         };
         var status_box: vxfw.SizedBox = .{ .child = status_bar_w.widget(), .size = .{ .width = max_width, .height = 1 } };
         const status_surface = try status_box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = 1 }, .{ .width = max_width, .height = 1 }));
