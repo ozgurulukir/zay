@@ -174,7 +174,8 @@ test.describe("grep regex output handling", function()
       stderr = "",
       code = 0,
     }
-    local out = grep.handler({ pattern = "hello", regex = true })
+    local out, extra = grep.handler({ pattern = "hello", regex = true })
+    test.assert.equal(nil, extra)
     test.assert.contains("Found 3 matches:", out)
     test.assert.contains("src/a.zig:", out)
     test.assert.contains("Line 10: hello", out)
@@ -242,7 +243,8 @@ test.describe("grep substring output handling", function()
         { file = "src/b.zig", line = 2, content = "hello world" },
       },
     }
-    local out = grep.handler({ pattern = "hello" })
+    local out, extra = grep.handler({ pattern = "hello" })
+    test.assert.equal(nil, extra)
     test.assert.is_true(last_bash == nil)
     test.assert.contains("Found 2 matches:", out)
     test.assert.contains("src/a.zig:", out)
