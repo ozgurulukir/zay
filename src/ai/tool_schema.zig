@@ -147,27 +147,33 @@ fn writeParameters(
     for (schema.properties, 0..) |prop, p| {
         if (p > 0) try writer.writeByte(',');
         try wire_json.writeString(writer, gpa, prop.name);
-        try writer.writeAll(":{\"type\":");
-        const kind_str = kindName(prop.kind);
-        if (prop.kind_alternatives.len > 0) {
-            try writer.writeByte('[');
-            try std.json.Stringify.value(kind_str, .{}, writer);
-            for (prop.kind_alternatives) |alternative| {
-                try writer.writeByte(',');
-                try std.json.Stringify.value(kindName(alternative), .{}, writer);
-            }
-            if (prop.acceptsNull()) try writer.writeAll(",\"null\"");
-            try writer.writeByte(']');
-        } else if (prop.acceptsNull()) {
-            try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
+        try writer.writeAll(":{");
+        if (prop.kind_unconstrained) {
+            try writer.writeAll("\"description\":");
+            try wire_json.writeString(writer, gpa, prop.description);
         } else {
-            try std.json.Stringify.value(kind_str, .{}, writer);
+            try writer.writeAll("\"type\":");
+            const kind_str = kindName(prop.kind);
+            if (prop.kind_alternatives.len > 0) {
+                try writer.writeByte('[');
+                try std.json.Stringify.value(kind_str, .{}, writer);
+                for (prop.kind_alternatives) |alternative| {
+                    try writer.writeByte(',');
+                    try std.json.Stringify.value(kindName(alternative), .{}, writer);
+                }
+                if (prop.acceptsNull()) try writer.writeAll(",\"null\"");
+                try writer.writeByte(']');
+            } else if (prop.acceptsNull()) {
+                try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
+            } else {
+                try std.json.Stringify.value(kind_str, .{}, writer);
+            }
+            try writer.writeAll(",\"description\":");
+            try wire_json.writeString(writer, gpa, prop.description);
         }
-        try writer.writeAll(",\"description\":");
-        try wire_json.writeString(writer, gpa, prop.description);
         // Emit enum constraint when present.
         if (prop.enum_values) |ev| {
-            if (ev.len > 0) {
+            if (!prop.kind_unconstrained and ev.len > 0) {
                 try writer.writeAll(",\"enum\":[");
                 for (ev, 0..) |v, ei| {
                     if (ei > 0) try writer.writeByte(',');
@@ -179,8 +185,10 @@ fn writeParameters(
         }
         // Emit default value when present (already a raw JSON fragment).
         if (prop.default_value) |dv| {
-            try writer.writeAll(",\"default\":");
-            try writer.writeAll(dv);
+            if (!prop.kind_unconstrained) {
+                try writer.writeAll(",\"default\":");
+                try writer.writeAll(dv);
+            }
         }
         if (prop.kind == .object) {
             try writer.writeAll(",\"additionalProperties\":");
@@ -240,6 +248,31 @@ test "tool schema emits mixed union types" {
     }}, false, .completions);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":{\"type\":[\"array\",\"string\",\"null\"]") != null);
+}
+
+test "tool schema omits unsupported projection constraints" {
+    const gpa = std.testing.allocator;
+    const props = [_]tools_common.Schema.Property{.{
+        .name = "value",
+        .kind = .string,
+        .description = "Server-defined value",
+        .required = true,
+        .enum_values = &.{"local-only"},
+        .default_value = "\"local-only\"",
+        .kind_unconstrained = true,
+    }};
+    const schema = tools_common.Schema{ .properties = &props };
+    const json = try buildToolsJson(gpa, &.{.{
+        .name = "unconstrained",
+        .description = "Unconstrained",
+        .schema = schema,
+    }}, true, .responses);
+    defer gpa.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"value\":{\"description\":\"Server-defined value\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"string\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enum\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default\"") == null);
 }
 
 const test_tools = [_]tools_common.Tool{
