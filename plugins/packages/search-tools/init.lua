@@ -90,7 +90,8 @@ local function group_rg_output(raw, pattern, max_results)
     end
     table.insert(out, "")
   end
-  return table.concat(out, "\n"):gsub("\n$", "")
+  local text = table.concat(out, "\n")
+  return (text:gsub("\n$", ""))
 end
 
 -- Local, separator-agnostic path splitters. The plugin sandbox does not
@@ -182,7 +183,8 @@ local function native_substring_search(params, root, case_sensitive, max_results
     end
     table.insert(out, "")
   end
-  return table.concat(out, "\n"):gsub("\n$", "")
+  local text = table.concat(out, "\n")
+  return (text:gsub("\n$", ""))
 end
 
 -- ── grep ────────────────────────────────────────────────────────────
