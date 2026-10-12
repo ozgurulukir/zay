@@ -88,13 +88,13 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
     return text.toOwnedSlice(gpa);
 }
 
-/// Convert a JSON Schema object to a tools_common.Schema.
-/// Handles `properties`, `required`, `type`, `description`, `enum`,
-/// and `default`. Simple JSON Schema unions preserve their primitive kinds
-/// instead of collapsing a mixed union to `string`; nullable single-kind unions
-/// preserve their enum constraint as well. Unsupported composition keywords
-/// ($ref, allOf, or complex union branches) log a warning and fall back to
-/// string kind so the tool is still callable.
+/// Convert a JSON Schema object to the local validation/serialization projection.
+/// The MCP `inputSchema` remains authoritative: this projection retains the
+/// type shape, nullability, enums, defaults, and object openness that Zay can
+/// model, while unsupported JSON Schema constraints are deliberately ignored
+/// instead of being reported as discovery failures. Unresolved composition
+/// still falls back to a callable string shape without warning, because the
+/// MCP server will validate the original schema at dispatch time.
 pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tools_common.Schema {
     if (value != .object) return tools_common.Schema{ .properties = &.{} };
     const obj = value.object;
@@ -141,57 +141,58 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
     while (iter.next()) |entry| {
         const prop_name = entry.key_ptr.*;
         const prop_val = entry.value_ptr.*;
-        if (prop_val != .object) continue;
+        if (prop_val != .object) {
+            try appendUnconstrainedProperty(gpa, &props, prop_name, required_set.contains(prop_name));
+            continue;
+        }
         const prop_obj = prop_val.object;
 
         var kind_alternatives: []const tools_common.Schema.Kind = &.{};
         var kind_alternatives_owned = false;
+        var kind_unconstrained = false;
         errdefer if (kind_alternatives_owned) gpa.free(kind_alternatives);
 
         // Determine kind — preserve simple oneOf/anyOf primitive branches,
         // including mixed unions such as seek's array-or-empty-string fields.
         const kind = blk: {
             if (prop_obj.get("$ref") != null) {
-                log.warn("MCP schema: $ref unsupported for '{s}', using string", .{prop_name});
+                kind_unconstrained = true;
                 break :blk tools_common.Schema.Kind.string;
             }
 
             const one_of = prop_obj.get("oneOf");
             const any_of = prop_obj.get("anyOf");
             if (one_of != null and any_of != null) {
-                log.warn("MCP schema: both oneOf and anyOf unsupported for '{s}', using string", .{prop_name});
+                kind_unconstrained = true;
                 break :blk tools_common.Schema.Kind.string;
             }
             if (one_of orelse any_of) |branches| {
                 if (try resolveUnionKinds(gpa, &branches, one_of != null)) |parsed_union| {
-                    if (unionHasEnumConstraint(&branches) and
-                        enumValueFromNullableUnion(&prop_val, parsed_union.primary, parsed_union.alternatives) == null)
-                    {
-                        if (parsed_union.owned) gpa.free(parsed_union.alternatives);
-                        log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
-                        break :blk tools_common.Schema.Kind.string;
-                    }
                     kind_alternatives = parsed_union.alternatives;
                     kind_alternatives_owned = parsed_union.owned;
                     break :blk parsed_union.primary;
                 }
-                log.warn("MCP schema: oneOf/anyOf unsupported for '{s}', using string", .{prop_name});
+                kind_unconstrained = true;
                 break :blk tools_common.Schema.Kind.string;
             }
 
-            if (prop_obj.get("type")) |types| {
-                if (types == .array) {
-                    for (types.array.items) |item| {
-                        if (item == .string and !std.mem.eql(u8, item.string, "null"))
-                            break :blk kindFromString(item.string);
-                    }
+            const type_value = prop_obj.get("type") orelse {
+                kind_unconstrained = true;
+                break :blk tools_common.Schema.Kind.string;
+            };
+            if (type_value == .array) {
+                for (type_value.array.items) |item| {
+                    if (item == .string and !std.mem.eql(u8, item.string, "null"))
+                        break :blk kindFromString(item.string);
                 }
+                kind_unconstrained = true;
+                break :blk tools_common.Schema.Kind.string;
             }
-            const type_str = if (prop_obj.get("type")) |t|
-                (if (t == .string) t.string else "string")
-            else
-                "string";
-            break :blk kindFromString(type_str);
+            if (type_value != .string) {
+                kind_unconstrained = true;
+                break :blk tools_common.Schema.Kind.string;
+            }
+            break :blk kindFromString(type_value.string);
         };
 
         // Build description — append enum values if present
@@ -311,6 +312,7 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
             .enum_values = p_enum,
             .default_value = p_default,
             .kind_alternatives = kind_alternatives,
+            .kind_unconstrained = kind_unconstrained,
         });
         // Ownership transferred to `props`; null the locals so a later
         // iteration's error doesn't double-free them via this errdefer.
@@ -328,7 +330,26 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
     };
 }
 
-// Keep server nullability separate from the provider's optional-null encoding.
+fn appendUnconstrainedProperty(
+    gpa: std.mem.Allocator,
+    props: *std.ArrayList(tools_common.Schema.Property),
+    prop_name: []const u8,
+    required: bool,
+) !void {
+    const name = try gpa.dupe(u8, prop_name);
+    errdefer gpa.free(name);
+    const description = try gpa.dupe(u8, "");
+    errdefer gpa.free(description);
+    try props.append(gpa, .{
+        .name = name,
+        .kind = .string,
+        .description = description,
+        .required = required,
+        .nullable = true,
+        .kind_unconstrained = true,
+    });
+}
+
 // Preserve null when unsupported schema constraints leave nullability unknown.
 // Only known non-nullable types/unions justify optional-null omission.
 fn schemaAllowsNull(value: *const std.json.Value) bool {
@@ -422,7 +443,7 @@ fn resolveUnionKinds(gpa: std.mem.Allocator, value: *const std.json.Value, exclu
     const supported = blk: {
         for (value.array.items) |branch| {
             if (branch != .object) break :blk false;
-            if (!unionBranchHasOnlyTypeAndAnnotations(&branch.object)) break :blk false;
+            if (!unionBranchHasType(&branch.object)) break :blk false;
             const type_value = branch.object.get("type") orelse break :blk false;
             const branch_kinds = unionBranchKinds(&type_value) orelse break :blk false;
 
@@ -481,36 +502,16 @@ const UnionBranchKinds = struct {
     }
 };
 
-fn unionBranchHasOnlyTypeAndAnnotations(branch: *const std.json.ObjectMap) bool {
-    var iterator = branch.iterator();
-    while (iterator.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (std.mem.eql(u8, key, "type")) continue;
-        if (std.mem.eql(u8, key, "title")) continue;
-        if (std.mem.eql(u8, key, "description")) continue;
-        if (std.mem.eql(u8, key, "default")) continue;
-        if (std.mem.eql(u8, key, "enum")) continue;
-        if (std.mem.eql(u8, key, "examples")) continue;
-        if (std.mem.eql(u8, key, "$comment")) continue;
-        if (std.mem.eql(u8, key, "deprecated")) continue;
-        if (std.mem.eql(u8, key, "readOnly")) continue;
-        if (std.mem.eql(u8, key, "writeOnly")) continue;
-        return false;
-    }
-    return true;
+/// A union branch may carry any JSON Schema validation keyword or annotation.
+/// The projection only needs a type shape; unsupported constraints are left for
+/// the MCP server, which remains the source of truth when the call is made.
+fn unionBranchHasType(branch: *const std.json.ObjectMap) bool {
+    return branch.get("type") != null;
 }
 
-fn unionHasEnumConstraint(branches: *const std.json.Value) bool {
-    if (branches.* != .array) return false;
-    for (branches.array.items) |branch| {
-        if (branch == .object and branch.object.get("enum") != null) return true;
-    }
-    return false;
-}
-
-/// Return the enum from a nullable union only when it describes the union's
-/// sole non-null branch. A branch-specific enum cannot be represented when
-/// multiple non-null kinds are accepted by `Schema.Property`.
+/// Preserve a branch enum for a nullable union only when it describes the
+/// union's sole non-null kind. Multi-kind unions intentionally widen branch
+/// constraints because `Schema.Property` has one shared enum field.
 fn enumValueFromNullableUnion(
     value: *const std.json.Value,
     primary_kind: tools_common.Schema.Kind,
@@ -525,7 +526,7 @@ fn enumValueFromNullableUnion(
     var has_null_branch = false;
     for (branches.array.items) |branch| {
         if (branch != .object) return null;
-        if (!unionBranchHasOnlyTypeAndAnnotations(&branch.object)) return null;
+        if (!unionBranchHasType(&branch.object)) return null;
         const type_value = branch.object.get("type") orelse return null;
         const branch_kinds = unionBranchKinds(&type_value) orelse return null;
         if (branch_kinds.has_null) has_null_branch = true;
@@ -777,7 +778,45 @@ test "schemaFromJsonSchema preserves nullable enum unions" {
     try std.testing.expect(found_exact_match);
 }
 
-test "schemaFromJsonSchema resolves nullable primitive unions (type:null branch ignored)" {
+test "schemaFromJsonSchema preserves seek aggs union" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "aggs":{"anyOf":[
+        \\    {"type":["null","array"],"items":{"type":"string"}},
+        \\    {"type":"string","enum":[""]}
+        \\  ],"description":"Aggregations","default":null}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    const aggs = schema.properties[0];
+    try std.testing.expectEqual(tools_common.Schema.Kind.array, aggs.kind);
+    try std.testing.expectEqual(@as(usize, 1), aggs.kind_alternatives.len);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, aggs.kind_alternatives[0]);
+    try std.testing.expect(aggs.nullable);
+    try std.testing.expect(aggs.enum_values == null);
+    try std.testing.expectEqualStrings("null", aggs.default_value.?);
+
+    const tools_schema = @import("../tools/schema.zig");
+    var array_validation = try tools_schema.validateArgs(gpa, schema, "{\"aggs\":[\"doc_type:terms\"]}");
+    defer array_validation.deinit(gpa);
+    try std.testing.expect(array_validation.isValid());
+
+    var string_validation = try tools_schema.validateArgs(gpa, schema, "{\"aggs\":\"\"}");
+    defer string_validation.deinit(gpa);
+    try std.testing.expect(string_validation.isValid());
+
+    var null_validation = try tools_schema.validateArgs(gpa, schema, "{\"aggs\":null}");
+    defer null_validation.deinit(gpa);
+    try std.testing.expect(null_validation.isValid());
+}
+
+test "schemaFromJsonSchema preserves nullable primitive unions (type:null branch ignored)" {
     const gpa = std.testing.allocator;
     // count is the load-bearing case: without skipping "null", integer != the
     // .string that kindFromString("null") yields, so resolution would fail and
@@ -922,7 +961,7 @@ test "schemaFromJsonSchema preserves disjoint oneOf alternatives" {
     try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind_alternatives[0]);
 }
 
-test "schemaFromJsonSchema falls back for constrained or overlapping unions" {
+test "schemaFromJsonSchema ignores unmodeled union constraints but preserves ambiguous fallback" {
     const gpa = std.testing.allocator;
     const schema_json =
         \\{"type":"object","required":["duplicate_null"],"properties":{
@@ -943,19 +982,23 @@ test "schemaFromJsonSchema falls back for constrained or overlapping unions" {
     for (schema.properties) |prop| {
         if (std.mem.eql(u8, prop.name, "constrained")) {
             found_constrained = true;
-            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
-            try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
+            try std.testing.expectEqual(tools_common.Schema.Kind.integer, prop.kind);
+            try std.testing.expectEqual(@as(usize, 1), prop.kind_alternatives.len);
+            try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind_alternatives[0]);
         }
         if (std.mem.eql(u8, prop.name, "overlapping")) {
             found_overlapping = true;
             try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
             try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
+            try std.testing.expect(!prop.nullable);
+            try std.testing.expect(prop.kind_unconstrained);
         }
         if (std.mem.eql(u8, prop.name, "duplicate_null")) {
             found_duplicate_null = true;
             try std.testing.expectEqual(tools_common.Schema.Kind.string, prop.kind);
             try std.testing.expectEqual(@as(usize, 0), prop.kind_alternatives.len);
             try std.testing.expect(!prop.nullable);
+            try std.testing.expect(prop.kind_unconstrained);
         }
     }
     try std.testing.expect(found_constrained);
@@ -969,7 +1012,9 @@ test "schemaFromJsonSchema falls back for constrained or overlapping unions" {
         "{\"constrained\":4,\"duplicate_null\":\"present\"}",
     );
     defer constrained_validation.deinit(gpa);
-    try std.testing.expect(!constrained_validation.isValid());
+    // The local projection must not reject a value only because it cannot
+    // model the branch's minimum or pattern; the MCP server owns that check.
+    try std.testing.expect(constrained_validation.isValid());
 
     var overlapping_validation = try tools_schema.validateArgs(
         gpa,
@@ -977,7 +1022,7 @@ test "schemaFromJsonSchema falls back for constrained or overlapping unions" {
         "{\"overlapping\":1,\"duplicate_null\":\"present\"}",
     );
     defer overlapping_validation.deinit(gpa);
-    try std.testing.expect(!overlapping_validation.isValid());
+    try std.testing.expect(overlapping_validation.isValid());
 
     var duplicate_null_validation = try tools_schema.validateArgs(
         gpa,
@@ -988,7 +1033,7 @@ test "schemaFromJsonSchema falls back for constrained or overlapping unions" {
     try std.testing.expect(!duplicate_null_validation.isValid());
 }
 
-test "schemaFromJsonSchema falls back to string for empty unions" {
+test "schemaFromJsonSchema falls back to an unconstrained projection for empty unions" {
     const gpa = std.testing.allocator;
     const schema_json =
         \\{"type":"object","properties":{"empty":{"oneOf":[]}}}
@@ -999,6 +1044,7 @@ test "schemaFromJsonSchema falls back to string for empty unions" {
     var schema = try schemaFromJsonSchema(gpa, parsed.value);
     defer schema.deinit(gpa);
     try std.testing.expectEqual(tools_common.Schema.Kind.string, schema.properties[0].kind);
+    try std.testing.expect(schema.properties[0].kind_unconstrained);
 }
 
 test "schemaFromJsonSchema preserves object and array union alternatives" {

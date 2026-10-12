@@ -215,6 +215,7 @@ pub fn coerceNumericStrings(
     for (schema.properties) |prop| {
         const v = parsed.value.object.getPtr(prop.name) orelse continue;
         if (v.* != .string) continue;
+        if (prop.kind_unconstrained) continue;
         if (prop.acceptsKind(.string)) continue;
         if (prop.kind == .integer or prop.kind == .number) {
             const num = coerceNumericString(v.string) orelse continue;
@@ -270,6 +271,10 @@ fn checkProperty(
         }
         return;
     }
+
+    // The source schema still owns type and constraint checks when the
+    // projected type is unresolved; nullability remains independently known.
+    if (prop.kind_unconstrained) return;
 
     // Type check (TD-5): JSON integers satisfy both integer and number;
     // floats only number; a quoted "42" is neither.

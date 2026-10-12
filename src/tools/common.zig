@@ -380,6 +380,9 @@ pub const Schema = struct {
         /// Additional JSON kinds accepted by a simple oneOf/anyOf union.
         /// Empty for ordinary properties; `kind` remains the primary branch.
         kind_alternatives: []const Kind = &.{},
+        /// True when the source schema has no safely projectable type shape.
+        /// Local validation must defer that decision to the source tool/server.
+        kind_unconstrained: bool = false,
 
         pub fn acceptsKind(self: Property, kind: Kind) bool {
             if (self.kind == kind) return true;
@@ -454,6 +457,7 @@ pub const Schema = struct {
                 .enum_values = enum_values,
                 .default_value = if (prop.default_value) |dv| try gpa.dupe(u8, dv) else null,
                 .kind_alternatives = kind_alternatives,
+                .kind_unconstrained = prop.kind_unconstrained,
             };
             built = i + 1;
         }

@@ -118,7 +118,47 @@ test "MCP arguments omit optional non-nullable nulls and preserve server nulls" 
     try std.testing.expectError(error.RequiredArgumentNull, normalizeArguments(gpa, schema, "{\"query\":null}"));
 }
 
-/// Human display metadata for an MCP tool: the bare tool name, plus the
+test "MCP arguments preserve unconstrained nullable nulls" {
+    const gpa = std.testing.allocator;
+    const schema: tools_common.Schema = .{ .properties = &.{.{
+        .name = "value",
+        .kind = .string,
+        .description = "",
+        .required = true,
+        .nullable = true,
+        .kind_unconstrained = true,
+    }} };
+    const args = try normalizeArguments(gpa, schema, "{\"value\":null}");
+    defer gpa.free(args);
+    try std.testing.expectEqualStrings("{\"value\":null}", args);
+}
+
+test "MCP arguments enforce nullability for unconstrained properties" {
+    const gpa = std.testing.allocator;
+    const schema: tools_common.Schema = .{ .properties = &.{.{
+        .name = "value",
+        .kind = .string,
+        .description = "",
+        .required = false,
+        .kind_unconstrained = true,
+    }} };
+    const args = try normalizeArguments(gpa, schema, "{\"value\":null}");
+    defer gpa.free(args);
+    try std.testing.expectEqualStrings("{}", args);
+
+    const required_schema: tools_common.Schema = .{ .properties = &.{.{
+        .name = "value",
+        .kind = .string,
+        .description = "",
+        .required = true,
+        .kind_unconstrained = true,
+    }} };
+    try std.testing.expectError(
+        error.RequiredArgumentNull,
+        normalizeArguments(gpa, required_schema, "{\"value\":null}"),
+    );
+}
+
 /// arguments when expanded (mirrors the plugin display policy).
 pub fn displayMcpTool(
     gpa: std.mem.Allocator,
