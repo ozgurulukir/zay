@@ -287,13 +287,16 @@ test "applyLineRange_slicesContentCorrectly_forLineRanges" {
 }
 
 test "writeFileAtomic_and_readFileBytes_and_statFileSize_and_deleteFileBestEffort" {
-    // We test filesystem operations usingstd.testing.io if available or standard temp pathing
     const io = std.testing.io;
-    const test_dir = "zay-fs-ops-test-dir";
-    std.Io.Dir.cwd().makeDir(io, test_dir) catch {};
-    defer std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const test_file = "zay-fs-ops-test-dir/test_file.txt";
+    // writeFileAtomic renames via renameAbsolute, so the target must be absolute.
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const test_file = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "test_file.txt" });
+    defer gpa.free(test_file);
     defer deleteFileBestEffort(io, test_file);
 
     const content = "Hello, atomic filesystem operations!";
@@ -313,11 +316,14 @@ test "writeFileAtomic_and_readFileBytes_and_statFileSize_and_deleteFileBestEffor
 
 test "editFileSplice_replacesSubstringSuccessfully" {
     const io = std.testing.io;
-    const test_dir = "zay-fs-splice-test-dir";
-    std.Io.Dir.cwd().makeDir(io, test_dir) catch {};
-    defer std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const test_file = "zay-fs-splice-test-dir/splice.txt";
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const test_file = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "splice.txt" });
+    defer gpa.free(test_file);
     defer deleteFileBestEffort(io, test_file);
 
     const initial = "foo bar baz";
@@ -333,11 +339,14 @@ test "editFileSplice_replacesSubstringSuccessfully" {
 
 test "editFileSplice_returnsError_whenOldStringNotFound" {
     const io = std.testing.io;
-    const test_dir = "zay-fs-splice-err-dir";
-    std.Io.Dir.cwd().makeDir(io, test_dir) catch {};
-    defer std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const test_file = "zay-fs-splice-err-dir/splice_err.txt";
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const test_file = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "splice_err.txt" });
+    defer gpa.free(test_file);
     defer deleteFileBestEffort(io, test_file);
 
     try writeFileAtomic(io, test_file, "hello world");
