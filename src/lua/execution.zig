@@ -427,3 +427,36 @@ test "noteError_recancelsIo_whenIoIsPresentAndErrorIsCanceled" {
     try std.testing.expectEqual(StopReason.canceled, data.stop_reason);
     try std.testing.expect(stopped(L.handle));
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "budget_returnsNull_whenExtraSpaceIsEmpty" {
+    const L = c.luaL_newstate() orelse return error.LuaInitFailed;
+    defer c.lua_close(L);
+
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = null;
+    try std.testing.expectEqual(@as(?*Budget, null), budget(L));
+}
+
+test "budget_returnsBudgetPointer_whenExtraSpaceIsSet" {
+    const L = c.luaL_newstate() orelse return error.LuaInitFailed;
+    defer c.lua_close(L);
+
+    var test_budget: Budget = .{
+        .instruction_limit = 1000,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 5000,
+    };
+
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = &test_budget;
+
+    const b = budget(L);
+    try std.testing.expect(b != null);
+    try std.testing.expectEqual(&test_budget, b.?);
+    try std.testing.expectEqual(@as(u32, 1000), b.?.instruction_limit);
+    try std.testing.expectEqual(StopReason.none, b.?.stop_reason);
+
+    b.?.stop_reason = .canceled;
+    try std.testing.expectEqual(StopReason.canceled, test_budget.stop_reason);
+}
