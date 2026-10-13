@@ -396,3 +396,89 @@ test "readReceipt_returnsFileNotFound_whenFileDoesNotExist" {
 
     try std.testing.expectError(error.FileNotFound, readReceipt(gpa, io, root));
 }
+
+test "readFile reads regular file contents within limit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sample.lua" });
+    defer gpa.free(path);
+
+    const expected_content = "return { name = \"test-plugin\", version = \"1.0.0\" }";
+    try atomicWrite(io, path, expected_content);
+
+    const content = try readFile(gpa, io, path, 1024);
+    defer gpa.free(content);
+
+    try std.testing.expectEqualStrings(expected_content, content);
+}
+
+test "readFile returns StreamTooLong when file exceeds limit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "large.txt" });
+    defer gpa.free(path);
+
+    try atomicWrite(io, path, "12345678901234567890");
+
+    try std.testing.expectError(error.StreamTooLong, readFile(gpa, io, path, 5));
+}
+
+test "readFile returns InvalidPluginPackage when path points to a directory" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sub_dir" });
+    defer gpa.free(dir_path);
+
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_path);
+
+    try std.testing.expectError(error.InvalidPluginPackage, readFile(gpa, io, dir_path, 1024));
+}
+
+test "readFile returns FileNotFound when file does not exist" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const missing_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "nonexistent.file" });
+    defer gpa.free(missing_path);
+
+    try std.testing.expectError(error.FileNotFound, readFile(gpa, io, missing_path, 1024));
+}
+
+test "readFile reads empty file successfully" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "empty.txt" });
+    defer gpa.free(path);
+
+    try atomicWrite(io, path, "");
+
+    const content = try readFile(gpa, io, path, 1024);
+    defer gpa.free(content);
+
+    try std.testing.expectEqualStrings("", content);
+}
+
+test "safeDirectoryName validates directory names correctly" {
+    try std.testing.expect(safeDirectoryName("valid-name"));
+    try std.testing.expect(safeDirectoryName("valid_name_123"));
+    try std.testing.expect(safeDirectoryName("a"));
+    try std.testing.expect(!safeDirectoryName(""));
+    try std.testing.expect(!safeDirectoryName("invalid/path"));
+    try std.testing.expect(!safeDirectoryName("invalid..name"));
+    try std.testing.expect(!safeDirectoryName("invalid space"));
+    try std.testing.expect(!safeDirectoryName("a" ** 65));
+}
