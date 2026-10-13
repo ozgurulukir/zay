@@ -254,3 +254,145 @@ test "returnsInvalidEndpoint_whenUrlIsInvalid" {
     const res = fetchUnbounded(gpa, std.testing.io, &opts);
     try std.testing.expectError(error.InvalidEndpoint, res);
 }
+
+const mock_http_server = @import("../ai/mock_http_server.zig");
+
+test "returnsResponse_whenGetRequestSucceeds" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "hello http transport" },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/test", .{server.port()});
+    defer gpa.free(endpoint);
+
+    const options = Options{
+        .method = .GET,
+        .url = endpoint,
+    };
+
+    const response = try fetch(gpa, io, &options);
+    defer gpa.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("hello http transport", response.body);
+}
+
+test "sendsAuthorizationHeaderAndPayload_whenPostRequestWithAuth" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "{\"success\":true}" },
+    };
+    var server = try mock_http_server.MockHttpServer.initCapturing(gpa, io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1/query", .{server.port()});
+    defer gpa.free(endpoint);
+
+    const payload = "{\"sql\":\"SELECT 1\"}";
+    const options = Options{
+        .method = .POST,
+        .url = endpoint,
+        .payload = payload,
+        .auth_token = "bearer-secret-token",
+    };
+
+    const response = try fetch(gpa, io, &options);
+    defer gpa.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("{\"success\":true}", response.body);
+
+    const captured_body = server.captured[0] orelse return error.TestFailed;
+    try std.testing.expectEqualStrings(payload, captured_body);
+}
+
+test "returnsResponseTooLarge_whenResponseBodyExceedsMaxBytes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "0123456789abcdefghij" },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/large", .{server.port()});
+    defer gpa.free(endpoint);
+
+    const options = Options{
+        .method = .GET,
+        .url = endpoint,
+        .response_max_bytes = 10,
+    };
+
+    try std.testing.expectError(error.ResponseTooLarge, fetch(gpa, io, &options));
+}
+
+test "returnsServerTimeout_whenServerExceedsTimeout" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .ok, .body = "delayed body", .body_delay_ms = 3000 },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/slow", .{server.port()});
+    defer gpa.free(endpoint);
+
+    const options = Options{
+        .method = .GET,
+        .url = endpoint,
+        .timeout_seconds = 1,
+    };
+
+    try std.testing.expectError(error.ServerTimeout, fetch(gpa, io, &options));
+}
+
+test "returnsInvalidEndpoint_whenUrlIsInvalid" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const options = Options{
+        .method = .GET,
+        .url = "http://[invalid-ipv6-host",
+    };
+
+    try std.testing.expectError(error.InvalidEndpoint, fetch(gpa, io, &options));
+}
+
+test "returnsConnectionRefused_whenServerNotListening" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const dummy_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var dummy_server = try dummy_addr.listen(io, .{ .reuse_address = true });
+    const unused_port = dummy_server.socket.address.ip4.port;
+    dummy_server.deinit(io);
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/closed", .{unused_port});
+    defer gpa.free(endpoint);
+
+    const options = Options{
+        .method = .GET,
+        .url = endpoint,
+    };
+
+    try std.testing.expectError(error.ConnectionRefused, fetch(gpa, io, &options));
+}
