@@ -14,6 +14,7 @@ pub const PluginInstance = @import("manager.zig").PluginInstance;
 pub const Event = @import("events.zig").Event;
 pub const plugin_api = @import("plugin_api.zig");
 pub const registry_bridge = @import("registry_bridge.zig");
+pub const execution = @import("execution.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -29,4 +30,5 @@ test {
     std.testing.refAllDecls(plugin_api.search_bridge);
     std.testing.refAllDecls(@import("bridges/git.zig"));
     std.testing.refAllDecls(@import("bridges/fs_ops.zig"));
+    std.testing.refAllDecls(execution);
 }
