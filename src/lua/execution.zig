@@ -570,3 +570,202 @@ test "returnsZeroTimeout_whenDeadlineIsExpired" {
     // Assert
     try testing.expectEqual(@as(i128, 0), timeout.duration.raw.nanoseconds);
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const State = @import("state.zig").State;
+
+test "returnsSafely_whenBudgetIsNull" {
+    var L = try State.init();
+    defer L.deinit();
+
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = null;
+
+    check(L.handle);
+    try std.testing.expectEqual(@as(?*Budget, null), budget(L.handle));
+}
+
+test "preservesStopReason_whenAlreadyStopped" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+        .stop_reason = .memory_limit,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    check(L.handle);
+    try std.testing.expectEqual(StopReason.memory_limit, b.stop_reason);
+}
+
+test "setsCanceled_whenCancelRequestedSlotIsTrue" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    bridge.cancel_requested_slot = &cancel_flag;
+    defer bridge.cancel_requested_slot = null;
+
+    check(L.handle);
+    try std.testing.expectEqual(StopReason.canceled, b.stop_reason);
+}
+
+test "preservesNone_whenCancelRequestedSlotIsFalse" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    bridge.cancel_requested_slot = &cancel_flag;
+    defer bridge.cancel_requested_slot = null;
+
+    check(L.handle);
+    try std.testing.expectEqual(StopReason.none, b.stop_reason);
+}
+
+test "setsCanceled_whenIoCheckCancelFails" {
+    var L = try State.init();
+    defer L.deinit();
+
+    const mockIo = struct {
+        fn checkCancel(_: ?*anyopaque) error{Canceled}!void {
+            return error.Canceled;
+        }
+        fn recancel(_: ?*anyopaque) void {}
+    };
+
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.checkCancel = mockIo.checkCancel;
+    mock_vtable.recancel = mockIo.recancel;
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vtable };
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+        .io = mock_io,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    check(L.handle);
+    try std.testing.expectEqual(StopReason.canceled, b.stop_reason);
+}
+
+test "setsTimeout_whenMonotonicDeadlineHasPassed" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+        .deadline_ns = @intCast(platform.monotonicNowNs() - 1),
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    check(L.handle);
+    try std.testing.expectEqual(StopReason.timeout, b.stop_reason);
+}
+
+test "preservesNone_whenMonotonicDeadlineIsInFuture" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+        .deadline_ns = @intCast(platform.monotonicNowNs() + std.time.ns_per_s * 10),
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    check(L.handle);
+    try std.testing.expectEqual(StopReason.none, b.stop_reason);
+}
+
+test "noteError_setsCanceled_onlyForCanceledError" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    // Arrange & Act: non-canceled error
+    noteError(L.handle, error.OutOfMemory);
+    // Assert
+    try std.testing.expectEqual(StopReason.none, b.stop_reason);
+
+    // Arrange & Act: canceled error
+    noteError(L.handle, error.Canceled);
+    // Assert
+    try std.testing.expectEqual(StopReason.canceled, b.stop_reason);
+}
+
+test "stopped_returnsTrue_whenStopReasonIsNotNone" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    try std.testing.expect(!stopped(L.handle));
+
+    b.stop_reason = .canceled;
+    try std.testing.expect(stopped(L.handle));
+}
+
+test "capDeadline_restrictsDeadline_withoutExtendingIt" {
+    var L = try State.init();
+    defer L.deinit();
+
+    var b = Budget{
+        .instruction_limit = 100,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+        .deadline_ns = 0,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    // Arrange & Act: initial cap
+    capDeadline(L.handle, 5000);
+    try std.testing.expect(b.deadline_ns > 0);
+
+    const old_deadline = b.deadline_ns;
+    // Act: cap with larger duration should not extend existing deadline
+    capDeadline(L.handle, 10000);
+    // Assert
+    try std.testing.expectEqual(old_deadline, b.deadline_ns);
+}
