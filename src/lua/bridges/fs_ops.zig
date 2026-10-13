@@ -225,3 +225,122 @@ pub fn getExtension(path: []const u8) []const u8 {
 fn preserveCancellation(io: std.Io, err: anyerror) void {
     if (err == error.Canceled) io.recancel();
 }
+
+test "getExtension_returnsExtension_whenDotIsPresent" {
+    try std.testing.expectEqualStrings("zig", getExtension("src/main.zig"));
+    try std.testing.expectEqualStrings("lua", getExtension("plugin.lua"));
+    try std.testing.expectEqualStrings("gz", getExtension("archive.tar.gz"));
+}
+
+test "getExtension_returnsEmpty_whenNoDotIsPresent" {
+    try std.testing.expectEqualStrings("", getExtension("Makefile"));
+    try std.testing.expectEqualStrings("", getExtension("README"));
+    try std.testing.expectEqualStrings("", getExtension(""));
+}
+
+test "getMimeType_returnsMappedType_whenExtensionIsKnown" {
+    try std.testing.expectEqualStrings("text/x-lua", getMimeType("script.lua"));
+    try std.testing.expectEqualStrings("application/json", getMimeType("config.json"));
+    try std.testing.expectEqualStrings("image/png", getMimeType("logo.png"));
+}
+
+test "getMimeType_returnsDefault_whenExtensionIsUnknown" {
+    try std.testing.expectEqualStrings("application/octet-stream", getMimeType("file.unknown"));
+    try std.testing.expectEqualStrings("application/octet-stream", getMimeType("binary"));
+}
+
+test "detectLanguage_returnsLanguage_whenExtensionIsKnown" {
+    try std.testing.expectEqualStrings("zig", detectLanguage("main.zig", ""));
+    try std.testing.expectEqualStrings("python", detectLanguage("script.py", ""));
+    try std.testing.expectEqualStrings("lua", detectLanguage("init.lua", ""));
+}
+
+test "detectLanguage_returnsScript_whenShebangIsPresent" {
+    try std.testing.expectEqualStrings("script", detectLanguage("cli_tool", "#!/usr/bin/env bash"));
+}
+
+test "detectLanguage_returnsText_whenExtensionAndShebangAreMissing" {
+    try std.testing.expectEqualStrings("text", detectLanguage("notes", "Just some plain text content"));
+}
+
+test "countLines_returnsLineCount_forVariousTextFormats" {
+    try std.testing.expectEqual(1, countLines("single line"));
+    try std.testing.expectEqual(3, countLines("line 1\nline 2\nline 3"));
+    try std.testing.expectEqual(2, countLines("line 1\n"));
+}
+
+test "applyLineRange_slicesContentCorrectly_forLineRanges" {
+    const text = "line 1\nline 2\nline 3\nline 4\nline 5";
+
+    // Full range (default)
+    try std.testing.expectEqualStrings(text, applyLineRange(text, null, null));
+    try std.testing.expectEqualStrings(text, applyLineRange(text, 1, null));
+
+    // Start line specified
+    try std.testing.expectEqualStrings("line 3\nline 4\nline 5", applyLineRange(text, 3, null));
+
+    // Range specified
+    try std.testing.expectEqualStrings("line 2\nline 3", applyLineRange(text, 2, 3));
+
+    // Start out of bounds
+    try std.testing.expectEqualStrings("", applyLineRange(text, 10, null));
+}
+
+test "writeFileAtomic_and_readFileBytes_and_statFileSize_and_deleteFileBestEffort" {
+    // We test filesystem operations usingstd.testing.io if available or standard temp pathing
+    const io = std.testing.io;
+    const test_dir = "zay-fs-ops-test-dir";
+    std.Io.Dir.cwd().makeDir(io, test_dir) catch {};
+    defer std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
+
+    const test_file = "zay-fs-ops-test-dir/test_file.txt";
+    defer deleteFileBestEffort(io, test_file);
+
+    const content = "Hello, atomic filesystem operations!";
+
+    // Write file atomically
+    try writeFileAtomic(io, test_file, content);
+
+    // Stat file size
+    const size = try statFileSize(io, test_file);
+    try std.testing.expectEqual(@as(u64, content.len), size);
+
+    // Read file bytes
+    const read_bytes = try readFileBytes(io, test_file, 1024);
+    defer std.heap.page_allocator.free(read_bytes);
+    try std.testing.expectEqualStrings(content, read_bytes);
+}
+
+test "editFileSplice_replacesSubstringSuccessfully" {
+    const io = std.testing.io;
+    const test_dir = "zay-fs-splice-test-dir";
+    std.Io.Dir.cwd().makeDir(io, test_dir) catch {};
+    defer std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
+
+    const test_file = "zay-fs-splice-test-dir/splice.txt";
+    defer deleteFileBestEffort(io, test_file);
+
+    const initial = "foo bar baz";
+    try writeFileAtomic(io, test_file, initial);
+
+    // Replace "bar" with "qux"
+    try editFileSplice(io, test_file, "bar", "qux");
+
+    const modified = try readFileBytes(io, test_file, 1024);
+    defer std.heap.page_allocator.free(modified);
+    try std.testing.expectEqualStrings("foo qux baz", modified);
+}
+
+test "editFileSplice_returnsError_whenOldStringNotFound" {
+    const io = std.testing.io;
+    const test_dir = "zay-fs-splice-err-dir";
+    std.Io.Dir.cwd().makeDir(io, test_dir) catch {};
+    defer std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
+
+    const test_file = "zay-fs-splice-err-dir/splice_err.txt";
+    defer deleteFileBestEffort(io, test_file);
+
+    try writeFileAtomic(io, test_file, "hello world");
+
+    try std.testing.expectError(error.OldStringNotFound, editFileSplice(io, test_file, "nonexistent", "replacement"));
+}
