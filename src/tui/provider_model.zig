@@ -489,6 +489,7 @@ pub fn mergeRegistryModels(
     // models already present are not duplicated.
     var seen = std.StringHashMap(void).init(gpa);
     defer seen.deinit();
+    try seen.ensureTotalCapacity(@intCast(catalogue.entries.items.len));
     for (catalogue.entries.items) |entry| {
         try seen.put(entry.model.id, {});
     }
@@ -497,6 +498,7 @@ pub fn mergeRegistryModels(
     // twice (e.g. the same dynamic provider appearing in multiple sources).
     var seen_conns = std.StringHashMap(void).init(gpa);
     defer seen_conns.deinit();
+    try seen_conns.ensureTotalCapacity(@intCast(sources.len));
 
     for (sources) |source| switch (source) {
         .openai_codex => {},
