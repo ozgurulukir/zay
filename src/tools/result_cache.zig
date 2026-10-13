@@ -399,7 +399,7 @@ test "isReadOnlyShellCommand accepts single read-only verbs" {
     try std.testing.expect(isReadOnlyShellCommand("cat package.json"));
     try std.testing.expect(isReadOnlyShellCommand("/usr/bin/git diff"));
     try std.testing.expect(isReadOnlyShellCommand("Get-ChildItem -Force"));
-    try std.testing.expect(isReadOnlyShellCommand("rg TODO src/"));
+    try std.testing.expect(isReadOnlyShellCommand("rg -i --hidden TODO src/"));
 
     try std.testing.expect(!isReadOnlyShellCommand("git commit -m x"));
     try std.testing.expect(!isReadOnlyShellCommand("git branch feature"));
