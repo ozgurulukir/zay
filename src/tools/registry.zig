@@ -127,6 +127,9 @@ pub const ToolRegistry = struct {
         }
         if (removed) {
             self.lookup_index.clearRetainingCapacity();
+            self.lookup_index.ensureTotalCapacity(gpa, @intCast(self.builtin.len + self.plugin.items.len)) catch |err| {
+                log.warn("failed to ensure capacity for lookup index rebuild: {s}", .{@errorName(err)});
+            };
             for (self.builtin) |tool| {
                 self.lookup_index.put(gpa, tool.name, tool) catch |err| {
                     log.warn("failed to index builtin tool '{s}': {s}", .{ tool.name, @errorName(err) });
