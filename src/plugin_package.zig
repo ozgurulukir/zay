@@ -190,7 +190,6 @@ pub fn remove(gpa: std.mem.Allocator, io: std.Io, root: []const u8, directory: [
     try parent.deleteTree(io, directory);
 }
 
-
 test "returnsParsedManifest_whenPluginLuaIsValid" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -305,7 +304,6 @@ test "returnsManifestTooLarge_whenPluginLuaExceedsSizeLimit" {
 
     try std.testing.expectError(error.ManifestTooLarge, readManifest(gpa, io, root));
 }
-
 
 test "readReceipt_returnsParsedReceipt_whenValidJson" {
     const gpa = std.testing.allocator;
@@ -483,7 +481,6 @@ test "safeDirectoryName validates directory names correctly" {
     try std.testing.expect(!safeDirectoryName("a" ** 65));
 }
 
-
 test "atomicWrite creates new file, overwrites existing file, and creates parent directories" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -523,4 +520,274 @@ test "atomicWrite creates new file, overwrites existing file, and creates parent
     const read_content3 = try readFile(gpa, io, nested_file_path, 1024);
     defer gpa.free(read_content3);
     try std.testing.expectEqualStrings(content3, read_content3);
+}
+
+test "safeDirectoryName validates allowed characters and length bounds" {
+    try std.testing.expect(safeDirectoryName("my-plugin_1"));
+    try std.testing.expect(!safeDirectoryName(""));
+    try std.testing.expect(!safeDirectoryName("plugin/sub"));
+    try std.testing.expect(!safeDirectoryName("plugin.."));
+    try std.testing.expect(!safeDirectoryName("plugin@1"));
+
+    const max_valid = "a" ** 64;
+    const too_long = "a" ** 65;
+    try std.testing.expect(safeDirectoryName(max_valid));
+    try std.testing.expect(!safeDirectoryName(too_long));
+}
+
+test "Package and Inventory methods work as expected" {
+    const gpa = std.testing.allocator;
+
+    var pkg: Package = .{
+        .directory = try gpa.dupe(u8, "dir_name"),
+        .path = try gpa.dupe(u8, "/path/to/dir_name"),
+        .origin = .global,
+        .diagnostic = try gpa.dupe(u8, "err_diag"),
+    };
+
+    try std.testing.expectEqualStrings("dir_name", pkg.name());
+    try std.testing.expectEqualStrings("unknown", pkg.version());
+
+    pkg.manifest = .{
+        .name = "manifest_name",
+        .version = "2.0.0",
+    };
+
+    try std.testing.expectEqualStrings("manifest_name", pkg.name());
+    try std.testing.expectEqualStrings("2.0.0", pkg.version());
+
+    var inventory: Inventory = .{
+        .packages = try gpa.alloc(Package, 1),
+    };
+    inventory.packages[0] = pkg;
+
+    inventory.deinit(gpa);
+    try std.testing.expectEqual(0, inventory.packages.len);
+}
+
+test "readFile reads content or fails on non-file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "readfile-test" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const file_path = try std.fs.path.join(gpa, &.{ root, "sample.txt" });
+    defer gpa.free(file_path);
+    try atomicWrite(io, file_path, "hello world");
+
+    const content = try readFile(gpa, io, file_path, 1024);
+    defer gpa.free(content);
+    try std.testing.expectEqualStrings("hello world", content);
+
+    try std.testing.expectError(error.InvalidPluginPackage, readFile(gpa, io, root, 1024));
+}
+
+test "readManifest parses valid lua manifest" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "manifest-test" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const manifest_path = try std.fs.path.join(gpa, &.{ root, "plugin.lua" });
+    defer gpa.free(manifest_path);
+    try atomicWrite(io, manifest_path, "return { name = \"my-plugin\", version = \"1.2.3\" }");
+
+    var manifest = try readManifest(gpa, io, root);
+    defer manifest.deinit(gpa);
+
+    try std.testing.expectEqualStrings("my-plugin", manifest.name);
+    try std.testing.expectEqualStrings("1.2.3", manifest.version);
+}
+
+test "readReceipt validates schema, fingerprint, and fields" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "receipt-test" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const receipt_path = try std.fs.path.join(gpa, &.{ root, receipt_name });
+    defer gpa.free(receipt_path);
+
+    const valid_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const valid_json = try std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "schema": 1,
+        \\  "id": "valid-id",
+        \\  "name": "Valid Name",
+        \\  "version": "1.0.0",
+        \\  "catalog": "official",
+        \\  "fingerprint": "{s}"
+        \\}}
+    , .{valid_fingerprint});
+    defer gpa.free(valid_json);
+
+    try atomicWrite(io, receipt_path, valid_json);
+
+    var parsed = try readReceipt(gpa, io, root);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.schema);
+    try std.testing.expectEqualStrings("valid-id", parsed.value.id);
+    try std.testing.expectEqualStrings("Valid Name", parsed.value.name);
+    try std.testing.expectEqualStrings("1.0.0", parsed.value.version);
+    try std.testing.expectEqualStrings("official", parsed.value.catalog);
+    try std.testing.expectEqualStrings(valid_fingerprint, parsed.value.fingerprint);
+
+    try atomicWrite(io, receipt_path,
+        \\{
+        \\  "schema": 2,
+        \\  "id": "valid-id",
+        \\  "name": "Valid Name",
+        \\  "version": "1.0.0",
+        \\  "catalog": "official",
+        \\  "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\}
+    );
+    try std.testing.expectError(error.InvalidInstallReceipt, readReceipt(gpa, io, root));
+
+    try atomicWrite(io, receipt_path,
+        \\{
+        \\  "schema": 1,
+        \\  "id": "valid-id",
+        \\  "name": "Valid Name",
+        \\  "version": "1.0.0",
+        \\  "catalog": "official",
+        \\  "fingerprint": "ZZZZ456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\}
+    );
+    try std.testing.expectError(error.InvalidInstallReceipt, readReceipt(gpa, io, root));
+
+    try atomicWrite(io, receipt_path,
+        \\{
+        \\  "schema": 1,
+        \\  "id": "../unsafe",
+        \\  "name": "Valid Name",
+        \\  "version": "1.0.0",
+        \\  "catalog": "official",
+        \\  "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\}
+    );
+    try std.testing.expectError(error.InvalidInstallReceipt, readReceipt(gpa, io, root));
+}
+
+test "atomicWrite and lock operate on disk" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "lock-test" });
+    defer gpa.free(root);
+
+    const test_file = try std.fs.path.join(gpa, &.{ root, "data.txt" });
+    defer gpa.free(test_file);
+
+    try atomicWrite(io, test_file, "initial data");
+    const content = try readFile(gpa, io, test_file, 1024);
+    defer gpa.free(content);
+    try std.testing.expectEqualStrings("initial data", content);
+
+    try atomicWrite(io, test_file, "updated data");
+    const updated = try readFile(gpa, io, test_file, 1024);
+    defer gpa.free(updated);
+    try std.testing.expectEqualStrings("updated data", updated);
+
+    var lock_file = try lock(gpa, io, root, "plugin-key");
+    defer lock_file.close(io);
+
+    try std.testing.expectError(error.InvalidPluginName, lock(gpa, io, root, "../invalid"));
+}
+
+test "loadInventory scans origins and sorts by path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "inv-test" });
+    defer gpa.free(base);
+
+    const home = try std.fs.path.join(gpa, &.{ base, "home" });
+    defer gpa.free(home);
+    const project = try std.fs.path.join(gpa, &.{ base, "project" });
+    defer gpa.free(project);
+
+    const global_dir = try paths.globalPluginsDir(gpa, io, home);
+    defer gpa.free(global_dir);
+    const p_global = try std.fs.path.join(gpa, &.{ global_dir, "plugin-a" });
+    defer gpa.free(p_global);
+    try std.Io.Dir.createDirPath(.cwd(), io, p_global);
+    const m_global = try std.fs.path.join(gpa, &.{ p_global, "plugin.lua" });
+    defer gpa.free(m_global);
+    try atomicWrite(io, m_global, "return { name = \"Plugin A\", version = \"1.0.0\" }");
+
+    const legacy_p = try std.fs.path.join(gpa, &.{ project, ".zay", "plugins", "plugin-b" });
+    defer gpa.free(legacy_p);
+    try std.Io.Dir.createDirPath(.cwd(), io, legacy_p);
+    const m_legacy = try std.fs.path.join(gpa, &.{ legacy_p, "plugin.lua" });
+    defer gpa.free(m_legacy);
+    try atomicWrite(io, m_legacy, "return { name = \"Plugin B\", version = \"2.0.0\" }");
+
+    const project_p = try std.fs.path.join(gpa, &.{ project, "plugins", "plugin-c" });
+    defer gpa.free(project_p);
+    try std.Io.Dir.createDirPath(.cwd(), io, project_p);
+    const m_project = try std.fs.path.join(gpa, &.{ project_p, "plugin.lua" });
+    defer gpa.free(m_project);
+    try atomicWrite(io, m_project, "return { name = \"Plugin C\", version = \"3.0.0\" }");
+
+    var inventory = try loadInventory(gpa, io, home, project);
+    defer inventory.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), inventory.packages.len);
+}
+
+test "remove deletes plugin when fingerprint matches" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "remove-test" });
+    defer gpa.free(root);
+    const plugin_dir = try std.fs.path.join(gpa, &.{ root, "my-plugin" });
+    defer gpa.free(plugin_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, plugin_dir);
+
+    const fp = "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff";
+    const receipt_content = try std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "schema": 1,
+        \\  "id": "my-plugin",
+        \\  "name": "My Plugin",
+        \\  "version": "1.0.0",
+        \\  "catalog": "official",
+        \\  "fingerprint": "{s}"
+        \\}}
+    , .{fp});
+    defer gpa.free(receipt_content);
+
+    const receipt_file = try std.fs.path.join(gpa, &.{ plugin_dir, receipt_name });
+    defer gpa.free(receipt_file);
+    try atomicWrite(io, receipt_file, receipt_content);
+
+    const wrong_fp = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.InstallationChanged, remove(gpa, io, root, "my-plugin", wrong_fp));
+
+    try remove(gpa, io, root, "my-plugin", fp);
+
+    std.Io.Dir.access(.cwd(), io, plugin_dir, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+    };
 }
