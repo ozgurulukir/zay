@@ -381,6 +381,7 @@ pub const Agent = struct {
 
         var resolved = std.StringHashMap(void).init(self.gpa);
         defer resolved.deinit();
+        try resolved.ensureTotalCapacity(@intCast(history.len));
         for (history) |message| {
             switch (message) {
                 .tool => |t| try resolved.put(t.call_id.slice(), {}),
