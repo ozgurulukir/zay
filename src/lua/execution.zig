@@ -769,3 +769,74 @@ test "capDeadline_restrictsDeadline_withoutExtendingIt" {
     // Assert
     try std.testing.expectEqual(old_deadline, b.deadline_ns);
 }
+const State = @import("state.zig").State;
+const sandbox = @import("sandbox.zig");
+
+test "execution: stopped returns false when no budget attached" {
+    var state = try State.init();
+    defer state.deinit();
+
+    // Raw lua state has no budget pointer in extraspace
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(state.handle)))).* = null;
+    try std.testing.expect(!stopped(state.handle));
+}
+
+test "execution: stopped returns false when stop_reason is none" {
+    var state = try sandbox.createSandboxedState(.{});
+    defer {
+        sandbox.freeHookData(state.handle);
+        state.deinit();
+    }
+
+    try std.testing.expect(!stopped(state.handle));
+}
+
+test "execution: stopped returns true for non-none stop reasons" {
+    var state = try sandbox.createSandboxedState(.{});
+    defer {
+        sandbox.freeHookData(state.handle);
+        state.deinit();
+    }
+
+    const data = budget(state.handle).?;
+
+    data.stop_reason = .canceled;
+    try std.testing.expect(stopped(state.handle));
+
+    data.stop_reason = .instruction_limit;
+    try std.testing.expect(stopped(state.handle));
+
+    data.stop_reason = .timeout;
+    try std.testing.expect(stopped(state.handle));
+
+    data.stop_reason = .memory_limit;
+    try std.testing.expect(stopped(state.handle));
+}
+
+test "execution: noteError sets stop_reason to canceled when error is Canceled" {
+    var state = try sandbox.createSandboxedState(.{});
+    defer {
+        sandbox.freeHookData(state.handle);
+        state.deinit();
+    }
+
+    const data = budget(state.handle).?;
+    try std.testing.expect(!stopped(state.handle));
+
+    // Non-canceled error should not change stop_reason
+    noteError(state.handle, error.OutOfMemory);
+    try std.testing.expectEqual(StopReason.none, data.stop_reason);
+    try std.testing.expect(!stopped(state.handle));
+
+    // error.Canceled sets stop_reason to .canceled
+    noteError(state.handle, error.Canceled);
+    try std.testing.expectEqual(StopReason.canceled, data.stop_reason);
+    try std.testing.expect(stopped(state.handle));
+}
+
+test "execution: stopReason message returns expected strings" {
+    try std.testing.expectEqualStrings("plugin execution canceled", StopReason.canceled.message());
+    try std.testing.expectEqualStrings("instruction limit exceeded", StopReason.instruction_limit.message());
+    try std.testing.expectEqualStrings("timeout exceeded", StopReason.timeout.message());
+    try std.testing.expectEqualStrings("memory limit exceeded", StopReason.memory_limit.message());
+}
