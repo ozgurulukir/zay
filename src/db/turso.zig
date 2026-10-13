@@ -638,11 +638,9 @@ pub fn serializeHranaValue(writer: anytype, allocator: std.mem.Allocator, val: d
     switch (val) {
         .null => try writer.writeAll("{\"type\":\"null\"}"),
         .int => |v| {
-            try writer.writeAll("{\"type\":\"integer\",\"value\":");
-            var num_buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "\"{d}\"", .{v}) catch unreachable;
-            try writer.writeAll(s);
-            try writer.writeAll("}");
+            try writer.writeAll("{\"type\":\"integer\",\"value\":\"");
+            try writer.print("{d}", .{v});
+            try writer.writeAll("\"}");
         },
         .float => |v| {
             // NaN/Infinity are not representable in JSON — reject them before
@@ -859,6 +857,29 @@ test "serializeHranaValue rejects non-finite floats" {
     // A finite float still serializes.
     try serializeHranaValue(&out.writer, gpa, .{ .float = 1.5 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"type\":\"float\"") != null);
+}
+
+test "serializeHranaValue_formatsIntegerAsString_whenValueProvided" {
+    const gpa = std.testing.allocator;
+
+    const test_cases = [_]struct {
+        val: i64,
+        expected: []const u8,
+    }{
+        .{ .val = 0, .expected = "{\"type\":\"integer\",\"value\":\"0\"}" },
+        .{ .val = 42, .expected = "{\"type\":\"integer\",\"value\":\"42\"}" },
+        .{ .val = -100, .expected = "{\"type\":\"integer\",\"value\":\"-100\"}" },
+        .{ .val = std.math.maxInt(i64), .expected = "{\"type\":\"integer\",\"value\":\"9223372036854775807\"}" },
+        .{ .val = std.math.minInt(i64), .expected = "{\"type\":\"integer\",\"value\":\"-9223372036854775808\"}" },
+    };
+
+    for (test_cases) |tc| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+
+        try serializeHranaValue(&out.writer, gpa, .{ .int = tc.val });
+        try std.testing.expectEqualStrings(tc.expected, out.written());
+    }
 }
 
 // #162: a close-response failure is observed (code+message logged) but must
