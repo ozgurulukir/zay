@@ -858,3 +858,39 @@ test "lock acquires nonblocking lock and rejects invalid key or concurrent acqui
     var guard2 = try lock(gpa, io, root, "test-plugin");
     defer guard2.close(io);
 }
+
+test "safeDirectoryName_returnsTrue_whenNameIsValidAlphanumericHyphenOrUnderscore" {
+    // Arrange
+    const valid_simple = "my-plugin_1";
+    const valid_single = "a";
+    const valid_mixed_case = "MyPlugin123";
+
+    // Act & Assert
+    try std.testing.expect(safeDirectoryName(valid_simple));
+    try std.testing.expect(safeDirectoryName(valid_single));
+    try std.testing.expect(safeDirectoryName(valid_mixed_case));
+}
+
+test "safeDirectoryName_handlesLengthBoundaries_correctly" {
+    // Arrange
+    const empty = "";
+    const exactly_64 = "a" ** 64;
+    const oversized_65 = "a" ** 65;
+
+    // Act & Assert
+    try std.testing.expect(!safeDirectoryName(empty));
+    try std.testing.expect(safeDirectoryName(exactly_64));
+    try std.testing.expect(!safeDirectoryName(oversized_65));
+}
+
+test "safeDirectoryName_returnsFalse_whenNameContainsInvalidCharactersOrPathTraversal" {
+    // Arrange & Act & Assert
+    try std.testing.expect(!safeDirectoryName("plugin name"));
+    try std.testing.expect(!safeDirectoryName("plugin.name"));
+    try std.testing.expect(!safeDirectoryName("../plugin"));
+    try std.testing.expect(!safeDirectoryName("plugin/name"));
+    try std.testing.expect(!safeDirectoryName("plugin\\name"));
+    try std.testing.expect(!safeDirectoryName("plugin@name"));
+    try std.testing.expect(!safeDirectoryName("plugin!name"));
+    try std.testing.expect(!safeDirectoryName("plugin#name"));
+}
