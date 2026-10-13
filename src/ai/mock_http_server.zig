@@ -91,6 +91,7 @@ pub const MockHttpServer = struct {
     }
 
     fn captureRequestBody(self: *MockHttpServer, connection_index: u32, request: *std.http.Server.Request) void {
+        if (!request.head.method.requestHasBody()) return;
         var body_buf: [16384]u8 = undefined;
         var body_reader = request.readerExpectNone(&body_buf);
         if (self.gpa) |gpa| {
