@@ -359,3 +359,71 @@ test "execution: installProtectedCallGuards makes cancellation sticky across pca
     try testing.expect(std.mem.indexOf(u8, co_err.?, "timeout exceeded") != null);
     L.pop(1);
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const sandbox = @import("sandbox.zig");
+
+test "noteError_ignoresNonCanceledErrors_whenErrorIsNotCanceled" {
+    var L = try sandbox.createSandboxedState(.{});
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    const data = budget(L.handle).?;
+    try std.testing.expectEqual(StopReason.none, data.stop_reason);
+
+    noteError(L.handle, error.OutOfMemory);
+
+    try std.testing.expectEqual(StopReason.none, data.stop_reason);
+    try std.testing.expect(!stopped(L.handle));
+}
+
+test "noteError_handlesNullBudget_whenExtraspaceIsNull" {
+    const L = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(L);
+
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = null;
+
+    try std.testing.expect(budget(L) == null);
+
+    noteError(L, error.Canceled);
+
+    try std.testing.expect(!stopped(L));
+}
+
+test "noteError_setsStopReasonToCanceled_whenErrorIsCanceled" {
+    var L = try sandbox.createSandboxedState(.{});
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    const data = budget(L.handle).?;
+    try std.testing.expectEqual(StopReason.none, data.stop_reason);
+    try std.testing.expect(!stopped(L.handle));
+
+    noteError(L.handle, error.Canceled);
+
+    try std.testing.expectEqual(StopReason.canceled, data.stop_reason);
+    try std.testing.expect(stopped(L.handle));
+}
+
+test "noteError_recancelsIo_whenIoIsPresentAndErrorIsCanceled" {
+    const io = std.testing.io;
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    const data = budget(L.handle).?;
+    try std.testing.expect(data.io != null);
+    try std.testing.expectEqual(StopReason.none, data.stop_reason);
+
+    noteError(L.handle, error.Canceled);
+
+    try std.testing.expectEqual(StopReason.canceled, data.stop_reason);
+    try std.testing.expect(stopped(L.handle));
+}
