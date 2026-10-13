@@ -482,3 +482,45 @@ test "safeDirectoryName validates directory names correctly" {
     try std.testing.expect(!safeDirectoryName("invalid space"));
     try std.testing.expect(!safeDirectoryName("a" ** 65));
 }
+
+
+test "atomicWrite creates new file, overwrites existing file, and creates parent directories" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &tmp_path_buf);
+
+    // 1. Writes a new file with text content
+    const file_path = try std.fs.path.join(gpa, &.{ tmp_path, "test_file.txt" });
+    defer gpa.free(file_path);
+
+    const content1 = "hello atomic write";
+    try atomicWrite(io, file_path, content1);
+
+    const read_content1 = try readFile(gpa, io, file_path, 1024);
+    defer gpa.free(read_content1);
+    try std.testing.expectEqualStrings(content1, read_content1);
+
+    // 2. Overwrites an existing file with new content
+    const content2 = "overwritten content";
+    try atomicWrite(io, file_path, content2);
+
+    const read_content2 = try readFile(gpa, io, file_path, 1024);
+    defer gpa.free(read_content2);
+    try std.testing.expectEqualStrings(content2, read_content2);
+
+    // 3. Automatically creates parent directories when writing a file in a nested non-existent directory path
+    const nested_file_path = try std.fs.path.join(gpa, &.{ tmp_path, "nested", "sub_dir", "nested_file.txt" });
+    defer gpa.free(nested_file_path);
+
+    const content3 = "nested atomic write";
+    try atomicWrite(io, nested_file_path, content3);
+
+    const read_content3 = try readFile(gpa, io, nested_file_path, 1024);
+    defer gpa.free(read_content3);
+    try std.testing.expectEqualStrings(content3, read_content3);
+}
