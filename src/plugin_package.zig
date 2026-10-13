@@ -305,3 +305,94 @@ test "returnsManifestTooLarge_whenPluginLuaExceedsSizeLimit" {
 
     try std.testing.expectError(error.ManifestTooLarge, readManifest(gpa, io, root));
 }
+
+
+test "readReceipt_returnsParsedReceipt_whenValidJson" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root);
+    const receipt_path = try std.fs.path.join(gpa, &.{ root, receipt_name });
+    defer gpa.free(receipt_path);
+
+    const valid_receipt = Receipt{
+        .schema = 1,
+        .id = "my-plugin",
+        .name = "My Plugin",
+        .version = "1.0.0",
+        .catalog = "official",
+        .fingerprint = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    };
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try std.json.Stringify.value(valid_receipt, .{}, &payload.writer);
+    try atomicWrite(io, receipt_path, payload.written());
+
+    var parsed = try readReceipt(gpa, io, root);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.schema);
+    try std.testing.expectEqualStrings("my-plugin", parsed.value.id);
+    try std.testing.expectEqualStrings("My Plugin", parsed.value.name);
+    try std.testing.expectEqualStrings("1.0.0", parsed.value.version);
+    try std.testing.expectEqualStrings("official", parsed.value.catalog);
+    try std.testing.expectEqualStrings("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", parsed.value.fingerprint);
+}
+
+test "readReceipt_returnsInvalidInstallReceipt_whenReceiptIsInvalid" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root);
+    const receipt_path = try std.fs.path.join(gpa, &.{ root, receipt_name });
+    defer gpa.free(receipt_path);
+
+    const valid_fingerprint = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    const invalid_cases = [_]Receipt{
+        // Invalid schema
+        .{ .schema = 2, .id = "plugin-a", .name = "Plugin A", .version = "1.0.0", .catalog = "official", .fingerprint = valid_fingerprint },
+        // Short fingerprint
+        .{ .schema = 1, .id = "plugin-a", .name = "Plugin A", .version = "1.0.0", .catalog = "official", .fingerprint = "0011223344" },
+        // Non-hex fingerprint of length 64
+        .{ .schema = 1, .id = "plugin-a", .name = "Plugin A", .version = "1.0.0", .catalog = "official", .fingerprint = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" },
+        // Unsafe id (path traversal / special characters)
+        .{ .schema = 1, .id = "../escape", .name = "Plugin A", .version = "1.0.0", .catalog = "official", .fingerprint = valid_fingerprint },
+        // Empty id
+        .{ .schema = 1, .id = "", .name = "Plugin A", .version = "1.0.0", .catalog = "official", .fingerprint = valid_fingerprint },
+        // Empty name
+        .{ .schema = 1, .id = "plugin-a", .name = "", .version = "1.0.0", .catalog = "official", .fingerprint = valid_fingerprint },
+        // Empty version
+        .{ .schema = 1, .id = "plugin-a", .name = "Plugin A", .version = "", .catalog = "official", .fingerprint = valid_fingerprint },
+        // Empty catalog
+        .{ .schema = 1, .id = "plugin-a", .name = "Plugin A", .version = "1.0.0", .catalog = "", .fingerprint = valid_fingerprint },
+    };
+
+    for (invalid_cases) |invalid_receipt| {
+        var payload: std.Io.Writer.Allocating = .init(gpa);
+        defer payload.deinit();
+        try std.json.Stringify.value(invalid_receipt, .{}, &payload.writer);
+        try atomicWrite(io, receipt_path, payload.written());
+
+        try std.testing.expectError(error.InvalidInstallReceipt, readReceipt(gpa, io, root));
+    }
+}
+
+test "readReceipt_returnsFileNotFound_whenFileDoesNotExist" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root);
+
+    try std.testing.expectError(error.FileNotFound, readReceipt(gpa, io, root));
+}
