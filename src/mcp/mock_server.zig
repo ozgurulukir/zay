@@ -277,7 +277,6 @@ test "processRequests_skipsInvalidJsonLines_andContinuesProcessing" {
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n", writer.written());
 }
 
-
 test "modeEnum_parsesValidModesAndRejectsInvalid" {
     // Arrange & Act & Assert
     try std.testing.expectEqual(Mode.default, std.meta.stringToEnum(Mode, "default"));
@@ -308,9 +307,7 @@ test "readLine_returnsNull_whenStreamIsEmpty" {
 test "readLine_readsSingleLine_withoutTrailingNewline" {
     // Arrange
     const gpa = std.testing.allocator;
-    var reader = std.Io.Reader.fixed("first line
-second line
-");
+    var reader = std.Io.Reader.fixed("first line\nsecond line\n");
 
     // Act
     const line1 = try readLine(gpa, &reader);
@@ -343,8 +340,7 @@ test "writeLine_appendsNewlineAndFlushes_whenCalled" {
     defer gpa.free(written);
 
     // Assert
-    try std.testing.expectEqualStrings("hello json-rpc
-", written);
+    try std.testing.expectEqualStrings("hello json-rpc\n", written);
 }
 
 test "toolList_containsValidJsonAndGreetTool" {

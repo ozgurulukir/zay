@@ -489,7 +489,8 @@ test "atomicWrite creates new file, overwrites existing file, and creates parent
     defer tmp.cleanup();
 
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &tmp_path_buf);
+    const tmp_path_len = try tmp.dir.realPath(io, &tmp_path_buf);
+    const tmp_path = tmp_path_buf[0..tmp_path_len];
 
     // 1. Writes a new file with text content
     const file_path = try std.fs.path.join(gpa, &.{ tmp_path, "test_file.txt" });

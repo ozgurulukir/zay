@@ -203,7 +203,6 @@ fn mapError(err: anyerror) anyerror {
     };
 }
 
-
 test "returnsMappedError_whenNetworkOrTimeoutErrorOccurs" {
     try std.testing.expectEqual(error.ConnectionRefused, mapError(error.ConnectionRefused));
     try std.testing.expectEqual(error.ConnectionRefused, mapError(error.ConnectionResetByPeer));
