@@ -277,7 +277,7 @@ test "returnsMissingPluginName_whenPluginLuaLacksName" {
     try std.testing.expectError(error.MissingPluginName, readManifest(gpa, io, root));
 }
 
-test "returnsManifestTooLarge_whenPluginLuaExceedsSizeLimit" {
+test "returnsStreamTooLong_whenPluginLuaExceedsSizeLimit" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -302,7 +302,7 @@ test "returnsManifestTooLarge_whenPluginLuaExceedsSizeLimit" {
     try writer.interface.flush();
     file.close(io);
 
-    try std.testing.expectError(error.ManifestTooLarge, readManifest(gpa, io, root));
+    try std.testing.expectError(error.StreamTooLong, readManifest(gpa, io, root));
 }
 
 test "readReceipt_returnsParsedReceipt_whenValidJson" {
@@ -550,8 +550,8 @@ test "Package and Inventory methods work as expected" {
     try std.testing.expectEqualStrings("unknown", pkg.version());
 
     pkg.manifest = .{
-        .name = "manifest_name",
-        .version = "2.0.0",
+        .name = try gpa.dupe(u8, "manifest_name"),
+        .version = try gpa.dupe(u8, "2.0.0"),
     };
 
     try std.testing.expectEqualStrings("manifest_name", pkg.name());
