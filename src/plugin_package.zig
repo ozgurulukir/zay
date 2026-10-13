@@ -189,3 +189,119 @@ pub fn remove(gpa: std.mem.Allocator, io: std.Io, root: []const u8, directory: [
     if (!std.mem.eql(u8, receipt.value.fingerprint, expected_fingerprint)) return error.InstallationChanged;
     try parent.deleteTree(io, directory);
 }
+
+
+test "returnsParsedManifest_whenPluginLuaIsValid" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "read-manifest-valid" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const plugin_lua_path = try std.fs.path.join(gpa, &.{ root, "plugin.lua" });
+    defer gpa.free(plugin_lua_path);
+
+    var file = try std.Io.Dir.createFile(.cwd(), io, plugin_lua_path, .{ .truncate = true });
+    var buf: [256]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll("return { name = \"test_pkg\", version = \"1.0.0\", author = \"jules\" }");
+    try writer.interface.flush();
+    file.close(io);
+
+    var manifest = try readManifest(gpa, io, root);
+    defer manifest.deinit(gpa);
+
+    try std.testing.expectEqualStrings("test_pkg", manifest.name);
+    try std.testing.expectEqualStrings("1.0.0", manifest.version);
+    try std.testing.expectEqualStrings("jules", manifest.author);
+}
+
+test "returnsFileNotFound_whenPluginLuaMissing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "read-manifest-missing" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    try std.testing.expectError(error.FileNotFound, readManifest(gpa, io, root));
+}
+
+test "returnsInvalidManifest_whenPluginLuaHasInvalidSyntax" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "read-manifest-syntax-err" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const plugin_lua_path = try std.fs.path.join(gpa, &.{ root, "plugin.lua" });
+    defer gpa.free(plugin_lua_path);
+
+    var file = try std.Io.Dir.createFile(.cwd(), io, plugin_lua_path, .{ .truncate = true });
+    var buf: [256]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll("return { name = ");
+    try writer.interface.flush();
+    file.close(io);
+
+    try std.testing.expectError(error.InvalidManifest, readManifest(gpa, io, root));
+}
+
+test "returnsMissingPluginName_whenPluginLuaLacksName" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "read-manifest-no-name" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const plugin_lua_path = try std.fs.path.join(gpa, &.{ root, "plugin.lua" });
+    defer gpa.free(plugin_lua_path);
+
+    var file = try std.Io.Dir.createFile(.cwd(), io, plugin_lua_path, .{ .truncate = true });
+    var buf: [256]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll("return { version = \"1.0.0\" }");
+    try writer.interface.flush();
+    file.close(io);
+
+    try std.testing.expectError(error.MissingPluginName, readManifest(gpa, io, root));
+}
+
+test "returnsManifestTooLarge_whenPluginLuaExceedsSizeLimit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "read-manifest-too-large" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+
+    const plugin_lua_path = try std.fs.path.join(gpa, &.{ root, "plugin.lua" });
+    defer gpa.free(plugin_lua_path);
+
+    var file = try std.Io.Dir.createFile(.cwd(), io, plugin_lua_path, .{ .truncate = true });
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    const chunk = "-- " ++ ("a" ** 100) ++ "\n";
+    var written: usize = 0;
+    while (written <= manifest_mod.max_manifest_bytes) {
+        try writer.interface.writeAll(chunk);
+        written += chunk.len;
+    }
+    try writer.interface.flush();
+    file.close(io);
+
+    try std.testing.expectError(error.ManifestTooLarge, readManifest(gpa, io, root));
+}
