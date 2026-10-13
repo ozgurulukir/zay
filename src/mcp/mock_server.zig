@@ -276,3 +276,94 @@ test "processRequests_skipsInvalidJsonLines_andContinuesProcessing" {
     // Assert
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n", writer.written());
 }
+
+
+test "modeEnum_parsesValidModesAndRejectsInvalid" {
+    // Arrange & Act & Assert
+    try std.testing.expectEqual(Mode.default, std.meta.stringToEnum(Mode, "default"));
+    try std.testing.expectEqual(Mode.list_changed, std.meta.stringToEnum(Mode, "list_changed"));
+    try std.testing.expectEqual(Mode.interleaved, std.meta.stringToEnum(Mode, "interleaved"));
+    try std.testing.expectEqual(Mode.malformed_tools, std.meta.stringToEnum(Mode, "malformed_tools"));
+    try std.testing.expectEqual(Mode.fail, std.meta.stringToEnum(Mode, "fail"));
+    try std.testing.expectEqual(Mode.slow, std.meta.stringToEnum(Mode, "slow"));
+    try std.testing.expectEqual(Mode.hang, std.meta.stringToEnum(Mode, "hang"));
+    try std.testing.expectEqual(Mode.partial, std.meta.stringToEnum(Mode, "partial"));
+
+    try std.testing.expectEqual(@as(?Mode, null), std.meta.stringToEnum(Mode, "nonexistent"));
+    try std.testing.expectEqual(@as(?Mode, null), std.meta.stringToEnum(Mode, "DEFAULT"));
+}
+
+test "readLine_returnsNull_whenStreamIsEmpty" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var reader = std.Io.Reader.fixed("");
+
+    // Act
+    const result = try readLine(gpa, &reader);
+
+    // Assert
+    try std.testing.expectEqual(@as(?[]u8, null), result);
+}
+
+test "readLine_readsSingleLine_withoutTrailingNewline" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var reader = std.Io.Reader.fixed("first line
+second line
+");
+
+    // Act
+    const line1 = try readLine(gpa, &reader);
+    defer if (line1) |l| gpa.free(l);
+
+    const line2 = try readLine(gpa, &reader);
+    defer if (line2) |l| gpa.free(l);
+
+    const line3 = try readLine(gpa, &reader);
+
+    // Assert
+    try std.testing.expect(line1 != null);
+    try std.testing.expectEqualStrings("first line", line1.?);
+
+    try std.testing.expect(line2 != null);
+    try std.testing.expectEqualStrings("second line", line2.?);
+
+    try std.testing.expectEqual(@as(?[]u8, null), line3);
+}
+
+test "writeLine_appendsNewlineAndFlushes_whenCalled" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var allocating_writer: std.Io.Writer.Allocating = .init(gpa);
+    defer allocating_writer.deinit();
+
+    // Act
+    try writeLine(&allocating_writer, "hello json-rpc");
+    const written = try allocating_writer.toOwnedSlice();
+    defer gpa.free(written);
+
+    // Assert
+    try std.testing.expectEqualStrings("hello json-rpc
+", written);
+}
+
+test "toolList_containsValidJsonAndGreetTool" {
+    // Arrange
+    const gpa = std.testing.allocator;
+
+    // Act
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, tool_list, .{});
+    defer parsed.deinit();
+
+    // Assert
+    try std.testing.expectEqualStrings("2024-11-05", protocol_version);
+    try std.testing.expect(parsed.value == .object);
+    const tools_val = parsed.value.object.get("tools");
+    try std.testing.expect(tools_val != null);
+    try std.testing.expect(tools_val.? == .array);
+    try std.testing.expectEqual(@as(usize, 1), tools_val.?.array.items.len);
+
+    const greet_tool = tools_val.?.array.items[0].object;
+    try std.testing.expectEqualStrings("greet", greet_tool.get("name").?.string);
+    try std.testing.expectEqualStrings("Say hello", greet_tool.get("description").?.string);
+}
