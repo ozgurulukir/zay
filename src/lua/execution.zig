@@ -146,7 +146,6 @@ pub fn installProtectedCallGuards(L: *c.lua_State) void {
 }
 
 test "execution: StopReason message returns expected strings" {
-    const testing = std.testing;
     try testing.expectEqualStrings("plugin execution canceled", StopReason.canceled.message());
     try testing.expectEqualStrings("instruction limit exceeded", StopReason.instruction_limit.message());
     try testing.expectEqualStrings("timeout exceeded", StopReason.timeout.message());
@@ -154,11 +153,11 @@ test "execution: StopReason message returns expected strings" {
 }
 
 test "execution: budget retrieval and stopped check" {
-    const testing = std.testing;
-    const State = @import("state.zig").State;
     var L = try State.init();
     defer L.deinit();
 
+    // A fresh Lua state does not initialize the extraspace budget slot.
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = null;
     try testing.expect(budget(L.handle) == null);
     try testing.expect(!stopped(L.handle));
 
@@ -187,8 +186,6 @@ test "execution: budget retrieval and stopped check" {
 }
 
 test "execution: check handles timeout and atomic cancellation" {
-    const testing = std.testing;
-    const State = @import("state.zig").State;
     var L = try State.init();
     defer L.deinit();
 
@@ -201,7 +198,7 @@ test "execution: check handles timeout and atomic cancellation" {
     @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
 
     // Set deadline in past
-    b.deadline_ns = platform.monotonicNowNs() - 1000;
+    b.deadline_ns = @intCast(platform.monotonicNowNs() - 1000);
     check(L.handle);
     try testing.expectEqual(StopReason.timeout, b.stop_reason);
 
@@ -217,8 +214,6 @@ test "execution: check handles timeout and atomic cancellation" {
 }
 
 test "execution: noteError sets canceled stop_reason on error.Canceled" {
-    const testing = std.testing;
-    const State = @import("state.zig").State;
     var L = try State.init();
     defer L.deinit();
 
@@ -238,8 +233,6 @@ test "execution: noteError sets canceled stop_reason on error.Canceled" {
 }
 
 test "execution: capDeadline and ioTimeout calculation" {
-    const testing = std.testing;
-    const State = @import("state.zig").State;
     var L = try State.init();
     defer L.deinit();
 
@@ -274,8 +267,6 @@ test "execution: capDeadline and ioTimeout calculation" {
 }
 
 test "execution: pushGuardedFunction executes when active and raises when stopped" {
-    const testing = std.testing;
-    const State = @import("state.zig").State;
     var L = try State.init();
     defer L.deinit();
 
@@ -290,8 +281,8 @@ test "execution: pushGuardedFunction executes when active and raises when stoppe
     const Dummy = struct {
         fn add(state: ?*c.lua_State) callconv(.c) c_int {
             const raw = state.?;
-            const a = c.lua_tointeger(raw, 1);
-            const b_val = c.lua_tointeger(raw, 2);
+            const a = c.lua_tointegerx(raw, 1, null);
+            const b_val = c.lua_tointegerx(raw, 2, null);
             c.lua_pushinteger(raw, a + b_val);
             return 1;
         }
@@ -315,8 +306,6 @@ test "execution: pushGuardedFunction executes when active and raises when stoppe
 }
 
 test "execution: installProtectedCallGuards makes cancellation sticky across pcall, xpcall, coroutines" {
-    const testing = std.testing;
-    const State = @import("state.zig").State;
     var L = try State.init();
     defer L.deinit();
 
@@ -422,7 +411,20 @@ test "noteError_recancelsIo_whenIoIsPresentAndErrorIsCanceled" {
     try std.testing.expect(data.io != null);
     try std.testing.expectEqual(StopReason.none, data.stop_reason);
 
-    noteError(L.handle, error.Canceled);
+    // Io.recancel is only legal after this task observed error.Canceled, so
+    // drive a real cancellation through a group task running on the test io.
+    const Task = struct {
+        fn run(task_io: std.Io, state: *c.lua_State) void {
+            task_io.sleep(.fromSeconds(3600), .awake) catch |err| {
+                std.debug.assert(err == error.Canceled);
+                noteError(state, err);
+            };
+        }
+    };
+    var group: std.Io.Group = .init;
+    group.async(io, Task.run, .{ io, L.handle });
+    group.cancel(io);
+    try group.await(io);
 
     try std.testing.expectEqual(StopReason.canceled, data.stop_reason);
     try std.testing.expect(stopped(L.handle));
@@ -469,6 +471,8 @@ test "returnsUncappedTimeout_whenNoBudgetAttached" {
     var L_state = try State.init();
     defer L_state.deinit();
     const L = L_state.handle;
+    // A fresh Lua state does not initialize the extraspace budget slot.
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = null;
 
     // Act
     const timeout = ioTimeout(L, 5);
@@ -572,8 +576,6 @@ test "returnsZeroTimeout_whenDeadlineIsExpired" {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
-
-const State = @import("state.zig").State;
 
 test "returnsSafely_whenBudgetIsNull" {
     var L = try State.init();
@@ -769,8 +771,6 @@ test "capDeadline_restrictsDeadline_withoutExtendingIt" {
     // Assert
     try std.testing.expectEqual(old_deadline, b.deadline_ns);
 }
-const State = @import("state.zig").State;
-const sandbox = @import("sandbox.zig");
 
 test "execution: stopped returns false when no budget attached" {
     var state = try State.init();

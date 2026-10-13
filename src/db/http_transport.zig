@@ -230,10 +230,8 @@ test "freesResponseBody_whenFetchBoundedCancelRunsOnResponseOutcome" {
     var select = std.Io.Select(FetchEvent).init(std.testing.io, &events);
 
     // Simulate fetch result stored in select buffer
-    var fetch_cancelled = false;
     // fetchBoundedCancel loops over select.cancel() which returns null on empty select
     fetchBoundedCancel(&select, gpa);
-    _ = fetch_cancelled;
     gpa.free(body_slice);
 }
 
@@ -241,7 +239,7 @@ test "sleepsWithoutPanic_whenDeadlineTaskIsExecuted" {
     deadlineTask(std.testing.io, 0);
 }
 
-test "returnsInvalidEndpoint_whenUrlIsInvalid" {
+test "fetchUnbounded_returnsInvalidEndpoint_whenUrlSchemaIsInvalid" {
     const gpa = std.testing.allocator;
     const opts = Options{
         .method = .GET,
