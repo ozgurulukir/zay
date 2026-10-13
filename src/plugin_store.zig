@@ -206,6 +206,7 @@ pub fn loadCatalogs(
         for (stores.items) |*store| store.deinit(gpa);
         stores.deinit(gpa);
     }
+    try stores.ensureTotalCapacity(gpa, registrations.items.len);
     for (registrations.items) |registration| {
         var store: StoreSource = .{ .url = try gpa.dupe(u8, registration.url), .enabled = registration.enabled };
         var store_transferred = false;
