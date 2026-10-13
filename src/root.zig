@@ -553,6 +553,7 @@ fn handleStrictScanFlag(init: std.process.Init, gpa: std.mem.Allocator, home_dir
 test {
     _ = @import("mcp/mock_server.zig");
     _ = @import("plugin_store.zig");
+    _ = @import("plugin_package.zig");
     _ = @import("tui/widgets/plugins_status.zig");
     std.testing.refAllDecls(@This());
     // The TUI tests moved out of `tui.zig` into `src/tui/tests.zig`; reference
