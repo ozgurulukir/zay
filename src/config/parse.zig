@@ -3782,9 +3782,9 @@ test "applyContextOverlay merges non-default values" {
 
 test "parseToast clamps out-of-range values" {
     const gpa = std.testing.allocator;
-    const json = std.json.parseFromSlice(std.json.Value, gpa,
+    const json = try std.json.parseFromSlice(std.json.Value, gpa,
         \\{"enabled":true,"durationMs":999999,"maxVisible":99,"position":"top-right"}
-    , .{}) catch unreachable;
+    , .{});
     defer json.deinit();
 
     const toast = try parseToast(gpa, json.value);
@@ -3798,9 +3798,9 @@ test "parseToast clamps out-of-range values" {
 
 test "parseToast accepts in-range values" {
     const gpa = std.testing.allocator;
-    const json = std.json.parseFromSlice(std.json.Value, gpa,
+    const json = try std.json.parseFromSlice(std.json.Value, gpa,
         \\{"enabled":false,"durationMs":2500,"maxVisible":2}
-    , .{}) catch unreachable;
+    , .{});
     defer json.deinit();
 
     const toast = try parseToast(gpa, json.value);
