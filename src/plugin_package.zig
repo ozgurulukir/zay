@@ -791,3 +791,70 @@ test "remove deletes plugin when fingerprint matches" {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
 }
+
+test "safeDirectoryName validates directory names" {
+    try std.testing.expect(safeDirectoryName("valid-name_123"));
+    try std.testing.expect(safeDirectoryName("a"));
+    const char_64 = "a" ** 64;
+    try std.testing.expect(safeDirectoryName(char_64));
+
+    try std.testing.expect(!safeDirectoryName(""));
+    const char_65 = "a" ** 65;
+    try std.testing.expect(!safeDirectoryName(char_65));
+    try std.testing.expect(!safeDirectoryName("../traversal"));
+    try std.testing.expect(!safeDirectoryName("invalid/path"));
+    try std.testing.expect(!safeDirectoryName("space name"));
+    try std.testing.expect(!safeDirectoryName("symbol!"));
+}
+
+test "atomicWrite writes and overwrites file contents" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sub", "test.txt" });
+    defer gpa.free(file_path);
+
+    try atomicWrite(io, file_path, "hello world");
+    const contents1 = try readFile(gpa, io, file_path, 1024);
+    defer gpa.free(contents1);
+    try std.testing.expectEqualStrings("hello world", contents1);
+
+    try atomicWrite(io, file_path, "overwritten content");
+    const contents2 = try readFile(gpa, io, file_path, 1024);
+    defer gpa.free(contents2);
+    try std.testing.expectEqualStrings("overwritten content", contents2);
+}
+
+test "lock acquires nonblocking lock and rejects invalid key or concurrent acquisition" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "lock_test" });
+    defer gpa.free(root);
+
+    // Invalid key error
+    try std.testing.expectError(error.InvalidPluginName, lock(gpa, io, root, "../invalid"));
+
+    // Happy path: create .locks directory and acquire lock
+    var guard1 = try lock(gpa, io, root, "test-plugin");
+    errdefer guard1.close(io);
+
+    // Concurrent lock acquisition on same key fails
+    const second_lock_res = lock(gpa, io, root, "test-plugin");
+    if (second_lock_res) |guard2| {
+        var g = guard2;
+        g.close(io);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.WouldBlock or err == error.FileBusy or err == error.LockViolation or err == error.AccessDenied);
+    }
+
+    // Re-acquire lock after closing the first lock holder
+    guard1.close(io);
+    var guard2 = try lock(gpa, io, root, "test-plugin");
+    defer guard2.close(io);
+}
