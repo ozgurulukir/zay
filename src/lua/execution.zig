@@ -144,3 +144,218 @@ pub fn installProtectedCallGuards(L: *c.lua_State) void {
     c.lua_pushcclosure(L, guardedWrap, 1);
     c.lua_setfield(L, -2, "wrap");
 }
+
+test "execution: StopReason message returns expected strings" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("plugin execution canceled", StopReason.canceled.message());
+    try testing.expectEqualStrings("instruction limit exceeded", StopReason.instruction_limit.message());
+    try testing.expectEqualStrings("timeout exceeded", StopReason.timeout.message());
+    try testing.expectEqualStrings("memory limit exceeded", StopReason.memory_limit.message());
+}
+
+test "execution: budget retrieval and stopped check" {
+    const testing = std.testing;
+    const State = @import("state.zig").State;
+    var L = try State.init();
+    defer L.deinit();
+
+    try testing.expect(budget(L.handle) == null);
+    try testing.expect(!stopped(L.handle));
+
+    var b: Budget = .{
+        .instruction_limit = 1000,
+        .instruction_count = 0,
+        .memory_limit = 1024 * 1024,
+        .timeout_ms = 1000,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    try testing.expectEqual(&b, budget(L.handle));
+    try testing.expect(!stopped(L.handle));
+
+    b.stop_reason = .canceled;
+    try testing.expect(stopped(L.handle));
+
+    b.stop_reason = .instruction_limit;
+    try testing.expect(stopped(L.handle));
+
+    b.stop_reason = .timeout;
+    try testing.expect(stopped(L.handle));
+
+    b.stop_reason = .memory_limit;
+    try testing.expect(stopped(L.handle));
+}
+
+test "execution: check handles timeout and atomic cancellation" {
+    const testing = std.testing;
+    const State = @import("state.zig").State;
+    var L = try State.init();
+    defer L.deinit();
+
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 100,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    // Set deadline in past
+    b.deadline_ns = platform.monotonicNowNs() - 1000;
+    check(L.handle);
+    try testing.expectEqual(StopReason.timeout, b.stop_reason);
+
+    // Reset stop reason & test atomic cancellation flag slot
+    b.stop_reason = .none;
+    b.deadline_ns = 0;
+    var flag = std.atomic.Value(bool).init(true);
+    bridge.cancel_requested_slot = &flag;
+    defer bridge.cancel_requested_slot = null;
+
+    check(L.handle);
+    try testing.expectEqual(StopReason.canceled, b.stop_reason);
+}
+
+test "execution: noteError sets canceled stop_reason on error.Canceled" {
+    const testing = std.testing;
+    const State = @import("state.zig").State;
+    var L = try State.init();
+    defer L.deinit();
+
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    noteError(L.handle, error.OutOfMemory);
+    try testing.expectEqual(StopReason.none, b.stop_reason);
+
+    noteError(L.handle, error.Canceled);
+    try testing.expectEqual(StopReason.canceled, b.stop_reason);
+}
+
+test "execution: capDeadline and ioTimeout calculation" {
+    const testing = std.testing;
+    const State = @import("state.zig").State;
+    var L = try State.init();
+    defer L.deinit();
+
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    // ioTimeout with no deadline
+    const t1 = ioTimeout(L.handle, 10);
+    try testing.expectEqual(@as(i128, 10) * std.time.ns_per_s, t1.duration.raw.toNanoseconds());
+
+    // capDeadline sets initial deadline
+    capDeadline(L.handle, 5000);
+    try testing.expect(b.deadline_ns > 0);
+    const initial_deadline = b.deadline_ns;
+
+    // capDeadline with larger remaining_ms does not extend deadline
+    capDeadline(L.handle, 10000);
+    try testing.expectEqual(initial_deadline, b.deadline_ns);
+
+    // capDeadline with smaller remaining_ms tightens deadline
+    capDeadline(L.handle, 100);
+    try testing.expect(b.deadline_ns < initial_deadline);
+
+    // ioTimeout is now bounded by the tighter deadline
+    const t2 = ioTimeout(L.handle, 10);
+    try testing.expect(t2.duration.raw.toNanoseconds() < @as(i128, 10) * std.time.ns_per_s);
+}
+
+test "execution: pushGuardedFunction executes when active and raises when stopped" {
+    const testing = std.testing;
+    const State = @import("state.zig").State;
+    var L = try State.init();
+    defer L.deinit();
+
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    const Dummy = struct {
+        fn add(state: ?*c.lua_State) callconv(.c) c_int {
+            const raw = state.?;
+            const a = c.lua_tointeger(raw, 1);
+            const b_val = c.lua_tointeger(raw, 2);
+            c.lua_pushinteger(raw, a + b_val);
+            return 1;
+        }
+    };
+
+    pushGuardedFunction(L.handle, Dummy.add);
+    c.lua_setglobal(L.handle, "guarded_add");
+
+    // Call normally
+    try testing.expect(L.doString("return guarded_add(10, 20)"));
+    try testing.expectEqual(@as(i64, 30), L.toInteger(-1));
+    L.pop(1);
+
+    // Stop VM and call again
+    b.stop_reason = .canceled;
+    try testing.expect(!L.doString("return guarded_add(10, 20)"));
+    const msg = L.getErrorMessage();
+    try testing.expect(msg != null);
+    try testing.expect(std.mem.indexOf(u8, msg.?, "plugin execution canceled") != null);
+    L.pop(1);
+}
+
+test "execution: installProtectedCallGuards makes cancellation sticky across pcall, xpcall, coroutines" {
+    const testing = std.testing;
+    const State = @import("state.zig").State;
+    var L = try State.init();
+    defer L.deinit();
+
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
+
+    installProtectedCallGuards(L.handle);
+
+    // Run normal pcall before stopping
+    try testing.expect(L.doString("local ok, res = pcall(function() return 42 end); return ok and res == 42"));
+    try testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    // Set stop_reason to timeout
+    b.stop_reason = .timeout;
+
+    // Protected pcall cannot catch or swallow the timeout stop reason
+    try testing.expect(!L.doString("local ok, err = pcall(function() return 1 end)"));
+    const pcall_err = L.getErrorMessage();
+    try testing.expect(pcall_err != null);
+    try testing.expect(std.mem.indexOf(u8, pcall_err.?, "timeout exceeded") != null);
+    L.pop(1);
+
+    // Protected xpcall cannot catch or swallow the stop reason
+    try testing.expect(!L.doString("local ok, err = xpcall(function() return 1 end, function(e) return e end)"));
+    const xpcall_err = L.getErrorMessage();
+    try testing.expect(xpcall_err != null);
+    try testing.expect(std.mem.indexOf(u8, xpcall_err.?, "timeout exceeded") != null);
+    L.pop(1);
+
+    // Protected coroutine.resume re-raises stop reason
+    try testing.expect(!L.doString("local co = coroutine.create(function() end); coroutine.resume(co)"));
+    const co_err = L.getErrorMessage();
+    try testing.expect(co_err != null);
+    try testing.expect(std.mem.indexOf(u8, co_err.?, "timeout exceeded") != null);
+    L.pop(1);
+}
