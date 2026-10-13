@@ -28,4 +28,5 @@ test {
     std.testing.refAllDecls(plugin_api);
     std.testing.refAllDecls(plugin_api.search_bridge);
     std.testing.refAllDecls(@import("bridges/git.zig"));
+    std.testing.refAllDecls(@import("bridges/fs_ops.zig"));
 }
