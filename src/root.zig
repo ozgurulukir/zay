@@ -582,6 +582,7 @@ test {
     // behind the lazy production import.
     _ = @import("tui/queue.zig");
     _ = @import("lua/root.zig");
+    _ = @import("lua/execution.zig");
     _ = @import("lua/state.zig");
     _ = @import("lua/bridge.zig");
     _ = @import("lua/sandbox.zig");
