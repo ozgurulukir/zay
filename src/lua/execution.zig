@@ -460,3 +460,113 @@ test "budget_returnsBudgetPointer_whenExtraSpaceIsSet" {
     b.?.stop_reason = .canceled;
     try std.testing.expectEqual(StopReason.canceled, test_budget.stop_reason);
 }
+
+const State = @import("state.zig").State;
+const testing = std.testing;
+
+test "returnsUncappedTimeout_whenNoBudgetAttached" {
+    // Arrange
+    var L_state = try State.init();
+    defer L_state.deinit();
+    const L = L_state.handle;
+
+    // Act
+    const timeout = ioTimeout(L, 5);
+
+    // Assert
+    try testing.expectEqual(@as(i128, 5) * std.time.ns_per_s, timeout.duration.raw.nanoseconds);
+}
+
+test "returnsUncappedTimeout_whenBudgetHasZeroDeadline" {
+    // Arrange
+    var L_state = try State.init();
+    defer L_state.deinit();
+    const L = L_state.handle;
+
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+        .deadline_ns = 0,
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = &b;
+
+    // Act
+    const timeout = ioTimeout(L, 10);
+
+    // Assert
+    try testing.expectEqual(@as(i128, 10) * std.time.ns_per_s, timeout.duration.raw.nanoseconds);
+}
+
+test "returnsRequestedTimeout_whenDeadlineIsFurtherThanRequested" {
+    // Arrange
+    var L_state = try State.init();
+    defer L_state.deinit();
+    const L = L_state.handle;
+
+    const now = platform.monotonicNowNs();
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+        .deadline_ns = @intCast(now + 10 * std.time.ns_per_s),
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = &b;
+
+    // Act
+    const timeout = ioTimeout(L, 2);
+
+    // Assert
+    try testing.expectEqual(@as(i128, 2) * std.time.ns_per_s, timeout.duration.raw.nanoseconds);
+}
+
+test "returnsCappedTimeout_whenDeadlineIsSoonerThanRequested" {
+    // Arrange
+    var L_state = try State.init();
+    defer L_state.deinit();
+    const L = L_state.handle;
+
+    const now = platform.monotonicNowNs();
+    const deadline_delta: i128 = 3 * std.time.ns_per_s;
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+        .deadline_ns = @intCast(now + deadline_delta),
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = &b;
+
+    // Act
+    const timeout = ioTimeout(L, 10);
+
+    // Assert
+    const remaining_ns = timeout.duration.raw.nanoseconds;
+    try testing.expect(remaining_ns <= deadline_delta);
+    try testing.expect(remaining_ns > 0);
+}
+
+test "returnsZeroTimeout_whenDeadlineIsExpired" {
+    // Arrange
+    var L_state = try State.init();
+    defer L_state.deinit();
+    const L = L_state.handle;
+
+    const now = platform.monotonicNowNs();
+    var b: Budget = .{
+        .instruction_limit = 0,
+        .instruction_count = 0,
+        .memory_limit = 0,
+        .timeout_ms = 0,
+        .deadline_ns = @intCast(now - 1 * std.time.ns_per_s),
+    };
+    @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = &b;
+
+    // Act
+    const timeout = ioTimeout(L, 5);
+
+    // Assert
+    try testing.expectEqual(@as(i128, 0), timeout.duration.raw.nanoseconds);
+}
