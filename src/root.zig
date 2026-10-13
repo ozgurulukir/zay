@@ -640,6 +640,7 @@ test {
     _ = @import("config/plugin_tests.zig");
     _ = @import("config/provider.zig");
     _ = @import("db.zig");
+    _ = @import("db/http_transport.zig");
     _ = @import("models/registry.zig");
     _ = @import("tools/database.zig");
 }

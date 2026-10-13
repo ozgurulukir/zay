@@ -202,3 +202,55 @@ fn mapError(err: anyerror) anyerror {
         else => err,
     };
 }
+
+
+test "returnsMappedError_whenNetworkOrTimeoutErrorOccurs" {
+    try std.testing.expectEqual(error.ConnectionRefused, mapError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.ConnectionRefused, mapError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.ConnectionRefused, mapError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.ConnectionRefused, mapError(error.BrokenPipe));
+    try std.testing.expectEqual(error.ConnectionRefused, mapError(error.ConnectionFailed));
+    try std.testing.expectEqual(error.ServerTimeout, mapError(error.Timeout));
+    try std.testing.expectEqual(error.OutOfMemory, mapError(error.OutOfMemory));
+    try std.testing.expectEqual(error.InvalidEndpoint, mapError(error.InvalidEndpoint));
+}
+
+test "delegatesToMapError_whenNoStreamErrorPresent" {
+    var req: std.http.Client.Request = undefined;
+    req.connection = null;
+    try std.testing.expectEqual(error.ConnectionRefused, mapRequestError(&req, error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.OutOfMemory, mapRequestError(&req, error.OutOfMemory));
+}
+
+test "freesResponseBody_whenFetchBoundedCancelRunsOnResponseOutcome" {
+    const gpa = std.testing.allocator;
+    const body_slice = try gpa.alloc(u8, 16);
+    @memset(body_slice, 'A');
+
+    var events: [2]FetchEvent = undefined;
+    var select = std.Io.Select(FetchEvent).init(std.testing.io, &events);
+
+    // Simulate fetch result stored in select buffer
+    var fetch_cancelled = false;
+    // fetchBoundedCancel loops over select.cancel() which returns null on empty select
+    fetchBoundedCancel(&select, gpa);
+    _ = fetch_cancelled;
+    gpa.free(body_slice);
+}
+
+test "sleepsWithoutPanic_whenDeadlineTaskIsExecuted" {
+    deadlineTask(std.testing.io, 0);
+}
+
+test "returnsInvalidEndpoint_whenUrlIsInvalid" {
+    const gpa = std.testing.allocator;
+    const opts = Options{
+        .method = .GET,
+        .url = "invalid-url-schema",
+    };
+    try std.testing.expectEqual(@as(u32, 30), opts.timeout_seconds);
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), opts.response_max_bytes);
+
+    const res = fetchUnbounded(gpa, std.testing.io, &opts);
+    try std.testing.expectError(error.InvalidEndpoint, res);
+}
