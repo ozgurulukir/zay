@@ -767,10 +767,10 @@ test "empty query returns all indexed files" {
     const io = std.testing.io;
 
     // Walk synchronously — test IO does not reliably run io.concurrent.
-    var dir = std.Io.Dir.openDir(.cwd(), io, ".", .{ .iterate = true }) catch unreachable;
+    var dir = try std.Io.Dir.openDir(.cwd(), io, ".", .{ .iterate = true });
     defer dir.close(io);
 
-    var walker = dir.walkSelectively(gpa) catch unreachable;
+    var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
 
     var files: std.ArrayListUnmanaged(u8) = .empty;
@@ -952,10 +952,10 @@ test "async empty query returns results" {
     const io = std.testing.io;
 
     // Walk synchronously — test IO does not reliably run io.concurrent.
-    var dir = std.Io.Dir.openDir(.cwd(), io, ".", .{ .iterate = true }) catch unreachable;
+    var dir = try std.Io.Dir.openDir(.cwd(), io, ".", .{ .iterate = true });
     defer dir.close(io);
 
-    var walker = dir.walkSelectively(gpa) catch unreachable;
+    var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
 
     var files: std.ArrayListUnmanaged(u8) = .empty;
