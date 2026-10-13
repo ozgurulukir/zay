@@ -40,8 +40,9 @@ pub const ToolRegistry = struct {
 
     pub fn init(gpa: std.mem.Allocator, builtin_slice: []const Tool) !ToolRegistry {
         var reg = ToolRegistry{ .builtin = builtin_slice };
+        try reg.lookup_index.ensureTotalCapacity(gpa, @intCast(builtin_slice.len));
         for (builtin_slice) |tool| {
-            try reg.lookup_index.put(gpa, tool.name, tool);
+            reg.lookup_index.putAssumeCapacity(tool.name, tool);
         }
         return reg;
     }
@@ -127,6 +128,9 @@ pub const ToolRegistry = struct {
         }
         if (removed) {
             self.lookup_index.clearRetainingCapacity();
+            self.lookup_index.ensureTotalCapacity(gpa, @intCast(self.builtin.len + self.plugin.items.len)) catch |err| {
+                log.warn("failed to reserve lookup_index capacity: {s}", .{@errorName(err)});
+            };
             for (self.builtin) |tool| {
                 self.lookup_index.put(gpa, tool.name, tool) catch |err| {
                     log.warn("failed to index builtin tool '{s}': {s}", .{ tool.name, @errorName(err) });
