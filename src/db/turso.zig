@@ -1042,7 +1042,6 @@ test "schema propagates pragma_table_info failures instead of omitting tables" {
     try std.testing.expectError(error.HttpError, client.schema(io, null));
 }
 
-
 test "schema fetches multiple table schemas in a single batched pipeline request" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

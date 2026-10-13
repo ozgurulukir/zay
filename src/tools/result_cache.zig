@@ -252,7 +252,7 @@ pub const ResultCache = struct {
         }
         // `orderedRemove` shifted indices — rebuild the map.
         self.map.clearRetainingCapacity();
-        self.map.ensureTotalCapacity(self.gpa, self.entries.items.len) catch return;
+        self.map.ensureTotalCapacity(self.gpa, @intCast(self.entries.items.len)) catch return;
         for (self.entries.items, 0..) |entry, i| {
             self.map.putAssumeCapacity(entry.key, i);
         }
