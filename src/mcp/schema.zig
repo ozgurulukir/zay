@@ -116,6 +116,7 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
     defer required_set.deinit(gpa);
     if (obj.get("required")) |req_val| {
         if (req_val == .array) {
+            required_set.ensureUnusedCapacity(gpa, req_val.array.items.len) catch {};
             for (req_val.array.items) |item| {
                 if (item == .string) required_set.put(gpa, item.string, {}) catch {};
             }
