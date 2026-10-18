@@ -15,6 +15,7 @@ Start here, then follow the links. For project overview, installation, and featu
 | [Architecture](ARCHITECTURE.md) | High-level architecture | LLM Gateway, agent tools (`bash`/`lane`), steering, timeline, parallel lanes, bash auto-review, safety. |
 | [Configuration namespace](config/README.md) | Configuration | Layered config system, setting references, environment variables, persistence, troubleshooting. |
 | [Response Classification](RESPONSE_CLASSIFICATION.md) | Inbound LLM semantics | Answer/reasoning classification, provider/model policy overrides, structured content and Responses item routing. |
+| [Safety & Classifier Guide](wiki/SAFETY_CLASSIFIER.md) | Shell command safety | Local and external classifier behavior, approval prompts, setup, API, and limitations. |
 | [MCP namespace](mcp/README.md) | MCP integration | Model Context Protocol transports, versions, security, async connects, tool injection. |
 | [Patterns namespace](patterns/README.md) | Engineering reference | Implementation patterns and invariants, split by subsystem. |
 | [Plugins namespace](plugins/README.md) | Lua plugin development | Plugin quick start, permissions, API reference, examples, testing. |
@@ -53,4 +54,5 @@ Start here, then follow the links. For project overview, installation, and featu
 
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md). Security issues: [SECURITY.md](../SECURITY.md).
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for contribution guidance. Repository instructions for coding agents
+are in [AGENTS.md](../AGENTS.md). For security issues, see [SECURITY.md](../SECURITY.md).

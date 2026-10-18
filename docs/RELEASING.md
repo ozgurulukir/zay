@@ -20,16 +20,18 @@ panel's About tab.
 ## Cutting a release
 
 1. Make sure `main` is green (`zig build test`).
-2. Bump `build.zig.zon`'s `.version` to the release version (e.g. `"0.10.7"`)
-   and commit it. The release workflow's `version-check` job fails fast when the
+2. Bump `build.zig.zon`'s `.version` to the release version and commit it. The
+   release workflow's `version-check` job fails fast when the
    tag (minus its leading `v`) and `.version` disagree, so the package metadata
-   cannot drift from the release. A pre-release tag such as `v0.10.8-beta.1`
-   needs the matching `"0.10.8-beta.1"` in `.version`.
-3. Tag the commit you want to ship and push the tag:
+   cannot drift from the release. A pre-release tag with a suffix such as
+   `vX.Y.Z-beta.1` needs the matching suffix in `.version`.
+3. Tag the commit you want to ship and push that tag. Remove the leading `v`
+   from the tag when setting `.version`:
 
    ```bash
-   git tag v0.10.7
-   git push origin v0.10.7
+   RELEASE_TAG="v<version>" # Replace <version> with the release version first.
+   git tag "$RELEASE_TAG"
+   git push origin "$RELEASE_TAG"
    ```
 
 4. The `release` workflow builds `ReleaseFast` binaries for **Linux**,
@@ -42,11 +44,13 @@ panel's About tab.
 ### Pre-releases
 
 A tag containing `-` is treated as a pre-release and the resulting GitHub
-Release is marked **pre-release**:
+Release is marked **pre-release**. For example, use the `vX.Y.Z-beta.1` shape
+with the intended version in place of `X.Y.Z`:
 
 ```bash
-git tag v0.10.8-beta.1
-git push origin v0.10.8-beta.1
+RELEASE_TAG="v<version>-beta.1" # Replace <version> before running these commands.
+git tag "$RELEASE_TAG"
+git push origin "$RELEASE_TAG"
 ```
 
 ## What the workflow produces

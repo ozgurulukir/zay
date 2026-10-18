@@ -1,6 +1,10 @@
 # Zay Architecture
 
-High-level architecture of Zay. For implementation patterns, engineering gotchas, and the type-system discipline, see [Patterns](PATTERNS.md). For configuration details, see [Configuration](CONFIG.md). For MCP internals, see [MCP](MCP.md). For plugin development, see [Plugins](plugins/README.md).
+High-level architecture of Zay. For project overview and installation, see the
+[README](../README.md). For implementation patterns and invariants, see
+[Patterns](patterns/README.md). For configuration details, see
+[Configuration](config/README.md). For MCP internals, see [MCP](mcp/README.md).
+For plugin development, see [Plugins](plugins/README.md).
 
 ## Platform Abstraction
 
@@ -47,9 +51,6 @@ Only the primary driver may supervise workers or integrate their branches; a
 worker gets `list`/`read` only. The cap is **4 threads total — the primary
 driver plus at most 3 worker lanes** (the legacy 2x2 grid), because that is the
 empirical limit for the mental load required to manage all agents effectively.
-`validateCwd`'s containment guarantees are unchanged (lane roots are valid only
-because Zay owns them).
-
 See [Parallel](#parallel) for the user-facing lane model.
 
 ### Tool schema strict mode
@@ -66,7 +67,8 @@ fields that the server's schema does not declare nullable. Explicit server
 nullability is preserved separately during schema conversion; required
 non-nullable nulls are rejected rather than silently removed.
 
-The full strict-mode design, its gateway-incompatibility caveats, and its persistence rules live in the [Tool schema strict-mode pattern](PATTERNS.md#tool-schema-strict-mode-pattern) in Patterns.
+The full strict-mode design, its gateway-incompatibility caveats, and its
+persistence rules live in the [Tool schema strict-mode pattern](patterns/providers-tools-and-wire-protocols.md#tool-schema-strict-mode-pattern).
 
 ## Steering
 
@@ -78,13 +80,21 @@ User's can branch off at any point in their conversation to pursue different pat
 
 ## Session Persistence
 
-The session store (`sessions.sqlite`) records the active `model_provider`, `model_id`, and `reasoning_effort` on every turn and on every mid-session model switch, and resumes correctly across restarts — including cross-project resumes. The store defaults to a local
-`sessions.sqlite`, but the backend is pluggable: the active backends are
-`local`, `zay_service`, `turso_http` (LibSQL/Turso), and `d1_http`
-(Cloudflare D1). PostgreSQL is supported through the `zay_service` companion;
-the `postgres_native` config value is accepted for compatibility but is not
-implemented and falls back where the startup path permits it. See
-[DATABASE.md](DATABASE.md). The full lifecycle (schema, resume paths, custom-provider round-tripping, dynamic-provider auth resolution, restart catalog restore) is documented in the [Mid-session model persistence pattern](PATTERNS.md#mid-session-model-persistence-pattern), the [Cross-project session resume pattern](PATTERNS.md#cross-project-session-resume-pattern), and the related provider patterns in Patterns.
+The session store (`sessions.sqlite`) records the active `model_provider`,
+`model_id`, and `reasoning_effort` on every turn and on every mid-session model
+switch, and resumes correctly across restarts — including cross-project
+resumes. The store defaults to a local `sessions.sqlite`, but the backend is
+pluggable: the active backends are `local`, `zay_service`, `turso_http`
+(LibSQL/Turso), and `d1_http` (Cloudflare D1). PostgreSQL is supported through
+the `zay_service` companion; the `postgres_native` config value is accepted for
+compatibility but is not implemented and falls back where the startup path
+permits it. See [Database](database/README.md). The full lifecycle (schema,
+resume paths, custom-provider round-tripping, dynamic-provider auth resolution,
+restart catalog restore) is documented in the [Mid-session model persistence
+pattern](patterns/configuration-sessions-and-persistence.md#mid-session-model-persistence-pattern),
+the [Cross-project session resume
+pattern](patterns/runtime-observability-and-portability.md#cross-project-session-resume-pattern),
+and related provider patterns in [Patterns](patterns/README.md).
 
 ## Parallel
 
@@ -103,25 +113,23 @@ A lane starts on a random `zay/<hex>` branch. On its first prompt, the session's
 
 ## Shell Safety & Auto-Review
 
-Zay employs a two-tier defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) before execution:
+Before a shell command or a `skill` command-mode call runs, Zay classifies
+it. With no external URL, the built-in pattern matcher supplies the verdict.
+When configured, the external classifier supplies it; request failures fall
+back to the local matcher. A command classified as unsafe asks for
+interactive approval. A safe verdict continues without a prompt.
 
-1. **Tier 1: Built-in Deterministic Safety Matcher (Always Active):**
-   A zero-dependency pattern and AST analyzer in `src/tools/bash_safety.zig` intercepts destructive operations with microsecond latency:
-   - `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`
-   - Fork bombs (`:(){ :|:& };:` and PowerShell unbounded job loops)
-   - Destructive `dd` to block devices (`of=/dev/sda`, `of=/boot/`, etc.)
-   - `mkfs` targeting `/dev/`
-   - PowerShell drive root wipes (`Remove-Item -Recurse -Force C:\`, `Clear-RecycleBin -Force`)
-   - Redirects into critical system paths (`/etc/`, `/boot/`, `C:\Windows\`, etc.)
+The built-in matcher recognizes selected command patterns. It is not a
+general command sandbox and does not guarantee that every harmful command
+will be identified. Git worktrees isolate lane branches and working files,
+but a process in a lane still runs with Zay's operating-system permissions.
 
-2. **Tier 2: External AI Safety Classifier (Optional & Pluggable):**
-   Zay can query a standalone REST safety service (`POST /classify`) powered by a fine-tuned Transformer model (ModernBERT) or an LLM safety proxy located in `tools/classifier/`. When marked unsafe, an interactive approval prompt is presented to the user.
-
-For setup details, see [Wiki: Command Safety & Classifier Guide](wiki/SAFETY_CLASSIFIER.md).
-
-### Working directory validation
-
-The `cwd` parameter in bash tool calls is validated against the project root in `src/tools/bash.zig` (`validateCwd`). The resolved path is normalized (resolving `..` and `.` segments) and checked to stay within the project root. This prevents the model from escaping the project via absolute paths like `/etc` or relative paths like `../../sensitive`.
+The shell tool checks the requested `cwd` against the project root after path
+normalization and attempts a real-path containment check for symlinks.
+Symlink resolution is best-effort; this check constrains the working-directory
+argument, not what a running process can access. See the [Safety & Classifier
+Guide](wiki/SAFETY_CLASSIFIER.md) for the classifier flow, configuration,
+and limits.
 
 ### Temp file safety
 
@@ -129,12 +137,17 @@ Temporary log files use hex-only filenames (`zay-bash-<hex>.log` via `bytesToHex
 
 ## Lua Plugin System
 
-Zay supports extending its capabilities through Lua 5.4 plugins. The plugin system lives in `src/lua/` and provides a sandboxed runtime, plugin lifecycle, event bus, tool registration, config integration, and TUI integration.
+Zay supports extending its capabilities through Lua 5.4 plugins. The plugin
+system lives in `src/lua/` and provides a restricted runtime, plugin lifecycle,
+event bus, tool registration, config integration, and TUI integration.
 
-The full plugin development guide, API reference, and example walkthroughs live in [Plugins](plugins/README.md). The internal wiring patterns (tool dispatch, event wiring, bridge functions, two-store state) live in [Patterns](PATTERNS.md).
+The full plugin development guide, API reference, and examples live in
+[Plugins](plugins/README.md). Internal wiring patterns (tool dispatch, event
+wiring, bridge functions, two-store state) live in [Patterns](patterns/README.md).
 
 ## Type System Discipline
 
 Zay uses `union(enum)` instead of flat structs with optional fields wherever a value can be in one of several mutually-exclusive states. This makes illegal combinations unrepresentable at compile time.
 
-The complete, current list of `union(enum)` types and the construction patterns live in the [Type System Discipline pattern](PATTERNS.md#type-system-discipline-pattern) in Patterns.
+The complete, current list of `union(enum)` types and construction patterns
+live in the [Type System Discipline pattern](patterns/configuration-sessions-and-persistence.md#type-system-discipline-pattern).

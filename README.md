@@ -2,7 +2,7 @@
 
 # Zay
 
-**A fast, single-binary coding agent for your terminal.**
+**A single-binary coding agent for your terminal.**
 
 <sub>Z(ig) + *ay* (Turkish for "moon") — a nod to Lua, Portuguese for moon.</sub>
 
@@ -17,9 +17,17 @@
 
 ## About
 
-Zay is a **terminal-native coding agent** designed for speed, focus, and low latency. It ships as a single compiled Zig binary that connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, logs every turn to a local SQLite database (with optional Turso / LibSQL, Cloudflare D1, or PostgreSQL companion backends), and is extensible with sandboxed Lua plugins and MCP servers.
+Zay is a **terminal-native coding agent** built as a single compiled Zig
+binary. It connects to OpenAI Codex (via ChatGPT OAuth) or configurable
+OpenAI-compatible providers, runs parallel workers in separate Git
+worktrees, records turns in a local SQLite database (with optional Turso /
+LibSQL, Cloudflare D1, or PostgreSQL companion backends), and supports Lua
+plugins and MCP servers.
 
-It is built for developers who want a fast, local-first agent that stays in the terminal and keeps the human in the loop: the agent proposes and executes, the human steers, approves, and decides.
+It is built for developers who want a local-first agent that stays in the
+terminal. The developer steers the work, reviews changes, and makes the
+decisions. Zay asks for approval when its command classifier marks a shell or
+skill command unsafe.
 
 ## Quickstart
 
@@ -64,37 +72,48 @@ Then type a request, e.g. `explain this repository` or `fix the failing tests`. 
 
 ## Features
 
-1. **Native TUI** — instant startup, fluid scrolling, custom color themes (built on libvaxis).
-2. **Any LLM provider** — native ChatGPT & Codex OAuth (no API keys), plus OpenRouter, Ollama, DeepSeek, Gemini, Mistral, Cerebras, and custom OpenAI-compatible endpoints.
-3. **Parallel git lanes** — run multiple agent threads concurrently in isolated git worktrees; inspect progress and merge back cleanly.
+1. **Native TUI** — terminal interface with scrolling and custom color themes, built on libvaxis.
+2. **LLM providers** — native ChatGPT and Codex OAuth, plus configurable
+   OpenAI-compatible endpoints.
+3. **Parallel git lanes** — run multiple agent threads concurrently in
+   separate Git worktrees; inspect progress and merge results back.
 4. **Background jobs** — asynchronous test runs, builds, or dev servers with real-time log tailing (`Ctrl+O`).
-5. **Context compaction** — dynamic, token-calibrated retention budgets that preserve critical history below model limits.
-6. **Extensible via Lua & MCP** — Lua plugins register custom tools and receive tool-call notifications; MCP servers provide additional tools.
-7. **Local-first persistence** — SQLite timeline by default; optional cloud roaming (Turso LibSQL / Cloudflare D1) or a PostgreSQL companion service; branch switching (`/timeline`) and single-keystroke rewind (`/undo`).
-8. **Layered safety** — deterministic command safety matcher, git worktree isolation, sandboxed Lua plugins, optional AI safety classifier.
+5. **Context compaction** — summarizes older conversation content and trims tool results to manage context usage.
+6. **Extensible via Lua & MCP** — Lua plugins register custom tools and
+   receive tool-call notifications; MCP servers provide additional tools.
+7. **Local-first persistence** — SQLite timeline by default; optional cloud
+   roaming (Turso LibSQL / Cloudflare D1) or a PostgreSQL companion service;
+   branch switching (`/timeline`) and single-keystroke rewind (`/undo`).
+8. **Layered safety** — local command patterns, approval prompts for commands
+   classified as unsafe, worktree isolation, restricted Lua runtime, and an
+   optional external classifier.
 
 ## Execution & Safety Model
 
-Zay runs without granular per-action permission prompts (YOLO mode), relying on layered safety guardrails:
+Ordinary shell commands run without a per-command confirmation prompt. Before
+a shell command or a `skill` command-mode call runs, Zay classifies it. By
+default, it uses a built-in pattern matcher. When configured, an external
+classifier supplies the verdict; failed requests fall back to the local
+matcher. A command classified as unsafe prompts for interactive approval.
+The built-in matcher recognizes selected patterns and cannot identify every
+risky command.
 
-- **Built-in Deterministic Safety Matcher (default):** zero-dependency lexical token analysis (`src/tools/bash_safety.zig`) that intercepts high-risk destructive commands (`rm -rf /`, drive wipes, `mkfs`, fork bombs) and gates them behind confirmation prompts.
-- **Git Worktree Isolation:** risky or wide refactors can be spawned into isolated **Parallel Lanes** (`/parallel` or `lane spawn`), physically contained in dedicated worktrees.
-- **Sandboxed Lua Plugins:** embedded runtime with unsafe libraries stripped (`io`, `os.execute`), strict workspace path confinement, and instruction budgets.
-- **Optional AI Safety Classifier:** deep contextual command evaluation via a local ModernBERT service or an LLM-as-classifier proxy (OpenAI / Ollama / OpenRouter) (`tools/classifier/`).
+- **Parallel lanes:** separate Git worktrees isolate each lane's branch and
+  working files. They do not restrict the process's operating-system
+  permissions.
+- **Lua plugins:** plugins run in a restricted Lua environment with an
+  instruction budget and Zay-provided bridge functions. See [plugin
+  permissions and runtime](docs/plugins/permissions-and-runtime.md).
+- **Optional external classifier:** the service supports model-based, rules,
+  and LLM-proxy presets. See the [Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)
+  for setup and behavior.
 
 > [!CAUTION]
-> Because Zay executes commands directly in your workspace without per-action confirmation prompts, run it in repositories you trust or confine broad changes to parallel git lanes.
-
-### Optional safety classifier
-
-To enable Tier 2 contextual risk analysis with the ModernBERT classifier:
-
-```bash
-uv run -m tools.classifier.server --model modernbert --port 8765
-export ZAY_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
-```
-
-See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Docker deployment and API details.
+> Shell commands run with the operating-system permissions of the Zay
+> process. The classifier is a heuristic approval gate, and a Git worktree
+> is workspace isolation; neither is an operating-system sandbox. Use a
+> restricted account, container, or virtual machine when untrusted code needs
+> that boundary.
 
 ## Essential Shortcuts
 
@@ -116,20 +135,21 @@ See the **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** for Dock
 
 - 🏛️ **[Documentation index](docs/index.md)** — entry point to all docs.
 - 🏛️ **[System Architecture](docs/ARCHITECTURE.md)** — event pipeline, client layers, memory model.
-- 🛡️ **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** — multi-tier safety architecture.
-- 🗄️ **[Database & Sessions](docs/DATABASE.md)** — SQLite, Turso / LibSQL, Cloudflare D1, PostgreSQL.
-- ⚙️ **[Configuration Reference](docs/CONFIG.md)** — providers, API keys, compaction, themes.
-- 🧠 **[Engineering Patterns](docs/PATTERNS.md)** — invariants, background slots, thread safety.
-- 🔌 **[MCP Guide](docs/MCP.md)** — stdio and Streamable HTTP MCP integration.
+- 🛡️ **[Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)** — classifier flow, approval prompts, and limits.
+- 🗄️ **[Database & Sessions](docs/database/README.md)** — SQLite, Turso / LibSQL, Cloudflare D1, PostgreSQL.
+- ⚙️ **[Configuration Reference](docs/config/README.md)** — providers, API keys, compaction, themes.
+- 🧠 **[Engineering Patterns](docs/patterns/README.md)** — invariants, background slots, thread safety.
+- 🔌 **[MCP Guide](docs/mcp/README.md)** — stdio and Streamable HTTP MCP integration.
 - 🧩 **[Lua Plugins](docs/plugins/)** — building custom tools.
-- 🛠️ **[Contributor Guidelines](AGENTS.md)** — TigerStyle, Zig 0.16 idioms, testing.
+- 🛠️ **[Contributor Guidelines](CONTRIBUTING.md)** — development setup, coding conventions, and pull requests.
 - 🛠️ **[Building from source](docs/BUILDING.md)** — clone, fetch, build, test, install.
 
-## Platform Support
+## Release Targets
 
-- **Linux:** fully supported and tested daily.
-- **macOS (Apple Silicon):** binaries shipped for every release (`zay-macos-aarch64`); beta until exercised on real hardware. Unsigned — see the installer's Gatekeeper note.
-- **Windows:** daily-driver ready; release CI builds `zay-windows-x86_64.exe` natively. PowerShell 7 (`pwsh`) is the shell tool.
+The release workflow builds Linux x86_64, macOS arm64 (Apple Silicon), and
+Windows x86_64 binaries. It runs a `--version` smoke check on Linux and macOS;
+the Windows artifact is build-only in that workflow. The macOS binary is
+unsigned; see the installer's Gatekeeper note if macOS blocks it.
 
 ## Contributing
 
@@ -137,4 +157,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Please also read the [Code of Conduct](C
 
 ## License
 
-Zay is open source under the [MIT License](LICENSE). Third-party components and licenses are listed in [attribution.md](attribution.md). Distributed "AS IS", without warranty. See also [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+Zay is open source under the [MIT License](LICENSE). Third-party components
+and licenses are listed in [attribution.md](attribution.md). Distributed "AS
+IS", without warranty. See [SECURITY.md](SECURITY.md) for vulnerability
+reporting.
