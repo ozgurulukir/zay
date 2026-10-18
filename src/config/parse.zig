@@ -1986,6 +1986,7 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.compaction.keep_recent_tool_turns != d.compaction.keep_recent_tool_turns) return true;
     if (ctx.compaction.tool_output_cap_bytes != d.compaction.tool_output_cap_bytes) return true;
     if (ctx.compaction.tool_output_cap_bytes_is_set) return true;
+    if (ctx.compaction.evict_history_images != d.compaction.evict_history_images) return true;
     return false;
 }
 
