@@ -24,13 +24,13 @@ const ShellBackend = enum {
 };
 
 fn shellBackendErrorMessage(err: anyerror, backend: ShellBackend) []const u8 {
-    return switch (backend) {
-        .bash => @errorName(err),
-        .pwsh => switch (err) {
-            error.FileNotFound => "pwsh executable not found in PATH; ensure PowerShell is installed",
-            else => @errorName(err),
-        },
-    };
+    if (err == error.FileNotFound) {
+        return switch (backend) {
+            .bash => "ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider zay.run_shell",
+            .pwsh => "ShellUnavailable: pwsh not found (install PowerShell 7, or ensure powershell.exe is on PATH)",
+        };
+    }
+    return @errorName(err);
 }
 
 /// Best-effort plugin directory identifier for logging.
@@ -326,4 +326,11 @@ test "sanitizePath rejects control characters before any resolution" {
     try std.testing.expectError(error.InvalidPath, sanitizePath(io, "\x07bell"));
     // A NUL byte keeps its dedicated check and must not reach the loop below.
     try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\x00file"));
+}
+
+test "shellBackendErrorMessage maps only FileNotFound" {
+    try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .bash), "ShellUnavailable: bash not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .pwsh), "ShellUnavailable: pwsh not found") != null);
+    try std.testing.expectEqualStrings("Timeout", shellBackendErrorMessage(error.Timeout, .bash));
+    try std.testing.expectEqualStrings("StreamTooLong", shellBackendErrorMessage(error.StreamTooLong, .pwsh));
 }

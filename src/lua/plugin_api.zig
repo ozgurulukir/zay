@@ -259,24 +259,6 @@ fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
     return dir;
 }
 
-/// The exec backend a plugin shell call routes to: `run_bash` always uses
-/// bash (git-bash on Windows); `run_shell` uses the native shell (pwsh on
-/// Windows, bash on POSIX).
-const ShellBackend = enum { bash, pwsh };
-
-/// Map a backend spawn failure to an actionable Lua-facing message. Only
-/// `error.FileNotFound` (the backend binary is missing) is remapped — every
-/// other error name (Timeout, StreamTooLong, …) is already meaningful to
-/// plugin authors.
-fn shellBackendErrorMessage(err: anyerror, backend: ShellBackend) []const u8 {
-    if (err == error.FileNotFound) {
-        return switch (backend) {
-            .bash => "ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider zay.run_shell",
-            .pwsh => "ShellUnavailable: pwsh not found (install PowerShell 7, or ensure powershell.exe is on PATH)",
-        };
-    }
-    return @errorName(err);
-}
 
 pub const quoteShellArg = git_bridge.quoteShellArg;
 pub const appendQuotedArg = git_bridge.appendQuotedArg;
@@ -1788,13 +1770,6 @@ test "quoteShellArg posix output survives a real shell round-trip" {
     defer r.deinit(gpa);
     try std.testing.expectEqualStrings(original, r.stdout);
     try std.testing.expect(r.code == 0);
-}
-
-test "shellBackendErrorMessage maps only FileNotFound" {
-    try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .bash), "ShellUnavailable: bash not found") != null);
-    try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .pwsh), "ShellUnavailable: pwsh not found") != null);
-    try std.testing.expectEqualStrings("Timeout", shellBackendErrorMessage(error.Timeout, .bash));
-    try std.testing.expectEqualStrings("StreamTooLong", shellBackendErrorMessage(error.StreamTooLong, .pwsh));
 }
 
 test "zay.shell_quote dialects and error contract (P7)" {
