@@ -349,6 +349,11 @@
           "minimum": 4096,
           "default": 8192,
           "description": "Shared byte cap for model-facing tool output and historical pruning. Larger results from built-in, shell, database, plugin, and MCP tools are saved in the active session and returned as head+tail previews with retrieval instructions. Full saved results can be read in bounded windows with database action=read_tool_result."
+        },
+        "evictHistoryImages": {
+          "type": "boolean",
+          "default": true,
+          "description": "Evict image views from compacted history."
         }
       },
       "additionalProperties": false
