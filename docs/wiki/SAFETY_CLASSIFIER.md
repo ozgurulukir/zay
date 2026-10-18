@@ -1,124 +1,115 @@
-# Command Safety & External Classifier Guide
+# Shell Command Safety and Classifier
 
-Zay Agent uses a defense-in-depth safety architecture to evaluate shell tool invocations (`bash` on Linux/macOS, `pwsh` on Windows) and `skill` command mode before execution. Skill commands are classified with the registered skill directory as their cwd and use the same interactive approval hook.
+Zay classifies shell commands (`bash` on Linux and macOS, `pwsh` on Windows)
+and `skill` command-mode calls before execution. Classification is a
+heuristic approval gate, not an operating-system sandbox. See the [README](../../README.md)
+for project overview and installation, [Architecture](../ARCHITECTURE.md)
+for broader structure, and [Plugin permissions and runtime](../plugins/permissions-and-runtime.md)
+for plugin boundaries.
 
----
-
-## 1. Safety Architecture Overview
+## How command classification works
 
 ```mermaid
 flowchart TD
-    A[Agent Requests Shell Command] --> B[Executor Safety Interceptor]
-    B --> C{Classifier URL Configured?}
-    
-    C -->|Yes: HTTP POST| D[External Safety Classifier]
-    D -->|200 OK: safe / unsafe| E{Verdict}
-    D -->|Network Error| F[Built-in Deterministic Pattern Matcher]
-    
-    C -->|No: null| F
-    F -->|safe / unsafe| E
-    
-    E -->|safe| G[Execute Shell Command]
-    E -->|unsafe| H[Prompt User for Interactive Approval]
+    A[Shell or skill command] --> B{External classifier configured?}
+    B -->|No| C[Built-in pattern matcher]
+    B -->|Yes| D[POST /classify]
+    D -->|Request fails| C
+    D -->|Verdict returned| E{safe or unsafe}
+    C --> E
+    E -->|safe| F[Run command]
+    E -->|unsafe| G[Ask for interactive approval]
 ```
 
-The system operates across two complementary tiers:
-1. **Tier 1: Built-in Deterministic Safety Matcher (Always Active)**
-   - Zero-dependency, microsecond-latency token pattern matcher built directly into the native Zig binary.
-   - Intercepts known destructive commands: `rm -rf /`, `mkfs.*`, `dd of=/dev/sd*`, PowerShell `Remove-Item -Recurse -Force` on system roots, `Clear-RecycleBin -Force`, fork bombs (`:(){ :|:& };:`), critical system redirects (`> /etc/passwd`), **and privileged package management** — a privilege escalator (`sudo`, `doas`, `runas`), a bare package-manager token (`apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `pacman`, `apk`, `brew`, `zypper`, `emerge`, `aptitude`, `nix-env`, `snap`), or an install verb (`pip install`, `npm install -g`, `cargo install`, `gem install`, `go install`, `conda install`, `flatpak install`). This last family is why `sudo apt install …` always surfaces for interactive approval.
-2. **Tier 2: External AI Safety Classifier (Optional & Pluggable)**
-   - External REST endpoint powered by a fine-tuned Transformer model (such as ModernBERT) or an LLM proxy.
-   - Evaluates natural language shell commands semantically for dangerous side effects beyond simple regex matching.
+Zay uses the built-in matcher when no external URL is configured. With an
+external URL, it uses that verdict; if the request fails, Zay falls back to
+the built-in matcher. A verdict of `unsafe` asks the user to approve or
+reject the command. A `safe` verdict runs without a prompt.
 
-> [!NOTE]
-> **Fallback semantics:** any failure on the classify call — connection
-> error, non-2xx status, malformed body, or a stalled server — falls back
-> to the Tier 1 matcher. On POSIX, plain-`http` classifier URLs carry a
-> **5-second deadline** covering the response exchange: a classifier that
-> accepts the connection but never responds fails to the local matcher
-> instead of blocking the turn. Windows and `https://` URLs keep the plain
-> HTTP-client exchange without a deadline, so run the service somewhere
-> with reliable latency (it defaults to `127.0.0.1:8765`).
+The built-in matcher recognizes selected patterns, including some
+destructive disk operations, critical system-file redirects, shell
+fork-bomb forms, and privileged package-management commands. It does not
+parse arbitrary commands into a complete security policy and cannot detect
+every dangerous action. A command not classified as unsafe may run without
+an approval prompt.
 
----
+Parallel lanes use separate Git worktrees for branch and working-file
+isolation. Worktrees do not restrict a process's permissions. The shell tool
+validates its requested working directory against the project root, with
+symlink resolution best-effort; this does not sandbox filesystem access
+after a process starts. Use an operating-system container or virtual machine
+when untrusted code needs a stronger boundary.
 
-## 2. Quickstart: Running the Classifier Tool
+### External classifier failures and timing
 
-We provide a standalone Python/FastAPI service in `tools/classifier/` with built-in model presets and automatic weight downloading.
+If an external classifier request fails or its response cannot be used, Zay
+falls back to the built-in matcher. That fallback is heuristic and does not
+guarantee that the command will be stopped.
 
-### Option A: Using Astral `uv` (Recommended)
+On POSIX, plain `http://` classifier URLs use a five-second receive deadline
+for the response exchange. Connection setup and sending are outside that
+deadline. Windows and `https://` URLs use the standard HTTP-client path
+without this explicit five-second bound.
+
+## Run the classifier service
+
+The standalone service is in `tools/classifier/` and requires Python
+dependencies managed with `uv`. Run the commands below from the repository
+root.
 
 ```bash
-# Run with fine-tuned ModernBERT ONNX model (Default):
-# From the repo root (the module uses package-relative imports):
-uv run -m tools.classifier.server --port 8765
-
-# Run zero-ML fast rule mock engine:
+# Start the zero-ML rules preset
 uv run -m tools.classifier.server --model rules --port 8765
+
+# Or request the ModernBERT ONNX preset
+uv run -m tools.classifier.server --model modernbert --port 8765
 ```
 
-> [!NOTE]
-> **Model weights source:** the `modernbert` preset downloads weights from the
-> upstream repo `nova-agent/ModernBERT-bash-classifier`, which is currently
-> **private** — anonymous downloads fail, and the loader falls back to the
-> legacy `vendor/local-models/ModernBERT-bash-classifier/` snapshot (if
-> present) or the rules engine. Point it at any accessible mirror (the model
-> is Apache-2.0, so re-hosting with notices is permitted) via
-> `ZAY_CLASSIFIER_REPO_ID`, and pin a commit hash with
-> `ZAY_CLASSIFIER_REVISION`.
+The service loads its selected model in the background. If downloading
+ModernBERT weights fails, the loader logs a warning and falls back to the
+rules preset. Other initialization errors are reported by the service;
+`/health` returns an error and `/classify` returns HTTP 500. Set
+`ZAY_CLASSIFIER_REPO_ID` and `ZAY_CLASSIFIER_REVISION` to choose a model
+repository and revision. The rules preset does not download weights.
 
-### Option B: Using Docker
+To run it in Docker:
 
 ```bash
-# Build and run the container:
 docker build -t zay-classifier -f tools/classifier/Dockerfile tools/classifier
 docker run -d -p 8765:8765 --name zay-classifier zay-classifier
 ```
 
----
+## Configure Zay
 
-## 3. Configuring Zay Agent
+Set the endpoint with an environment variable:
 
-Once your classifier service is running, connect Zay Agent using any of the following methods:
-
-### Method 1: Environment Variable
 ```bash
-# Linux / macOS
 export ZAY_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
+```
 
-# PowerShell (Windows)
+In PowerShell:
+
+```powershell
 $env:ZAY_BASH_CLASSIFIER_URL = "http://127.0.0.1:8765/classify"
 ```
 
-### Method 2: Configuration File (`~/.config/zay/config.json`)
+Or add it to `~/.config/zay/config.json`:
+
 ```json
 {
   "bashClassifierUrl": "http://127.0.0.1:8765/classify"
 }
 ```
 
-### Method 3: In-App TUI Settings
-1. Open Zay and press `/settings` (or navigate to the Settings tab).
-2. Go to the **Advanced** section.
-3. Enter your classifier URL in the `bashClassifierUrl` field and press Enter.
+The same setting is available in the TUI under Settings → Advanced. See the
+[configuration reference](../config/file-format-and-schema.md#supported-fields)
+for its exact behavior.
 
----
+## REST API for custom classifiers
 
-## 4. REST API Specification (Custom Classifiers)
+Implement `POST /classify` with a JSON request containing the command and
+working directory:
 
-You can implement your own safety classifier in any programming language (Go, Rust, Node.js, Python, etc.) by implementing this HTTP REST contract:
-
-> [!IMPORTANT]
-> **Response deadline:** Zay enforces a **5-second deadline** on the
-> response exchange for POSIX plain-`http` classifier URLs. A response that
-> has not fully arrived within the budget is abandoned and the command
-> falls back to the Tier 1 matcher, so a custom classifier must answer
-> within that window.
-
-### Endpoint: `POST /classify`
-
-- **Headers:** `Content-Type: application/json`
-- **Request Body:**
 ```json
 {
   "command": "rm -rf /var/log/app.log",
@@ -126,35 +117,27 @@ You can implement your own safety classifier in any programming language (Go, Ru
 }
 ```
 
-- **Response Body:**
+Return `label` as `safe` or `unsafe`. `score` and `latency_ms` are optional
+numeric response fields:
+
 ```json
 {
-  "label": "safe",
-  "score": 0.02,
+  "label": "unsafe",
+  "score": 0.98,
   "latency_ms": 12.5
 }
 ```
 
-#### Fields:
-- `label` *(string, required)*: Must be `"safe"` or `"unsafe"`.
-- `score` *(float, optional)*: Confidence score for unsafe prediction ($0.0 \dots 1.0$).
-- `latency_ms` *(float, optional)*: Latency in milliseconds.
+The service also provides `GET /health` with its loading status. Its
+`/classify` endpoint returns an error while the selected model is loading or
+if loading failed.
 
-### Endpoint: `GET /health` *(Optional)*
-```json
-{
-  "status": "ok",
-  "model": "modernbert",
-  "classifier": "ready"
-}
-```
+## Available service presets
 
----
+| Preset | Behavior |
+|---|---|
+| `modernbert` | ONNX preset; weight-download failures fall back to `rules`. Other initialization errors are reported. |
+| `rules` | Local regex and token heuristics; no model weights. |
+| `llm-proxy` | Delegates classification to a configured remote LLM. |
 
-## 5. Model Catalog Comparison
-
-| Preset Name | Model Architecture | Memory / Disk | Inference Latency (CPU) | Best For |
-| :--- | :--- | :--- | :--- | :--- |
-| **`modernbert`** | ModernBERT-bash-classifier | ~450 MB | ~15–30 ms | High accuracy fine-tuned semantic classification. |
-| **`llm-proxy`** | OpenAI / Ollama / OpenRouter | 0 MB (Remote) | ~300–800 ms | Zero-shot evaluation using existing LLM keys. |
-| **`rules`** | Heuristic Regex / Pattern Engine | <1 MB | <1 ms | Zero-ML testing and local mock environments. |
+For service implementation notes, see [`tools/classifier/README.md`](../../tools/classifier/README.md).

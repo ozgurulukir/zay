@@ -1,58 +1,40 @@
-# Security Policy & Safeguards
+# Security
 
-## 1. Supported Versions
+## Reporting a vulnerability
 
-Security updates and patches are actively provided for the following releases:
+Please report vulnerabilities through the [GitHub Security Advisory
+reporting page](https://github.com/ozgurulukir/zay/security/advisories/new).
+Do not report them in a public issue. Include the affected version, impact,
+and reproduction steps when possible.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.10.x  | :white_check_mark: |
-| < 0.10  | :x:                |
+## Execution and safety boundaries
 
----
+Zay can run shell commands (`bash` on Linux and macOS, `pwsh` on Windows)
+with the permissions of the user running Zay. Ordinary commands run without
+a per-command confirmation prompt.
 
-## 2. Reporting a Vulnerability
+Before a shell command or a `skill` command-mode call runs, Zay classifies
+it. It uses the built-in pattern matcher unless an external classifier URL
+is configured. If the external request fails, Zay falls back to the built-in
+matcher. A command classified as unsafe prompts for interactive approval.
+The built-in rules recognize selected patterns and do not detect every
+dangerous command. See the [Safety & Classifier Guide](docs/wiki/SAFETY_CLASSIFIER.md)
+for the classifier flow and limits.
 
-We take the security of Zay Agent seriously. If you discover a security vulnerability (such as a path-traversal vulnerability, sandbox escape in Lua, prompt injection vector that bypasses safety filters, or remote code execution), please **do not open a public issue**.
+The shell tool checks its requested working directory against the project
+root. Symlink resolution is best-effort, and this check does not constrain a
+process's filesystem access after it runs. Parallel lanes use separate Git
+worktrees to isolate branch and working-file changes; they do not limit
+operating-system permissions. Neither mechanism is an operating-system
+sandbox.
 
-Instead, report vulnerabilities responsibly via:
-- **GitHub Security Advisory:** [Report a vulnerability](https://github.com/ozgurulukir/zay/security/advisories/new)
-- **Direct Contact:** Contact the repository maintainers through GitHub profiles.
+Lua plugins run in a restricted runtime. See [Plugin permissions and runtime](docs/plugins/permissions-and-runtime.md) for its boundaries.
 
-Please include:
-1. Description of the vulnerability and attack vector.
-2. Step-by-step reproduction instructions or a minimal Proof of Concept (PoC).
-3. Impact assessment.
+## Operating guidance
 
-We will acknowledge receipt within 48 hours and work with you on a coordinated disclosure timeline.
-
----
-
-## 3. Zay Agent Security & Safety Model
-
-Zay Agent operates as an autonomous coding assistant with direct shell access (`pwsh` on Windows, `bash` on Linux/macOS). To mitigate risks, Zay incorporates multiple layers of defense:
-
-### A. Deterministic Command Safety Matcher
-Zay includes a zero-dependency, hardcoded command safety classifier (`src/tools/bash_safety.zig`) that inspects shell commands before execution with `<1µs` latency. It automatically intercepts:
-- Recursive deletions targeting root or home filesystems (`rm -rf /`, `rm -rf ~`, `Remove-Item C:\ -Recurse`).
-- Raw disk wipes, partition table overwrites (`dd if=/dev/zero of=/dev/sd*`, `mkfs`).
-- Fork bombs and runaway shell loops (`:(){ :|:& };:`).
-- Windows drive-root or system directory wipes (`Remove-Item $env:SystemRoot`).
-
-### B. Project Root Containment (`validateCwd`)
-Tool executions and filesystem modifications enforce strict lexical and realpath containment checks to prevent directory escaping outside the project root without explicit user configuration.
-
-### C. Sandboxed Lua Plugins
-Lua plugin execution is confined to a protected runtime environment with strict per-dispatch instruction budgets (`resetInstructionBudget`) and memory limits.
-
-### D. Optional External AI Safety Classifier
-For sensitive or high-risk development environments, users can enable a standalone REST safety classifier service (`tools/classifier/`) powered by Transformer models (ModernBERT) to perform deep semantic risk evaluation on generated shell commands.
-
----
-
-## 4. User Responsibilities & Operational Best Practices
-
-- **Use Version Control:** Always run Zay inside Git-tracked repositories so changes can be audited and rolled back (`git diff`, `git restore`).
-- **Least Privilege:** Avoid running Zay with elevated privileges (`root` / `Administrator`).
-- **Isolated Environments:** For untrusted repositories or risky tasks, run Zay inside Docker containers or dedicated VMs, or isolate changes using Zay's `/parallel` Git worktree lanes.
-- **Review Critical Operations:** Review model actions when interacting with databases, remote infrastructure, or sensitive configuration files.
+- Prefer Git-tracked repositories so changes can be reviewed and recovered.
+- Run Zay without elevated privileges.
+- Use an operating-system container or virtual machine when untrusted code
+  needs a stronger isolation boundary.
+- Review changes and consequential operations, especially around databases,
+  remote infrastructure, or sensitive configuration.

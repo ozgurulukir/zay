@@ -16,11 +16,40 @@ The `/connect` setup form (`drawForm` in `src/tui/widgets/provider_picker.zig`) 
 
 ### Bounded classifier fetch pattern (`src/tools/bash_safety.zig`)
 
-The remote safety-classifier call (`classifyOverSocket`) is a hand-rolled, deadline-bounded HTTP/1.1 exchange over a raw socket — NOT `std.http.Client`. It polls the socket with the remaining budget (`receiveResponseBounded`) into a fixed 16 KiB buffer, frames the response by EOF (`Connection: close`, which the uvicorn sidecar honours), and fails open to the local matcher on timeout/oversize/malformed responses — the same fail-open contract as every other classifier failure. The AI wire clients remain on `std.http.Client`; their shared transport wraps the `Io.Threaded` read callback on POSIX so the `EAGAIN` from `SO_RCVTIMEO` becomes `error.Timeout` instead of Zig 0.16.0's `errnoBug` panic in Debug / `error.Unexpected` in ReleaseFast. That timeout applies to the response body after its head; connect and response-head reads remain on the standard client's unbounded path. Windows and `https://` classifier URLs keep the plain `fetch` exchange without a deadline (documented in `docs/wiki/SAFETY_CLASSIFIER.md`). The classifier deadline is receive-only — send (blocking stream write) and connect (kernel-default; `Io.Threaded.netConnectIpPosix` panics on `ConnectOptions.timeout`, a std TODO) remain unbounded, matching the pre-deadline behavior.
+The remote safety-classifier call (`classifyOverSocket`) is a hand-rolled,
+deadline-bounded HTTP/1.1 exchange over a raw socket — not `std.http.Client`.
+It polls the socket with the remaining budget (`receiveResponseBounded`) into
+a fixed 16 KiB buffer, and frames the response by EOF (`Connection: close`,
+which the uvicorn sidecar honours). On timeout, oversized or malformed
+responses, it falls back to the local matcher. This is the fallback behavior
+for classifier failures; the local verdict still decides whether to ask for
+approval.
+
+The AI wire clients remain on `std.http.Client`; their shared transport wraps
+the `Io.Threaded` read callback on POSIX so `EAGAIN` from `SO_RCVTIMEO` becomes
+`error.Timeout` instead of Zig 0.16.0's `errnoBug` panic in Debug or
+`error.Unexpected` in ReleaseFast. That timeout applies to the response body
+after its head; connect and response-head reads remain unbounded. Windows and
+`https://` classifier URLs use the standard fetch path without this explicit
+deadline. The classifier deadline covers receiving only; send and connect
+remain unbounded. See the [Safety & Classifier Guide](../wiki/SAFETY_CLASSIFIER.md)
+for user-facing behavior and setup.
 
 ### MCP Server & Tool Discovery pattern
 
-`src/mcp/manager.zig` merges `mcp_servers` configuration across global/project layers (supporting `mcp_servers`, `mcpServers`, and `mcp` JSON aliases) into `McpClient` objects. Transports are `union(enum) { stdio, sse }`; the `{env:VAR}` security model, async-connect lifecycle (`ConnectJob`/`drainConnects`/`installConnectResult`), timeouts, tool injection, and crash isolation are documented in [MCP](../mcp/README.md#3-connection-lifecycle). The `McpMode.handle` routing in `command_router.zig` maps `Up`/`Down`/`j`/`k` to navigation, `Space`/`Enter` to toggle, `Ctrl+R`/`r` to re-sync, `d` to disconnect, `a` to add a remote server by URL (a `State.adding` sub-state fed by the `input_buffers.mcp_url` buffer; the single new entry is persisted to global `config.json` best-effort, while toggling only changes the current process; URL-only, no headers), and `Esc`/`q` to close.
+`src/mcp/manager.zig` merges `mcp_servers` configuration across global and
+project layers (supporting `mcp_servers`, `mcpServers`, and `mcp` JSON aliases)
+into `McpClient` objects. Transports are `union(enum) { stdio, sse }`.
+The `{env:VAR}` security model, async-connect lifecycle, timeouts, tool
+injection, and crash isolation are documented in [MCP connection
+lifecycle](../mcp/connection-lifecycle-and-tools.md#3-connection-lifecycle).
+
+`McpMode.handle` in `command_router.zig` maps `Up`/`Down`/`j`/`k` to
+navigation, `Space`/`Enter` to toggle, `Ctrl+R`/`r` to re-sync, `d` to
+disconnect, and `Esc`/`q` to close. Press `a` to add a remote server by URL;
+the `State.adding` sub-state uses the `input_buffers.mcp_url` buffer. The new
+entry is persisted to global `config.json` best-effort; toggling only changes
+the current process. URL-only; headers are not supported.
 
 - **`McpClient.stop()` must free a `.failed` reason.** `stop` clobbers `lifecycle` to `.disabled`; if the client carries an owned failure reason (set via `setError`), free `lifecycle.failed.reason` **before** overwriting the lifecycle, or the reason leaks silently (`deinit` calls `stop` before its `failed`-arm switch, so the switch can never see it). Caught by the async-connect tests.
 
