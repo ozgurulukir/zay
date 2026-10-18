@@ -1,10 +1,10 @@
 //! Job(T) — the one convention for App-level background futures: arm a
 //! worker on the Io implementation's concurrent lane, poll completion
 //! non-blockingly from the tick, adopt the result exactly once, and join at
-//! teardown. The five App-level families (diff refresh, models.dev registry,
-//! model load, git label, codex login) build on this; their debounce,
-//! generation/session drops, adopt protocols, and result projections stay in
-//! the family lifecycle files — those are behaviour, not plumbing.
+//! teardown. The six App-level families (diff refresh, models.dev registry,
+//! model load, git label, codex login, plugin store) build on this; their
+//! debounce, generation/session drops, adopt protocols, and result projections
+//! stay in the family lifecycle files — those are behaviour, not plumbing.
 
 const std = @import("std");
 
