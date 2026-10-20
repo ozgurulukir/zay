@@ -223,7 +223,7 @@ pub fn loadDriverPin(gpa: std.mem.Allocator, conn: *db.Connection, repo_key: []c
     return try gpa.dupe(u8, row.text(0));
 }
 
-/// Column read mirrors `session.readSummary`: nullable columns checked by
+/// Column read mirrors `session.readSummaryFromRow`: nullable columns checked by
 /// type, owned strings duped off the statement's transient buffers. Each
 /// dupe registers its own errdefer so an OOM partway through cannot leak
 /// the earlier ones.
