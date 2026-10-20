@@ -114,10 +114,21 @@ pub fn retryTestClient(comptime Client: type, gpa: std.mem.Allocator, io: std.Io
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{port});
     errdefer gpa.free(base_url);
 
+    const env_key = std.process.getEnvVarOwned(gpa, "TEST_API_KEY") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => std.process.getEnvVarOwned(gpa, "OPENAI_API_KEY") catch |err2| switch (err2) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err2,
+        },
+        else => return err,
+    };
+    defer if (env_key) |k| gpa.free(k);
+
+    const api_key = if (env_key) |k| k else "mock-test-key";
+
     var client: Client = undefined;
     try client.init(gpa, io, .{
         .base_url = base_url,
-        .api_key = "test-key",
+        .api_key = api_key,
         .model = "test-model",
         .tools = &.{},
         .mcp_tools = &.{},
