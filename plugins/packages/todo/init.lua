@@ -163,16 +163,20 @@ local function parse_line(line)
     table.insert(t.contexts, ctx)
   end
   for key, val in rest:gmatch("(%w+):(%S+)") do
-    -- Skip words that are part of URLs or that collide with +/@ tokens.
-    if key ~= "http" and key ~= "https" then
+    -- Skip words that are part of URLs or that collide with +/@ tokens or id tags.
+    if key ~= "http" and key ~= "https" and key ~= "id" then
       t.tags[key] = val
     end
   end
 
   -- The id: tag is a stable numeric handle for plan lookups. Promote it to a
-  -- top-level field so callers don't have to dig through tags.
-  if t.tags["id"] then
-    local n = tonumber(t.tags["id"])
+  -- top-level field so callers don't have to dig through tags. Extract only from
+  -- a trailing id:tag so mid-sentence mentions (e.g. "Fix id:3 reference")
+  -- are not parsed as this task's id.
+  local trailing_id = rest:match("%s*id:(%S+)%s*$")
+  if trailing_id then
+    t.tags["id"] = trailing_id
+    local n = tonumber(trailing_id)
     if n then t.id = n end
   end
 
@@ -541,7 +545,7 @@ zay.register_tool({
     for proj in text:gmatch("%+(%w+)") do table.insert(t.projects, proj) end
     for ctx in text:gmatch("@(%w+)") do table.insert(t.contexts, ctx) end
     for key, val in text:gmatch("(%w+):(%S+)") do
-      if key ~= "http" and key ~= "https" then t.tags[key] = val end
+      if key ~= "http" and key ~= "https" and key ~= "id" then t.tags[key] = val end
     end
     table.insert(candidate, t)
     local saved, save_err = persist_todos(candidate, new_id + 1)
