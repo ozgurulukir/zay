@@ -20,7 +20,6 @@ const turn_view_mod = @import("turn_view.zig");
 const queue_mod = @import("queue.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
-const command_router = @import("command_router.zig");
 const vcs = @import("../vcs.zig");
 const background_mod = @import("../background.zig");
 const bash = @import("../tools/bash_exec.zig");
