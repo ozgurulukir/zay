@@ -21,7 +21,6 @@ const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
 const vcs = @import("vcs.zig");
 pub const transcript_mod = @import("transcript.zig");
-const CountingAllocator = @import("counting_allocator").CountingAllocator;
 pub const agent_worker = @import("tui/agent_worker.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
