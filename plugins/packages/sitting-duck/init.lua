@@ -315,11 +315,19 @@ end
 -- todo-plugin sidecar pattern: missing or corrupt marker → nil, never a
 -- crash; the plugin just re-bootstraps.
 local function read_marker()
-  local result = zay.read_file(MARKER_PATH, {})
-  if result == nil then return nil end
-  local decoded = zay.json_decode(result.content)
-  if type(decoded) ~= "table" then return nil end
-  return decoded
+  local ok, res = pcall(function()
+    local result = zay.read_file(MARKER_PATH, {})
+    if type(result) ~= "table" or type(result.content) ~= "string" then
+      return nil
+    end
+    local decoded = zay.json_decode(result.content)
+    if type(decoded) ~= "table" then return nil end
+    return decoded
+  end)
+  if ok and type(res) == "table" then
+    return res
+  end
+  return nil
 end
 
 local function write_marker(version)
