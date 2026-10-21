@@ -70,6 +70,15 @@ sha256sum -c zay-linux-x86_64.sha256
 ./zay-linux-x86_64 --version   # prints the tag
 ```
 
+Every `.sha256` file records the **bare basename** of its asset, so
+`sha256sum -c` works on a plain download directory with no path fixups. The
+workflow writes all of them from a single step, from inside `dist/`, because
+`sha256sum` records the path it was handed — running it on `dist/<asset>` from
+the repo root would bake that build-machine path into the file and make
+verification fail on a good download. (Releases up to and including v0.11.3
+shipped `zay-linux-x86_64.debug.sha256` with a stale `dist/` prefix; strip it,
+or verify with `sed 's|dist/||' zay-linux-x86_64.debug.sha256 | sha256sum -c -`.)
+
 ## One-Line Installers
 
 Users can install the latest release directly via the root installer scripts:

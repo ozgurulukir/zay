@@ -125,8 +125,16 @@ jobs:
           objcopy --only-keep-debug dist/${{ matrix.artifact }} dist/${{ matrix.artifact }}.debug
           strip --strip-debug dist/${{ matrix.artifact }}
           objcopy --add-gnu-debuglink=dist/${{ matrix.artifact }}.debug dist/${{ matrix.artifact }}
-          sha256sum dist/${{ matrix.artifact }}.debug > dist/${{ matrix.artifact }}.debug.sha256
 
+      # Every published asset gets its checksum from THIS step, and every
+      # checksum is written from inside dist/ so the recorded path is the
+      # bare basename. `sha256sum` records the path it was handed, so
+      # running it on `dist/<artifact>` from the repo root bakes that
+      # build-machine path into the file — a path that does not exist in a
+      # user's download directory, which makes `sha256sum -c` fail on a
+      # perfectly good download. Keeping one writer for all assets is what
+      # prevents that from recurring: adding an asset cannot introduce a
+      # second, differently-scoped checksum step.
       - name: Checksum
         shell: bash
         run: |
@@ -135,6 +143,17 @@ jobs:
             sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
           else
             shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+          fi
+          # The Linux debug sidecar needs its own checksum. The basename
+          # also matches how the sidecar is actually consumed: the
+          # .gnu_debuglink section stores the basename, and gdb/objdump
+          # resolve it next to the binary.
+          if [ -f ${{ matrix.artifact }}.debug ]; then
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum ${{ matrix.artifact }}.debug > ${{ matrix.artifact }}.debug.sha256
+            else
+              shasum -a 256 ${{ matrix.artifact }}.debug > ${{ matrix.artifact }}.debug.sha256
+            fi
           fi
 
       - name: Upload artifact
