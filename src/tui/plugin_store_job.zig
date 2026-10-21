@@ -271,7 +271,7 @@ fn forgetMissingPluginConfig(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8
     const plugins = try next.toOwnedSlice(gpa);
     errdefer deinitPluginConfigs(gpa, plugins);
     try config_mod.removeProjectPlugin(gpa, io, cwd, name);
-    deinitPluginConfigs(gpa, cached.plugins);
+    if (cached.plugins.len > 0) deinitPluginConfigs(gpa, cached.plugins);
     cached.plugins = plugins;
 }
 
@@ -307,6 +307,11 @@ test "missing plugin removal clears disk and cached preferences and preserves ot
     try std.testing.expectEqualStrings("keep", disk.plugins[0].name);
     try forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing");
     try std.testing.expectEqual(@as(usize, 1), cached.plugins.len);
+
+    var empty_cached: config_mod.Config = .{};
+    try forgetMissingPluginConfig(gpa, io, project, home, &empty_cached, "nonexistent");
+    defer empty_cached.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), empty_cached.plugins.len);
 }
 
 pub fn startUninstall(app: *App, selected_path: []const u8) !void {
