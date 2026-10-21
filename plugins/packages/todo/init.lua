@@ -173,11 +173,18 @@ local function parse_line(line)
   -- top-level field so callers don't have to dig through tags. Extract only from
   -- a trailing id:tag so mid-sentence mentions (e.g. "Fix id:3 reference")
   -- are not parsed as this task's id.
-  local trailing_id = rest:match("%s*id:(%S+)%s*$")
+  --
+  -- The captured value must be a plain integer. A trailing `id:abc` (or
+  -- `id:1,` — punctuation rides along in `%S+`) is not an id tag at all, so
+  -- it is left in the text and no `tags.id` is set: recording it would make
+  -- the whole file fail to load with "invalid numeric id tag".
+  local trailing_id = rest:match("%s*id:(%d+)%s*$")
   if trailing_id then
-    t.tags["id"] = trailing_id
     local n = tonumber(trailing_id)
-    if n then t.id = n end
+    if n then
+      t.tags["id"] = trailing_id
+      t.id = n
+    end
   end
 
   return t
