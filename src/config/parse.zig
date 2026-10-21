@@ -4457,7 +4457,7 @@ test "parseCompaction accepts evictHistoryImages and writeCompaction round-trips
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"evictHistoryImages\":false") != null);
 }
 
-test "readGlobal_whenFileReadFails_returnsDefaultConfigAndFreesDiagnostics" {
+test "readGlobal_whenFileReadFails_returnsDefaultConfigAndRecordsDiagnostic" {
     // Arrange
     const gpa = std.testing.allocator;
     var mock_vtable = std.testing.io.vtable.*;
@@ -4486,4 +4486,44 @@ test "readGlobal_whenFileReadFails_returnsDefaultConfigAndFreesDiagnostics" {
 
     // Assert
     try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
+}
+
+test "loadGlobalFile_whenFileReadFails_recordsTheErrorAsADiagnostic" {
+    // The read failure must surface as a diagnostic, not as a silent
+    // default: `readGlobal` swallows its diagnostic sink, so assert on the
+    // sink directly. A missing file is NOT an error (no diagnostic); any
+    // other open failure IS one, and that is the branch under test.
+    const gpa = std.testing.allocator;
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.dirOpenFile = struct {
+        fn openFile(
+            userdata: ?*anyopaque,
+            dir: std.Io.Dir,
+            sub_path: []const u8,
+            flags: std.Io.File.OpenFlags,
+        ) std.Io.File.OpenError!std.Io.File {
+            _ = userdata;
+            _ = dir;
+            _ = sub_path;
+            _ = flags;
+            return error.AccessDenied;
+        }
+    }.openFile;
+    const mock_io: std.Io = .{
+        .userdata = std.testing.io.userdata,
+        .vtable = &mock_vtable,
+    };
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+
+    var cfg = try loadGlobalFile(gpa, mock_io, "/home/testuser", &sink);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+    try std.testing.expect(sink.items[0] == .config_parse_error);
+    try std.testing.expectEqualStrings("AccessDenied", sink.items[0].config_parse_error.reason);
 }

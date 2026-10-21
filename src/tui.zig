@@ -286,10 +286,11 @@ pub const App = struct {
     /// runtime-bound set. `closeRuntimeBoundOverlays` (park) consults it to
     /// decide which open panels to force-close when the focused lane loses its
     /// runtime. The submit-time `refuseOnIdleLane` refusals overlap this set but
-    /// are expressed per-branch in `submitMode` (a few runtime-bound modes —
-    /// `tree_picker`, `save_message` — use `orelse`, so they don't crash and
-    /// aren't refused; and `.command`'s crash-prone paths are sub-states, not a
-    /// mode). A mode is runtime-free when it needs no live agent: the
+    /// are expressed per-mode in `mode_lifecycle.zig`'s submit helpers (a few
+    /// runtime-bound modes — `tree_picker`, `save_message` — use `orelse`, so
+    /// they don't crash and aren't refused; and `.command`'s crash-prone paths
+    /// are sub-states, not a mode). A mode is runtime-free when it needs no
+    /// live agent: the
     /// pure-display modes (help, mcp, plugins) plus the modes that act on
     /// in-process state only (settings, search, theme, command menu, lanes list,
     /// diff viewer) and `.normal`. Wiring a new runtime-deref mode? List it here

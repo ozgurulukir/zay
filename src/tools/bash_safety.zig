@@ -504,8 +504,8 @@ const ClassifierExchange = struct {
     }
 
     fn fetch(self: *ClassifierExchange) !Verdict {
-        if (os.is_windows) return classifyOverClient(self.gpa, self.io, self.url, self.payload);
-        if (self.transport == .http_client) return classifyOverClient(self.gpa, self.io, self.url, self.payload);
+        if (os.is_windows) return classifyOverClient(self.gpa, self.io, self.url, self.payload, self.timeout_seconds);
+        if (self.transport == .http_client) return classifyOverClient(self.gpa, self.io, self.url, self.payload, self.timeout_seconds);
         const uri = try std.Uri.parse(self.url);
 
         if (!std.mem.eql(u8, uri.scheme, "http")) return error.UnsupportedScheme;
@@ -514,15 +514,29 @@ const ClassifierExchange = struct {
 };
 
 /// Explicit `std.http.Client` exchange for HTTPS and Windows, executed
-/// under ClassifierExchange's cancelable watchdog. Uses `http.timeoutAwareIo(io)`
-/// to handle socket read timeouts, translating POSIX EAGAIN into `error.Timeout`
-/// rather than treating EAGAIN as an unhandled error/panic in Debug mode under
-/// `Io.Threaded`.
+/// under ClassifierExchange's cancelable watchdog.
+///
+/// The read path is bounded two ways, and BOTH are needed:
+///
+/// 1. `http.setSocketTimeout` puts `SO_RCVTIMEO` on the connection, so a
+///    stalled server makes the read fail with `EAGAIN`/`ETIMEDOUT` instead
+///    of blocking forever.
+/// 2. `http.timeoutAwareIo` swaps the `Io.Threaded` read callback for one
+///    that translates that `EAGAIN` into `error.Timeout` rather than
+///    letting Zig 0.16.0's `errnoBug` treat it as a programmer bug (a
+///    panic in Debug, `error.Unexpected` in ReleaseFast).
+///
+/// Wrapping the Io WITHOUT the socket timeout is a no-op: the wrapper
+/// reads `SO_RCVTIMEO`, sees no timeout, and falls through to the
+/// unmodified read path — so the `EAGAIN` bug it exists to prevent would
+/// still fire. The socket timeout is applied after the response head
+/// arrives, so the (fast) head exchange is not affected.
 fn classifyOverClient(
     gpa: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
     payload: []const u8,
+    timeout_seconds: u32,
 ) !Verdict {
     var body_buffer: [response_bytes_max]u8 = undefined;
     var response_body: std.Io.Writer = .fixed(&body_buffer);
@@ -545,6 +559,11 @@ fn classifyOverClient(
     try request.connection.?.flush();
     var response = try request.receiveHead(&redirect_buffer);
     if (!http.isSuccess(@intFromEnum(response.head.status))) return error.HttpUnexpectedStatus;
+    // Socket-level read timeout: bounds the BODY read, which is the phase
+    // that can stall (a server that answers the head and then goes quiet).
+    // Applied after the head so the fast head exchange is unaffected.
+    // `timeoutAwareIo` above turns the resulting EAGAIN into `error.Timeout`.
+    if (request.connection) |conn| http.setSocketTimeout(conn, timeout_seconds);
     const decompress_size: usize = switch (response.head.content_encoding) {
         .identity => 0,
         .zstd => std.compress.zstd.default_window_len,
@@ -1000,4 +1019,40 @@ test "lock architecture: client classifier watchdog cancels stalled response hea
         try std.testing.expectError(error.ClassifierTimeout, classifyExchange(gpa, io, url, "{}", 1, .http_client));
         try std.testing.expect(std.Io.Timestamp.now(io, .awake).nanoseconds - start < 3 * std.time.ns_per_s);
     }
+}
+
+test "client classifier body read is bounded by the socket timeout" {
+    // The `std.http.Client` path must not park forever on a server that
+    // answers the head and then goes quiet. This needs BOTH halves of the
+    // fix: the socket timeout (`SO_RCVTIMEO`) that bounds the read, and the
+    // timeout-aware Io that turns the resulting EAGAIN into `error.Timeout`
+    // instead of Zig 0.16.0's `errnoBug` panic. Wrapping the Io alone is a
+    // no-op — the wrapper reads `SO_RCVTIMEO`, finds no timeout, and falls
+    // through to the unmodified read path.
+    //
+    // `classifyOverClient` is called directly, WITHOUT the
+    // `ClassifierExchange` watchdog, so the socket-level bound is what ends
+    // the read. Going through the watchdog would mask the difference: the
+    // watchdog fires at the same deadline and would make the test pass with
+    // the fix reverted.
+    if (os.is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var server = try StallServer.init(io);
+    defer server.deinit();
+    var fixture: ClassifierStallFixture = .{ .server = &server, .send_head = true };
+    var task = try io.concurrent(ClassifierStallFixture.run, .{&fixture});
+    defer task.cancel(io);
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/classify", .{server.port()});
+    defer gpa.free(url);
+
+    const start = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    // The head arrives, then the body never does. The socket timeout must
+    // end the body read; without it the read parks until the server's
+    // 30 s stall ends.
+    const outcome = classifyOverClient(gpa, io, url, "{}", 1);
+    const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start;
+    try std.testing.expect(outcome == error.Timeout or outcome == error.ReadFailed);
+    try std.testing.expect(elapsed < 10 * std.time.ns_per_s);
 }

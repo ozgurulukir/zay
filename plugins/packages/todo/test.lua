@@ -238,6 +238,32 @@ test.describe("todo_add id handling", function()
     test.assert.contains("Fix id:3 reference id:1", last_write.content)
     test.assert.contains("another task id:2", last_write.content)
   end)
+
+  test.it("treats a trailing non-numeric id tag as text, not as an id", function()
+    -- `id:abc` is not an id tag. Recording it would make the whole file
+    -- fail to load with "invalid numeric id tag" — one bad line takes
+    -- down every task.
+    reset("resolve the id:abc migration\n")
+    local out = todo_list.handler({})
+    test.assert.contains("resolve the id:abc migration", out)
+  end)
+
+  test.it("ignores trailing punctuation after a numeric id tag", function()
+    -- `%S+` would capture "1," including the comma, which is not a
+    -- number. The id must be the digits alone.
+    reset("task id:1,\n")
+    local out = todo_list.handler({})
+    test.assert.contains("task id:1,", out)
+  end)
+
+  test.it("loads a file whose only id tag is a trailing non-numeric one", function()
+    -- The regression that matters: a non-numeric trailing id must not
+    -- abort the whole load.
+    reset("first task id:xyz\nsecond task id:2\n")
+    local out = todo_list.handler({})
+    test.assert.contains("first task", out)
+    test.assert.contains("second task", out)
+  end)
 end)
 
 -- ── C1/C2: durable ids and plan sidecar integrity ─────────────────

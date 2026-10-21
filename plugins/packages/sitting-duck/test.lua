@@ -315,7 +315,11 @@ test.describe("bootstrap", function()
     test.assert.is_true(fs[MARKER_PATH]:find("v1.4.3", 1, true) ~= nil)
   end)
 
-  test.it("corrupt marker (non-object JSON) re-bootstraps and rewrites the marker", function()
+  test.it("marker with a non-object JSON body re-bootstraps and rewrites the marker", function()
+    -- A JSON array decodes to a Lua table, so it is not corrupt at the
+    -- decode step — it is rejected by the version check below, which is
+    -- what sends the plugin back to the bootstrap path. The re-bootstrap
+    -- is the observable behaviour; the decode step accepts it.
     fresh()
     fs[MARKER_PATH] = "[1, 2, 3]"
     script_ok()
@@ -325,7 +329,10 @@ test.describe("bootstrap", function()
     test.assert.is_true(fs[MARKER_PATH]:find("v1.4.3", 1, true) ~= nil)
   end)
 
-  test.it("corrupt marker (non-string content) re-bootstraps and rewrites the marker", function()
+  test.it("marker with non-string content re-bootstraps and rewrites the marker", function()
+    -- The mock's read_file returns the stored value as `content` whatever
+    -- its type, so a non-string body reaches read_marker. It is treated as
+    -- an unreadable marker and the plugin re-bootstraps.
     fresh()
     fs[MARKER_PATH] = true
     script_ok()

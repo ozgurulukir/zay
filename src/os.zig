@@ -224,7 +224,13 @@ test "terminateChildTree_isNoOp_onPosixPlatforms" {
     try std.testing.expect(job_handle == null);
     try std.testing.expect(child.id != null);
 
-    _ = child.wait(io) catch {};
+    // Kill, do NOT wait: `wait` blocks until the child exits, and this child
+    // is a 30 s sleep. `defer child.kill` alone would run only after a
+    // blocking wait returned, parking the suite for the full sleep.
+    // `Child.kill` reaps the child itself (it leaves `id == null`), so
+    // there is nothing left to wait for.
+    child.kill(io);
+    try std.testing.expect(child.id == null);
 }
 
 test "terminateChildTree_terminatesProcessTree_whenJobHandleProvidedOnWindows" {

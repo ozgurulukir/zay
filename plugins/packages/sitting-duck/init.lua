@@ -314,20 +314,19 @@ end
 
 -- todo-plugin sidecar pattern: missing or corrupt marker → nil, never a
 -- crash; the plugin just re-bootstraps.
+--
+-- `zay.read_file` and `zay.json_decode` never raise — a failure returns
+-- `nil` plus an error message — so the guard is on the returned values,
+-- not on a pcall. A marker that is not a table, or whose content is not
+-- a string, is treated exactly like an unparseable one.
 local function read_marker()
-  local ok, res = pcall(function()
-    local result = zay.read_file(MARKER_PATH, {})
-    if type(result) ~= "table" or type(result.content) ~= "string" then
-      return nil
-    end
-    local decoded = zay.json_decode(result.content)
-    if type(decoded) ~= "table" then return nil end
-    return decoded
-  end)
-  if ok and type(res) == "table" then
-    return res
+  local result = zay.read_file(MARKER_PATH, {})
+  if type(result) ~= "table" or type(result.content) ~= "string" then
+    return nil
   end
-  return nil
+  local decoded = zay.json_decode(result.content)
+  if type(decoded) ~= "table" then return nil end
+  return decoded
 end
 
 local function write_marker(version)
