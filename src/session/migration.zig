@@ -710,8 +710,10 @@ const RacingAlterTarget = struct {
                 // The "other" client applies the WHOLE unit first (column +
                 // project_locations table — the realistic concurrent case)...
                 self.raced = true;
-                try self.inner.exec(io, "alter table sessions add column project_key text", &.{});
-                try self.inner.exec(io, "create table project_locations(project_key text not null, host_id text not null, cwd text not null, cwd_key text not null, updated_at_ms bigint not null, primary key(project_key, host_id, cwd_key))", &.{});
+                try self.inner.batch(io, &.{
+                    .{ .sql = "alter table sessions add column project_key text" },
+                    .{ .sql = "create table project_locations(project_key text not null, host_id text not null, cwd text not null, cwd_key text not null, updated_at_ms bigint not null, primary key(project_key, host_id, cwd_key))" },
+                });
                 // ...so ours fails with a duplicate-column error.
                 return error.QueryFailed;
             }
