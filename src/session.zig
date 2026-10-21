@@ -1508,56 +1508,6 @@ fn collapseWhitespace(gpa: std.mem.Allocator, text: []const u8, max: u32) Error!
     return out.toOwnedSlice(gpa);
 }
 
-fn readSummary(gpa: std.mem.Allocator, row: *const db.Row) Error!SessionSummary {
-    var leaf_buffer: [entry_id_len]u8 = undefined;
-    return .{
-        .id = try gpa.dupe(u8, row.text(0)),
-        .title = if (row.columnType(1) == .null) null else try gpa.dupe(u8, row.text(1)),
-        .cwd = try gpa.dupe(u8, row.text(2)),
-        .created_at_ms = row.int(3),
-        .updated_at_ms = row.int(4),
-        .leaf_entry_id = if (row.columnType(5) == .null) null else blk: {
-            const value = row.text(5);
-            // A wrong-length leaf_entry_id is corrupt data (e.g. a test row or a
-            // leftover from an older schema). Treat it as null so one bad row
-            // doesn't crash the entire resume picker; the session still shows up
-            // and a resume attempt fails gracefully via manager.@"resume".
-            if (value.len != entry_id_len) break :blk null;
-            @memcpy(leaf_buffer[0..], value);
-            break :blk EntryId{ .bytes = leaf_buffer };
-        },
-        .model_provider = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
-        .model_id = if (row.columnType(7) == .null) null else try gpa.dupe(u8, row.text(7)),
-        .reasoning_effort = if (row.columnType(8) == .null) null else try gpa.dupe(u8, row.text(8)),
-    };
-}
-
-fn readEntry(gpa: std.mem.Allocator, row: *const db.Row) Error!EntryRecord {
-    var id: [entry_id_len]u8 = undefined;
-    const id_text = row.text(0);
-    if (id_text.len != entry_id_len) return error.BadEntryId;
-    @memcpy(id[0..], id_text);
-
-    var parent_id: ?[entry_id_len]u8 = null;
-    if (row.columnType(1) != .null) {
-        const parent_text = row.text(1);
-        if (parent_text.len != entry_id_len) return error.BadEntryId;
-        var parent_buffer: [entry_id_len]u8 = undefined;
-        @memcpy(parent_buffer[0..], parent_text);
-        parent_id = parent_buffer;
-    }
-
-    return .{
-        .id = id,
-        .parent_id = parent_id,
-        .kind = try gpa.dupe(u8, row.text(2)),
-        .role = if (row.columnType(3) == .null) null else try gpa.dupe(u8, row.text(3)),
-        .payload_json = try gpa.dupe(u8, row.text(4)),
-        .created_at_ms = row.int(5),
-        .snapshot = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
-    };
-}
-
 fn readSummaryFromRow(gpa: std.mem.Allocator, row: []const backend_mod.Value) Error!SessionSummary {
     var leaf_buffer: [entry_id_len]u8 = undefined;
     const id_str = switch (row[0]) {
@@ -1703,15 +1653,6 @@ fn fillHex(io: std.Io, buffer: []u8) void {
 
 fn deinitMessage(gpa: std.mem.Allocator, message: *ai.ChatMessage) void {
     message.deinit(gpa);
-}
-
-fn freeToolCalls(gpa: std.mem.Allocator, calls: []const ai.ToolCall) void {
-    if (calls.len == 0) return;
-    for (calls) |call| {
-        var owned = call;
-        owned.deinit(gpa);
-    }
-    gpa.free(calls);
 }
 
 test "session skill context follows branch ancestry through compaction" {
