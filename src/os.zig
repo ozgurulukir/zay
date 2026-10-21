@@ -207,6 +207,82 @@ test "terminateChildBounded escalates to SIGKILL when TERM is trapped" {
     try std.testing.expect(child.id == null);
 }
 
+test "terminateChildTree_isNoOp_onPosixPlatforms" {
+    if (is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // Arrange
+    var child = try spawnGrouped("sleep 30");
+    defer child.kill(io);
+
+    // Act
+    const job_handle = attachJobObjectKillOnClose(&child);
+    terminateChildTree(io, &child, job_handle);
+    terminateChildTree(io, &child, @ptrFromInt(0x12345678));
+
+    // Assert
+    try std.testing.expect(job_handle == null);
+    try std.testing.expect(child.id != null);
+
+    _ = child.wait(io) catch {};
+}
+
+test "terminateChildTree_terminatesProcessTree_whenJobHandleProvidedOnWindows" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // Arrange & Act & Assert: Scenario A - Null job handle is a safe no-op
+    {
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "cmd.exe", "/c", "ping", "127.0.0.1", "-n", "30" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        defer child.kill(io);
+
+        terminateChildTree(io, &child, null);
+        try std.testing.expect(child.id != null);
+    }
+
+    // Arrange & Act & Assert: Scenario B - Valid job handle terminates process tree
+    {
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "cmd.exe", "/c", "ping", "127.0.0.1", "-n", "30" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+
+        const handle = attachJobObjectKillOnClose(&child);
+        try std.testing.expect(handle != null);
+
+        terminateChildTree(io, &child, handle);
+
+        const term = try child.wait(io);
+        try std.testing.expectEqual(@as(u8, 1), termCode(term));
+        try std.testing.expect(child.id == null);
+    }
+
+    // Arrange & Act & Assert: Scenario C - Child already reaped (child.id == null) closes handle safely
+    {
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "cmd.exe", "/c", "ping", "127.0.0.1", "-n", "30" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+
+        const handle = attachJobObjectKillOnClose(&child);
+        try std.testing.expect(handle != null);
+
+        child.kill(io);
+        try std.testing.expect(child.id == null);
+
+        terminateChildTree(io, &child, handle);
+    }
+}
+
 test "terminateChildBounded returns quickly when TERM kills instantly" {
     // Pins the Linux `waitid(NOWAIT)` fast path; the non-Linux POSIX fallback
     // is zombie-blind by design and pays the full grace here.
