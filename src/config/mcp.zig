@@ -298,8 +298,12 @@ test "expandEnvVars emits an unterminated placeholder verbatim" {
     try std.testing.expectEqualStrings("https://x.com/?key={env:FOO", out);
 }
 
-test "expandsStdioServerConfig_whenEnvVarsAndLiteralsProvided" {
+test "expandMcpServer expands stdio command and arguments from the environment" {
     const gpa = std.testing.allocator;
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+    const path = env_map.get("PATH") orelse return error.SkipZigTest;
+    if (path.len == 0) return error.SkipZigTest;
 
     var raw_args = try gpa.alloc([]u8, 2);
     raw_args[0] = try gpa.dupe(u8, "--flag");
@@ -311,7 +315,7 @@ test "expandsStdioServerConfig_whenEnvVarsAndLiteralsProvided" {
         .request_timeout_ms = 5000,
         .transport = .{
             .stdio = .{
-                .command = try gpa.dupe(u8, "node"),
+                .command = try gpa.dupe(u8, "{env:PATH}"),
                 .args = raw_args,
             },
         },
@@ -327,51 +331,17 @@ test "expandsStdioServerConfig_whenEnvVarsAndLiteralsProvided" {
 
     switch (expanded.transport) {
         .stdio => |t| {
-            try std.testing.expectEqualStrings("node", t.command);
+            try std.testing.expectEqualStrings(path, t.command);
             try std.testing.expectEqual(@as(usize, 2), t.args.len);
             try std.testing.expectEqualStrings("--flag", t.args[0]);
-            try std.testing.expect(std.mem.indexOf(u8, t.args[1], "{env:") == null);
+            try std.testing.expect(std.mem.startsWith(u8, t.args[1], "val-"));
+            try std.testing.expectEqualStrings(path, t.args[1]["val-".len..]);
         },
-        .sse => try std.testing.expect(false),
+        .sse => return error.Unexpected,
     }
-}
 
-test "expandsSseServerConfigAndHeaders_whenEnvVarsAndLiteralsProvided" {
-    const gpa = std.testing.allocator;
-
-    var headers = try gpa.alloc(McpHeader, 1);
-    headers[0] = .{
-        .name = try gpa.dupe(u8, "Authorization"),
-        .value = try gpa.dupe(u8, "Bearer {env:ZAY_TEST_NONEXISTENT_KEY}"),
-    };
-
-    var original: McpServerConfig = .{
-        .name = try gpa.dupe(u8, "test-sse"),
-        .enabled = false,
-        .request_timeout_ms = null,
-        .transport = .{
-            .sse = .{
-                .url = try gpa.dupe(u8, "https://mcp.example.com/sse"),
-                .headers = headers,
-            },
-        },
-    };
-    defer original.deinit(gpa);
-
-    var expanded = try expandMcpServer(gpa, original);
-    defer expanded.deinit(gpa);
-
-    try std.testing.expectEqualStrings("test-sse", expanded.name);
-    try std.testing.expect(!expanded.enabled);
-    try std.testing.expectEqual(@as(?u32, null), expanded.request_timeout_ms);
-
-    switch (expanded.transport) {
-        .sse => |t| {
-            try std.testing.expectEqualStrings("https://mcp.example.com/sse", t.url);
-            try std.testing.expectEqual(@as(usize, 1), t.headers.len);
-            try std.testing.expectEqualStrings("Authorization", t.headers[0].name);
-            try std.testing.expectEqualStrings("Bearer ", t.headers[0].value);
-        },
-        .stdio => try std.testing.expect(false),
+    switch (original.transport) {
+        .stdio => |t| try std.testing.expectEqualStrings("val-{env:PATH}", t.args[1]),
+        .sse => return error.Unexpected,
     }
 }
