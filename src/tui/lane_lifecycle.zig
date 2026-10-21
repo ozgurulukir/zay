@@ -13,7 +13,6 @@ const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
 const lane_recovery = @import("lanes/recovery.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
-const lanes_picker = @import("widgets/lanes_picker.zig");
 const lifecycle = @import("lifecycle.zig");
 const mode_lifecycle = @import("mode_lifecycle.zig");
 const turn_view_mod = @import("turn_view.zig");
