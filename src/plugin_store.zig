@@ -255,6 +255,20 @@ fn appendFailure(gpa: std.mem.Allocator, failures: *std.ArrayList(StoreFailure),
     try failures.append(gpa, .{ .source = source_copy, .message = message });
 }
 
+fn isHttpSource(source: []const u8) bool {
+    const uri = std.Uri.parse(source) catch return false;
+    return std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+        std.ascii.eqlIgnoreCase(uri.scheme, "https");
+}
+
+fn sourcesEqual(a: []const u8, b: []const u8) bool {
+    const a_is_http = isHttpSource(a);
+    const b_is_http = isHttpSource(b);
+    if (a_is_http != b_is_http) return false;
+    if (a_is_http) return std.mem.eql(u8, a, b);
+    return paths.pathsEqual(a, b);
+}
+
 fn cachePath(gpa: std.mem.Allocator, home: []const u8, source: []const u8) ![]u8 {
     const base = try paths.platformConfigDir(gpa, home);
     defer gpa.free(base);
@@ -285,15 +299,15 @@ fn loadSource(gpa: std.mem.Allocator, io: std.Io, home: ?[]const u8, project: []
 
 fn appendSource(gpa: std.mem.Allocator, io: std.Io, home: []const u8, project: []const u8, source: []const u8, catalogs: *std.ArrayList(Catalog), failures: *std.ArrayList(StoreFailure)) !void {
     for (catalogs.items) |existing| {
-        if (paths.pathsEqual(existing.source, source)) return;
+        if (sourcesEqual(existing.source, source)) return;
     }
     for (failures.items) |failure| {
-        if (paths.pathsEqual(failure.source, source)) return;
+        if (sourcesEqual(failure.source, source)) return;
     }
     var catalog = loadSource(gpa, io, home, project, source) catch |err| blk: {
         if (err == error.OutOfMemory or err == error.Canceled) return err;
         try appendFailure(gpa, failures, source, err);
-        if (!std.mem.startsWith(u8, source, "https://") and !std.mem.startsWith(u8, source, "http://")) return;
+        if (!isHttpSource(source)) return;
         const cached = try cachePath(gpa, home, source);
         defer gpa.free(cached);
         const bytes = readFile(gpa, io, cached, catalog_max_bytes) catch |cache_err| {
@@ -1276,6 +1290,13 @@ test "appendSource ignores duplicate catalog sources" {
 
     try appendSource(gpa, io, "home", ".", local_path, &catalogs, &failures);
     try std.testing.expectEqual(first_len, catalogs.items.len);
+}
+
+test "sourcesEqual preserves URL path semantics and normalizes local separators" {
+    try std.testing.expect(sourcesEqual("HTTPS://example.com/catalog", "HTTPS://example.com/catalog"));
+    try std.testing.expect(!sourcesEqual("HTTPS://example.com/catalog", "HTTPS://example.com/catalog/"));
+    try std.testing.expect(!sourcesEqual("HTTPS://example.com/Catalog", "HTTPS://example.com/catalog"));
+    try std.testing.expect(sourcesEqual("./plugins/store.json", ".\\plugins\\store.json"));
 }
 
 test "removeStoreUrl purges all duplicate occurrences of store url" {
