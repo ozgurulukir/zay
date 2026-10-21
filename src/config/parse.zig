@@ -4456,3 +4456,34 @@ test "parseCompaction accepts evictHistoryImages and writeCompaction round-trips
     try writeCompaction(&buf.writer, parsed.context.compaction);
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"evictHistoryImages\":false") != null);
 }
+
+test "readGlobal_whenFileReadFails_returnsDefaultConfigAndFreesDiagnostics" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.dirOpenFile = struct {
+        fn openFile(
+            userdata: ?*anyopaque,
+            dir: std.Io.Dir,
+            sub_path: []const u8,
+            flags: std.Io.File.OpenFlags,
+        ) std.Io.File.OpenError!std.Io.File {
+            _ = userdata;
+            _ = dir;
+            _ = sub_path;
+            _ = flags;
+            return error.AccessDenied;
+        }
+    }.openFile;
+    const mock_io: std.Io = .{
+        .userdata = std.testing.io.userdata,
+        .vtable = &mock_vtable,
+    };
+
+    // Act
+    var cfg = try readGlobal(gpa, mock_io, "/home/testuser");
+    defer cfg.deinit(gpa);
+
+    // Assert
+    try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
+}
