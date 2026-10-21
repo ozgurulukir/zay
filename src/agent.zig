@@ -1638,11 +1638,22 @@ const tool_display = @import("tools/display.zig");
 pub const parseCommand = tool_display.parseCommand;
 pub const formatToolDisplay = tool_display.formatToolDisplay;
 
+
+fn getTestApiKey(gpa: std.mem.Allocator) ![]u8 {
+    if (std.process.Environ.getAlloc(.{ .block = .global }, gpa, "OPENAI_API_KEY")) |val| {
+        if (val.len > 0) return val;
+        gpa.free(val);
+    } catch {};
+    return gpa.dupe(u8, "test-key-placeholder");
+}
+
 test "streaming callbacks emit owned events" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
@@ -1695,7 +1706,9 @@ test "StreamContext coalesces small content deltas into one response_delta" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
@@ -1737,7 +1750,9 @@ test "StreamContext coalescing preserves wire order across types" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
@@ -1782,7 +1797,9 @@ test "StreamContext coalesces the real per-chunk cadence" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
@@ -1840,7 +1857,9 @@ test "stream callbacks do not double-free when the listener returns an error" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
@@ -1887,7 +1906,9 @@ test "run gates the request on the limiter and releases on the error path" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
@@ -2228,9 +2249,11 @@ test "context token estimate anchors on usage plus trailing messages" {
 
 test "context footprint includes wire tools before usage without counting them twice" {
     const gpa = std.testing.allocator;
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
     var client: ai.openai_compatible.Client = undefined;
     try client.init(gpa, std.testing.io, .{
-        .api_key = "test",
+        .api_key = test_api_key,
         .model = "test",
         .base_url = "http://localhost:1",
         .system_prompt = "",
@@ -2559,10 +2582,12 @@ test "run auto-continues once after a length-cut stream" {
 
     const openai_compatible = @import("ai/openai_compatible.zig");
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{server.port()});
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
     var client: openai_compatible.Client = undefined;
     try client.init(gpa, io, .{
         .base_url = base_url,
-        .api_key = "test-key",
+        .api_key = test_api_key,
         .model = "test-model",
         .tools = &.{},
         .mcp_tools = &.{},
@@ -2642,10 +2667,12 @@ test "run retries once when the provider truncates tool-call arguments" {
 
     const openai_compatible = @import("ai/openai_compatible.zig");
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1", .{server.port()});
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
     var client: openai_compatible.Client = undefined;
     try client.init(gpa, io, .{
         .base_url = base_url,
-        .api_key = "test-key",
+        .api_key = test_api_key,
         .model = "test-model",
         .tools = &.{},
         .mcp_tools = &.{},
@@ -3168,7 +3195,9 @@ test "requestManualCompact: defers to a stale run instead of starting a second" 
     defer writer.deinit();
 
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
@@ -3204,7 +3233,9 @@ test "requestManualCompact starts a run; poll fails it against a dead server" {
     defer writer.deinit();
 
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
@@ -3236,7 +3267,9 @@ test "pollManualCompact: returns null while the summarizer is running" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
@@ -3267,7 +3300,9 @@ test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clear
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
@@ -3317,7 +3352,9 @@ test "pollManualCompact: discards a stale background result before the manual ru
     defer writer.deinit();
 
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
@@ -3425,7 +3462,9 @@ test "drain and failed compaction preserve live and persisted context" {
         const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
         defer gpa.free(base_url);
         var client: openai.Client = undefined;
-        try client.init(gpa, io, .{ .base_url = base_url, .api_key = "test", .model = "test", .request_timeout_seconds = 30 });
+        const test_api_key = try getTestApiKey(gpa);
+        defer gpa.free(test_api_key);
+        try client.init(gpa, io, .{ .base_url = base_url, .api_key = test_api_key, .model = "test", .request_timeout_seconds = 30 });
         defer client.deinit();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -3492,7 +3531,9 @@ test "drain joins a running summarizer that fails against a dead server" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -3538,7 +3579,9 @@ test "compaction breaker trips after repeated failures and backs off automatical
     defer writer.deinit();
 
     var client: openai_compatible.Client = undefined;
-    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer client.deinit();
 
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
@@ -3634,7 +3677,9 @@ test "assistant message with only reasoning is dropped from history" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
@@ -3651,7 +3696,9 @@ test "assistant message with text or tool calls is kept" {
     const gpa = std.testing.allocator;
     const openai_compatible = @import("ai/openai_compatible.zig");
     var openai_compatible_client: openai_compatible.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    const test_api_key = try getTestApiKey(gpa);
+    defer gpa.free(test_api_key);
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = test_api_key, .model = "test" });
     defer openai_compatible_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
     defer agent.deinit();
