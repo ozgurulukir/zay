@@ -297,3 +297,51 @@ test "expandEnvVars emits an unterminated placeholder verbatim" {
     defer gpa.free(out);
     try std.testing.expectEqualStrings("https://x.com/?key={env:FOO", out);
 }
+
+test "expandMcpServer expands stdio command and arguments from the environment" {
+    const gpa = std.testing.allocator;
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+    const path = env_map.get("PATH") orelse return error.SkipZigTest;
+    if (path.len == 0) return error.SkipZigTest;
+
+    var raw_args = try gpa.alloc([]u8, 2);
+    raw_args[0] = try gpa.dupe(u8, "--flag");
+    raw_args[1] = try gpa.dupe(u8, "val-{env:PATH}");
+
+    var original: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "test-stdio"),
+        .enabled = true,
+        .request_timeout_ms = 5000,
+        .transport = .{
+            .stdio = .{
+                .command = try gpa.dupe(u8, "{env:PATH}"),
+                .args = raw_args,
+            },
+        },
+    };
+    defer original.deinit(gpa);
+
+    var expanded = try expandMcpServer(gpa, original);
+    defer expanded.deinit(gpa);
+
+    try std.testing.expectEqualStrings("test-stdio", expanded.name);
+    try std.testing.expect(expanded.enabled);
+    try std.testing.expectEqual(@as(?u32, 5000), expanded.request_timeout_ms);
+
+    switch (expanded.transport) {
+        .stdio => |t| {
+            try std.testing.expectEqualStrings(path, t.command);
+            try std.testing.expectEqual(@as(usize, 2), t.args.len);
+            try std.testing.expectEqualStrings("--flag", t.args[0]);
+            try std.testing.expect(std.mem.startsWith(u8, t.args[1], "val-"));
+            try std.testing.expectEqualStrings(path, t.args[1]["val-".len..]);
+        },
+        .sse => return error.Unexpected,
+    }
+
+    switch (original.transport) {
+        .stdio => |t| try std.testing.expectEqualStrings("val-{env:PATH}", t.args[1]),
+        .sse => return error.Unexpected,
+    }
+}
