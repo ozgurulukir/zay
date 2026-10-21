@@ -289,12 +289,6 @@ pub const AgentRuntime = struct {
         target.session_writer_started = true;
         errdefer target.session_writer.deinit();
 
-        // The agent must share the runtime's owned cwd, NOT the borrowed
-        // `cwd` parameter — a cross-project resume hands us `summary.cwd`,
-        // and the next `reloadResumeSessions` frees it via `resumeClear`
-        // while the worker thread may still be running tools against it.
-        // `agent.deinit` does not free cwd; `deinit` frees `self.cwd` (this
-        // same allocation) after the agent, so ownership is unambiguous.
         target.agent = agent_mod.Agent.init(gpa, io, owned_cwd, .none);
         errdefer target.agent.deinit();
         target.agent.skills = target.skills;
