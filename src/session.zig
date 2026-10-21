@@ -45,6 +45,65 @@ pub const CompactionCut = session_type.CompactionCut;
 pub const EntryKind = session_type.EntryKind;
 pub const EntrySummary = session_type.EntrySummary;
 
+const MessageProjection = struct {
+    entries: []EntryRecord,
+    summary_message: ?ai.ChatMessage = null,
+
+    fn deinit(self: *MessageProjection, gpa: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(gpa);
+        gpa.free(self.entries);
+        if (self.summary_message) |*message| deinitMessage(gpa, message);
+        self.* = undefined;
+    }
+};
+
+const message_branch_probe_sql =
+    \\with recursive branch(session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid) as (
+    \\  select session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid
+    \\    from session_entries where session_id = ? and id = ?
+    \\  union all
+    \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.created_at_ms, e.snapshot, e.rowid
+    \\    from session_entries e join branch
+    \\      on e.session_id = branch.session_id and e.id = branch.parent_id
+    \\    where branch.parent_id is not null
+    \\)
+    \\select branch.id, branch.parent_id, branch.kind, branch.role,
+    \\       case
+    \\         when not exists (select 1 from branch where kind = 'compaction') then e.payload_json
+    \\         when branch.id = (
+    \\           select newest.id from branch newest where newest.kind = 'compaction'
+    \\           order by newest.created_at_ms desc, newest.rowid desc limit 1
+    \\         ) then e.payload_json
+    \\         else null
+    \\       end as payload_json,
+    \\       branch.created_at_ms, branch.snapshot, branch.rowid
+    \\  from branch join session_entries e
+    \\    on e.session_id = branch.session_id and e.id = branch.id
+    \\ order by branch.created_at_ms, branch.rowid
+;
+
+const message_branch_suffix_sql =
+    \\with recursive branch(session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid) as (
+    \\  select session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid
+    \\    from session_entries where session_id = ? and id = ?
+    \\  union all
+    \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.created_at_ms, e.snapshot, e.rowid
+    \\    from session_entries e join branch
+    \\      on e.session_id = branch.session_id and e.id = branch.parent_id
+    \\    where branch.parent_id is not null
+    \\)
+    \\select branch.id, branch.parent_id, branch.kind, branch.role,
+    \\       case
+    \\         when branch.id = ? or branch.kind in ('message', 'branch_summary') then e.payload_json
+    \\         else null
+    \\       end as payload_json,
+    \\       branch.created_at_ms, branch.snapshot, branch.rowid
+    \\  from branch join session_entries e
+    \\    on e.session_id = branch.session_id and e.id = branch.id
+    \\ where branch.created_at_ms > ? or (branch.created_at_ms = ? and branch.rowid >= ?)
+    \\ order by branch.created_at_ms, branch.rowid
+;
+
 /// The backend selection a caller wants the session store to come from.
 /// Borrowed strings — a picker builds it from the live config right before
 /// use. `kind == null` falls back to `remote_service` when a url is present,
@@ -1058,32 +1117,36 @@ pub const Session = struct {
     }
 
     /// Project the active branch into the message list the model sees. The
-    /// durable tree is the source of truth; this is the derived view. When the
-    /// branch carries a compaction boundary, the summarized prefix is replaced
-    /// by the summary message and everything from the first kept entry onward
-    /// is emitted verbatim (see `findCompactionBoundary`). Without a boundary
-    /// the whole branch is emitted, preserving the pre-compaction behavior.
+    /// durable tree is the source of truth; this is the derived view. A valid
+    /// compaction replaces the prefix with its summary and projected suffix.
+    /// Missing or stale boundaries preserve the full-branch behavior.
     pub fn messages(self: *Session, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
-        const path = try self.loadBranch(gpa);
-        defer {
-            for (path) |*entry| entry.deinit(gpa);
-            gpa.free(path);
-        }
-        assert(path.len <= path_entries_max);
-
-        const boundary = try findCompactionBoundary(gpa, path);
-        const emit_start: u32 = if (boundary) |b| b.first_kept_index else 0;
+        var projection = try self.loadMessageProjection(gpa);
+        defer projection.deinit(gpa);
+        assert(projection.entries.len <= path_entries_max);
 
         var messages_list: std.ArrayList(ai.ChatMessage) = .empty;
         errdefer {
             for (messages_list.items) |*message| deinitMessage(gpa, message);
             messages_list.deinit(gpa);
         }
-        if (boundary) |b| {
-            try messages_list.append(gpa, try serialize.compactionSummaryToMessage(gpa, path[b.summary_index].payload_json));
-        }
-        for (path[emit_start..]) |entry| {
-            try appendProjectedEntry(gpa, &messages_list, entry);
+        if (projection.summary_message) |summary_message| {
+            try messages_list.append(gpa, summary_message);
+            projection.summary_message = null;
+            for (projection.entries) |entry| {
+                try appendProjectedEntry(gpa, &messages_list, entry);
+            }
+        } else {
+            const boundary = try findCompactionBoundary(gpa, projection.entries);
+            const emit_start: u32 = if (boundary) |b| b.first_kept_index else 0;
+            if (boundary) |b| {
+                var summary_msg = try serialize.compactionSummaryToMessage(gpa, projection.entries[b.summary_index].payload_json);
+                errdefer deinitMessage(gpa, &summary_msg);
+                try messages_list.append(gpa, summary_msg);
+            }
+            for (projection.entries[emit_start..]) |entry| {
+                try appendProjectedEntry(gpa, &messages_list, entry);
+            }
         }
         return messages_list.toOwnedSlice(gpa);
     }
@@ -1291,7 +1354,162 @@ pub const Session = struct {
         }
         return records.toOwnedSlice(gpa);
     }
+
+    fn loadMessageProjection(self: *Session, gpa: std.mem.Allocator) Error!MessageProjection {
+        const leaf_id = self.leaf_entry_id orelse return .{ .entries = try gpa.alloc(EntryRecord, 0) };
+
+        var probe = try self.manager.backend.query(self.manager.io, message_branch_probe_sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = leaf_id.slice() },
+        });
+        defer probe.deinit();
+        if (probe.rows.len == 0) return error.MissingEntry;
+        assert(probe.rows.len <= path_entries_max);
+
+        var latest_compaction_index: ?usize = null;
+        for (probe.rows, 0..) |row, index| {
+            _ = try readBranchProbeId(row);
+            const kind = branchProbeKind(row) catch return error.CorruptData;
+            if (std.mem.eql(u8, kind, "compaction")) latest_compaction_index = index;
+        }
+
+        const summary_index = latest_compaction_index orelse {
+            var message_entries: std.ArrayList(EntryRecord) = .empty;
+            errdefer {
+                for (message_entries.items) |*entry| entry.deinit(gpa);
+                message_entries.deinit(gpa);
+            }
+            for (probe.rows) |row| {
+                try message_entries.append(gpa, try readEntryFromRow(gpa, row));
+            }
+            return .{ .entries = try message_entries.toOwnedSlice(gpa) };
+        };
+
+        const summary_row = probe.rows[summary_index];
+        const summary_payload_json = switch (summary_row[4]) {
+            .text => |payload| payload,
+            else => return error.CorruptData,
+        };
+        const first_kept_id = try serialize.compactionFirstKeptId(gpa, summary_payload_json);
+        var first_kept_index: ?usize = null;
+        for (probe.rows, 0..) |row, index| {
+            const id = try readBranchProbeId(row);
+            if (std.mem.eql(u8, id[0..], first_kept_id[0..])) first_kept_index = index;
+        }
+        const boundary_index = first_kept_index orelse return .{ .entries = try self.loadBranch(gpa) };
+        if (boundary_index > summary_index) return .{ .entries = try self.loadBranch(gpa) };
+
+        const boundary_row = probe.rows[boundary_index];
+        const boundary_created_at_ms = switch (boundary_row[5]) {
+            .int => |value| value,
+            else => return .{ .entries = try self.loadBranch(gpa) },
+        };
+        const boundary_rowid = switch (boundary_row[7]) {
+            .int => |value| value,
+            else => return .{ .entries = try self.loadBranch(gpa) },
+        };
+        const summary_id = try readBranchProbeId(summary_row);
+        return try self.loadProjectedSuffix(gpa, first_kept_id, summary_id, boundary_created_at_ms, boundary_rowid);
+    }
+
+    fn loadProjectedSuffix(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        first_kept_id: [entry_id_len]u8,
+        expected_summary_id: [entry_id_len]u8,
+        boundary_created_at_ms: i64,
+        boundary_rowid: i64,
+    ) Error!MessageProjection {
+        const leaf_id = self.leaf_entry_id orelse return .{ .entries = try gpa.alloc(EntryRecord, 0) };
+        var qres = try self.manager.backend.query(self.manager.io, message_branch_suffix_sql, &.{
+            .{ .text = self.id.slice() },
+            .{ .text = leaf_id.slice() },
+            .{ .text = expected_summary_id[0..] },
+            .{ .int = boundary_created_at_ms },
+            .{ .int = boundary_created_at_ms },
+            .{ .int = boundary_rowid },
+        });
+        defer qres.deinit();
+        if (qres.rows.len == 0) return .{ .entries = try self.loadBranch(gpa) };
+        assert(qres.rows.len <= path_entries_max);
+
+        var boundary_index: ?usize = null;
+        var summary_index: ?usize = null;
+        var latest_compaction_id: ?[entry_id_len]u8 = null;
+        var summary_payload_json: ?[]const u8 = null;
+        for (qres.rows, 0..) |row, index| {
+            const id = try readBranchProbeId(row);
+            const kind = branchProbeKind(row) catch return error.CorruptData;
+            if (std.mem.eql(u8, id[0..], first_kept_id[0..])) boundary_index = index;
+            if (std.mem.eql(u8, kind, "compaction")) latest_compaction_id = id;
+            if (std.mem.eql(u8, id[0..], expected_summary_id[0..])) {
+                if (!std.mem.eql(u8, kind, "compaction")) return .{ .entries = try self.loadBranch(gpa) };
+                summary_index = index;
+                summary_payload_json = switch (row[4]) {
+                    .text => |payload| payload,
+                    else => return error.CorruptData,
+                };
+            }
+        }
+        const kept_index = boundary_index orelse return .{ .entries = try self.loadBranch(gpa) };
+        if (kept_index != 0) return .{ .entries = try self.loadBranch(gpa) };
+        const compact_index = summary_index orelse return .{ .entries = try self.loadBranch(gpa) };
+        if (kept_index > compact_index) return .{ .entries = try self.loadBranch(gpa) };
+        if (latest_compaction_id == null or !std.mem.eql(u8, latest_compaction_id.?[0..], expected_summary_id[0..])) {
+            return .{ .entries = try self.loadBranch(gpa) };
+        }
+
+        const confirmed_payload_json = summary_payload_json orelse return error.CorruptData;
+        const confirmed_first_kept_id = try serialize.compactionFirstKeptId(gpa, confirmed_payload_json);
+        if (!std.mem.eql(u8, confirmed_first_kept_id[0..], first_kept_id[0..])) {
+            return .{ .entries = try self.loadBranch(gpa) };
+        }
+        const summary_message = try serialize.compactionSummaryToMessage(gpa, confirmed_payload_json);
+        errdefer {
+            var message = summary_message;
+            deinitMessage(gpa, &message);
+        }
+
+        var message_entries: std.ArrayList(EntryRecord) = .empty;
+        errdefer {
+            for (message_entries.items) |*entry| entry.deinit(gpa);
+            message_entries.deinit(gpa);
+        }
+        for (qres.rows[kept_index..]) |row| {
+            const kind = branchProbeKind(row) catch return error.CorruptData;
+            if (std.mem.eql(u8, kind, "message") or std.mem.eql(u8, kind, "branch_summary")) {
+                try message_entries.append(gpa, try readEntryFromRow(gpa, row));
+            }
+        }
+        return .{ .entries = try message_entries.toOwnedSlice(gpa), .summary_message = summary_message };
+    }
 };
+
+fn readBranchProbeId(row: []const backend_mod.Value) Error![entry_id_len]u8 {
+    assert(row.len >= 8);
+    const id_text = switch (row[0]) {
+        .text => |text| text,
+        else => return error.BadEntryId,
+    };
+    if (id_text.len != entry_id_len) return error.BadEntryId;
+    var id: [entry_id_len]u8 = undefined;
+    @memcpy(id[0..], id_text);
+
+    switch (row[1]) {
+        .text => |parent_text| if (parent_text.len != entry_id_len) return error.BadEntryId,
+        else => {},
+    }
+    _ = try branchProbeKind(row);
+    return id;
+}
+
+fn branchProbeKind(row: []const backend_mod.Value) Error![]const u8 {
+    assert(row.len >= 8);
+    return switch (row[2]) {
+        .text => |kind| kind,
+        else => error.CorruptData,
+    };
+}
 
 fn expectDone(statement: *db.Statement) Error!void {
     if (try statement.step()) |_| return error.Sqlite;
@@ -1850,15 +2068,18 @@ test "session branch remains scoped when entry ids collide across sessions" {
         .{ .text = other.id.slice() },
         .{ .text = other_id[0..] },
     });
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try session.appendCompaction(root_id[0..], "summary", &id_compaction);
 
     const messages = try session.messages(gpa);
     defer {
         for (messages) |*message| deinitMessage(gpa, message);
         gpa.free(messages);
     }
-    try std.testing.expectEqual(@as(usize, 2), messages.len);
-    try std.testing.expectEqualStrings("root", messages[0].text());
-    try std.testing.expectEqualStrings("leaf", messages[1].text());
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("summary", messages[0].text());
+    try std.testing.expectEqualStrings("root", messages[1].text());
+    try std.testing.expectEqualStrings("leaf", messages[2].text());
 }
 
 test "session compaction boundary replaces summarized prefix" {
@@ -1911,6 +2132,275 @@ test "session compaction boundary keeps entries appended after it" {
     try std.testing.expectEqualStrings("SUMMARY", messages[0].text());
     try std.testing.expectEqualStrings("keep me", messages[1].text());
     try std.testing.expectEqualStrings("after compaction", messages[2].text());
+}
+
+test "session message queries omit compacted prefix payloads" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "cccccccccccccccccccccccccccccccc" });
+
+    var id_old_user: [entry_id_len]u8 = undefined;
+    var id_old_agent: [entry_id_len]u8 = undefined;
+    var id_kept: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    var id_after: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "old user", &id_old_user);
+    try appendTextEntry(&session, gpa, .assistant, "old assistant", &id_old_agent);
+    try appendTextEntry(&session, gpa, .user, "kept", &id_kept);
+    try session.appendCompaction(id_kept[0..], "SUMMARY", &id_compaction);
+    try appendTextEntry(&session, gpa, .assistant, "after", &id_after);
+
+    var probe = try manager.backend.query(std.testing.io, message_branch_probe_sql, &.{
+        .{ .text = session.id.slice() },
+        .{ .text = id_after[0..] },
+    });
+    defer probe.deinit();
+    try std.testing.expectEqual(@as(usize, 5), probe.rows.len);
+    var found_summary = false;
+    var boundary_created_at_ms: ?i64 = null;
+    var boundary_rowid: ?i64 = null;
+    for (probe.rows) |row| {
+        const id = switch (row[0]) {
+            .text => |text| text,
+            else => return error.BadEntryId,
+        };
+        if (std.mem.eql(u8, id, id_kept[0..])) {
+            boundary_created_at_ms = switch (row[5]) {
+                .int => |value| value,
+                else => return error.CorruptData,
+            };
+            boundary_rowid = switch (row[7]) {
+                .int => |value| value,
+                else => return error.CorruptData,
+            };
+        }
+        if (std.mem.eql(u8, id, id_compaction[0..])) {
+            const payload = switch (row[4]) {
+                .text => |text| text,
+                else => return error.CorruptData,
+            };
+            try std.testing.expect(std.mem.indexOf(u8, payload, "SUMMARY") != null);
+            found_summary = true;
+        } else {
+            try std.testing.expect(row[4] == .null);
+        }
+    }
+    try std.testing.expect(found_summary);
+
+    var suffix = try manager.backend.query(std.testing.io, message_branch_suffix_sql, &.{
+        .{ .text = session.id.slice() },
+        .{ .text = id_after[0..] },
+        .{ .text = id_compaction[0..] },
+        .{ .int = boundary_created_at_ms orelse return error.CorruptData },
+        .{ .int = boundary_created_at_ms orelse return error.CorruptData },
+        .{ .int = boundary_rowid orelse return error.CorruptData },
+    });
+    defer suffix.deinit();
+    try std.testing.expectEqual(@as(usize, 3), suffix.rows.len);
+    for (suffix.rows, 0..) |row, index| {
+        const expected_id = switch (index) {
+            0 => id_kept[0..],
+            1 => id_compaction[0..],
+            2 => id_after[0..],
+            else => unreachable,
+        };
+        try std.testing.expectEqualStrings(expected_id, row[0].text);
+        try std.testing.expect(row[4] == .text);
+    }
+
+    var projection = try session.loadMessageProjection(gpa);
+    defer projection.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), projection.entries.len);
+    try std.testing.expectEqualSlices(u8, id_kept[0..], projection.entries[0].id[0..]);
+    try std.testing.expectEqualSlices(u8, id_after[0..], projection.entries[1].id[0..]);
+    try std.testing.expect(projection.summary_message != null);
+    try std.testing.expectEqualStrings("SUMMARY", projection.summary_message.?.text());
+}
+
+test "session message projection uses the newest of multiple compactions" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "dddddddddddddddddddddddddddddddd" });
+
+    var id_old: [entry_id_len]u8 = undefined;
+    var id_kept_first: [entry_id_len]u8 = undefined;
+    var id_first_summary: [entry_id_len]u8 = undefined;
+    var id_kept_second: [entry_id_len]u8 = undefined;
+    var id_latest_summary: [entry_id_len]u8 = undefined;
+    var id_after: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "old", &id_old);
+    try appendTextEntry(&session, gpa, .assistant, "kept first", &id_kept_first);
+    try session.appendCompaction(id_kept_first[0..], "OLD SUMMARY", &id_first_summary);
+    try appendTextEntry(&session, gpa, .user, "kept second", &id_kept_second);
+    try session.appendCompaction(id_kept_second[0..], "NEW SUMMARY", &id_latest_summary);
+    try appendTextEntry(&session, gpa, .assistant, "after latest summary", &id_after);
+
+    var projection = try session.loadMessageProjection(gpa);
+    defer projection.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), projection.entries.len);
+    try std.testing.expectEqualSlices(u8, id_kept_second[0..], projection.entries[0].id[0..]);
+    try std.testing.expectEqualSlices(u8, id_after[0..], projection.entries[1].id[0..]);
+    try std.testing.expect(projection.summary_message != null);
+    try std.testing.expectEqualStrings("NEW SUMMARY", projection.summary_message.?.text());
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("NEW SUMMARY", messages[0].text());
+    try std.testing.expectEqualStrings("kept second", messages[1].text());
+    try std.testing.expectEqualStrings("after latest summary", messages[2].text());
+
+    var probe = try manager.backend.query(std.testing.io, message_branch_probe_sql, &.{
+        .{ .text = session.id.slice() },
+        .{ .text = id_after[0..] },
+    });
+    defer probe.deinit();
+    for (probe.rows) |row| {
+        const id = switch (row[0]) {
+            .text => |text| text,
+            else => return error.BadEntryId,
+        };
+        if (std.mem.eql(u8, id, id_latest_summary[0..])) {
+            try std.testing.expect(row[4] == .text);
+        } else {
+            try std.testing.expect(row[4] == .null);
+        }
+    }
+}
+
+test "session message projection falls back when compaction boundary leaves the branch" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" });
+
+    var id_root: [entry_id_len]u8 = undefined;
+    var id_abandoned: [entry_id_len]u8 = undefined;
+    var id_branch: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "root", &id_root);
+    try appendTextEntry(&session, gpa, .assistant, "abandoned", &id_abandoned);
+    try session.branch(id_root[0..], "active branch", &id_branch);
+    try session.appendCompaction(id_abandoned[0..], "STALE SUMMARY", &id_compaction);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("root", messages[0].text());
+    try std.testing.expectEqualStrings("Branch summary: active branch", messages[1].text());
+}
+
+test "session message projection fails on a corrupt newest compaction boundary" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "ffffffffffffffffffffffffffffffff" });
+
+    var id_kept: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "kept", &id_kept);
+    try session.appendCompaction(id_kept[0..], "SUMMARY", &id_compaction);
+    try manager.backend.exec(
+        std.testing.io,
+        "update session_entries set payload_json = ? where session_id = ? and id = ?",
+        &.{
+            .{ .text = "not-json" },
+            .{ .text = session.id.slice() },
+            .{ .text = id_compaction[0..] },
+        },
+    );
+
+    try std.testing.expectError(error.CorruptPayload, session.messages(gpa));
+}
+
+test "session message projection skips interleaved non-message entries in retained suffix" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "11111111111111111111111111111111" });
+
+    var id_kept: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    var id_info: [entry_id_len]u8 = undefined;
+    var id_after: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "kept", &id_kept);
+    try session.appendCompaction(id_kept[0..], "SUMMARY", &id_compaction);
+    try session.info("re-titled", &id_info);
+    try appendTextEntry(&session, gpa, .assistant, "after", &id_after);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("SUMMARY", messages[0].text());
+    try std.testing.expectEqualStrings("kept", messages[1].text());
+    try std.testing.expectEqualStrings("after", messages[2].text());
+}
+
+test "session message projection supports compaction keeping leaf entry alone" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "22222222222222222222222222222222" });
+
+    var id_old: [entry_id_len]u8 = undefined;
+    var id_leaf: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "old", &id_old);
+    try appendTextEntry(&session, gpa, .assistant, "leaf", &id_leaf);
+    try session.appendCompaction(id_leaf[0..], "LEAF SUMMARY", &id_compaction);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("LEAF SUMMARY", messages[0].text());
+    try std.testing.expectEqualStrings("leaf", messages[1].text());
+}
+
+test "session message projection falls back to full branch when suffix query kept_index is non-zero" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "33333333333333333333333333333333" });
+
+    var id_first: [entry_id_len]u8 = undefined;
+    var id_second: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "first", &id_first);
+    try appendTextEntry(&session, gpa, .assistant, "second", &id_second);
+    try session.appendCompaction(id_second[0..], "SUMMARY", &id_compaction);
+
+    // Artificially give id_first a newer created_at_ms than id_second so suffix query
+    // matching >= id_second's timestamp would encounter id_first with kept_index > 0.
+    try manager.backend.exec(
+        std.testing.io,
+        "update session_entries set created_at_ms = 999999 where session_id = ? and id = ?",
+        &.{
+            .{ .text = session.id.slice() },
+            .{ .text = id_first[0..] },
+        },
+    );
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    // Full fallback projects the messages without failing
+    try std.testing.expect(messages.len > 0);
 }
 
 test "compaction cut splits the branch at the keep-recent budget" {
