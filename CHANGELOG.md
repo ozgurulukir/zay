@@ -6,6 +6,15 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-10-21
+
+### Changed
+- Optimize compacted session resume (`Session.messages`): probe active branch metadata and newest compaction summary first, transferring payload JSON only for the retained suffix. Reduces payload volume and remote roundtrip transfer for compacted histories (#163, #262).
+
+### Fixed
+- Release workflow checksum format: compute SHA-256 checksums from inside the distribution directory so that `.sha256` files record bare basenames rather than paths with `dist/` prefixes, fixing download-side verification (#261).
+- Harden session message projection: guard against row-ordering anomalies by verifying `kept_index == 0` on suffix probe or falling back to full branch load; slice retained suffix strictly from `kept_index`; enforce row width and path entry count invariants; eliminate potential memory leak during summary message allocation on OOM (#262).
+
 ## [0.11.3] - 2026-10-21
 
 ### Added
