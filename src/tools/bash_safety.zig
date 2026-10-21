@@ -514,10 +514,10 @@ const ClassifierExchange = struct {
 };
 
 /// Explicit `std.http.Client` exchange for HTTPS and Windows, executed
-/// under ClassifierExchange's cancelable watchdog. The client itself cannot
-/// bound its reads here (a socket read timeout surfaces as EAGAIN, which
-/// the `Io.Threaded` read path treats as a programmer bug — panic in
-/// Debug), so the deadline-carrying http path is `classifyOverSocket`.
+/// under ClassifierExchange's cancelable watchdog. Uses `http.timeoutAwareIo(io)`
+/// to handle socket read timeouts, translating POSIX EAGAIN into `error.Timeout`
+/// rather than treating EAGAIN as an unhandled error/panic in Debug mode under
+/// `Io.Threaded`.
 fn classifyOverClient(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -528,7 +528,7 @@ fn classifyOverClient(
     var response_body: std.Io.Writer = .fixed(&body_buffer);
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
 
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    var client: std.http.Client = .{ .allocator = gpa, .io = http.timeoutAwareIo(io) };
     defer client.deinit();
 
     const uri = try std.Uri.parse(url);
