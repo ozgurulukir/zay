@@ -718,9 +718,6 @@ pub const Agent = struct {
             if (turn.assistant == .assistant and hasWireContent(turn.assistant)) {
                 try self.takeAssistantMessage(&turn.assistant);
                 turn_owned = false;
-            } else {
-                turn.deinit(self.gpa);
-                turn_owned = false;
             }
             // Anchor after the assistant reply is in history: `usage` accounts
             // for everything up to and including it; later appends are trailing.
