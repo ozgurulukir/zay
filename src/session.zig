@@ -1140,7 +1140,9 @@ pub const Session = struct {
             const boundary = try findCompactionBoundary(gpa, projection.entries);
             const emit_start: u32 = if (boundary) |b| b.first_kept_index else 0;
             if (boundary) |b| {
-                try messages_list.append(gpa, try serialize.compactionSummaryToMessage(gpa, projection.entries[b.summary_index].payload_json));
+                var summary_msg = try serialize.compactionSummaryToMessage(gpa, projection.entries[b.summary_index].payload_json);
+                errdefer deinitMessage(gpa, &summary_msg);
+                try messages_list.append(gpa, summary_msg);
             }
             for (projection.entries[emit_start..]) |entry| {
                 try appendProjectedEntry(gpa, &messages_list, entry);
@@ -1429,6 +1431,7 @@ pub const Session = struct {
         });
         defer qres.deinit();
         if (qres.rows.len == 0) return .{ .entries = try self.loadBranch(gpa) };
+        assert(qres.rows.len <= path_entries_max);
 
         var boundary_index: ?usize = null;
         var summary_index: ?usize = null;
@@ -1449,6 +1452,7 @@ pub const Session = struct {
             }
         }
         const kept_index = boundary_index orelse return .{ .entries = try self.loadBranch(gpa) };
+        if (kept_index != 0) return .{ .entries = try self.loadBranch(gpa) };
         const compact_index = summary_index orelse return .{ .entries = try self.loadBranch(gpa) };
         if (kept_index > compact_index) return .{ .entries = try self.loadBranch(gpa) };
         if (latest_compaction_id == null or !std.mem.eql(u8, latest_compaction_id.?[0..], expected_summary_id[0..])) {
@@ -1471,7 +1475,7 @@ pub const Session = struct {
             for (message_entries.items) |*entry| entry.deinit(gpa);
             message_entries.deinit(gpa);
         }
-        for (qres.rows) |row| {
+        for (qres.rows[kept_index..]) |row| {
             const kind = branchProbeKind(row) catch return error.CorruptData;
             if (std.mem.eql(u8, kind, "message") or std.mem.eql(u8, kind, "branch_summary")) {
                 try message_entries.append(gpa, try readEntryFromRow(gpa, row));
@@ -1482,6 +1486,7 @@ pub const Session = struct {
 };
 
 fn readBranchProbeId(row: []const backend_mod.Value) Error![entry_id_len]u8 {
+    assert(row.len >= 8);
     const id_text = switch (row[0]) {
         .text => |text| text,
         else => return error.BadEntryId,
@@ -1499,6 +1504,7 @@ fn readBranchProbeId(row: []const backend_mod.Value) Error![entry_id_len]u8 {
 }
 
 fn branchProbeKind(row: []const backend_mod.Value) Error![]const u8 {
+    assert(row.len >= 8);
     return switch (row[2]) {
         .text => |kind| kind,
         else => error.CorruptData,
@@ -2313,6 +2319,88 @@ test "session message projection fails on a corrupt newest compaction boundary" 
     );
 
     try std.testing.expectError(error.CorruptPayload, session.messages(gpa));
+}
+
+test "session message projection skips interleaved non-message entries in retained suffix" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "11111111111111111111111111111111" });
+
+    var id_kept: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    var id_info: [entry_id_len]u8 = undefined;
+    var id_after: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "kept", &id_kept);
+    try session.appendCompaction(id_kept[0..], "SUMMARY", &id_compaction);
+    try session.info("re-titled", &id_info);
+    try appendTextEntry(&session, gpa, .assistant, "after", &id_after);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("SUMMARY", messages[0].text());
+    try std.testing.expectEqualStrings("kept", messages[1].text());
+    try std.testing.expectEqualStrings("after", messages[2].text());
+}
+
+test "session message projection supports compaction keeping leaf entry alone" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "22222222222222222222222222222222" });
+
+    var id_old: [entry_id_len]u8 = undefined;
+    var id_leaf: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "old", &id_old);
+    try appendTextEntry(&session, gpa, .assistant, "leaf", &id_leaf);
+    try session.appendCompaction(id_leaf[0..], "LEAF SUMMARY", &id_compaction);
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("LEAF SUMMARY", messages[0].text());
+    try std.testing.expectEqualStrings("leaf", messages[1].text());
+}
+
+test "session message projection falls back to full branch when suffix query kept_index is non-zero" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "33333333333333333333333333333333" });
+
+    var id_first: [entry_id_len]u8 = undefined;
+    var id_second: [entry_id_len]u8 = undefined;
+    var id_compaction: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "first", &id_first);
+    try appendTextEntry(&session, gpa, .assistant, "second", &id_second);
+    try session.appendCompaction(id_second[0..], "SUMMARY", &id_compaction);
+
+    // Artificially give id_first a newer created_at_ms than id_second so suffix query
+    // matching >= id_second's timestamp would encounter id_first with kept_index > 0.
+    try manager.backend.exec(
+        std.testing.io,
+        "update session_entries set created_at_ms = 999999 where session_id = ? and id = ?",
+        &.{
+            .{ .text = session.id.slice() },
+            .{ .text = id_first[0..] },
+        },
+    );
+
+    const messages = try session.messages(gpa);
+    defer {
+        for (messages) |*message| deinitMessage(gpa, message);
+        gpa.free(messages);
+    }
+    // Full fallback projects the messages without failing
+    try std.testing.expect(messages.len > 0);
 }
 
 test "compaction cut splits the branch at the keep-recent budget" {
