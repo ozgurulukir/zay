@@ -268,9 +268,6 @@ fn scanTree(
     while (walker.next(io) catch |err| return err) |entry| {
         if (entry.kind == .directory) {
             if (!isIgnoredDir(entry.basename)) {
-                // entry.depth() is 1-based and OS-correct (counts `path.sep`
-                // only, so backslashes in POSIX filenames aren't mistaken
-                // for separators).
                 const depth: u32 = @intCast(entry.depth());
                 if (depth <= max_index_depth) try walker.enter(io, entry);
             }
