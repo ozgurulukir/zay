@@ -223,6 +223,21 @@ test.describe("todo_add id handling", function()
     local _, count = last_write.content:gsub("id:1", "")
     test.assert.equal(1, count)
   end)
+
+  test.it("ignores mid-sentence id:N when parsing existing task with trailing id", function()
+    reset("Fix id:3 reference and link id:7 later id:1\n")
+    local out = todo_list.handler({})
+    test.assert.contains("Fix id:3 reference and link id:7 later", out)
+    local get_out = todo_get_plan.handler({ id = 1 })
+    test.assert.contains("Fix id:3 reference and link id:7 later id:1", get_out)
+  end)
+
+  test.it("assigns fresh id when existing task has mid-sentence id:N but no trailing id tag", function()
+    reset("Fix id:3 reference\n")
+    local out = todo_add.handler({ text = "another task" })
+    test.assert.contains("Fix id:3 reference id:1", last_write.content)
+    test.assert.contains("another task id:2", last_write.content)
+  end)
 end)
 
 -- ── C1/C2: durable ids and plan sidecar integrity ─────────────────
