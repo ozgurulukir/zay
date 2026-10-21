@@ -297,3 +297,81 @@ test "expandEnvVars emits an unterminated placeholder verbatim" {
     defer gpa.free(out);
     try std.testing.expectEqualStrings("https://x.com/?key={env:FOO", out);
 }
+
+test "expandsStdioServerConfig_whenEnvVarsAndLiteralsProvided" {
+    const gpa = std.testing.allocator;
+
+    var raw_args = try gpa.alloc([]u8, 2);
+    raw_args[0] = try gpa.dupe(u8, "--flag");
+    raw_args[1] = try gpa.dupe(u8, "val-{env:PATH}");
+
+    var original: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "test-stdio"),
+        .enabled = true,
+        .request_timeout_ms = 5000,
+        .transport = .{
+            .stdio = .{
+                .command = try gpa.dupe(u8, "node"),
+                .args = raw_args,
+            },
+        },
+    };
+    defer original.deinit(gpa);
+
+    var expanded = try expandMcpServer(gpa, original);
+    defer expanded.deinit(gpa);
+
+    try std.testing.expectEqualStrings("test-stdio", expanded.name);
+    try std.testing.expect(expanded.enabled);
+    try std.testing.expectEqual(@as(?u32, 5000), expanded.request_timeout_ms);
+
+    switch (expanded.transport) {
+        .stdio => |t| {
+            try std.testing.expectEqualStrings("node", t.command);
+            try std.testing.expectEqual(@as(usize, 2), t.args.len);
+            try std.testing.expectEqualStrings("--flag", t.args[0]);
+            try std.testing.expect(std.mem.indexOf(u8, t.args[1], "{env:") == null);
+        },
+        .sse => try std.testing.expect(false),
+    }
+}
+
+test "expandsSseServerConfigAndHeaders_whenEnvVarsAndLiteralsProvided" {
+    const gpa = std.testing.allocator;
+
+    var headers = try gpa.alloc(McpHeader, 1);
+    headers[0] = .{
+        .name = try gpa.dupe(u8, "Authorization"),
+        .value = try gpa.dupe(u8, "Bearer {env:ZAY_TEST_NONEXISTENT_KEY}"),
+    };
+
+    var original: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "test-sse"),
+        .enabled = false,
+        .request_timeout_ms = null,
+        .transport = .{
+            .sse = .{
+                .url = try gpa.dupe(u8, "https://mcp.example.com/sse"),
+                .headers = headers,
+            },
+        },
+    };
+    defer original.deinit(gpa);
+
+    var expanded = try expandMcpServer(gpa, original);
+    defer expanded.deinit(gpa);
+
+    try std.testing.expectEqualStrings("test-sse", expanded.name);
+    try std.testing.expect(!expanded.enabled);
+    try std.testing.expectEqual(@as(?u32, null), expanded.request_timeout_ms);
+
+    switch (expanded.transport) {
+        .sse => |t| {
+            try std.testing.expectEqualStrings("https://mcp.example.com/sse", t.url);
+            try std.testing.expectEqual(@as(usize, 1), t.headers.len);
+            try std.testing.expectEqualStrings("Authorization", t.headers[0].name);
+            try std.testing.expectEqualStrings("Bearer ", t.headers[0].value);
+        },
+        .stdio => try std.testing.expect(false),
+    }
+}
