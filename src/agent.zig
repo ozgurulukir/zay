@@ -665,13 +665,14 @@ pub const Agent = struct {
             try stream_context.flushPending();
             // Hoisted before the ownership branch: `Turn.deinit` sets
             // `self.* = undefined`, and the no-wire-content branch (a
-            // reasoning-only response cut before any prose) deinits the turn
-            // — the length branch below must read the scalar, not the
-            // undefined struct.
+            // reasoning-only response cut before any prose) leaves the turn
+            // owned — the `defer` below deinits it at scope exit — so the
+            // length branch below must read the scalar, not the undefined
+            // struct.
             const finish_reason = turn.finish_reason;
             const usage = turn.usage;
             // Hoisted for the same reason as the two above: the
-            // no-wire-content branch deinits the turn, and the
+            // no-wire-content branch deinits the turn at scope exit, and the
             // truncation guard below reads this scalar after that.
             const tool_calls_truncated = turn.tool_calls_truncated;
             var turn_owned = true;
@@ -715,6 +716,11 @@ pub const Agent = struct {
                 log.warn("finish_reason=tool_calls but no tool call parsed or recovered — tool_call section likely truncated by the provider", .{});
             }
 
+            // Ownership: a turn with wire content is MOVED into history by
+            // `takeAssistantMessage`, so the turn is no longer ours to free.
+            // A turn WITHOUT wire content (a reasoning-only response cut
+            // before any prose) stays owned — the `defer` above frees it at
+            // scope exit. Either way exactly one owner frees the message.
             if (turn.assistant == .assistant and hasWireContent(turn.assistant)) {
                 try self.takeAssistantMessage(&turn.assistant);
                 turn_owned = false;
