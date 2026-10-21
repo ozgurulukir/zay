@@ -305,6 +305,36 @@ test.describe("bootstrap", function()
     test.assert.is_true(fs[MARKER_PATH]:find("v1.4.3", 1, true) ~= nil)
   end)
 
+  test.it("corrupt marker (invalid JSON) re-bootstraps and rewrites the marker", function()
+    fresh()
+    fs[MARKER_PATH] = "{invalid json..."
+    script_ok()
+    outline({ glob = "src/**/*.zig" })
+    test.assert.equal(3, #run_log)
+    test.assert.is_true(fs[MARKER_PATH]:find("bootstrapped", 1, true) ~= nil)
+    test.assert.is_true(fs[MARKER_PATH]:find("v1.4.3", 1, true) ~= nil)
+  end)
+
+  test.it("corrupt marker (non-object JSON) re-bootstraps and rewrites the marker", function()
+    fresh()
+    fs[MARKER_PATH] = "[1, 2, 3]"
+    script_ok()
+    outline({ glob = "src/**/*.zig" })
+    test.assert.equal(3, #run_log)
+    test.assert.is_true(fs[MARKER_PATH]:find("bootstrapped", 1, true) ~= nil)
+    test.assert.is_true(fs[MARKER_PATH]:find("v1.4.3", 1, true) ~= nil)
+  end)
+
+  test.it("corrupt marker (non-string content) re-bootstraps and rewrites the marker", function()
+    fresh()
+    fs[MARKER_PATH] = true
+    script_ok()
+    outline({ glob = "src/**/*.zig" })
+    test.assert.equal(3, #run_log)
+    test.assert.is_true(type(fs[MARKER_PATH]) == "string")
+    test.assert.is_true(fs[MARKER_PATH]:find("v1.4.3", 1, true) ~= nil)
+  end)
+
   test.it("steady state: second call adds one dispatch only", function()
     fresh()
     script_ok()
