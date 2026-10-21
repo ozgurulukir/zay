@@ -255,6 +255,20 @@ fn appendFailure(gpa: std.mem.Allocator, failures: *std.ArrayList(StoreFailure),
     try failures.append(gpa, .{ .source = source_copy, .message = message });
 }
 
+fn isHttpSource(source: []const u8) bool {
+    const uri = std.Uri.parse(source) catch return false;
+    return std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+        std.ascii.eqlIgnoreCase(uri.scheme, "https");
+}
+
+fn sourcesEqual(a: []const u8, b: []const u8) bool {
+    const a_is_http = isHttpSource(a);
+    const b_is_http = isHttpSource(b);
+    if (a_is_http != b_is_http) return false;
+    if (a_is_http) return std.mem.eql(u8, a, b);
+    return paths.pathsEqual(a, b);
+}
+
 fn cachePath(gpa: std.mem.Allocator, home: []const u8, source: []const u8) ![]u8 {
     const base = try paths.platformConfigDir(gpa, home);
     defer gpa.free(base);
@@ -284,10 +298,16 @@ fn loadSource(gpa: std.mem.Allocator, io: std.Io, home: ?[]const u8, project: []
 }
 
 fn appendSource(gpa: std.mem.Allocator, io: std.Io, home: []const u8, project: []const u8, source: []const u8, catalogs: *std.ArrayList(Catalog), failures: *std.ArrayList(StoreFailure)) !void {
+    for (catalogs.items) |existing| {
+        if (sourcesEqual(existing.source, source)) return;
+    }
+    for (failures.items) |failure| {
+        if (sourcesEqual(failure.source, source)) return;
+    }
     var catalog = loadSource(gpa, io, home, project, source) catch |err| blk: {
         if (err == error.OutOfMemory or err == error.Canceled) return err;
         try appendFailure(gpa, failures, source, err);
-        if (!std.mem.startsWith(u8, source, "https://") and !std.mem.startsWith(u8, source, "http://")) return;
+        if (!isHttpSource(source)) return;
         const cached = try cachePath(gpa, home, source);
         defer gpa.free(cached);
         const bytes = readFile(gpa, io, cached, catalog_max_bytes) catch |cache_err| {
@@ -348,9 +368,17 @@ pub fn removeStoreUrl(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, 
     defer guard.close(io);
     var registrations = try loadStoreRegistrations(gpa, io, home_dir);
     defer deinitStoreRegistrations(gpa, &registrations);
-    for (registrations.items, 0..) |existing, index| {
-        if (!std.mem.eql(u8, existing.url, url)) continue;
-        gpa.free(registrations.orderedRemove(index).url);
+    var removed_any = false;
+    var index: usize = 0;
+    while (index < registrations.items.len) {
+        if (std.mem.eql(u8, registrations.items[index].url, url)) {
+            gpa.free(registrations.orderedRemove(index).url);
+            removed_any = true;
+        } else {
+            index += 1;
+        }
+    }
+    if (removed_any) {
         try writeStoreRegistrations(gpa, io, home_dir, registrations.items);
         const cached = try cachePath(gpa, home_dir, url);
         defer gpa.free(cached);
@@ -644,7 +672,7 @@ fn openRelativeDirectory(io: std.Io, root: *std.Io.Dir, relative: []const u8) !s
     var current = root.*;
     var current_owned = false;
     errdefer if (current_owned) current.close(io);
-    var segments = std.mem.splitScalar(u8, relative, '/');
+    var segments = std.mem.tokenizeAny(u8, relative, "/\\");
     while (segments.next()) |segment| {
         if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidSourceDir;
         const child = try current.openDir(io, segment, .{ .iterate = true, .follow_symlinks = false });
@@ -869,6 +897,14 @@ fn loadStoreRegistrations(gpa: std.mem.Allocator, io: std.Io, home_dir: []const 
         else
             true;
         validateHttpUrl(url) catch return error.InvalidStoreList;
+        var duplicate = false;
+        for (registrations.items) |existing| {
+            if (std.mem.eql(u8, existing.url, url)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
         const copy = try gpa.dupe(u8, url);
         var appended = false;
         errdefer if (!appended) gpa.free(copy);
@@ -1200,4 +1236,88 @@ test "plugin_store official catalog pins one revision and verifies every file" {
         }
     }
     try std.testing.expect(count > 0);
+}
+
+test "openRelativeDirectory supports both forward and backslash separators and blocks traversal" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_path);
+
+    const sub_dir = try std.fs.path.join(gpa, &.{ root_path, "a", "b", "c" });
+    defer gpa.free(sub_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, sub_dir);
+
+    var root = try std.Io.Dir.openDir(.cwd(), io, root_path, .{ .iterate = true });
+    defer root.close(io);
+
+    var dir1 = try openRelativeDirectory(io, &root, "a/b/c");
+    dir1.close(io);
+
+    var dir2 = try openRelativeDirectory(io, &root, "a\\b\\c");
+    dir2.close(io);
+
+    var dir3 = try openRelativeDirectory(io, &root, "a/b\\c");
+    dir3.close(io);
+
+    try std.testing.expectError(error.InvalidSourceDir, openRelativeDirectory(io, &root, ".."));
+    try std.testing.expectError(error.InvalidSourceDir, openRelativeDirectory(io, &root, "a/../b"));
+}
+
+test "appendSource ignores duplicate catalog sources" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var catalogs: std.ArrayList(Catalog) = .empty;
+    defer deinitCatalogs(gpa, &catalogs);
+    var failures: std.ArrayList(StoreFailure) = .empty;
+    defer {
+        for (failures.items) |failure| {
+            gpa.free(failure.source);
+            gpa.free(failure.message);
+        }
+        failures.deinit(gpa);
+    }
+
+    const local_path = try std.fs.path.join(gpa, &.{ ".", "plugins", "store.json" });
+    defer gpa.free(local_path);
+
+    try appendSource(gpa, io, "home", ".", local_path, &catalogs, &failures);
+    const first_len = catalogs.items.len;
+    try std.testing.expectEqual(@as(usize, 1), first_len);
+
+    try appendSource(gpa, io, "home", ".", local_path, &catalogs, &failures);
+    try std.testing.expectEqual(first_len, catalogs.items.len);
+}
+
+test "sourcesEqual preserves URL path semantics and normalizes local separators" {
+    try std.testing.expect(sourcesEqual("HTTPS://example.com/catalog", "HTTPS://example.com/catalog"));
+    try std.testing.expect(!sourcesEqual("HTTPS://example.com/catalog", "HTTPS://example.com/catalog/"));
+    try std.testing.expect(!sourcesEqual("HTTPS://example.com/Catalog", "HTTPS://example.com/catalog"));
+    try std.testing.expect(sourcesEqual("./plugins/store.json", ".\\plugins\\store.json"));
+}
+
+test "removeStoreUrl purges all duplicate occurrences of store url" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home);
+
+    const store_url = "https://example.com/duplicate-store.json";
+    var regs: [2]StoreRegistration = .{
+        .{ .url = @constCast(store_url), .enabled = true },
+        .{ .url = @constCast(store_url), .enabled = true },
+    };
+    try writeStoreRegistrations(gpa, io, home, &regs);
+
+    try removeStoreUrl(gpa, io, home, store_url);
+
+    var loaded = try loadStoreRegistrations(gpa, io, home);
+    defer deinitStoreRegistrations(gpa, &loaded);
+    try std.testing.expectEqual(@as(usize, 0), loaded.items.len);
 }
