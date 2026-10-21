@@ -21,7 +21,6 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const panel = @import("widgets/panel.zig");
 const tui_style = @import("style.zig");
 
 /// Severity of a toast; drives its accent color.
