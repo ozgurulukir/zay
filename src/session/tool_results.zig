@@ -711,6 +711,7 @@ test "project pruning breaks ties by session identity" {
     defer gpa.free(content);
     @memset(content, 'x');
 
+    try backend.beginTransaction(io);
     for (0..project_result_limit + 1) |index| {
         var session_id_buffer: [32]u8 = undefined;
         const session_id = try std.fmt.bufPrint(&session_id_buffer, "session-{d}", .{index});
@@ -721,6 +722,7 @@ test "project pruning breaks ties by session identity" {
         });
         _ = try storeAt(gpa, io, &backend, session_id, "same-result-id", "bash", 0, content, 1234);
     }
+    try backend.commitTransaction(io);
 
     var results = try backend.query(io, "select count(*) from tool_results where project_key = ?", &.{.{ .text = "project-a" }});
     defer results.deinit();
