@@ -233,6 +233,50 @@ test "terminateChildTree_isNoOp_onPosixPlatforms" {
     try std.testing.expect(child.id == null);
 }
 
+test "attachJobObjectKillOnClose_returnsNull_onPosix" {
+    if (is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try spawnGrouped("sleep 30");
+    defer child.kill(io);
+
+    const handle = attachJobObjectKillOnClose(&child);
+    try std.testing.expect(handle == null);
+}
+
+test "attachJobObjectKillOnClose_returnsNull_whenChildIdIsNullOnWindows" {
+    if (comptime !is_windows) return error.SkipZigTest;
+
+    var mock_child: std.process.Child = undefined;
+    mock_child.id = null;
+
+    const handle = attachJobObjectKillOnClose(&mock_child);
+    try std.testing.expect(handle == null);
+}
+
+test "attachJobObjectKillOnClose_attachesJobObject_whenChildIsValidOnWindows" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "cmd.exe", "/c", "ping", "127.0.0.1", "-n", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer {
+        child.kill(io);
+        _ = child.wait(io) catch {};
+    }
+
+    const handle = attachJobObjectKillOnClose(&child);
+    try std.testing.expect(handle != null);
+
+    if (handle) |h| {
+        _ = windows.CloseHandle(h);
+    }
+}
+
 test "terminateChildTree_terminatesProcessTree_whenJobHandleProvidedOnWindows" {
     if (comptime !is_windows) return error.SkipZigTest;
     const io = std.testing.io;
