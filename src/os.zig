@@ -315,6 +315,8 @@ const windows = if (is_windows) struct {
     const UINT = u32;
     extern "kernel32" fn SetConsoleOutputCP(wCodePageID: UINT) callconv(.winapi) BOOL;
     extern "kernel32" fn SetConsoleCP(wCodePageID: UINT) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) UINT;
+    extern "kernel32" fn GetConsoleCP() callconv(.winapi) UINT;
     extern "kernel32" fn FlushConsoleInputBuffer(hConsoleInput: HANDLE) callconv(.winapi) BOOL;
 
     // Job Object surface (kill-on-close process trees). Byte-identical to the
@@ -386,6 +388,35 @@ pub fn initConsoleUtf8() void {
         _ = windows.SetConsoleOutputCP(65001);
         _ = windows.SetConsoleCP(65001);
     }
+}
+
+test "initConsoleUtf8_isNoOp_onPosixPlatforms" {
+    if (is_windows) return error.SkipZigTest;
+
+    // Act
+    initConsoleUtf8();
+
+    // Assert: should execute safely as a no-op on non-Windows platforms.
+    try std.testing.expect(true);
+}
+
+test "initConsoleUtf8_setsConsoleCodepageToUtf8_onWindows" {
+    if (comptime !is_windows) return error.SkipZigTest;
+
+    // Arrange: capture original output and input code pages so we can restore them afterwards
+    const orig_out_cp = windows.GetConsoleOutputCP();
+    const orig_in_cp = windows.GetConsoleCP();
+    defer {
+        _ = windows.SetConsoleOutputCP(orig_out_cp);
+        _ = windows.SetConsoleCP(orig_in_cp);
+    }
+
+    // Act
+    initConsoleUtf8();
+
+    // Assert: output and input code pages should now be set to UTF-8 (65001)
+    try std.testing.expectEqual(@as(u32, 65001), windows.GetConsoleOutputCP());
+    try std.testing.expectEqual(@as(u32, 65001), windows.GetConsoleCP());
 }
 
 /// Discard Win32 input records left over when the TUI exits on a key press.
