@@ -674,7 +674,6 @@ local function shape_span(node, file, content, first_line)
   -- Split keeping EMPTY lines: the bridge's read_file keeps them (it slices
   -- by \n positions), and dropping one would shift every number after it.
   local body = (tostring(content):gsub("\r\n", "\n"))
-  if body:sub(-1) == "\n" then body = body:sub(1, -2) end
   if #body > 0 then
     local lineno = first_line
     local start = 1
