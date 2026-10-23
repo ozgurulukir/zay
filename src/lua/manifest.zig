@@ -237,16 +237,96 @@ test "manifest evaluator bounds instructions and allocations" {
     try std.testing.expectError(error.ManifestMemoryLimit, evaluate(std.testing.allocator, "local t = {}; for i = 1, 90000 do t[i] = {} end; return t"));
 }
 
+const LockedAllocator = struct {
+    child: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+
+    pub fn allocator(self: *LockedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const LoadCtx = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+};
+
+fn evalManifestTask(ctx: LoadCtx) anyerror!void {
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "plugins/packages/{s}/plugin.lua", .{ctx.name});
+    const file = try std.Io.Dir.openFile(.cwd(), ctx.io, path, .{});
+    defer file.close(ctx.io);
+    var reader = file.reader(ctx.io, &.{});
+    const bytes = try reader.interface.allocRemaining(ctx.allocator, .limited(max_manifest_bytes));
+    defer ctx.allocator.free(bytes);
+    var manifest = try evaluate(ctx.allocator, bytes);
+    defer manifest.deinit(ctx.allocator);
+    try std.testing.expectEqualStrings(ctx.name, manifest.name);
+}
+
 test "manifest evaluator accepts every shipped manifest" {
-    inline for (.{ "hello-world", "todo", "file-tools", "search-tools", "file-watcher", "git-tools", "path-tools", "modular-demo", "sitting-duck" }) |name| {
-        const file = try std.Io.Dir.openFile(.cwd(), std.testing.io, "plugins/packages/" ++ name ++ "/plugin.lua", .{});
-        defer file.close(std.testing.io);
-        var reader = file.reader(std.testing.io, &.{});
-        const bytes = try reader.interface.allocRemaining(std.testing.allocator, .limited(max_manifest_bytes));
-        defer std.testing.allocator.free(bytes);
-        var manifest = try evaluate(std.testing.allocator, bytes);
-        defer manifest.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(name, manifest.name);
+    const packages = [_][]const u8{
+        "hello-world",
+        "todo",
+        "file-tools",
+        "search-tools",
+        "file-watcher",
+        "git-tools",
+        "path-tools",
+        "modular-demo",
+        "sitting-duck",
+    };
+    var locked_alloc: LockedAllocator = .{ .child = std.testing.allocator, .io = std.testing.io };
+    const gpa = locked_alloc.allocator();
+
+    var futures: [packages.len]std.Io.Future(anyerror!void) = undefined;
+    var ctxs: [packages.len]LoadCtx = undefined;
+
+    for (packages, 0..) |name, i| {
+        ctxs[i] = .{ .allocator = gpa, .io = std.testing.io, .name = name };
+        futures[i] = try std.testing.io.concurrent(evalManifestTask, .{ctxs[i]});
+    }
+
+    for (&futures) |*f| {
+        try f.await(std.testing.io);
     }
 }
 
