@@ -471,8 +471,22 @@ pub const InputWidget = struct {
         };
     }
 
-    fn drawInput(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *InputWidget = @ptrCast(@alignCast(ptr));
+    const InputLayout = struct {
+        max_width: u16,
+        height: u16,
+        input_row: u16,
+        text_rows: u16,
+        border_height: u16,
+        base_row: u16,
+        queued_visible: bool,
+        show_hint: bool,
+        show_diff: bool,
+        show_badge: bool,
+        show_lanes: bool,
+        children_count: usize,
+    };
+
+    fn computeInputLayout(self: *InputWidget, ctx: vxfw.DrawContext) InputLayout {
         const max_width = ctx.max.width orelse 0;
         const height: u16 = ctx.max.height orelse 4;
 
@@ -482,81 +496,119 @@ pub const InputWidget = struct {
         const input_width = max_width -| 4;
         const text_rows: u16 = @min(wrappedTextRows(ctx, self.props.input_text, input_width), @max(@as(u16, 1), avail -| 2));
         const border_height: u16 = text_rows + 2;
-
-        if (height < input_row + border_height) {
-            return try self.drawInputBorder(ctx, max_width, @min(height, border_height), text_rows);
-        }
-
         const base_row: u16 = input_row + border_height;
+
         const show_hint = height >= base_row + 1;
         const show_diff = show_hint and self.props.diff_counts != null;
         const show_badge = show_hint and self.props.background_jobs > 0;
         // The pink lanes chip only makes sense while fullscreened (`.tab`,
         // not split) with other lanes hidden behind the active one.
         const show_lanes = show_hint and self.props.show_lanes_chip;
+
         const children_count: usize = 1 +
             @as(usize, if (show_hint) 1 else 0) +
             @as(usize, if (show_diff) 1 else 0) +
             @as(usize, if (show_badge) 1 else 0) +
             @as(usize, if (show_lanes) 1 else 0) +
             @as(usize, if (queued_visible) 1 else 0);
-        const children = try ctx.arena.alloc(vxfw.SubSurface, children_count);
+
+        return .{
+            .max_width = max_width,
+            .height = height,
+            .input_row = input_row,
+            .text_rows = text_rows,
+            .border_height = border_height,
+            .base_row = base_row,
+            .queued_visible = queued_visible,
+            .show_hint = show_hint,
+            .show_diff = show_diff,
+            .show_badge = show_badge,
+            .show_lanes = show_lanes,
+            .children_count = children_count,
+        };
+    }
+
+    fn assembleInputChildren(
+        self: *InputWidget,
+        ctx: vxfw.DrawContext,
+        layout: InputLayout,
+    ) std.mem.Allocator.Error![]vxfw.SubSurface {
+        const children = try ctx.arena.alloc(vxfw.SubSurface, layout.children_count);
         var child_index: usize = 0;
-        if (queued_visible) {
+
+        if (layout.queued_visible) {
             children[child_index] = .{
                 .origin = .{ .row = 0, .col = 1 },
-                .surface = try self.drawQueuedMessage(ctx, max_width -| 2),
+                .surface = try self.drawQueuedMessage(ctx, layout.max_width -| 2),
                 .z_index = 0,
             };
             child_index += 1;
         }
+
         children[child_index] = .{
-            .origin = .{ .row = input_row, .col = 0 },
-            .surface = try self.drawInputBorder(ctx, max_width, border_height, text_rows),
+            .origin = .{ .row = layout.input_row, .col = 0 },
+            .surface = try self.drawInputBorder(ctx, layout.max_width, layout.border_height, layout.text_rows),
             .z_index = 0,
         };
         child_index += 1;
-        if (show_hint) {
-            const padding_x: u16 = @min(@as(u16, 1), max_width);
-            const inner_width = max_width -| (padding_x * 2);
-            try self.drawInputHint(ctx, children, child_index, base_row, padding_x, inner_width);
+
+        if (layout.show_hint) {
+            const padding_x: u16 = @min(@as(u16, 1), layout.max_width);
+            const inner_width = layout.max_width -| (padding_x * 2);
+            try self.drawInputHint(ctx, children, child_index, layout.base_row, padding_x, inner_width);
             child_index += 1;
         }
-        if (show_diff) {
-            try self.drawDiffCounts(ctx, children, child_index, base_row, max_width);
+
+        if (layout.show_diff) {
+            try self.drawDiffCounts(ctx, children, child_index, layout.base_row, layout.max_width);
             child_index += 1;
         }
+
         // Lay the two bottom-left pills out left-to-right: pink lanes chip first,
         // then the blue background-jobs badge shifted past it when both show.
         var lanes_width: u16 = 0;
-        if (show_lanes) {
-            const lanes_surface = try self.drawLanesBadge(ctx, max_width -| 2);
+        if (layout.show_lanes) {
+            const lanes_surface = try self.drawLanesBadge(ctx, layout.max_width -| 2);
             lanes_width = lanes_surface.size.width;
             children[child_index] = .{
-                .origin = .{ .row = base_row, .col = 1 },
+                .origin = .{ .row = layout.base_row, .col = 1 },
                 .surface = lanes_surface,
                 .z_index = 2,
             };
             child_index += 1;
             if (self.props.chip_rect_out) |out| {
                 out.* = .{
-                    .row = self.props.input_surface_row + base_row,
+                    .row = self.props.input_surface_row + layout.base_row,
                     .col = 1,
                     .width = lanes_width,
                 };
             }
         }
-        if (show_badge) {
-            const badge_col: u16 = if (show_lanes) 1 + lanes_width + 1 else 1;
+
+        if (layout.show_badge) {
+            const badge_col: u16 = if (layout.show_lanes) 1 + lanes_width + 1 else 1;
             children[child_index] = .{
-                .origin = .{ .row = base_row, .col = badge_col },
-                .surface = try self.drawBackgroundBadge(ctx, max_width -| badge_col -| 1),
+                .origin = .{ .row = layout.base_row, .col = badge_col },
+                .surface = try self.drawBackgroundBadge(ctx, layout.max_width -| badge_col -| 1),
                 .z_index = 2,
             };
             child_index += 1;
         }
+
+        return children;
+    }
+
+    fn drawInput(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *InputWidget = @ptrCast(@alignCast(ptr));
+        const layout = self.computeInputLayout(ctx);
+
+        if (layout.height < layout.input_row + layout.border_height) {
+            return try self.drawInputBorder(ctx, layout.max_width, @min(layout.height, layout.border_height), layout.text_rows);
+        }
+
+        const children = try self.assembleInputChildren(ctx, layout);
         return .{
-            .size = .{ .width = max_width, .height = height },
+            .size = .{ .width = layout.max_width, .height = layout.height },
             .widget = self.widget(),
             .buffer = &.{},
             .children = children,
