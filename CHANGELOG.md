@@ -6,6 +6,25 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-10-24
+
+### Added
+- Unit tests for MCP server stdio environment variable expansion (#263).
+- Unit tests for Windows console UTF-8 initialization (#266) and process tree Job Object attachment (#267).
+- Error path test coverage for project configuration loading (#271).
+
+### Changed
+- Optimize plugin store tree copying: add 4KB buffered reading and unsynced staging writes, avoiding per-file fsync calls during temporary directory copy (#272).
+- Optimize test execution: batch session setup and tool result storage in a single SQLite transaction in tool results test (#265).
+- Modularize TUI input widget layout and drawing logic into discrete compute and assembly passes (#276).
+- Evaluate shipped plugin manifests concurrently in tests with thread-safe `LockedAllocator` (#268).
+
+### Fixed
+- Preserve remote URL source identity, resolve local path separators, fix store deduplication, and enforce config memory safety in plugin store (#264).
+- Preserve trailing empty lines when slicing AST code blocks in the sitting-duck plugin (#269).
+- Harden project config loader: catch and record diagnostics on file stat and read errors rather than propagating unhandled I/O failures on non-regular files (#271).
+- Remove unused imports in toast and lane lifecycle components (#273, #275).
+
 ## [0.11.4] - 2026-10-21
 
 ### Changed
@@ -61,6 +80,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.5...HEAD
+[0.11.5]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.5
+[0.11.4]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.4
 [0.11.3]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.3
 [0.11.2]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.2
