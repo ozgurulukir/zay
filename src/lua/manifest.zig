@@ -238,15 +238,48 @@ test "manifest evaluator bounds instructions and allocations" {
 }
 
 test "manifest evaluator accepts every shipped manifest" {
-    inline for (.{ "hello-world", "todo", "file-tools", "search-tools", "file-watcher", "git-tools", "path-tools", "modular-demo", "sitting-duck" }) |name| {
-        const file = try std.Io.Dir.openFile(.cwd(), std.testing.io, "plugins/packages/" ++ name ++ "/plugin.lua", .{});
-        defer file.close(std.testing.io);
-        var reader = file.reader(std.testing.io, &.{});
-        const bytes = try reader.interface.allocRemaining(std.testing.allocator, .limited(max_manifest_bytes));
-        defer std.testing.allocator.free(bytes);
-        var manifest = try evaluate(std.testing.allocator, bytes);
-        defer manifest.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(name, manifest.name);
+    const names = [_][]const u8{
+        "hello-world",
+        "todo",
+        "file-tools",
+        "search-tools",
+        "file-watcher",
+        "git-tools",
+        "path-tools",
+        "modular-demo",
+        "sitting-duck",
+    };
+
+    const Task = struct {
+        fn run(io: std.Io, name: []const u8, err_out: *?anyerror) void {
+            runImpl(io, name) catch |err| {
+                err_out.* = err;
+            };
+        }
+
+        fn runImpl(io: std.Io, name: []const u8) !void {
+            var path_buf: [256]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "plugins/packages/{s}/plugin.lua", .{name});
+            const file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
+            defer file.close(io);
+            var reader = file.reader(io, &.{});
+            const bytes = try reader.interface.allocRemaining(std.testing.allocator, .limited(max_manifest_bytes));
+            defer std.testing.allocator.free(bytes);
+            var manifest = try evaluate(std.testing.allocator, bytes);
+            defer manifest.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings(name, manifest.name);
+        }
+    };
+
+    var errors = [_]?anyerror{null} ** names.len;
+    var group: std.Io.Group = .init;
+    for (names, 0..) |name, i| {
+        group.async(std.testing.io, Task.run, .{ std.testing.io, name, &errors[i] });
+    }
+    try group.await(std.testing.io);
+
+    for (errors) |err| {
+        if (err) |e| return e;
     }
 }
 
