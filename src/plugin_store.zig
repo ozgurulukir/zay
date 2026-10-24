@@ -612,12 +612,13 @@ fn copyTree(
                 if (file_count.* > max_plugin_files) return error.TooManyFiles;
                 const file = try source.openFile(io, entry.name, .{ .follow_symlinks = false });
                 defer file.close(io);
-                var reader = file.reader(io, &.{});
+                var read_buf: [4096]u8 = undefined;
+                var reader = file.reader(io, &read_buf);
                 const bytes = try reader.interface.allocRemaining(gpa, .limited(plugin_file_max_bytes));
                 defer gpa.free(bytes);
                 total_bytes.* = std.math.add(usize, total_bytes.*, bytes.len) catch return error.PluginTooLarge;
                 if (total_bytes.* > plugin_total_max_bytes) return error.PluginTooLarge;
-                try writeFile(io, target_path, bytes);
+                try writeFileUnsynced(io, target_path, bytes);
             },
             .sym_link => return error.PluginSymlinkUnsupported,
             else => return error.InvalidPluginPackage,
@@ -952,6 +953,15 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usi
         error.StreamTooLong => error.ResponseTooLarge,
         else => |e| e,
     };
+}
+
+fn writeFileUnsynced(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
 }
 
 fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
