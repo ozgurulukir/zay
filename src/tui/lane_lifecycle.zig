@@ -24,7 +24,6 @@ const command_router = @import("command_router.zig");
 const vcs = @import("../vcs.zig");
 const background_mod = @import("../background.zig");
 const bash = @import("../tools/bash_exec.zig");
-const pws = @import("../tools/pwsh_exec.zig");
 const tools_common = @import("../tools/common.zig");
 const os = @import("../os.zig");
 const platform = @import("platform");
@@ -3414,7 +3413,7 @@ test "cleanupLaneWorktreeAndBranch terminates background processes and removes w
         .command = if (is_win) "Start-Sleep -Seconds 60" else "sleep 60",
         .cwd = wt_path,
         .env_map = &env_map,
-        .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
+        .shell_path = if (is_win) @import("../tools/pwsh_exec.zig").shellPath(io) else bash.shellPath(io),
         .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
         .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
         .stderr_merge_suffix = if (is_win) "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }" else "",
