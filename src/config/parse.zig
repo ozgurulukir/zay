@@ -650,7 +650,10 @@ fn loadFile(
         },
     };
     defer file.close(io);
-    const stat = try file.stat(io);
+    const stat = file.stat(io) catch |err| {
+        try appendConfigError(gpa, diagnostics, path, "{s}", .{@errorName(err)});
+        return .{};
+    };
     if (stat.size > 32 * 1024) {
         try appendConfigError(gpa, diagnostics, path, "FileTooBig", .{});
         return .{};
@@ -658,7 +661,10 @@ fn loadFile(
     const bytes = try gpa.alloc(u8, @intCast(stat.size));
     defer gpa.free(bytes);
     var reader = file.reader(io, &.{});
-    try reader.interface.readSliceAll(bytes);
+    reader.interface.readSliceAll(bytes) catch |err| {
+        try appendConfigError(gpa, diagnostics, path, "{s}", .{@errorName(err)});
+        return .{};
+    };
     return parseFile(gpa, path, bytes, diagnostics);
 }
 
@@ -4526,4 +4532,67 @@ test "loadGlobalFile_whenFileReadFails_recordsTheErrorAsADiagnostic" {
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
     try std.testing.expect(sink.items[0] == .config_parse_error);
     try std.testing.expectEqualStrings("AccessDenied", sink.items[0].config_parse_error.reason);
+}
+
+test "readProject_whenFileLoadFails_cleansUpDiagnosticsAndReturnsEmptyConfig" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const project_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(project_dir);
+
+    // Create .zay/config.json as a directory instead of a regular file to trigger openFile failure
+    const config_path = try projectConfigPath(gpa, project_dir);
+    defer gpa.free(config_path);
+    try std.Io.Dir.createDirPath(.cwd(), io, config_path);
+
+    // Act
+    var cfg = try readProject(gpa, io, project_dir);
+    defer cfg.deinit(gpa);
+
+    // Assert
+    try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
+    try std.testing.expectEqual(@as(?Model, null), cfg.model);
+}
+
+test "readProject_whenFileHasInvalidJson_cleansUpDiagnosticsAndReturnsEmptyConfig" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const project_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(project_dir);
+
+    // Create .zay directory and write malformed JSON to config.json
+    const config_path = try projectConfigPath(gpa, project_dir);
+    defer gpa.free(config_path);
+    const dirname = std.fs.path.dirname(config_path).?;
+    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
+
+    const invalid_json = "not valid json {";
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, config_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(invalid_json);
+        try writer.interface.flush();
+    }
+
+    // Act
+    var cfg = try readProject(gpa, io, project_dir);
+    defer cfg.deinit(gpa);
+
+    // Assert
+    try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
+    try std.testing.expectEqual(@as(?Model, null), cfg.model);
 }
