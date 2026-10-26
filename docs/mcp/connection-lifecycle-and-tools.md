@@ -32,8 +32,11 @@ Then, for both transports:
 
 1. **Handshake**: JSON-RPC `initialize` request → server responds with protocol version
    and capabilities → client sends `notifications/initialized`.
-2. **Discovery**: JSON-RPC `tools/list` request → server returns tool schemas → parsed
-   into `tools_common.Schema` format.
+2. **Discovery**: JSON-RPC `tools/list` request → server returns tool schemas → each
+   tool's raw `inputSchema` is kept as an owned, lossless JSON copy (the source of
+   truth for provider serialization) alongside a best-effort `tools_common.Schema`
+   projection for local validation and UX. See [Known limitations](limitations.md)
+   for the projection/adaptation split.
 
 **Timeouts** — a server that doesn't respond in time is marked `[FAILED]` with an error
 message:
@@ -84,6 +87,12 @@ degrades in-band (`MCP server not found` / a failed tool result), never dangles.
 `AgentRuntime.syncToolJson` — see AGENTS.md), alongside the
 built-in tools. The model sees them as regular function-calling tools with namespaced
 names (`mcp__<server>__<tool>`).
+
+Tool `parameters` serialization is dialect-aware: on non-strict requests the MCP tool's
+raw `inputSchema` is passed through to the provider verbatim; on strict
+structured-outputs requests the local projection is transformed to meet that contract
+(see [Known limitations](limitations.md)). The single implementation lives in
+`ai/tool_schema.zig` (`parametersPassThrough`).
 
 ### Phase D — Execution (agent turn)
 

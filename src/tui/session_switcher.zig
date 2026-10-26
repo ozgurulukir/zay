@@ -1129,7 +1129,7 @@ test "refreshAllLaneTools pushes synced MCP and plugin tools into a non-viewed l
     };
     var mcp_client = try mcp_client_mod.McpClient.init(gpa, "test", "echo", &.{}, null);
     mcp_client.lifecycle = .{ .stdio = .{ .process = mcp_client_mod.zeroedChild(), .status = .ready } };
-    try mcp_client.addTool("search", "Search the index", .{ .properties = props });
+    try mcp_client.addTool("search", "Search the index", .{ .properties = props }, null);
     try app.mcp_manager.clients.append(gpa, mcp_client);
 
     const plugin_name = try gpa.dupe(u8, "lua__p__t");

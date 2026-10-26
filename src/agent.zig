@@ -2831,7 +2831,7 @@ test "run executes a synced MCP tool through the registry (scripted, socket-free
         };
         var client = try mcp_client_mod.McpClient.init(gpa, "test", "echo", &.{}, null);
         client.lifecycle = .{ .stdio = .{ .process = mcp_client_mod.zeroedChild(), .status = .ready } };
-        try client.addTool("search", "Search the index", .{ .properties = props });
+        try client.addTool("search", "Search the index", .{ .properties = props }, null);
         try manager.clients.append(gpa, client);
     }
     var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());

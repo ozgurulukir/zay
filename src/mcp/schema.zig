@@ -88,6 +88,20 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
     return text.toOwnedSlice(gpa);
 }
 
+/// Serialize a discovered tool's original `inputSchema` into an owned,
+/// lossless JSON string — the source-of-truth form kept alongside the local
+/// projection (see `schemaFromJsonSchema`). Only object-typed schemas are
+/// preserved: a non-object `inputSchema` cannot be a JSON Schema root and
+/// cannot be sent as a provider `parameters` object, so it returns null and
+/// the local projection (which treats it as unconstrained) remains the only
+/// form.
+pub fn rawInputSchemaJson(gpa: std.mem.Allocator, value: ?std.json.Value) !?[]u8 {
+    const schema_value = value orelse return null;
+    if (schema_value != .object) return null;
+    const raw = try std.json.Stringify.valueAlloc(gpa, schema_value, .{});
+    return raw;
+}
+
 /// Convert a JSON Schema object to the local validation/serialization projection.
 /// The MCP `inputSchema` remains authoritative: this projection retains the
 /// type shape, nullability, enums, defaults, and object openness that Zay can
@@ -598,6 +612,47 @@ fn unionKindsOverlap(left: []const tools_common.Schema.Kind, right: []const tool
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "rawInputSchemaJson preserves a rich schema losslessly" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","$defs":{"Filter":{"type":"object"}},"properties":{
+        \\  "filter":{"$ref":"#/$defs/Filter"},
+        \\  "tuple":{"type":"array","prefixItems":[{"type":"string"}]},
+        \\  "composite":{"allOf":[{"type":"object"}]},
+        \\  "email":{"type":"string","pattern":"^.+@.+$","minLength":3}
+        \\},"required":["filter"],"additionalProperties":false}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    const raw = (try rawInputSchemaJson(gpa, parsed.value)) orelse return error.RawSchemaMissing;
+    defer gpa.free(raw);
+
+    // The raw capture is a fixpoint of parse+serialize: re-parsing and
+    // re-serializing yields the same bytes, so every constraint the
+    // projection cannot model survives bytewise.
+    const round_tripped = try std.json.parseFromSlice(std.json.Value, gpa, raw, .{});
+    defer round_tripped.deinit();
+    const reserialized = try std.json.Stringify.valueAlloc(gpa, round_tripped.value, .{});
+    defer gpa.free(reserialized);
+    try std.testing.expectEqualStrings(raw, reserialized);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "$defs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "prefixItems") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "allOf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "pattern") != null);
+}
+
+test "rawInputSchemaJson returns null for missing and non-object schemas" {
+    const gpa = std.testing.allocator;
+    // A missing inputSchema carries no source schema to preserve.
+    try std.testing.expectEqual(@as(?[]u8, null), try rawInputSchemaJson(gpa, null));
+    // A non-object inputSchema cannot be a JSON Schema root (and cannot be
+    // sent as a provider `parameters` object), so it is not preserved.
+    try std.testing.expectEqual(@as(?[]u8, null), try rawInputSchemaJson(gpa, .{ .string = "not-a-schema" }));
+    try std.testing.expectEqual(@as(?[]u8, null), try rawInputSchemaJson(gpa, .{ .bool = true }));
+    try std.testing.expectEqual(@as(?[]u8, null), try rawInputSchemaJson(gpa, .{ .integer = 7 }));
+}
 
 test "schemaFromJsonSchema handles array and number types" {
     const gpa = std.testing.allocator;
