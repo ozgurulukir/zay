@@ -319,12 +319,18 @@ pub const McpClient = struct {
         for (args, 0..) |arg, i| {
             owned_args[i] = try gpa.dupe(u8, arg);
         }
+        // Hoisted dupes: a failing `try` inside the struct literal would leave
+        // the earlier copies stranded when the return never materializes.
+        const name_owned = try gpa.dupe(u8, name);
+        errdefer gpa.free(name_owned);
+        const command_owned = try gpa.dupe(u8, command);
+        errdefer gpa.free(command_owned);
         return .{
             .gpa = gpa,
-            .name = try gpa.dupe(u8, name),
+            .name = name_owned,
             .transport = .{
                 .stdio = .{
-                    .command = try gpa.dupe(u8, command),
+                    .command = command_owned,
                     .args = owned_args,
                 },
             },
@@ -333,10 +339,14 @@ pub const McpClient = struct {
     }
 
     pub fn initSse(gpa: std.mem.Allocator, name: []const u8, url: []const u8) !McpClient {
+        const name_owned = try gpa.dupe(u8, name);
+        errdefer gpa.free(name_owned);
+        const url_owned = try gpa.dupe(u8, url);
+        errdefer gpa.free(url_owned);
         return .{
             .gpa = gpa,
-            .name = try gpa.dupe(u8, name),
-            .transport = .{ .sse = .{ .url = try gpa.dupe(u8, url) } },
+            .name = name_owned,
+            .transport = .{ .sse = .{ .url = url_owned } },
             .lifecycle = .disabled,
         };
     }
@@ -1128,7 +1138,11 @@ pub const McpClient = struct {
             const tool_name = if (obj.get("name")) |n| (if (n == .string) n.string else continue) else continue;
             const description = if (obj.get("description")) |d| (if (d == .string) d.string else "") else "";
             const input_schema = obj.get("inputSchema");
-            const schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(self.gpa, s)) else tools_common.Schema{ .properties = &.{} };
+            // addTool takes ownership on success; the errdefer covers the OOM
+            // window before the record is appended (raw capture or append
+            // failure), so the projection never leaks mid-discovery.
+            var schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(self.gpa, s)) else tools_common.Schema{ .properties = &.{} };
+            errdefer schema.deinit(self.gpa);
             // Discovery-time capture: addTool dupes the borrowed form into the
             // record, so the temporary is freed at the end of every iteration.
             const raw_input_schema = try schema_mod.rawInputSchemaJson(self.gpa, input_schema);
@@ -1212,14 +1226,24 @@ pub const McpClient = struct {
         const full_name = try naming.toolFullName(self.gpa, self.name, tool_name);
         errdefer self.gpa.free(full_name);
 
+        // Hoist the record's owned fields into locals so every errdefer below
+        // frees an initialized slice — `try` dupes inside the append's struct
+        // literal would leave the earlier copies stranded when a later one
+        // failed (same hazard `buildMcpTool` fixed in the registry bridge).
+        const server_name_owned = try self.gpa.dupe(u8, self.name);
+        errdefer self.gpa.free(server_name_owned);
+        const tool_name_owned = try self.gpa.dupe(u8, tool_name);
+        errdefer self.gpa.free(tool_name_owned);
+        const description_owned = try self.gpa.dupe(u8, description);
+        errdefer self.gpa.free(description_owned);
         const raw_owned = if (raw_input_schema) |raw| try self.gpa.dupe(u8, raw) else null;
         errdefer if (raw_owned) |raw| self.gpa.free(raw);
 
         try self.tools.append(self.gpa, .{
-            .server_name = try self.gpa.dupe(u8, self.name),
-            .name = try self.gpa.dupe(u8, tool_name),
+            .server_name = server_name_owned,
+            .name = tool_name_owned,
             .full_name = full_name,
-            .description = try self.gpa.dupe(u8, description),
+            .description = description_owned,
             .schema = schema,
             .raw_input_schema = raw_owned,
         });
@@ -1469,6 +1493,39 @@ test "McpClient addTool leaves raw_input_schema null without a source schema" {
     // only produces a non-null raw for object-typed inputSchemas.
     try client.addTool("noop", "No schema", .{ .properties = &.{} }, null);
     try std.testing.expect(client.tools.items[0].raw_input_schema == null);
+}
+
+test "McpClient init and addTool leak no partial copies on a mid-call OOM" {
+    // Regression for the hoisted errdefer chains: a `try` dupe failing inside
+    // a struct literal (initStdio's name/command, addTool's server/name/
+    // description) used to strand every already-copied slice. Iterate every
+    // allocation index so each failure point — including the tools append —
+    // is exercised; leak-freedom is asserted by the testing allocator at
+    // process end, not by the error code.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var succeeded = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        if (McpClient.init(failing.allocator(), "bare", "echo", &.{}, null)) |client_val| {
+            var client = client_val;
+            defer client.deinit(io);
+
+            if (client.addTool("search", "Search the index", .{ .properties = &.{} }, "{\"type\":\"object\"}")) {
+                try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+                try std.testing.expectEqualStrings("{\"type\":\"object\"}", client.tools.items[0].raw_input_schema.?);
+                succeeded = true;
+                break;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+            }
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try std.testing.expect(succeeded);
 }
 
 test "McpClient initialize captures tools.listChanged capability" {
