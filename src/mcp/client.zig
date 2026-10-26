@@ -202,12 +202,18 @@ pub const McpTool = struct {
     full_name: []u8,
     description: []u8,
     schema: tools_common.Schema,
+    /// The server's original `inputSchema` as raw JSON (lossless) — the
+    /// source of truth for provider serialization on pass-through-capable
+    /// dialects, while `schema` stays the best-effort local projection.
+    /// Owned; null when the server sent no object-typed `inputSchema`.
+    raw_input_schema: ?[]u8 = null,
 
     pub fn deinit(self: *McpTool, gpa: std.mem.Allocator) void {
         gpa.free(self.server_name);
         gpa.free(self.name);
         gpa.free(self.full_name);
         gpa.free(self.description);
+        if (self.raw_input_schema) |raw| gpa.free(raw);
         self.schema.deinit(gpa);
         self.* = undefined;
     }
@@ -1121,9 +1127,14 @@ pub const McpClient = struct {
 
             const tool_name = if (obj.get("name")) |n| (if (n == .string) n.string else continue) else continue;
             const description = if (obj.get("description")) |d| (if (d == .string) d.string else "") else "";
-            const schema = if (obj.get("inputSchema")) |s| (try schema_mod.schemaFromJsonSchema(self.gpa, s)) else tools_common.Schema{ .properties = &.{} };
+            const input_schema = obj.get("inputSchema");
+            const schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(self.gpa, s)) else tools_common.Schema{ .properties = &.{} };
+            // Discovery-time capture: addTool dupes the borrowed form into the
+            // record, so the temporary is freed at the end of every iteration.
+            const raw_input_schema = try schema_mod.rawInputSchemaJson(self.gpa, input_schema);
+            defer if (raw_input_schema) |raw| self.gpa.free(raw);
 
-            try self.addTool(tool_name, description, schema);
+            try self.addTool(tool_name, description, schema, raw_input_schema);
         }
     }
 
@@ -1188,14 +1199,21 @@ pub const McpClient = struct {
     }
 
     /// Register a mock or discovered tool for testing / dynamic loading.
+    /// `raw_input_schema` is the server's original `inputSchema` JSON
+    /// (borrowed; duped into the record) — pass null for mock tools that
+    /// have no source schema.
     pub fn addTool(
         self: *McpClient,
         tool_name: []const u8,
         description: []const u8,
         schema: tools_common.Schema,
+        raw_input_schema: ?[]const u8,
     ) !void {
         const full_name = try naming.toolFullName(self.gpa, self.name, tool_name);
         errdefer self.gpa.free(full_name);
+
+        const raw_owned = if (raw_input_schema) |raw| try self.gpa.dupe(u8, raw) else null;
+        errdefer if (raw_owned) |raw| self.gpa.free(raw);
 
         try self.tools.append(self.gpa, .{
             .server_name = try self.gpa.dupe(u8, self.name),
@@ -1203,6 +1221,7 @@ pub const McpClient = struct {
             .full_name = full_name,
             .description = try self.gpa.dupe(u8, description),
             .schema = schema,
+            .raw_input_schema = raw_owned,
         });
     }
 };
@@ -1310,7 +1329,7 @@ test "McpClient initializes and formats namespaced tool names" {
             .status = .ready,
         },
     };
-    try client.addTool("create_entities", "Create entities in graph", .{ .properties = &.{} });
+    try client.addTool("create_entities", "Create entities in graph", .{ .properties = &.{} }, null);
 
     try std.testing.expectEqualStrings("memory", client.name);
     try std.testing.expectEqual(ServerStatus.connected, client.status());
@@ -1402,7 +1421,54 @@ test "McpTool deinit frees extended schema fields" {
     defer parsed.deinit();
     const schema = try schema_mod.schemaFromJsonSchema(gpa, parsed.value);
 
-    try client.addTool("search", "Search", schema);
+    try client.addTool("search", "Search", schema, null);
+}
+
+test "McpClient listTools preserves the raw inputSchema of a rich schema" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "rich-server", "rich_schema");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+    try client.listTools(io);
+
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    const tool = client.tools.items[0];
+    const raw = tool.raw_input_schema orelse return error.RawSchemaMissing;
+
+    // Every construct the projection drops survives the raw capture.
+    for ([_][]const u8{ "$defs", "$ref", "prefixItems", "allOf", "oneOf", "anyOf", "\"not\"", "pattern", "minimum", "maxItems", "\"const\"", "exclusiveMaximum" }) |construct| {
+        try std.testing.expect(std.mem.indexOf(u8, raw, construct) != null);
+    }
+
+    // The raw capture is valid JSON — provider pass-through writes it verbatim.
+    const round_tripped = try std.json.parseFromSlice(std.json.Value, gpa, raw, .{});
+    defer round_tripped.deinit();
+    try std.testing.expect(round_tripped.value == .object);
+
+    // The projection is still built alongside it and stays lossy-by-design:
+    // a $ref property projects to an unconstrained string, never a claim
+    // about the referenced shape.
+    const filter_property = tool.schema.properties[0];
+    try std.testing.expectEqualStrings("filter", filter_property.name);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, filter_property.kind);
+    try std.testing.expect(filter_property.kind_unconstrained);
+}
+
+test "McpClient addTool leaves raw_input_schema null without a source schema" {
+    const gpa = std.testing.allocator;
+    var client = try McpClient.init(gpa, "bare", "echo", &.{}, null);
+    defer client.deinit(std.testing.io);
+
+    // addTool's null raw path is the mock registration contract; discovery
+    // only produces a non-null raw for object-typed inputSchemas.
+    try client.addTool("noop", "No schema", .{ .properties = &.{} }, null);
+    try std.testing.expect(client.tools.items[0].raw_input_schema == null);
 }
 
 test "McpClient initialize captures tools.listChanged capability" {

@@ -1190,7 +1190,7 @@ fn addTestMcpSearchTool(gpa: std.mem.Allocator, manager: *mcp_mod.McpManager) !v
             .status = .ready,
         },
     };
-    try client.addTool("search", "Search the index", .{ .properties = props });
+    try client.addTool("search", "Search the index", .{ .properties = props }, null);
     try manager.clients.append(gpa, client);
 }
 

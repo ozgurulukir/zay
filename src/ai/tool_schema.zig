@@ -28,12 +28,46 @@ pub const ToolSpec = struct {
     name: []const u8,
     description: []const u8,
     schema: tools_common.Schema,
+    /// The tool's original source schema as raw JSON (MCP `inputSchema`).
+    /// Borrowed from the owning record; null when the tool has no source
+    /// schema (builtins, plugins). See `parametersPassThrough` for how it is
+    /// used.
+    raw_input_schema: ?[]const u8 = null,
 };
 
 /// Convert a `tools.Tool` record. The description template still carries
 /// `{{hsep}}` placeholders — `writeToolDefinition` substitutes them.
 pub fn specFromTool(t: tools_common.Tool) ToolSpec {
-    return .{ .name = t.name, .description = t.description, .schema = t.schema };
+    return .{
+        .name = t.name,
+        .description = t.description,
+        .schema = t.schema,
+        .raw_input_schema = t.raw_input_schema,
+    };
+}
+
+/// Decide how a tool's `parameters` schema is adapted for the provider
+/// dialect. The source tool's schema (an MCP server's `inputSchema`) is the
+/// authority; the local `tools_common.Schema` is a best-effort projection
+/// that cannot model every JSON Schema constraint. Adaptation is therefore
+/// explicit and one-way per provider contract:
+///
+/// - **Pass-through** — dialects that accept arbitrary JSON Schema (every
+///   non-strict request) receive the raw source schema verbatim. Nothing is
+///   injected, dropped, or rewritten into it: no `additionalProperties`
+///   default, no nullable-union encoding, no `required` rewrites.
+/// - **Projection** — strict structured-outputs contracts (`strict: true`)
+///   accept only a JSON Schema subset and require every property in
+///   `required`, so the provider contract forces a transformation. This is
+///   the only reshaping path, and it never claims constraints the projection
+///   cannot model: `kind_unconstrained` properties lose their `type` rather
+///   than fabricate one. The MCP server remains the validation authority
+///   either way.
+fn parametersPassThrough(raw_input_schema: ?[]const u8, strict: bool) bool {
+    // Strict structured outputs is the one provider contract that rejects
+    // arbitrary JSON Schema; every other dialect passes the raw form through.
+    if (strict) return false;
+    return raw_input_schema != null;
 }
 
 /// Build the `tools` JSON array from one flat, already-deduped spec list.
@@ -53,7 +87,7 @@ pub fn buildToolsJson(
     for (specs) |spec| {
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, writer, spec.name, spec.description, spec.schema, strict, envelope);
+        try writeToolDefinition(gpa, writer, spec.name, spec.description, spec.schema, spec.raw_input_schema, strict, envelope);
     }
     try writer.writeByte(']');
     return aw.toOwnedSlice();
@@ -79,20 +113,20 @@ pub fn buildAllToolsJson(
     for (tools) |tool| {
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, strict, envelope);
+        try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, tool.raw_input_schema, strict, envelope);
     }
     if (registry) |r| {
         const plugin_slice = try r.all(gpa);
         for (plugin_slice) |tool| {
             if (!first) try writer.writeByte(',');
             first = false;
-            try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, strict, envelope);
+            try writeToolDefinition(gpa, writer, tool.name, tool.description, tool.schema, tool.raw_input_schema, strict, envelope);
         }
     }
     for (mcp_tools) |mcp| {
         if (!first) try writer.writeByte(',');
         first = false;
-        try writeToolDefinition(gpa, writer, mcp.name, mcp.description, mcp.schema, strict, envelope);
+        try writeToolDefinition(gpa, writer, mcp.name, mcp.description, mcp.schema, mcp.raw_input_schema, strict, envelope);
     }
     try writer.writeByte(']');
     return aw.toOwnedSlice();
@@ -104,6 +138,7 @@ fn writeToolDefinition(
     name: []const u8,
     description: []const u8,
     schema: tools_common.Schema,
+    raw_input_schema: ?[]const u8,
     strict: bool,
     envelope: Envelope,
 ) !void {
@@ -125,7 +160,14 @@ fn writeToolDefinition(
     } else {
         try writer.writeAll(",\"parameters\":");
     }
-    try writeParameters(gpa, writer, schema, strict);
+    if (parametersPassThrough(raw_input_schema, strict)) {
+        // Verbatim source schema. The bytes are valid JSON by construction:
+        // they were produced by serializing the server's parsed
+        // `inputSchema` (`mcp.schema.rawInputSchemaJson`).
+        try writer.writeAll(raw_input_schema.?);
+    } else {
+        try writeParameters(gpa, writer, schema, strict);
+    }
     switch (envelope) {
         // Close the inner `function` object (the outer tool object is closed
         // by the common `}` below; the Responses envelope has no inner object).
@@ -460,6 +502,107 @@ test "tool contract: strict schema closes provider arguments while non-strict ho
 
     try std.testing.expect(std.mem.indexOf(u8, strict_json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, loose_json, "\"additionalProperties\":true") != null);
+}
+
+test "provider adaptation: non-strict dialects pass the raw source schema through verbatim" {
+    const gpa = std.testing.allocator;
+    const raw = "{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"minLength\":1},\"maxItems\":10},\"filter\":{\"$ref\":\"#/$defs/F\"}},\"required\":[\"tags\"],\"$defs\":{\"F\":{\"type\":\"object\"}}}";
+    const specs = [_]ToolSpec{.{
+        .name = "mcp__srv__query",
+        .description = "Query",
+        .schema = .{ .properties = &.{.{ .name = "tags", .kind = .array, .description = "", .required = true }} },
+        .raw_input_schema = raw,
+    }};
+
+    for ([_]Envelope{ .completions, .responses }) |envelope| {
+        const json = try buildToolsJson(gpa, &specs, false, envelope);
+        defer gpa.free(json);
+        const expected_parameters = try std.fmt.allocPrint(gpa, "\"parameters\":{s}", .{raw});
+        defer gpa.free(expected_parameters);
+        // Verbatim: the wire form is byte-identical to the source schema —
+        // no injected additionalProperties, no nullable-union rewrites, no
+        // required-list reshaping.
+        try std.testing.expect(std.mem.indexOf(u8, json, expected_parameters) != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"items\":{}") == null);
+        // The projected form's open-arguments default never leaks into the
+        // pass-through (the raw schema carries no additionalProperties here).
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"additionalProperties\":true") == null);
+    }
+}
+
+test "provider adaptation: strict structured outputs falls back to the projection" {
+    const gpa = std.testing.allocator;
+    const raw = "{\"type\":\"object\",\"properties\":{\"filter\":{\"$ref\":\"#/$defs/F\"}},\"$defs\":{\"F\":{\"type\":\"object\"}}}";
+    const specs = [_]ToolSpec{.{
+        .name = "mcp__srv__query",
+        .description = "Query",
+        .schema = .{ .properties = &.{.{
+            .name = "filter",
+            .kind = .string,
+            .description = "Referenced",
+            .required = true,
+            .kind_unconstrained = true,
+        }} },
+        .raw_input_schema = raw,
+    }};
+
+    for ([_]Envelope{ .completions, .responses }) |envelope| {
+        const json = try buildToolsJson(gpa, &specs, true, envelope);
+        defer gpa.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"strict\":true") != null);
+        // The transform path never claims the constraints it dropped: the
+        // raw $defs/$ref vocabulary is absent, and the unconstrained property
+        // loses its type instead of fabricating one.
+        try std.testing.expect(std.mem.indexOf(u8, json, "$defs") == null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "$ref") == null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"filter\":{\"description\":\"Referenced\"}") != null);
+        // Still a well-formed tool definition for the strict dialect.
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+    }
+}
+
+test "provider adaptation: tools without a raw schema serialize the projection" {
+    const gpa = std.testing.allocator;
+    const specs = [_]ToolSpec{.{
+        .name = "builtin",
+        .description = "Builtin tool",
+        .schema = .{ .properties = &.{.{ .name = "path", .kind = .string, .description = "A path", .required = true }} },
+        .raw_input_schema = null,
+    }};
+    const json = try buildToolsJson(gpa, &specs, false, .completions);
+    defer gpa.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"object\",\"additionalProperties\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"path\":{\"type\":\"string\"") != null);
+}
+
+test "specFromTool carries the raw inputSchema alongside the projection" {
+    const gpa = std.testing.allocator;
+    const raw = try gpa.dupe(u8, "{\"type\":\"object\",\"properties\":{}}");
+    defer gpa.free(raw);
+    const tool: tools_common.Tool = .{
+        .name = "mcp__srv__ping",
+        .description = "Ping",
+        .schema = .{ .properties = &.{} },
+        .raw_input_schema = raw,
+        .run = undefined,
+        .display = undefined,
+    };
+    const spec = specFromTool(tool);
+    // The spec borrows the record's raw form — same bytes, no copy — so the
+    // runtime's assembled spec list can pass it to the serializer directly.
+    try std.testing.expectEqual(raw.ptr, spec.raw_input_schema.?.ptr);
+    try std.testing.expectEqualStrings(raw, spec.raw_input_schema.?);
+
+    const no_raw = specFromTool(.{
+        .name = "builtin",
+        .description = "Builtin",
+        .schema = .{ .properties = &.{} },
+        .run = undefined,
+        .display = undefined,
+    });
+    try std.testing.expect(no_raw.raw_input_schema == null);
 }
 
 test "tool schema repairs invalid UTF-8 in provider strings" {
