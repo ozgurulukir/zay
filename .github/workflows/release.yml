@@ -35,6 +35,21 @@ jobs:
           fi
           echo "build.zig.zon version ($zon_version) matches tag $tag"
 
+      # The tag is expected to carry its own CHANGELOG.md section: the entry
+      # rides the version-bump commit (0.11.3-0.11.5 all shipped this way).
+      # 0.11.6 landed the entry on main only after the tag was already
+      # published; this check fails the same drift fast, before building.
+      - name: Verify CHANGELOG.md has an entry for the tag
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! grep -q "^## \[${version}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no \"## [${version}]\" section. Add the changelog entry to the version-bump commit before tagging so the tagged tree carries its own entry."
+            exit 1
+          fi
+          echo "CHANGELOG.md contains a ${version} entry"
+
   build:
     name: build-${{ matrix.os }}
     needs: version-check

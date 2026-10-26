@@ -20,11 +20,18 @@ panel's About tab.
 ## Cutting a release
 
 1. Make sure `main` is green (`zig build test`).
-2. Bump `build.zig.zon`'s `.version` to the release version and commit it. The
-   release workflow's `version-check` job fails fast when the
-   tag (minus its leading `v`) and `.version` disagree, so the package metadata
-   cannot drift from the release. A pre-release tag with a suffix such as
-   `vX.Y.Z-beta.1` needs the matching suffix in `.version`.
+2. Update `CHANGELOG.md` and bump `build.zig.zon`'s `.version` **in the same
+   commit**. The changelog entry rides the bump commit so every tag carries
+   its own `## [X.Y.Z] - YYYY-MM-DD` section: add the section under
+   `[Unreleased]`, move the `[Unreleased]` compare link to the new version,
+   and add the release link ref at the bottom of the file. The release
+   workflow's `version-check` job fails fast when the tag (minus its leading
+   `v`) and `.version` disagree, or when the tagged tree's `CHANGELOG.md` has
+   no section for the release version, so neither can drift from the release.
+   A pre-release tag with a suffix such as `vX.Y.Z-beta.1` needs the matching
+   suffix in `.version` and its own changelog heading. (0.11.6 shipped the
+   entry on main only, after the tag was published — this convention is what
+   prevents a repeat.)
 3. Tag the commit you want to ship and push that tag. Remove the leading `v`
    from the tag when setting `.version`:
 
