@@ -6,6 +6,18 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-10-26
+
+### Added
+- MCP tools' original `inputSchema` is preserved losslessly through the pipeline: discovery serializes object-typed raw schemas into `McpTool.raw_input_schema`, registry records deep-copy it so it survives client disconnect/reconnect, and provider serialization borrows the record's copy (#199, #277).
+- `rich_schema` mock-server mode serving an `inputSchema` that exercises `$defs`/`$ref`, nested objects, `items`/`prefixItems`, `allOf`/`oneOf`/`anyOf`/`not`, `pattern`/`format`, numeric and length bounds, `const`, and mixed-type enums, with regression coverage across discovery, registry, and provider serialization (#277).
+
+### Changed
+- MCP tool `parameters` serialization is dialect-aware: non-strict dialects receive the server's raw schema verbatim (nothing injected, dropped, or rewritten), while strict structured-outputs dialects get the transformed local projection, which never fabricates constraints it cannot model. The local projection remains the best-effort form for UX, coercion, and null normalization; the MCP server stays the validation authority. Builtin and plugin tools serialize exactly as before (#199, #277).
+
+### Fixed
+- Close OOM `errdefer` hazards in `McpClient` initialization and tool registration, including a latent hazard in `buildMcpTool` where a failed struct-literal `try` left key fields undefined (#277).
+
 ## [0.11.5] - 2026-10-24
 
 ### Added
@@ -80,7 +92,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.5...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.6...HEAD
+[0.11.6]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.6
 [0.11.5]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.5
 [0.11.4]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.4
 [0.11.3]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.3
