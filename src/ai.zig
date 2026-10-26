@@ -21,6 +21,11 @@ pub const McpToolSchema = struct {
     name: []const u8,
     description: []const u8,
     schema: tools_common.Schema,
+    /// The server's original `inputSchema` as raw JSON (lossless). Borrowed
+    /// from the client's `McpTool` — the manager must outlive the slice, the
+    /// same contract as `name` and `description`. Null when the server sent
+    /// no object-typed `inputSchema`.
+    raw_input_schema: ?[]const u8 = null,
 };
 
 pub const ReasoningEffort = enum {

@@ -158,7 +158,7 @@ pub const ToolRegistry = struct {
         for (manager.clients.items) |*client| {
             if (client.status() != .connected) continue;
             for (client.tools.items) |*tool| {
-                const record = mcp_bridge.buildMcpTool(gpa, client.name, tool.name, tool.description, tool.schema) catch |err| {
+                const record = mcp_bridge.buildMcpTool(gpa, client.name, tool.name, tool.description, tool.schema, tool.raw_input_schema) catch |err| {
                     log.warn("syncMcpTools: buildMcpTool '{s}' failed: {s}", .{ tool.full_name, @errorName(err) });
                     continue;
                 };
@@ -477,6 +477,117 @@ test "ToolRegistry: plugin tool colliding with a builtin keeps builtin dispatch 
     try std.testing.expectEqual(@as(usize, 6), all.len);
     // deinit frees the heap-duped name/description without crashing — the
     // testing allocator's leak check is part of the assertion.
+}
+
+/// Discover the rich-schema mock tool over real stdio JSON-RPC and install
+/// the connected client into a fresh manager — the state an installed async
+/// connect result leaves behind. Caller owns the returned manager and must
+/// deinit it (which also stops the spawned server).
+fn managerWithRichServer(gpa: std.mem.Allocator, io: std.Io) !mcp_mod.McpManager {
+    const client_mod = @import("../mcp/client.zig");
+    var manager = mcp_mod.McpManager.init(gpa);
+    errdefer manager.deinit(io);
+    var client = try client_mod.McpClient.init(gpa, "rich", @import("mcp_mock_server").path, &.{"rich_schema"}, null);
+    errdefer client.deinit(io);
+    try client.startStdio(io);
+    try client.initialize(io);
+    try client.listTools(io);
+    // The list owns the client from here; manager.deinit (or the errdefer on
+    // a failed append) stops the spawned server.
+    try manager.clients.append(gpa, client);
+    return manager;
+}
+
+test "ToolRegistry: MCP raw inputSchema survives discovery, registry, and provider serialization" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const tool_schema = @import("../ai/tool_schema.zig");
+
+    var manager = try managerWithRichServer(gpa, io);
+    defer manager.deinit(io);
+
+    var reg = try ToolRegistry.init(gpa, @import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    const record = reg.lookup("mcp__rich__query") orelse return error.McpToolMissing;
+    const raw = record.raw_input_schema orelse return error.RawSchemaMissing;
+    const specs = [_]tool_schema.ToolSpec{tool_schema.specFromTool(record)};
+
+    // Pass-through-capable dialect (non-strict, both envelopes): the provider
+    // `parameters` is the server's schema verbatim — every construct the
+    // projection drops ($defs, $ref, prefixItems, allOf, pattern, bounds)
+    // reaches the wire without semantic loss and without injected rewrites.
+    for ([_]tool_schema.Envelope{ .completions, .responses }) |envelope| {
+        const json = try tool_schema.buildToolsJson(gpa, &specs, false, envelope);
+        defer gpa.free(json);
+        const expected_parameters = try std.fmt.allocPrint(gpa, "\"parameters\":{s}", .{raw});
+        defer gpa.free(expected_parameters);
+        try std.testing.expect(std.mem.indexOf(u8, json, expected_parameters) != null);
+
+        // Semantic equality, not just a substring: the wire form parses in
+        // place and re-serializes to the server's schema byte-for-byte, so
+        // the embedded parameters value is structurally identical to the
+        // source — nothing was dropped or reshaped in between.
+        const parsed_json = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+        defer parsed_json.deinit();
+        const parameters = switch (envelope) {
+            .completions => parsed_json.value.array.items[0].object.get("function").?.object.get("parameters").?,
+            .responses => parsed_json.value.array.items[0].object.get("parameters").?,
+        };
+        const reserialized = try std.json.Stringify.valueAlloc(gpa, parameters, .{});
+        defer gpa.free(reserialized);
+        try std.testing.expectEqualStrings(raw, reserialized);
+        // No fabricated projection content: the raw's constrained array items
+        // never degrade to the projection's empty `items:{}` marker.
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"items\":{}") == null);
+    }
+
+    // Strict structured-outputs contract: the raw schema is NOT passed
+    // through (the dialect accepts only a JSON Schema subset); the projected
+    // form is transformed instead and stays a valid tool definition.
+    const strict_json = try tool_schema.buildToolsJson(gpa, &specs, true, .completions);
+    defer gpa.free(strict_json);
+    try std.testing.expect(std.mem.indexOf(u8, strict_json, "\"strict\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, strict_json, "$defs") == null);
+    const strict_parsed = try std.json.parseFromSlice(std.json.Value, gpa, strict_json, .{});
+    defer strict_parsed.deinit();
+    try std.testing.expect(strict_parsed.value == .array);
+}
+
+test "ToolRegistry: MCP records outlive a server disconnect with their raw schema" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const tool_schema = @import("../ai/tool_schema.zig");
+
+    var manager = try managerWithRichServer(gpa, io);
+    defer manager.deinit(io);
+
+    var reg = try ToolRegistry.init(gpa, @import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+    try reg.syncMcpTools(gpa, &manager);
+
+    const record = reg.lookup("mcp__rich__query") orelse return error.McpToolMissing;
+    const raw_before = try gpa.dupe(u8, record.raw_input_schema.?);
+    defer gpa.free(raw_before);
+
+    // Disconnect the server: every client-side McpTool (and its raw schema)
+    // is freed. The registry record's deep copy must remain valid until the
+    // next (turn-gated) sync removes it.
+    manager.disconnectClient(io, 0);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+
+    const stale = reg.lookup("mcp__rich__query") orelse return error.McpToolMissing;
+    try std.testing.expectEqualStrings(raw_before, stale.raw_input_schema.?);
+
+    // The stale record still serializes for the provider — no dangling read
+    // through `raw_input_schema` or the projected `schema`.
+    const specs = [_]tool_schema.ToolSpec{tool_schema.specFromTool(stale)};
+    const json = try tool_schema.buildToolsJson(gpa, &specs, false, .completions);
+    defer gpa.free(json);
+    const expected_parameters = try std.fmt.allocPrint(gpa, "\"parameters\":{s}", .{raw_before});
+    defer gpa.free(expected_parameters);
+    try std.testing.expect(std.mem.indexOf(u8, json, expected_parameters) != null);
 }
 
 test "ToolRegistry: benchmark lookup performance" {

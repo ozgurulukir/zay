@@ -176,6 +176,7 @@ pub const McpManager = struct {
                     .name = tool.full_name,
                     .description = tool.description,
                     .schema = tool.schema,
+                    .raw_input_schema = tool.raw_input_schema,
                 };
                 idx += 1;
             }
@@ -618,6 +619,61 @@ test "McpManager async connect spawns, handshakes, discovers, and installs" {
     try std.testing.expectEqualStrings("mcp__mock__greet", manager.clients.items[0].tools.items[0].full_name);
     try std.testing.expectEqual(@as(usize, 1), manager.activeServerCount());
     try std.testing.expect(!manager.hasPendingConnects());
+}
+
+test "McpManager buildMcpToolSchemas carries the raw inputSchema" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "rich", "rich_schema");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try drainUntilConnected(&manager, std.testing.io);
+
+    const schemas = try manager.buildMcpToolSchemas(gpa);
+    defer gpa.free(schemas);
+    try std.testing.expectEqual(@as(usize, 1), schemas.len);
+    const raw = schemas[0].raw_input_schema orelse return error.RawSchemaMissing;
+    try std.testing.expectEqualStrings("mcp__rich__query", schemas[0].name);
+    // The borrowed raw form is the client's verbatim capture — the
+    // serialization path can pass it through without another copy.
+    try std.testing.expectEqualStrings(manager.clients.items[0].tools.items[0].raw_input_schema.?, raw);
+}
+
+test "McpManager reconnect frees and re-captures raw inputSchemas" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(gpa, "rich", "rich_schema");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    defer cfg.deinit(gpa);
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try drainUntilConnected(&manager, std.testing.io);
+
+    const client = &manager.clients.items[0];
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, client.status());
+    const raw_before = try gpa.dupe(u8, client.tools.items[0].raw_input_schema.?);
+    defer gpa.free(raw_before);
+    try std.testing.expect(std.mem.indexOf(u8, raw_before, "$defs") != null);
+
+    // Reconnect: the old tool records (raw schemas included) are freed and
+    // re-discovered. The testing allocator's leak check at process end pins
+    // that the pre-reconnect raw schema was actually released.
+    manager.reconnectClient(std.testing.io, 0);
+    try drainUntilConnected(&manager, std.testing.io);
+
+    const refreshed = &manager.clients.items[0];
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, refreshed.status());
+    try std.testing.expectEqual(@as(usize, 1), refreshed.tools.items.len);
+    const raw_after = refreshed.tools.items[0].raw_input_schema orelse return error.RawSchemaMissing;
+    try std.testing.expectEqualStrings(raw_before, raw_after);
 }
 
 test "McpManager async connect failure marks the client failed with a reason" {

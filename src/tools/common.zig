@@ -343,6 +343,14 @@ pub const Tool = struct {
         args: []const u8,
         env: Env,
     ) std.mem.Allocator.Error!ToolDisplay,
+    /// The tool's original source schema as raw JSON, when the tool came from
+    /// a source that publishes one (MCP servers). Borrowed — owned by the
+    /// per-tool state (`McpToolKey`) for registry records, and it shares that
+    /// record's lifetime. Null for builtins and plugin tools, whose
+    /// `schema` IS the source of truth. Provider serialization may pass this
+    /// through verbatim on dialects that accept arbitrary JSON Schema
+    /// (see `ai.tool_schema`); it is never rewritten.
+    raw_input_schema: ?[]const u8 = null,
     /// Optional per-tool state routed through `Env.userdata`. Plugin tools
     /// use this to carry their `(plugin_name, tool_name)` key; builtin tools
     /// leave it `undefined`. Borrowed; freed via `userdata_free` on registry

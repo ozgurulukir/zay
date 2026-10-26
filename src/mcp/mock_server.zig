@@ -5,6 +5,51 @@ const std = @import("std");
 const protocol_version = "2024-11-05";
 const tool_list = "{\"tools\":[{\"name\":\"greet\",\"description\":\"Say hello\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Name to greet\"}},\"required\":[\"name\"]}}]}";
 
+/// Comptime-collapse a multiline JSON literal into the single line the stdio
+/// transport requires — JSON-RPC responses are newline-delimited. Raw
+/// newlines can only be insignificant whitespace in valid JSON (control
+/// characters inside JSON strings are illegal), so dropping them is safe for
+/// this file's fixtures, which never split a token across lines.
+fn singleLineJson(comptime json: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(2 * json.len + 1000);
+        var line: []const u8 = &.{};
+        for (json) |byte| {
+            if (byte == '\n') continue;
+            line = line ++ [_]u8{byte};
+        }
+        return line;
+    }
+}
+
+/// A discovery response whose `inputSchema` exercises every JSON Schema
+/// construct the local projection cannot model: `$defs`/`$ref`, nested
+/// object `properties`/`required`, array `items`/`prefixItems`,
+/// `allOf`/`anyOf`/`oneOf`/`not`, `pattern`/`format`, numeric and length
+/// bounds, `const`, and a mixed-type `enum`. Served by the `rich_schema`
+/// mode so the raw-preservation pipeline can be tested end-to-end.
+const rich_tool_list = singleLineJson(
+    \\{"tools":[{"name":"query","description":"Query with a rich schema","inputSchema":{
+    \\  "type":"object",
+    \\  "$defs":{"Filter":{"type":"object","properties":{"field":{"type":"string"},"op":{"type":"string","enum":["eq","ne","gt"]}},"required":["field","op"]}},
+    \\  "properties":{
+    \\    "filter":{"$ref":"#/$defs/Filter","description":"Reusable filter"},
+    \\    "nested":{"type":"object","properties":{"inner":{"type":"object","properties":{"depth":{"type":"integer","minimum":0,"maximum":9}},"required":["depth"]}},"required":["inner"]},
+    \\    "tags":{"type":"array","items":{"type":"string","minLength":1},"maxItems":10},
+    \\    "tuple":{"type":"array","prefixItems":[{"type":"string"},{"type":"integer"}]},
+    \\    "composite":{"allOf":[{"type":"object","properties":{"a":{"type":"string"}}},{"type":"object","properties":{"b":{"type":"number"}}}]},
+    \\    "variant":{"oneOf":[{"type":"string","pattern":"^[a-z]+$"},{"type":"object","properties":{"kind":{"const":"custom"}},"required":["kind"]}]},
+    \\    "loose":{"anyOf":[{"type":"string","format":"date-time"},{"type":"integer"}],"description":"Loose variant"},
+    \\    "negated":{"not":{"type":"null"}},
+    \\    "mode":{"enum":["fast","slow",3,null]},
+    \\    "email":{"type":"string","format":"email","pattern":"^.+@.+$","minLength":3},
+    \\    "ratio":{"type":"number","minimum":0,"maximum":1,"exclusiveMaximum":true}
+    \\  },
+    \\  "required":["filter","tags"],
+    \\  "additionalProperties":false
+    \\}}]}
+);
+
 const Mode = enum {
     default,
     list_changed,
@@ -14,6 +59,7 @@ const Mode = enum {
     slow,
     hang,
     partial,
+    rich_schema,
 };
 
 pub fn parseMode(mode_name: ?[]const u8) !Mode {
@@ -80,10 +126,11 @@ pub fn processRequests(
             if (mode == .malformed_tools) {
                 try writeLine(writer, "this is not json");
             } else {
+                const list = if (mode == .rich_schema) rich_tool_list else tool_list;
                 const response = try std.fmt.allocPrint(
                     gpa,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}",
-                    .{ id_value.integer, tool_list },
+                    .{ id_value.integer, list },
                 );
                 defer gpa.free(response);
                 try writeLine(writer, response);
@@ -165,6 +212,7 @@ test "parseMode_returnsExpectedMode_whenGivenValidString" {
     try std.testing.expectEqual(Mode.slow, try parseMode("slow"));
     try std.testing.expectEqual(Mode.hang, try parseMode("hang"));
     try std.testing.expectEqual(Mode.partial, try parseMode("partial"));
+    try std.testing.expectEqual(Mode.rich_schema, try parseMode("rich_schema"));
 }
 
 test "parseMode_returnsInvalidMode_whenGivenUnknownString" {
@@ -287,9 +335,35 @@ test "modeEnum_parsesValidModesAndRejectsInvalid" {
     try std.testing.expectEqual(Mode.slow, std.meta.stringToEnum(Mode, "slow"));
     try std.testing.expectEqual(Mode.hang, std.meta.stringToEnum(Mode, "hang"));
     try std.testing.expectEqual(Mode.partial, std.meta.stringToEnum(Mode, "partial"));
+    try std.testing.expectEqual(Mode.rich_schema, std.meta.stringToEnum(Mode, "rich_schema"));
 
     try std.testing.expectEqual(@as(?Mode, null), std.meta.stringToEnum(Mode, "nonexistent"));
     try std.testing.expectEqual(@as(?Mode, null), std.meta.stringToEnum(Mode, "DEFAULT"));
+}
+
+test "richToolList_isValidJsonWithEveryUnsupportedConstruct" {
+    // Arrange & Act
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, rich_tool_list, .{});
+    defer parsed.deinit();
+
+    // Assert — the fixture must stay parseable and keep the constructs the
+    // raw-preservation tests assert on.
+    const tools_val = parsed.value.object.get("tools").?;
+    const input_schema = tools_val.array.items[0].object.get("inputSchema").?;
+    const schema_obj = input_schema.object;
+    try std.testing.expect(schema_obj.get("$defs") != null);
+    const properties = schema_obj.get("properties").?.object;
+    try std.testing.expect(properties.get("filter").?.object.get("$ref") != null);
+    try std.testing.expect(properties.get("tuple").?.object.get("prefixItems") != null);
+    try std.testing.expect(properties.get("composite").?.object.get("allOf") != null);
+    try std.testing.expect(properties.get("variant").?.object.get("oneOf") != null);
+    try std.testing.expect(properties.get("loose").?.object.get("anyOf") != null);
+    try std.testing.expect(properties.get("negated").?.object.get("not") != null);
+    // The format keyword lives inside the loose union's first branch.
+    const loose_branches = properties.get("loose").?.object.get("anyOf").?.array.items;
+    try std.testing.expectEqualStrings("date-time", loose_branches[0].object.get("format").?.string);
+    try std.testing.expectEqual(false, schema_obj.get("additionalProperties").?.bool);
 }
 
 test "readLine_returnsNull_whenStreamIsEmpty" {
