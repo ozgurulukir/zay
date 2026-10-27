@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
-            .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
+            .url = "git+https://github.com/rockorager/libvaxis.git#5b0c724e6434de3a259e790e94954d110688ce5f",
+            .hash = "vaxis-0.6.0-BWNV_FcJDQAY-hi2JHq9u7MWVRxQOg0S7V0YBnvfHtmf",
         },
         // Pinned to the SAME commit vaxis uses so both resolve to one copy.
         // Direct use: @-mention image downscaling (#119). vaxis also pulls it
@@ -44,8 +44,8 @@
             .hash = "zigimg-0.1.0-8_eo2oyaFwBZwJpmqPkCfVXWBrHcqbYwmrp1I6bTD3lI",
         },
         .uucode = .{
-            .url = "git+https://github.com/jacobsandlund/uucode#0620982aa8db310997b9e84305aaa102f60b4f30",
-            .hash = "uucode-0.2.0-ZZjBPji8VABcj6beXwjg4uj-K7oqjvLubm_mjacFLh1Q",
+            .url = "git+https://github.com/jacobsandlund/uucode#9d55524551411b493cca41ca06363625d90aff1e",
+            .hash = "uucode-0.2.0-ZZjBPuuFVgC8YZ8eld4fOKsZANLIhTFMzULQxhkLi1C7",
             .lazy = true,
         },
     },
