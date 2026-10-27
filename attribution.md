@@ -227,7 +227,7 @@ compiled into the shipped binary, so their licenses are listed here.
 ### vaxis (TUI framework)
 
 - **Source:** <https://github.com/rockorager/libvaxis>
-- **Version:** 0.6.0 @ `173a890`
+- **Version:** 0.6.0 @ `5b0c724`
 - **License:** MIT — Copyright (c) 2023 Tim Culverhouse
 - **Used for:** the terminal user interface (widget tree, event loop,
   drawing).
@@ -237,10 +237,7 @@ No local modifications.
 ### uucode (Unicode tables)
 
 - **Source:** <https://github.com/jacobsandlund/uucode>
-- **Version:** 0.2.0 @ `2826a37` — the effective pin is vaxis's transitive
-  dependency pin; the root `build.zig.zon`'s lazy `0620982` entry is unused
-  (it is declared lazy and is shadowed by vaxis's own pin; do not rely on it
-  for version resolution).
+- **Version:** 0.2.0 @ `9d55524`
 - **License:** MIT — Copyright (c) 2026 Jacob Sandlund
 - **Used for:** Unicode-aware string handling inside vaxis (grapheme/width
   tables). No local modifications.

@@ -6,6 +6,9 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Bump `vaxis` to `5b0c724` and `uucode` to `9d55524`, incorporating OSC 7501 Program Status Protocol reports, Unicode 18.0.0, and `multi_slice` packed field bugfixes for the Zig 0.16 toolchain.
+
 ## [0.11.6] - 2026-10-26
 
 ### Added
