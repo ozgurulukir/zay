@@ -29,6 +29,14 @@ project; restart Zay to apply the change. Press `x` to remove a disabled global
 installation after restarting to unload it, and confirm with `y`. Project
 plugins are not deleted by the Store removal action.
 
+Source identity rules: HTTP(S) catalog URLs are compared exactly, so a
+trailing slash or different letter case registers as a distinct source;
+local catalog paths treat `/` and `\` as equivalent separators, and local
+catalogs may use either separator in relative package paths. A source is
+registered at most once — duplicates cannot accumulate in the catalog
+bundle or the Store UI — and removing a source with `x` purges every
+registration of it.
+
 Remote catalogs use explicit file URLs and must include `plugin.lua` and
 `init.lua` for each plugin. Catalogs and files have bounded sizes, relative
 package paths, and safe plugin IDs; installs are published only after all

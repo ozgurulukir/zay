@@ -37,6 +37,11 @@ Configuration values are resolved by merging four layers in order of increasing 
 3. **Project Config**: `<cwd>/.zay/config.json` for repository-specific overrides (e.g. project system prompt or local Ollama endpoints).
 4. **Environment Variables**: Runtime overrides (e.g. `OPENAI_MODEL`, `OPENAI_API_KEY`).
 
+A project config that cannot be loaded — a non-regular file (e.g. a
+`.zay/config.json` path that is a directory), a permission error, or a
+failed read — is skipped with a recorded diagnostic; Zay continues with the
+remaining layers and built-in defaults instead of failing startup.
+
 ### Project-Layer Trust & Environment Expansion
 
 The project config travels with the repository, so it is the **least-trusted
