@@ -77,7 +77,13 @@ pub fn readReceipt(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) !s
     defer gpa.free(path);
     const bytes = try readFile(gpa, io, path, 16 * 1024);
     defer gpa.free(bytes);
-    var parsed = try std.json.parseFromSlice(Receipt, gpa, bytes, .{ .allocate = .alloc_always });
+    var parsed = std.json.parseFromSlice(Receipt, gpa, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Any unparseable receipt — truncated write, garbage, wrong shape —
+        // is an invalid receipt; the specific JSON failure is not
+        // actionable for callers.
+        else => return error.InvalidInstallReceipt,
+    };
     errdefer parsed.deinit();
     if (parsed.value.schema != 1 or parsed.value.fingerprint.len != 64 or
         !safeDirectoryName(parsed.value.id) or parsed.value.name.len == 0 or
@@ -381,6 +387,18 @@ test "readReceipt_returnsInvalidInstallReceipt_whenReceiptIsInvalid" {
         try std.json.Stringify.value(invalid_receipt, .{}, &payload.writer);
         try atomicWrite(io, receipt_path, payload.written());
 
+        try std.testing.expectError(error.InvalidInstallReceipt, readReceipt(gpa, io, root));
+    }
+
+    // Unparseable receipts (truncated write, garbage, empty) collapse to the
+    // same InvalidInstallReceipt instead of leaking JSON parse errors.
+    const garbage_payloads = [_][]const u8{
+        "{\"schema\":1,\"id\":\"plugin-a\"",
+        "not json at all",
+        "",
+    };
+    for (garbage_payloads) |payload| {
+        try atomicWrite(io, receipt_path, payload);
         try std.testing.expectError(error.InvalidInstallReceipt, readReceipt(gpa, io, root));
     }
 }
