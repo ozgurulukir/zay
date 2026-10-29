@@ -1017,8 +1017,15 @@ test "disabled hostile manifests cannot access the host or evade budgets" {
     defer looping.deinit(testing.allocator);
     try manager.syncPluginConfig(&.{ hostile, looping });
     try testing.expectEqual(@as(usize, 0), try manager.loadAll());
-    try testing.expectEqualStrings("InvalidManifest", manager.load_failures.get(plugins_root ++ "/hostile").?);
-    try testing.expectEqualStrings("ManifestInstructionLimit", manager.load_failures.get(plugins_root ++ "/looping").?);
+    // Failure keys mirror the manager's own native-separator joins from the
+    // project root; a literal "/plugins/hostile" suffix never matches on
+    // Windows.
+    const hostile_key = try std.fs.path.join(testing.allocator, &.{ root, "plugins", "hostile" });
+    defer testing.allocator.free(hostile_key);
+    const looping_key = try std.fs.path.join(testing.allocator, &.{ root, "plugins", "looping" });
+    defer testing.allocator.free(looping_key);
+    try testing.expectEqualStrings("InvalidManifest", manager.load_failures.get(hostile_key).?);
+    try testing.expectEqualStrings("ManifestInstructionLimit", manager.load_failures.get(looping_key).?);
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, marker, .{}));
 }
 
