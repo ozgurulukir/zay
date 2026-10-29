@@ -27,8 +27,15 @@ the built-in matcher. A verdict of `unsafe` asks the user to approve or
 reject the command. A `safe` verdict runs without a prompt.
 
 The built-in matcher recognizes selected patterns, including some
-destructive disk operations, critical system-file redirects, shell
-fork-bomb forms, and privileged package-management commands. It does not
+destructive disk operations (matched wherever `rm`/`dd` appear in command
+position: standalone, after separators such as `&&`, inside command
+substitution, backticks, or quotes, or backslash-escaped as `\rm`; the
+PowerShell spelling covers `Remove-Item` and its aliases with either path
+separator, and its drive-root targets include the drive-letter forms plus a
+bare `/` or `\`, which resolves to the current drive's root), critical
+system-file redirects, shell
+fork-bomb forms, and privileged package-management commands (Unix managers
+and the Windows installers `winget`, `choco`, and `scoop`). It does not
 parse arbitrary commands into a complete security policy and cannot detect
 every dangerous action. A command not classified as unsafe may run without
 an approval prompt.

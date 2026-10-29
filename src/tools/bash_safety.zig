@@ -103,7 +103,8 @@ fn localClassify(command: []const u8) Verdict {
 }
 
 /// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
-/// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, ...).
+/// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, and
+/// the Windows installers `winget`/`choco`/`scoop`, ...).
 /// These mutate system-wide install state and must surface for approval rather
 /// than running unattended. The matcher splits on every shell metacharacter
 /// (not just spaces) so syntax tricks like `apt;install`, `/usr/bin/apt`,
@@ -131,13 +132,17 @@ fn isPrivilegedPackageManagement(command: []const u8) bool {
     // `apt-cache show` does not false-positive on `apt` while `apt;install`
     // (no space) still trips the `apt` single-token rule above.
     // Install verbs that require an explicit subcommand; matched only at word
-    // boundaries so "pip show" / "apt-cache show" stay safe reads.
+    // boundaries so "pip show" / "apt-cache show" stay safe reads. The
+    // Windows installers (`winget`, `choco`, `scoop`) are phrase-matched so
+    // read-only subcommands (`winget list`, `choco list`) stay safe; the
+    // Windows shell target is pwsh, where these are the standard managers.
     const phrases = [_][]const u8{
-        "pip install",   "pip3 install",    "npm install -g", "npm i -g",
-        "cargo install", "gem install",     "go install",     "conda install",
-        "snap install",  "flatpak install", "apt install",    "apt-get install",
-        "dnf install",   "yum install",     "pacman -S",      "apk add",
-        "brew install",  "zypper install",  "emerge",
+        "pip install",      "pip3 install",    "npm install -g",  "npm i -g",
+        "cargo install",    "gem install",     "go install",      "conda install",
+        "snap install",     "flatpak install", "apt install",     "apt-get install",
+        "dnf install",      "yum install",     "pacman -S",       "apk add",
+        "brew install",     "zypper install",  "emerge",          "winget install",
+        "winget uninstall", "choco install",   "choco uninstall", "scoop install",
     };
     for (phrases) |phrase| {
         if (phraseAtBoundary(command, phrase)) return true;
@@ -186,14 +191,18 @@ fn tokenContains(command: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Case-insensitive match of `phrase` (may contain spaces) only when bounded
-/// by word boundaries (string edges or any shell metacharacter/whitespace), so
-/// `pip install` inside `pip install --user x` matches but `equip installation`
-/// does not. Advances past the match to avoid infinite loops on overlap.
+/// Case-insensitive match of `phrase` (may contain spaces, expected lowercase)
+/// only when bounded by word boundaries (string edges or any shell
+/// metacharacter/whitespace), so `pip install` inside `pip install --user x`
+/// matches but `equip installation` does not. Case-folds the normalized text
+/// so `PIP INSTALL` classifies the same as the token matcher's
+/// case-insensitive compare. Advances past the match to avoid infinite loops
+/// on overlap.
 fn phraseAtBoundary(command: []const u8, phrase: []const u8) bool {
     // Normalize so `apt\ninstall` still trips the `apt install` phrase.
     var buf: [4096]u8 = undefined;
     const normalized = normalizeShell(command, &buf);
+    for (normalized) |*c| c.* = std.ascii.toLower(c.*);
     var idx: usize = 0;
     while (idx < normalized.len) {
         const at = std.mem.indexOf(u8, normalized[idx..], phrase) orelse return false;
@@ -225,45 +234,92 @@ fn isPwshForkBomb(command: []const u8) bool {
     return false;
 }
 
-/// `Remove-Item -Recurse -Force` on system/drive roots — mirrors `isDangerousRm`
-/// for the PowerShell spelling. This is a conservative matcher; the remote
-/// classifier covers the full surface. Targets are flagged only when they are a
-/// drive ROOT (`C:\` bare), `$env:SystemRoot`, or a well-known system dir —
-/// never a project path that merely sits on the C: drive.
+/// `Remove-Item -Recurse -Force` (or an alias spelling) on system/drive
+/// roots — mirrors `isDangerousRm` for the PowerShell spellings. This is a
+/// conservative matcher; the remote classifier covers the full surface.
+/// Targets are flagged only when they are a drive ROOT (`C:\` / `C:/` bare),
+/// `$env:SystemRoot`, or a well-known system dir — never a project path that
+/// merely sits on the C: drive. Both path separators are accepted (pwsh
+/// treats `C:/Windows` and `C:\Windows` identically). Abbreviated flags
+/// (`-r`, `-fo`) are out of scope.
 fn isDangerousPwshRemove(command: []const u8) bool {
-    var idx: usize = 0;
-    while (findIgnoreCaseFrom(command, "Remove-Item", idx)) |pos| {
-        const rest_view = command[pos..];
-        if (!containsIgnoreCase(rest_view, "-Recurse") and !containsIgnoreCase(rest_view, "-Force")) {
-            idx = pos + 1;
-            continue;
-        }
-        // $env:SystemRoot / $env:WINDIR resolves to a system root.
-        if (containsIgnoreCase(command, "$env:systemroot") or containsIgnoreCase(command, "$env:windir")) return true;
-        // A well-known system dir.
-        if (containsIgnoreCase(command, "windows\\system32") or
-            containsIgnoreCase(command, "program files") or
-            containsIgnoreCase(command, "\\windows\\")) return true;
-        // A bare drive root: `C:\` followed by end-of-string, whitespace, a
-        // regular quote, or a path separator continuation that is still the root
-        // (e.g. `C:\*` or `C:\Windows` is caught above; here only bare `C:\`).
-        if (hasDriveRootTarget(command)) return true;
-        idx = pos + 1;
+    if (!hasRemoveItemSpelling(command)) return false;
+    if (!containsIgnoreCase(command, "-Recurse") and !containsIgnoreCase(command, "-Force")) return false;
+    return hasPwshSystemTarget(command);
+}
+
+/// True when `command` spells Remove-Item or one of its PowerShell command
+/// aliases (`ri`, `rm`, `rmdir`, `del`, `erase`, `rd`) as a whole token —
+/// `rm` inside `alarm` is not a spelling of Remove-Item.
+fn hasRemoveItemSpelling(command: []const u8) bool {
+    if (containsIgnoreCase(command, "Remove-Item")) return true;
+    const aliases = [_][]const u8{ "ri", "rm", "rmdir", "del", "erase", "rd" };
+    for (aliases) |alias| {
+        if (tokenContains(command, alias)) return true;
     }
     return false;
 }
 
-/// True when `command` contains a bare drive root target (`C:\` followed by
-/// end-of-string, whitespace, a quote, `*`, or nothing) — the `Remove-Item C:\`
-/// / `Remove-Item C:\*` case that nukes the whole drive.
+/// True when `command` names a Windows system target: `$env:SystemRoot` /
+/// `$env:WINDIR`, a well-known system dir, or a bare drive root. Project
+/// paths that merely sit on the C: drive are not targets. A project-relative
+/// directory literally named `windows` (e.g. `platforms\windows\`) does trip
+/// the substring — that fails closed into an approval prompt, which is the
+/// conservative posture this matcher documents; it never silently blocks.
+fn hasPwshSystemTarget(command: []const u8) bool {
+    // $env:SystemRoot / $env:WINDIR resolves to a system root.
+    if (containsIgnoreCase(command, "$env:systemroot") or containsIgnoreCase(command, "$env:windir")) return true;
+    // A well-known system dir (either separator spelling).
+    if (containsIgnoreCase(command, "windows\\system32") or
+        containsIgnoreCase(command, "windows/system32") or
+        containsIgnoreCase(command, "program files") or
+        containsIgnoreCase(command, "\\windows\\") or
+        containsIgnoreCase(command, "/windows/")) return true;
+    if (hasDriveRootTarget(command)) return true;
+    return hasPwshSeparatorRootTarget(command);
+}
+
+/// True when `command` contains a bare separator-only root target: a `/` or
+/// `\` introduced by whitespace or an opening quote and closed by
+/// end-of-string, a shell separator, a closing quote, or `*`. In pwsh a bare
+/// `/` or `\` resolves to the root of the CURRENT drive, so
+/// `rm -Recurse -Force /` is a whole-drive wipe like `rm -Recurse -Force C:\`.
+/// A separator attached to a word (`dist/`, `.\build\`) is a relative path,
+/// not a root.
+fn hasPwshSeparatorRootTarget(command: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < command.len) : (idx += 1) {
+        const c = command[idx];
+        if (c != '/' and c != '\\') continue;
+        if (idx == 0) continue;
+        const before = command[idx - 1];
+        // Whitespace, an opening quote, or a pwsh backtick escape introduces
+        // the root: `` ri -Force `/ `` still names the bare `/` root.
+        if (!std.ascii.isWhitespace(before) and before != '"' and before != '\'' and before != '`') continue;
+        const after = idx + 1;
+        if (after >= command.len) return true; // trailing ` /` / ` \`
+        const nxt = command[after];
+        if (isRootTargetDelimiter(nxt)) return true; // ` /"` — `ri -Force "/"`
+        if (nxt == '*') {
+            const after_star = after + 1;
+            if (after_star >= command.len or isRootTargetDelimiter(command[after_star])) return true;
+        }
+    }
+    return false;
+}
+
+/// True when `command` contains a bare drive root target (`C:\` or `C:/`
+/// followed by end-of-string, whitespace, a quote, `*`, or nothing) — the
+/// `Remove-Item C:\` / `Remove-Item C:\*` case that nukes the whole drive.
 fn hasDriveRootTarget(command: []const u8) bool {
     var idx: usize = 0;
     while (idx < command.len) {
-        // A drive letter somewhere, then `:\` right after is the drive root.
+        // A drive letter somewhere, then `:\` or `:/` right after is the
+        // drive root.
         if (idx + 2 < command.len and
             std.ascii.isAlphabetic(command[idx]) and
             command[idx + 1] == ':' and
-            command[idx + 2] == '\\')
+            (command[idx + 2] == '\\' or command[idx + 2] == '/'))
         {
             const after = idx + 3;
             if (after >= command.len) return true; // trailing `C:\`
@@ -289,86 +345,118 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
-/// Case-insensitive search returning the first match position, or null.
-fn findIgnoreCaseFrom(haystack: []const u8, needle: []const u8, from: usize) ?usize {
-    if (from >= haystack.len) return null;
-    return std.ascii.findIgnoreCasePos(haystack, from, needle);
-}
-
 test "containsIgnoreCase: empty needle matches, case folded" {
     try std.testing.expect(containsIgnoreCase("Remove-Item", ""));
     try std.testing.expect(containsIgnoreCase("rm -RF /", "-rf"));
     try std.testing.expect(!containsIgnoreCase("rm", "-rf"));
 }
 
-test "findIgnoreCaseFrom: past-end returns null, finds later occurrence" {
-    try std.testing.expectEqual(@as(?usize, null), findIgnoreCaseFrom("abc", "x", 10));
-    try std.testing.expectEqual(@as(?usize, 2), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 2));
-    try std.testing.expectEqual(@as(?usize, 16), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 3));
+/// Characters that may sit directly before an `rm`/`dd` command word while it
+/// still reads as command position: shell separators (`;`, `|`, `&` —
+/// including unspaced `&&rm`), substitution openings (`(`, backtick), quotes
+/// (`sh -c "rm -rf /"`), and the backslash escape (`\rm` bypasses a rm alias
+/// but still runs rm). Anything else (a letter in `alarm`, a digit, `=`)
+/// means the match is inside a larger word, not a command.
+fn isCommandWordBoundary(c: u8) bool {
+    return std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&' or
+        c == '(' or c == '`' or c == '"' or c == '\'' or c == '\\';
 }
 
-/// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /` etc.
-fn isDangerousRm(command: []const u8) bool {
-    // Must start with or contain `rm` as a command word.
-    const rm_idx = std.mem.indexOf(u8, command, "rm") orelse return false;
-    // Check that it's a word boundary before rm.
-    if (rm_idx > 0 and !std.ascii.isWhitespace(command[rm_idx - 1]) and command[rm_idx - 1] != ';' and command[rm_idx - 1] != '|') return false;
-
-    const rest = command[rm_idx + 2 ..];
-    // Look for `-rf` or `-fr` flags.
-    const has_recursive = std.mem.indexOf(u8, rest, "-rf") != null or
-        std.mem.indexOf(u8, rest, "-fr") != null or
-        std.mem.indexOf(u8, rest, "-r -f") != null or
-        std.mem.indexOf(u8, rest, "-f -r") != null;
-
-    // Look for target being root (`/` or `/*`) — not just any absolute path.
-    // Match ` /` followed by space, end-of-string, or `*` followed by space/end.
-    const targets_root = blk: {
-        var idx: usize = 0;
-        while (std.mem.indexOfPos(u8, rest, idx, " /")) |pos| {
-            const after = pos + 2;
-            if (after >= rest.len) break :blk true; // trailing ` /`
-            const c = rest[after];
-            if (c == ' ' or c == '\t' or c == ';' or c == '&' or c == '|' or c == '\r' or c == '\n') break :blk true; // ` / ` or ` /; ` (next arg / command)
-            if (c == '*') {
-                if (after + 1 >= rest.len or rest[after + 1] == ' ' or rest[after + 1] == '\t' or rest[after + 1] == ';' or rest[after + 1] == '&' or rest[after + 1] == '|') break :blk true; // ` /*` or `/* `
-            }
-            idx = after;
+/// True when `rest` (the text after an `rm` command word) names the
+/// filesystem root as a target: a `/` introduced by whitespace, an opening
+/// quote (`"/`), or a backslash escape (`\/`), optionally followed by `*` or
+/// a no-op `.` component, and closed by end-of-string, whitespace, a shell
+/// separator, or the closing quote/substitution characters — i.e. the whole
+/// root, never a longer path like `/tmp/x`.
+fn hasRootTarget(rest: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < rest.len) : (idx += 1) {
+        if (rest[idx] != '/') continue;
+        if (idx == 0) continue;
+        const before = rest[idx - 1];
+        // Any whitespace (space, tab, newline), an opening quote, or a
+        // backslash escape may introduce the root argument: `rm -rf\t/` is
+        // the same command as `rm -rf /`, and bash `\/` is just `/`.
+        if (!std.ascii.isWhitespace(before) and before != '"' and before != '\'' and before != '\\') continue;
+        const after = idx + 1;
+        if (after >= rest.len) return true; // trailing ` /` / `"/`
+        const c = rest[after];
+        if (isRootTargetDelimiter(c)) return true; // ` /)` — `$(rm -rf /)`
+        if (c == '*') {
+            const after_star = after + 1;
+            if (after_star >= rest.len or isRootTargetDelimiter(rest[after_star])) return true;
         }
-        break :blk false;
-    };
-    const has_no_preserve = std.mem.indexOf(u8, rest, "--no-preserve-root") != null;
-
-    return has_recursive and (targets_root or has_no_preserve);
+    }
+    return false;
 }
 
-/// Check for `dd if=/dev/zero of=/dev/sda` or similar destructive dd.
-fn isDangerousDd(command: []const u8) bool {
-    const dd_idx = std.mem.indexOf(u8, command, "dd") orelse return false;
-    if (dd_idx > 0 and !std.ascii.isWhitespace(command[dd_idx - 1]) and command[dd_idx - 1] != ';' and command[dd_idx - 1] != '|') return false;
+/// Delimiters that may follow the root `/` (or `/*`, `\`, `\.`) target:
+/// whitespace, shell separators, the closers of the substitution/quote
+/// contexts the root can be embedded in (`)`, backtick, `"`, `'`), and `.`
+/// — a dot is a no-op path component (`/.` and `/./` still name the root).
+fn isRootTargetDelimiter(c: u8) bool {
+    return c == ' ' or c == '\t' or c == ';' or c == '&' or c == '|' or c == '\r' or c == '\n' or
+        c == ')' or c == '`' or c == '"' or c == '\'' or c == '.';
+}
 
-    const rest = command[dd_idx + 2 ..];
-    // dd writing to a block device.
-    const of_dev = std.mem.indexOf(u8, rest, "of=/dev/");
-    if (of_dev) |idx| {
-        // Skip /dev/null, /dev/zero, /dev/random, /dev/urandom.
-        const target = rest[idx + 8 ..];
-        if (std.mem.startsWith(u8, target, "null") or
-            std.mem.startsWith(u8, target, "zero") or
-            std.mem.startsWith(u8, target, "random") or
-            std.mem.startsWith(u8, target, "urandom") or
-            std.mem.startsWith(u8, target, "stdout")) return false;
-        return true;
+/// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`, and the
+/// same inside command substitution (`$(rm -rf /)`), backticks, quotes, or
+/// after an unspaced separator (`&&rm`). Every occurrence of an `rm` command
+/// word is examined — a word merely embedding `rm` (`alarm`) does not stop a
+/// later standalone `rm` from being checked.
+fn isDangerousRm(command: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, command, search_from, "rm")) |rm_idx| {
+        search_from = rm_idx + 1;
+        // Word boundary before rm: command position, not inside `alarm`.
+        if (rm_idx > 0 and !isCommandWordBoundary(command[rm_idx - 1])) continue;
+
+        const rest = command[rm_idx + 2 ..];
+        // Look for `-rf` or `-fr` flags.
+        const has_recursive = std.mem.indexOf(u8, rest, "-rf") != null or
+            std.mem.indexOf(u8, rest, "-fr") != null or
+            std.mem.indexOf(u8, rest, "-r -f") != null or
+            std.mem.indexOf(u8, rest, "-f -r") != null;
+        if (!has_recursive) continue;
+
+        // Target being root (`/`, `/*`, `"/"`) — not just any absolute path.
+        if (hasRootTarget(rest)) return true;
+        if (std.mem.indexOf(u8, rest, "--no-preserve-root") != null) return true;
     }
-    // dd writing to other dangerous system paths.
-    const dangerous_of = [_][]const u8{
-        "of=/boot/",
-        "of=/etc/",
-        "of=/sys/",
-        "of=/proc/",
-    };
-    for (dangerous_of) |prefix| {
-        if (std.mem.indexOf(u8, rest, prefix) != null) return true;
+    return false;
+}
+
+/// Check for `dd if=/dev/zero of=/dev/sda` or similar destructive dd, in any
+/// command position (standalone, after a separator, in substitution).
+fn isDangerousDd(command: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, command, search_from, "dd")) |dd_idx| {
+        search_from = dd_idx + 1;
+        if (dd_idx > 0 and !isCommandWordBoundary(command[dd_idx - 1])) continue;
+
+        const rest = command[dd_idx + 2 ..];
+        // dd writing to a block device.
+        const of_dev = std.mem.indexOf(u8, rest, "of=/dev/");
+        if (of_dev) |idx| {
+            // Skip /dev/null, /dev/zero, /dev/random, /dev/urandom.
+            const target = rest[idx + 8 ..];
+            if (std.mem.startsWith(u8, target, "null") or
+                std.mem.startsWith(u8, target, "zero") or
+                std.mem.startsWith(u8, target, "random") or
+                std.mem.startsWith(u8, target, "urandom") or
+                std.mem.startsWith(u8, target, "stdout")) continue;
+            return true;
+        }
+        // dd writing to other dangerous system paths.
+        const dangerous_of = [_][]const u8{
+            "of=/boot/",
+            "of=/etc/",
+            "of=/sys/",
+            "of=/proc/",
+        };
+        for (dangerous_of) |prefix| {
+            if (std.mem.indexOf(u8, rest, prefix) != null) return true;
+        }
     }
     return false;
 }
@@ -410,12 +498,15 @@ fn isDangerousRedirect(command: []const u8) bool {
 
 /// PowerShell redirect (`>`) into a Windows system root. Case-insensitive on the
 /// ASCII text. Flags well-known system dirs and a bare drive root; a project path
-/// on the C: drive (`> C:\repo\out.txt`) is NOT flagged.
+/// on the C: drive (`> C:\repo\out.txt`) is NOT flagged. Both separators are
+/// accepted (pwsh treats `C:/Windows` and `C:\Windows` identically).
 fn isDangerousPwshRedirect(command: []const u8) bool {
     if (std.mem.indexOf(u8, command, ">") == null) return false;
     if (containsIgnoreCase(command, "windows\\system32") or
+        containsIgnoreCase(command, "windows/system32") or
         containsIgnoreCase(command, "program files") or
         containsIgnoreCase(command, "windows\\") or
+        containsIgnoreCase(command, "windows/") or
         containsIgnoreCase(command, "$env:systemroot"))
     {
         return true;
@@ -427,18 +518,20 @@ fn isDangerousPwshRedirect(command: []const u8) bool {
 }
 
 /// True when `command` contains a `>` redirect to a drive root with nothing but
-/// whitespace/quote/`*`/end after the `C:\` — i.e. writing to the root of a
-/// drive itself, not into a subdirectory.
+/// whitespace/quote/`*`/end after the `C:\` (or `C:/`) — i.e. writing to the
+/// root of a drive itself, not into a subdirectory.
 fn hasBareDriveRootRedirect(command: []const u8) bool {
     var idx: usize = 0;
     while (indexOfScalarPos(command, idx, '>')) |gt| {
         var after = gt + 1;
         while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
         if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
-        if (after + 2 <= command.len and
+        // Strict bound: a trailing `X:` (no root separator after the colon)
+        // is not a redirect target, and indexing one past it would panic.
+        if (after + 2 < command.len and
             std.ascii.isAlphabetic(command[after]) and
             command[after + 1] == ':' and
-            command[after + 2] == '\\')
+            (command[after + 2] == '\\' or command[after + 2] == '/'))
         {
             const tail = after + 3;
             if (tail >= command.len) return true;
@@ -862,6 +955,119 @@ test "local classifier still allows safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
     // `apt` substring inside an unrelated word must not false-positive.
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
+}
+
+test "S1 rm inside command substitution still flags root wipe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo $(rm -rf /)"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo $(rm -rf /*)"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("$(dd if=/dev/zero of=/dev/sda)"));
+}
+
+test "S1 rm after backtick or unspaced && still flags root wipe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo `rm -rf /`"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("true&&rm -rf /"));
+}
+
+test "S1 quoted rm root target still flags" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sh -c \"rm -rf /\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf \"/\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf '/'"));
+}
+
+test "S1 rm as a later command word after a word embedding rm" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("alarm; rm -rf /"));
+}
+
+test "S1 substitution-scoped rm on project paths stays safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo $(rm -rf /tmp/x)"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo $(rm -rf ./build)"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("cat alarm.log; rm -rf ./dist"));
+}
+
+test "S2 windows package managers install and uninstall are unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("winget install Microsoft.PowerToys"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("winget uninstall Microsoft.Edge"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("choco install nginx --yes"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("choco uninstall nginx"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("scoop install ripgrep"));
+}
+
+test "S2 windows package manager reads stay safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("winget list"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("winget search ripgrep"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("choco list --local-only"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("scoop info ripgrep"));
+}
+
+test "S2 install phrases match case-insensitively" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("PIP INSTALL requests"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Winget Install Microsoft.PowerToys"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("winget;install ripgrep"));
+}
+
+test "S3 pwsh Remove-Item aliases on system targets are unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force C:\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("del -Recurse -Force C:\\Windows\\System32\\bad"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rd -Force C:\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("ri -Recurse $env:SystemRoot"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("erase -Force 'C:\\Program Files'"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rmdir -Recurse -Force D:\\"));
+}
+
+test "S3 forward-slash drive roots and windows dirs are recognized" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:/"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force D:/"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:/Windows/System32/x"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Write-Output 'x' > C:/Windows/x.txt"));
+}
+
+test "S3 pwsh alias removals on project paths stay safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("rm -Recurse -Force .\\build"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("del -Recurse -Force C:\\repo\\dist"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("rd -Force D:\\repo\\out"));
+    // Abbreviated flags are out of scope for the conservative matcher.
+    try std.testing.expectEqual(Verdict.safe, localClassify("rm -r .\\node_modules"));
+}
+
+test "S3 trailing drive letter after redirect neither panics nor flags" {
+    // Regression: `X:` at end-of-string made hasBareDriveRootRedirect read
+    // one byte past the command; a drive letter with no root separator is
+    // not a redirect target at all.
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x > C:"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x > 'D:"));
+}
+
+test "S3 rm root target accepts tab and newline before the slash" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf\t/"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf\n/"));
+}
+
+test "S3 pwsh bare separator roots are recognized" {
+    // In pwsh a bare `/` or `\` resolves to the root of the current drive,
+    // so these are whole-drive wipes in the same class as `C:\`. A trailing
+    // `.` is a no-op path component: `/.` is still the root.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force /"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force \\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("ri -Force \"/\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rd -Recurse -Force /*"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force /."));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force '/'"));
+}
+
+test "S3 separators attached to words are relative paths, not roots" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("rm -Recurse -Force .\\build\\"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse dist/"));
+    // A UNC share is a remote path, not the current drive's root.
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force \\\\server\\share\\build"));
+}
+
+test "S1 backslash-escaped rm still flags root wipe" {
+    // `\rm` is the bash idiom for bypassing a rm alias; it is still the rm
+    // command in command position. `\/` is the same escape applied to the
+    // root target itself.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("\\rm -rf /"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("\\dd if=/dev/zero of=/dev/sda"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf \\/"));
 }
 
 test "RT semicolon" {
