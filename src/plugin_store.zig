@@ -505,21 +505,39 @@ fn installPlugin(
     if (std.Io.Dir.access(.cwd(), io, final_dir, .{})) |_| {
         var existing = std.Io.Dir.openDir(.cwd(), io, final_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.Canceled => return err,
-            else => return error.InvalidPluginPackage,
+            // The access() probe above succeeded, so a target that vanished
+            // or is not a directory since then is a damaged installation.
+            error.FileNotFound, error.NotDir => return error.InvalidPluginPackage,
+            // Environmental failures (ACLs, roaming share, SystemResources,
+            // Unexpected from directory-open sharing violations) propagate
+            // verbatim — the failure toast formats @errorName, and
+            // collapsing them into InvalidPluginPackage reported "bad
+            // package" for a directory that merely could not be opened.
+            else => return err,
         };
         defer existing.close(io);
         const entrypoint = existing.openFile(io, "init.lua", .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.Canceled => return err,
-            else => return error.InvalidPluginPackage,
+            // Missing or non-file entrypoint: damaged installation. An
+            // antivirus lock (FileBusy) or ACLs (AccessDenied) propagate.
+            error.FileNotFound, error.IsDir => return error.InvalidPluginPackage,
+            else => return err,
         };
         defer entrypoint.close(io);
         // Stat-only: NtQueryInformationFile cannot pend, so this no-follow
         // handle needs no os.repairNoFollowFileFlags — but any future read
         // from it does (see the helper's comment).
         if ((try entrypoint.stat(io)).kind != .file) return error.InvalidPluginPackage;
-        var receipt = package.readReceipt(gpa, io, final_dir) catch |err| {
-            if (err == error.OutOfMemory or err == error.Canceled) return err;
-            return error.UnmanagedOrInvalidInstallation;
+        var receipt = package.readReceipt(gpa, io, final_dir) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            // Absent, non-file, symlinked, oversized or malformed receipt: a
+            // foreign copy, not a managed zay installation. (On Windows a
+            // directory named like the receipt fails the no-follow open with
+            // IsDir before readFile's stat-kind check.)
+            error.FileNotFound, error.InvalidPluginPackage, error.IsDir, error.SymLinkLoop, error.StreamTooLong, error.InvalidInstallReceipt => return error.UnmanagedOrInvalidInstallation,
+            // Read-level failures (ReadFailed, AccessDenied, Unexpected)
+            // propagate verbatim so the failure message names the fault.
+            else => return err,
         };
         defer receipt.deinit();
         if (!std.mem.eql(u8, receipt.value.id, plugin.id) or !std.mem.eql(u8, receipt.value.catalog, catalog_source) or
@@ -1187,6 +1205,44 @@ test "installPlugin publishes a local package once and is idempotent" {
     try std.testing.expect(inventory.packages[0].manifest == null);
     try std.testing.expect(inventory.packages[0].receipt != null);
     try std.testing.expectEqualStrings("FileNotFound", inventory.packages[0].diagnostic.?);
+}
+
+test "installPlugin reports an unmanaged installation missing its receipt" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const root = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "plugin-unmanaged" });
+    defer gpa.free(root);
+    const source = try std.fs.path.join(gpa, &.{ root, "examples", "demo" });
+    defer gpa.free(source);
+    try std.Io.Dir.createDirPath(.cwd(), io, source);
+    const manifest_path = try std.fs.path.join(gpa, &.{ source, "plugin.lua" });
+    defer gpa.free(manifest_path);
+    try writeFile(io, manifest_path, "return { name = \"demo\", version = \"1.0.0\" }");
+    const init_path = try std.fs.path.join(gpa, &.{ source, "init.lua" });
+    defer gpa.free(init_path);
+    try writeFile(io, init_path, "return true");
+
+    const json = "{\"name\":\"Local\",\"plugins\":[{\"id\":\"demo\",\"name\":\"Demo\",\"version\":\"1.0.0\",\"sourceDir\":\"examples/demo\"}]}";
+    var catalog = try parseCatalog(gpa, "local", json, root, true);
+    defer catalog.deinit(gpa);
+
+    // A foreign copy of the plugin directory: valid entrypoint but no
+    // receipt — must stay UnmanagedOrInvalidInstallation, never an
+    // environmental error, after the open/read error narrowing.
+    const install_dir = try std.fs.path.join(gpa, &.{ root, "plugins" });
+    defer gpa.free(install_dir);
+    const foreign = try std.fs.path.join(gpa, &.{ install_dir, "demo" });
+    defer gpa.free(foreign);
+    try std.Io.Dir.createDirPath(.cwd(), io, foreign);
+    const foreign_init = try std.fs.path.join(gpa, &.{ foreign, "init.lua" });
+    defer gpa.free(foreign_init);
+    try writeFile(io, foreign_init, "return true");
+    try std.testing.expectError(error.UnmanagedOrInvalidInstallation, installPlugin(gpa, io, install_dir, &catalog.plugins[0], "local", root));
 }
 
 test "catalog parsing preserves allocation failures" {
