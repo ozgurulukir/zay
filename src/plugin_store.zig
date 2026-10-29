@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const os = @import("os.zig");
 const paths = @import("paths.zig");
 const package = @import("plugin_package.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -512,6 +513,9 @@ fn installPlugin(
             else => return error.InvalidPluginPackage,
         };
         defer entrypoint.close(io);
+        // Stat-only: NtQueryInformationFile cannot pend, so this no-follow
+        // handle needs no os.repairNoFollowFileFlags — but any future read
+        // from it does (see the helper's comment).
         if ((try entrypoint.stat(io)).kind != .file) return error.InvalidPluginPackage;
         var receipt = package.readReceipt(gpa, io, final_dir) catch |err| {
             if (err == error.OutOfMemory or err == error.Canceled) return err;
@@ -638,8 +642,9 @@ fn copyTree(
             .file => {
                 file_count.* += 1;
                 if (file_count.* > max_plugin_files) return error.TooManyFiles;
-                const file = try source.openFile(io, entry.name, .{ .follow_symlinks = false });
+                var file = try source.openFile(io, entry.name, .{ .follow_symlinks = false });
                 defer file.close(io);
+                os.repairNoFollowFileFlags(&file);
                 var read_buf: [4096]u8 = undefined;
                 var reader = file.reader(io, &read_buf);
                 const bytes = try reader.interface.allocRemaining(gpa, .limited(plugin_file_max_bytes));
@@ -1089,6 +1094,30 @@ test "validRelativePath rejects empty and traversal segments" {
     try std.testing.expect(!validRelativePath(""));
     try std.testing.expect(!validRelativePath("../init.lua"));
     try std.testing.expect(!validRelativePath("nested//init.lua"));
+}
+
+test "remote install staging read survives the Windows no-follow async handle" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "staged" });
+    defer gpa.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+    const manifest_path = try std.fs.path.join(gpa, &.{ root, "plugin.lua" });
+    defer gpa.free(manifest_path);
+
+    // installPlugin's remote path writes staged files with the synced writer,
+    // then immediately re-opens them no-follow to verify the manifest. On
+    // Windows that reopen yields an async handle Zig 0.16.0 mislabels as
+    // blocking, so the positional read hits STATUS_PENDING — a panic in
+    // Debug, `error.ReadFailed` in ReleaseFast — unless the flags are
+    // repaired (os.repairNoFollowFileFlags) before reading.
+    try writeFile(io, manifest_path, "return { name = \"demo\", version = \"1.0.0\" }");
+    var manifest = try package.readManifest(gpa, io, root);
+    defer manifest.deinit(gpa);
+    try std.testing.expectEqualStrings("demo", manifest.name);
+    try std.testing.expectEqualStrings("1.0.0", manifest.version);
 }
 
 test "installPlugin publishes a local package once and is idempotent" {

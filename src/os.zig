@@ -35,6 +35,23 @@ pub fn termCode(term: std.process.Child.Term) u8 {
     };
 }
 
+/// Correct `File.flags.nonblocking` for a handle opened with
+/// `Dir.OpenFileOptions{ .follow_symlinks = false }`.
+///
+/// Zig 0.16.0's Windows `openFile` pairs `OPEN_REPARSE_POINT` with
+/// `.IO = .ASYNCHRONOUS` (std/Io/Threaded.zig `dirOpenFileWtf16`) but still
+/// records the returned `File` as blocking. Every read then takes the
+/// synchronous `NtReadFile` path, where an asynchronous handle legitimately
+/// returns `STATUS_PENDING` — std treats that as unreachable: a panic in
+/// Debug and undefined behavior in ReleaseFast, observed in the wild as
+/// `error.ReadFailed` failing every remote plugin-store install at the
+/// staged-manifest read. Setting the flag routes reads to std's APC-based
+/// nonblocking path, which waits out PENDING. No-op on POSIX, where the
+/// option only adds `O_NOFOLLOW`.
+pub fn repairNoFollowFileFlags(file: *std.Io.File) void {
+    if (is_windows) file.flags.nonblocking = true;
+}
+
 /// Milliseconds `terminateChildBounded` waits after SIGTERM before escalating
 /// to SIGKILL: long enough for graceful-shutdown handlers, short enough that a
 /// stuck tool call feels interruptible.

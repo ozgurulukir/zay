@@ -1,6 +1,7 @@
 //! On-disk plugin identity, provenance and cross-process coordination. No live
 //! Lua states or TUI state are owned here. Manifest evaluation is metadata-only.
 const std = @import("std");
+const os = @import("os.zig");
 const paths = @import("paths.zig");
 const manifest_mod = @import("lua/manifest.zig");
 const Manifest = manifest_mod.Manifest;
@@ -55,8 +56,9 @@ pub const Inventory = struct {
 };
 
 pub fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {
-    const file = try std.Io.Dir.openFile(.cwd(), io, path, .{ .follow_symlinks = false });
+    var file = try std.Io.Dir.openFile(.cwd(), io, path, .{ .follow_symlinks = false });
     defer file.close(io);
+    os.repairNoFollowFileFlags(&file);
     if ((try file.stat(io)).kind != .file) return error.InvalidPluginPackage;
     var reader = file.reader(io, &.{});
     return reader.interface.allocRemaining(gpa, .limited(limit));
