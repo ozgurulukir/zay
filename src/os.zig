@@ -35,6 +35,34 @@ pub fn termCode(term: std.process.Child.Term) u8 {
     };
 }
 
+/// Correct `File.flags.nonblocking` for a handle opened with
+/// `Dir.OpenFileOptions{ .follow_symlinks = false }`.
+///
+/// Zig 0.16.0's Windows `openFile` pairs `OPEN_REPARSE_POINT` with
+/// `.IO = .ASYNCHRONOUS` (std/Io/Threaded.zig `dirOpenFileWtf16`) but still
+/// records the returned `File` as blocking. Every read then takes the
+/// synchronous `NtReadFile` path, where an asynchronous handle legitimately
+/// returns `STATUS_PENDING` — std treats that as unreachable: a panic in
+/// Debug and undefined behavior in ReleaseFast, observed in the wild as
+/// `error.ReadFailed` failing every remote plugin-store install at the
+/// staged-manifest read. Setting the flag routes reads to std's APC-based
+/// nonblocking path, which waits out PENDING. No-op on POSIX, where the
+/// option only adds `O_NOFOLLOW`.
+pub fn repairNoFollowFileFlags(file: *std.Io.File) void {
+    if (is_windows) file.flags.nonblocking = true;
+}
+
+// The workaround above is keyed to the pinned 0.16.x std: a newer toolchain
+// may fix the flag mislabeling by opening no-follow handles synchronously,
+// which would turn this APC-path routing into a hang. Fail the build rather
+// than let the workaround silently misapply — build.zig.zon's
+// minimum_zig_version only gates older toolchains.
+comptime {
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16) {
+        @compileError("Zig is not 0.16.x: re-audit os.repairNoFollowFileFlags against the new std Windows openFile path");
+    }
+}
+
 /// Milliseconds `terminateChildBounded` waits after SIGTERM before escalating
 /// to SIGKILL: long enough for graceful-shutdown handlers, short enough that a
 /// stuck tool call feels interruptible.
@@ -264,10 +292,7 @@ test "attachJobObjectKillOnClose_attachesJobObject_whenChildIsValidOnWindows" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer {
-        child.kill(io);
-        _ = child.wait(io) catch {};
-    }
+    defer child.kill(io);
 
     const handle = attachJobObjectKillOnClose(&child);
     try std.testing.expect(handle != null);
