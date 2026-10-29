@@ -1096,7 +1096,7 @@ test "validRelativePath rejects empty and traversal segments" {
     try std.testing.expect(!validRelativePath("nested//init.lua"));
 }
 
-test "remote install staging read survives the Windows no-follow async handle" {
+test "staged synced write then no-follow manifest read survives the Windows async handle" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1112,7 +1112,8 @@ test "remote install staging read survives the Windows no-follow async handle" {
     // Windows that reopen yields an async handle Zig 0.16.0 mislabels as
     // blocking, so the positional read hits STATUS_PENDING — a panic in
     // Debug, `error.ReadFailed` in ReleaseFast — unless the flags are
-    // repaired (os.repairNoFollowFileFlags) before reading.
+    // repaired (os.repairNoFollowFileFlags) before reading. This test
+    // reproduces the write→reopen pair directly, not the full install flow.
     try writeFile(io, manifest_path, "return { name = \"demo\", version = \"1.0.0\" }");
     var manifest = try package.readManifest(gpa, io, root);
     defer manifest.deinit(gpa);
