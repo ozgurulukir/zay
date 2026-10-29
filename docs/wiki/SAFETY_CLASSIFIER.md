@@ -30,7 +30,8 @@ The built-in matcher recognizes selected patterns, including some
 destructive disk operations (matched wherever `rm`/`dd` appear in command
 position: standalone, after separators such as `&&`, and inside command
 substitution, backticks, or quotes), critical system-file redirects, shell
-fork-bomb forms, and privileged package-management commands. It does not
+fork-bomb forms, and privileged package-management commands (Unix managers
+and the Windows installers `winget`, `choco`, and `scoop`). It does not
 parse arbitrary commands into a complete security policy and cannot detect
 every dangerous action. A command not classified as unsafe may run without
 an approval prompt.
