@@ -262,7 +262,10 @@ fn hasRemoveItemSpelling(command: []const u8) bool {
 
 /// True when `command` names a Windows system target: `$env:SystemRoot` /
 /// `$env:WINDIR`, a well-known system dir, or a bare drive root. Project
-/// paths that merely sit on the C: drive are not targets.
+/// paths that merely sit on the C: drive are not targets. A project-relative
+/// directory literally named `windows` (e.g. `platforms\windows\`) does trip
+/// the substring — that fails closed into an approval prompt, which is the
+/// conservative posture this matcher documents; it never silently blocks.
 fn hasPwshSystemTarget(command: []const u8) bool {
     // $env:SystemRoot / $env:WINDIR resolves to a system root.
     if (containsIgnoreCase(command, "$env:systemroot") or containsIgnoreCase(command, "$env:windir")) return true;
@@ -339,7 +342,10 @@ fn hasRootTarget(rest: []const u8) bool {
         if (rest[idx] != '/') continue;
         if (idx == 0) continue;
         const before = rest[idx - 1];
-        if (before != ' ' and before != '"' and before != '\'') continue;
+        // Any whitespace (space, tab, newline) or an opening quote may
+        // introduce the root argument: `rm -rf\t/` is the same command as
+        // `rm -rf /`.
+        if (!std.ascii.isWhitespace(before) and before != '"' and before != '\'') continue;
         const after = idx + 1;
         if (after >= rest.len) return true; // trailing ` /` / `"/`
         const c = rest[after];
@@ -487,7 +493,9 @@ fn hasBareDriveRootRedirect(command: []const u8) bool {
         var after = gt + 1;
         while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
         if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
-        if (after + 2 <= command.len and
+        // Strict bound: a trailing `X:` (no root separator after the colon)
+        // is not a redirect target, and indexing one past it would panic.
+        if (after + 2 < command.len and
             std.ascii.isAlphabetic(command[after]) and
             command[after + 1] == ':' and
             (command[after + 2] == '\\' or command[after + 2] == '/'))
@@ -986,6 +994,19 @@ test "S3 pwsh alias removals on project paths stay safe" {
     try std.testing.expectEqual(Verdict.safe, localClassify("rd -Force D:\\repo\\out"));
     // Abbreviated flags are out of scope for the conservative matcher.
     try std.testing.expectEqual(Verdict.safe, localClassify("rm -r .\\node_modules"));
+}
+
+test "S3 trailing drive letter after redirect neither panics nor flags" {
+    // Regression: `X:` at end-of-string made hasBareDriveRootRedirect read
+    // one byte past the command; a drive letter with no root separator is
+    // not a redirect target at all.
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x > C:"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x > 'D:"));
+}
+
+test "S3 rm root target accepts tab and newline before the slash" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf\t/"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf\n/"));
 }
 
 test "RT semicolon" {
