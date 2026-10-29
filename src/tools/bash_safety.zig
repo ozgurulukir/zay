@@ -275,7 +275,37 @@ fn hasPwshSystemTarget(command: []const u8) bool {
         containsIgnoreCase(command, "program files") or
         containsIgnoreCase(command, "\\windows\\") or
         containsIgnoreCase(command, "/windows/")) return true;
-    return hasDriveRootTarget(command);
+    if (hasDriveRootTarget(command)) return true;
+    return hasPwshSeparatorRootTarget(command);
+}
+
+/// True when `command` contains a bare separator-only root target: a `/` or
+/// `\` introduced by whitespace or an opening quote and closed by
+/// end-of-string, a shell separator, a closing quote, or `*`. In pwsh a bare
+/// `/` or `\` resolves to the root of the CURRENT drive, so
+/// `rm -Recurse -Force /` is a whole-drive wipe like `rm -Recurse -Force C:\`.
+/// A separator attached to a word (`dist/`, `.\build\`) is a relative path,
+/// not a root.
+fn hasPwshSeparatorRootTarget(command: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < command.len) : (idx += 1) {
+        const c = command[idx];
+        if (c != '/' and c != '\\') continue;
+        if (idx == 0) continue;
+        const before = command[idx - 1];
+        // Whitespace, an opening quote, or a pwsh backtick escape introduces
+        // the root: `` ri -Force `/ `` still names the bare `/` root.
+        if (!std.ascii.isWhitespace(before) and before != '"' and before != '\'' and before != '`') continue;
+        const after = idx + 1;
+        if (after >= command.len) return true; // trailing ` /` / ` \`
+        const nxt = command[after];
+        if (isRootTargetDelimiter(nxt)) return true; // ` /"` — `ri -Force "/"`
+        if (nxt == '*') {
+            const after_star = after + 1;
+            if (after_star >= command.len or isRootTargetDelimiter(command[after_star])) return true;
+        }
+    }
+    return false;
 }
 
 /// True when `command` contains a bare drive root target (`C:\` or `C:/`
@@ -323,29 +353,31 @@ test "containsIgnoreCase: empty needle matches, case folded" {
 
 /// Characters that may sit directly before an `rm`/`dd` command word while it
 /// still reads as command position: shell separators (`;`, `|`, `&` —
-/// including unspaced `&&rm`), substitution openings (`(`, backtick), and
-/// quotes (`sh -c "rm -rf /"`). Anything else (a letter in `alarm`, a digit,
-/// `=`) means the match is inside a larger word, not a command.
+/// including unspaced `&&rm`), substitution openings (`(`, backtick), quotes
+/// (`sh -c "rm -rf /"`), and the backslash escape (`\rm` bypasses a rm alias
+/// but still runs rm). Anything else (a letter in `alarm`, a digit, `=`)
+/// means the match is inside a larger word, not a command.
 fn isCommandWordBoundary(c: u8) bool {
     return std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&' or
-        c == '(' or c == '`' or c == '"' or c == '\'';
+        c == '(' or c == '`' or c == '"' or c == '\'' or c == '\\';
 }
 
 /// True when `rest` (the text after an `rm` command word) names the
-/// filesystem root as a target: a `/` introduced by whitespace or an opening
-/// quote (`"/`), optionally followed by `*`, and closed by end-of-string,
-/// whitespace, a shell separator, or the closing quote/substitution
-/// characters — i.e. the whole root, never a longer path like `/tmp/x`.
+/// filesystem root as a target: a `/` introduced by whitespace, an opening
+/// quote (`"/`), or a backslash escape (`\/`), optionally followed by `*` or
+/// a no-op `.` component, and closed by end-of-string, whitespace, a shell
+/// separator, or the closing quote/substitution characters — i.e. the whole
+/// root, never a longer path like `/tmp/x`.
 fn hasRootTarget(rest: []const u8) bool {
     var idx: usize = 0;
     while (idx < rest.len) : (idx += 1) {
         if (rest[idx] != '/') continue;
         if (idx == 0) continue;
         const before = rest[idx - 1];
-        // Any whitespace (space, tab, newline) or an opening quote may
-        // introduce the root argument: `rm -rf\t/` is the same command as
-        // `rm -rf /`.
-        if (!std.ascii.isWhitespace(before) and before != '"' and before != '\'') continue;
+        // Any whitespace (space, tab, newline), an opening quote, or a
+        // backslash escape may introduce the root argument: `rm -rf\t/` is
+        // the same command as `rm -rf /`, and bash `\/` is just `/`.
+        if (!std.ascii.isWhitespace(before) and before != '"' and before != '\'' and before != '\\') continue;
         const after = idx + 1;
         if (after >= rest.len) return true; // trailing ` /` / `"/`
         const c = rest[after];
@@ -358,12 +390,13 @@ fn hasRootTarget(rest: []const u8) bool {
     return false;
 }
 
-/// Delimiters that may follow the root `/` (or `/*`) target: whitespace,
-/// shell separators, and the closers of the substitution/quote contexts the
-/// root can be embedded in (`)`, backtick, `"`, `'`).
+/// Delimiters that may follow the root `/` (or `/*`, `\`, `\.`) target:
+/// whitespace, shell separators, the closers of the substitution/quote
+/// contexts the root can be embedded in (`)`, backtick, `"`, `'`), and `.`
+/// — a dot is a no-op path component (`/.` and `/./` still name the root).
 fn isRootTargetDelimiter(c: u8) bool {
     return c == ' ' or c == '\t' or c == ';' or c == '&' or c == '|' or c == '\r' or c == '\n' or
-        c == ')' or c == '`' or c == '"' or c == '\'';
+        c == ')' or c == '`' or c == '"' or c == '\'' or c == '.';
 }
 
 /// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`, and the
@@ -1007,6 +1040,34 @@ test "S3 trailing drive letter after redirect neither panics nor flags" {
 test "S3 rm root target accepts tab and newline before the slash" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf\t/"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf\n/"));
+}
+
+test "S3 pwsh bare separator roots are recognized" {
+    // In pwsh a bare `/` or `\` resolves to the root of the current drive,
+    // so these are whole-drive wipes in the same class as `C:\`. A trailing
+    // `.` is a no-op path component: `/.` is still the root.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force /"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force \\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("ri -Force \"/\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rd -Recurse -Force /*"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force /."));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force '/'"));
+}
+
+test "S3 separators attached to words are relative paths, not roots" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("rm -Recurse -Force .\\build\\"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse dist/"));
+    // A UNC share is a remote path, not the current drive's root.
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force \\\\server\\share\\build"));
+}
+
+test "S1 backslash-escaped rm still flags root wipe" {
+    // `\rm` is the bash idiom for bypassing a rm alias; it is still the rm
+    // command in command position. `\/` is the same escape applied to the
+    // root target itself.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("\\rm -rf /"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("\\dd if=/dev/zero of=/dev/sda"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf \\/"));
 }
 
 test "RT semicolon" {
