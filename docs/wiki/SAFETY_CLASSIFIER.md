@@ -28,9 +28,11 @@ reject the command. A `safe` verdict runs without a prompt.
 
 The built-in matcher recognizes selected patterns, including some
 destructive disk operations (matched wherever `rm`/`dd` appear in command
-position: standalone, after separators such as `&&`, and inside command
-substitution, backticks, or quotes; the PowerShell spelling covers
-`Remove-Item` and its aliases with either path separator), critical
+position: standalone, after separators such as `&&`, inside command
+substitution, backticks, or quotes, or backslash-escaped as `\rm`; the
+PowerShell spelling covers `Remove-Item` and its aliases with either path
+separator, and its drive-root targets include the drive-letter forms plus a
+bare `/` or `\`, which resolves to the current drive's root), critical
 system-file redirects, shell
 fork-bomb forms, and privileged package-management commands (Unix managers
 and the Windows installers `winget`, `choco`, and `scoop`). It does not
