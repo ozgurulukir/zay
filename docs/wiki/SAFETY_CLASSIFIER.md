@@ -27,7 +27,9 @@ the built-in matcher. A verdict of `unsafe` asks the user to approve or
 reject the command. A `safe` verdict runs without a prompt.
 
 The built-in matcher recognizes selected patterns, including some
-destructive disk operations, critical system-file redirects, shell
+destructive disk operations (matched wherever `rm`/`dd` appear in command
+position: standalone, after separators such as `&&`, and inside command
+substitution, backticks, or quotes), critical system-file redirects, shell
 fork-bomb forms, and privileged package-management commands. It does not
 parse arbitrary commands into a complete security policy and cannot detect
 every dangerous action. A command not classified as unsafe may run without

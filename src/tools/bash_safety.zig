@@ -307,68 +307,106 @@ test "findIgnoreCaseFrom: past-end returns null, finds later occurrence" {
     try std.testing.expectEqual(@as(?usize, 16), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 3));
 }
 
-/// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /` etc.
-fn isDangerousRm(command: []const u8) bool {
-    // Must start with or contain `rm` as a command word.
-    const rm_idx = std.mem.indexOf(u8, command, "rm") orelse return false;
-    // Check that it's a word boundary before rm.
-    if (rm_idx > 0 and !std.ascii.isWhitespace(command[rm_idx - 1]) and command[rm_idx - 1] != ';' and command[rm_idx - 1] != '|') return false;
-
-    const rest = command[rm_idx + 2 ..];
-    // Look for `-rf` or `-fr` flags.
-    const has_recursive = std.mem.indexOf(u8, rest, "-rf") != null or
-        std.mem.indexOf(u8, rest, "-fr") != null or
-        std.mem.indexOf(u8, rest, "-r -f") != null or
-        std.mem.indexOf(u8, rest, "-f -r") != null;
-
-    // Look for target being root (`/` or `/*`) — not just any absolute path.
-    // Match ` /` followed by space, end-of-string, or `*` followed by space/end.
-    const targets_root = blk: {
-        var idx: usize = 0;
-        while (std.mem.indexOfPos(u8, rest, idx, " /")) |pos| {
-            const after = pos + 2;
-            if (after >= rest.len) break :blk true; // trailing ` /`
-            const c = rest[after];
-            if (c == ' ' or c == '\t' or c == ';' or c == '&' or c == '|' or c == '\r' or c == '\n') break :blk true; // ` / ` or ` /; ` (next arg / command)
-            if (c == '*') {
-                if (after + 1 >= rest.len or rest[after + 1] == ' ' or rest[after + 1] == '\t' or rest[after + 1] == ';' or rest[after + 1] == '&' or rest[after + 1] == '|') break :blk true; // ` /*` or `/* `
-            }
-            idx = after;
-        }
-        break :blk false;
-    };
-    const has_no_preserve = std.mem.indexOf(u8, rest, "--no-preserve-root") != null;
-
-    return has_recursive and (targets_root or has_no_preserve);
+/// Characters that may sit directly before an `rm`/`dd` command word while it
+/// still reads as command position: shell separators (`;`, `|`, `&` —
+/// including unspaced `&&rm`), substitution openings (`(`, backtick), and
+/// quotes (`sh -c "rm -rf /"`). Anything else (a letter in `alarm`, a digit,
+/// `=`) means the match is inside a larger word, not a command.
+fn isCommandWordBoundary(c: u8) bool {
+    return std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&' or
+        c == '(' or c == '`' or c == '"' or c == '\'';
 }
 
-/// Check for `dd if=/dev/zero of=/dev/sda` or similar destructive dd.
-fn isDangerousDd(command: []const u8) bool {
-    const dd_idx = std.mem.indexOf(u8, command, "dd") orelse return false;
-    if (dd_idx > 0 and !std.ascii.isWhitespace(command[dd_idx - 1]) and command[dd_idx - 1] != ';' and command[dd_idx - 1] != '|') return false;
-
-    const rest = command[dd_idx + 2 ..];
-    // dd writing to a block device.
-    const of_dev = std.mem.indexOf(u8, rest, "of=/dev/");
-    if (of_dev) |idx| {
-        // Skip /dev/null, /dev/zero, /dev/random, /dev/urandom.
-        const target = rest[idx + 8 ..];
-        if (std.mem.startsWith(u8, target, "null") or
-            std.mem.startsWith(u8, target, "zero") or
-            std.mem.startsWith(u8, target, "random") or
-            std.mem.startsWith(u8, target, "urandom") or
-            std.mem.startsWith(u8, target, "stdout")) return false;
-        return true;
+/// True when `rest` (the text after an `rm` command word) names the
+/// filesystem root as a target: a `/` introduced by whitespace or an opening
+/// quote (`"/`), optionally followed by `*`, and closed by end-of-string,
+/// whitespace, a shell separator, or the closing quote/substitution
+/// characters — i.e. the whole root, never a longer path like `/tmp/x`.
+fn hasRootTarget(rest: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < rest.len) : (idx += 1) {
+        if (rest[idx] != '/') continue;
+        if (idx == 0) continue;
+        const before = rest[idx - 1];
+        if (before != ' ' and before != '"' and before != '\'') continue;
+        const after = idx + 1;
+        if (after >= rest.len) return true; // trailing ` /` / `"/`
+        const c = rest[after];
+        if (isRootTargetDelimiter(c)) return true; // ` /)` — `$(rm -rf /)`
+        if (c == '*') {
+            const after_star = after + 1;
+            if (after_star >= rest.len or isRootTargetDelimiter(rest[after_star])) return true;
+        }
     }
-    // dd writing to other dangerous system paths.
-    const dangerous_of = [_][]const u8{
-        "of=/boot/",
-        "of=/etc/",
-        "of=/sys/",
-        "of=/proc/",
-    };
-    for (dangerous_of) |prefix| {
-        if (std.mem.indexOf(u8, rest, prefix) != null) return true;
+    return false;
+}
+
+/// Delimiters that may follow the root `/` (or `/*`) target: whitespace,
+/// shell separators, and the closers of the substitution/quote contexts the
+/// root can be embedded in (`)`, backtick, `"`, `'`).
+fn isRootTargetDelimiter(c: u8) bool {
+    return c == ' ' or c == '\t' or c == ';' or c == '&' or c == '|' or c == '\r' or c == '\n' or
+        c == ')' or c == '`' or c == '"' or c == '\'';
+}
+
+/// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /`, and the
+/// same inside command substitution (`$(rm -rf /)`), backticks, quotes, or
+/// after an unspaced separator (`&&rm`). Every occurrence of an `rm` command
+/// word is examined — a word merely embedding `rm` (`alarm`) does not stop a
+/// later standalone `rm` from being checked.
+fn isDangerousRm(command: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, command, search_from, "rm")) |rm_idx| {
+        search_from = rm_idx + 1;
+        // Word boundary before rm: command position, not inside `alarm`.
+        if (rm_idx > 0 and !isCommandWordBoundary(command[rm_idx - 1])) continue;
+
+        const rest = command[rm_idx + 2 ..];
+        // Look for `-rf` or `-fr` flags.
+        const has_recursive = std.mem.indexOf(u8, rest, "-rf") != null or
+            std.mem.indexOf(u8, rest, "-fr") != null or
+            std.mem.indexOf(u8, rest, "-r -f") != null or
+            std.mem.indexOf(u8, rest, "-f -r") != null;
+        if (!has_recursive) continue;
+
+        // Target being root (`/`, `/*`, `"/"`) — not just any absolute path.
+        if (hasRootTarget(rest)) return true;
+        if (std.mem.indexOf(u8, rest, "--no-preserve-root") != null) return true;
+    }
+    return false;
+}
+
+/// Check for `dd if=/dev/zero of=/dev/sda` or similar destructive dd, in any
+/// command position (standalone, after a separator, in substitution).
+fn isDangerousDd(command: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, command, search_from, "dd")) |dd_idx| {
+        search_from = dd_idx + 1;
+        if (dd_idx > 0 and !isCommandWordBoundary(command[dd_idx - 1])) continue;
+
+        const rest = command[dd_idx + 2 ..];
+        // dd writing to a block device.
+        const of_dev = std.mem.indexOf(u8, rest, "of=/dev/");
+        if (of_dev) |idx| {
+            // Skip /dev/null, /dev/zero, /dev/random, /dev/urandom.
+            const target = rest[idx + 8 ..];
+            if (std.mem.startsWith(u8, target, "null") or
+                std.mem.startsWith(u8, target, "zero") or
+                std.mem.startsWith(u8, target, "random") or
+                std.mem.startsWith(u8, target, "urandom") or
+                std.mem.startsWith(u8, target, "stdout")) continue;
+            return true;
+        }
+        // dd writing to other dangerous system paths.
+        const dangerous_of = [_][]const u8{
+            "of=/boot/",
+            "of=/etc/",
+            "of=/sys/",
+            "of=/proc/",
+        };
+        for (dangerous_of) |prefix| {
+            if (std.mem.indexOf(u8, rest, prefix) != null) return true;
+        }
     }
     return false;
 }
@@ -862,6 +900,33 @@ test "local classifier still allows safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
     // `apt` substring inside an unrelated word must not false-positive.
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
+}
+
+test "S1 rm inside command substitution still flags root wipe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo $(rm -rf /)"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo $(rm -rf /*)"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("$(dd if=/dev/zero of=/dev/sda)"));
+}
+
+test "S1 rm after backtick or unspaced && still flags root wipe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo `rm -rf /`"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("true&&rm -rf /"));
+}
+
+test "S1 quoted rm root target still flags" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sh -c \"rm -rf /\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf \"/\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf '/'"));
+}
+
+test "S1 rm as a later command word after a word embedding rm" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("alarm; rm -rf /"));
+}
+
+test "S1 substitution-scoped rm on project paths stays safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo $(rm -rf /tmp/x)"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo $(rm -rf ./build)"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("cat alarm.log; rm -rf ./dist"));
 }
 
 test "RT semicolon" {
