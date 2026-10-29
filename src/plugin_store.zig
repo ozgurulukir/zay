@@ -1126,7 +1126,12 @@ test "installPlugin publishes a local package once and is idempotent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "plugin-install" });
+    // globalPluginsDir probes the AppData plugins dir with openDirAbsolute on
+    // Windows, which asserts an absolute path — anchor the scratch tree to
+    // the process cwd like the other global-dir tests.
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const root = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "plugin-install" });
     defer gpa.free(root);
     const source = try std.fs.path.join(gpa, &.{ root, "examples", "demo" });
     defer gpa.free(source);

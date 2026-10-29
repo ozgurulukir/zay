@@ -281,10 +281,7 @@ test "attachJobObjectKillOnClose_attachesJobObject_whenChildIsValidOnWindows" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer {
-        child.kill(io);
-        _ = child.wait(io) catch {};
-    }
+    defer child.kill(io);
 
     const handle = attachJobObjectKillOnClose(&child);
     try std.testing.expect(handle != null);
