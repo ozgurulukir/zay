@@ -52,6 +52,17 @@ pub fn repairNoFollowFileFlags(file: *std.Io.File) void {
     if (is_windows) file.flags.nonblocking = true;
 }
 
+// The workaround above is keyed to the pinned 0.16.x std: a newer toolchain
+// may fix the flag mislabeling by opening no-follow handles synchronously,
+// which would turn this APC-path routing into a hang. Fail the build rather
+// than let the workaround silently misapply — build.zig.zon's
+// minimum_zig_version only gates older toolchains.
+comptime {
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16) {
+        @compileError("Zig is not 0.16.x: re-audit os.repairNoFollowFileFlags against the new std Windows openFile path");
+    }
+}
+
 /// Milliseconds `terminateChildBounded` waits after SIGTERM before escalating
 /// to SIGKILL: long enough for graceful-shutdown handlers, short enough that a
 /// stuck tool call feels interruptible.
