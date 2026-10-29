@@ -234,45 +234,59 @@ fn isPwshForkBomb(command: []const u8) bool {
     return false;
 }
 
-/// `Remove-Item -Recurse -Force` on system/drive roots — mirrors `isDangerousRm`
-/// for the PowerShell spelling. This is a conservative matcher; the remote
-/// classifier covers the full surface. Targets are flagged only when they are a
-/// drive ROOT (`C:\` bare), `$env:SystemRoot`, or a well-known system dir —
-/// never a project path that merely sits on the C: drive.
+/// `Remove-Item -Recurse -Force` (or an alias spelling) on system/drive
+/// roots — mirrors `isDangerousRm` for the PowerShell spellings. This is a
+/// conservative matcher; the remote classifier covers the full surface.
+/// Targets are flagged only when they are a drive ROOT (`C:\` / `C:/` bare),
+/// `$env:SystemRoot`, or a well-known system dir — never a project path that
+/// merely sits on the C: drive. Both path separators are accepted (pwsh
+/// treats `C:/Windows` and `C:\Windows` identically). Abbreviated flags
+/// (`-r`, `-fo`) are out of scope.
 fn isDangerousPwshRemove(command: []const u8) bool {
-    var idx: usize = 0;
-    while (findIgnoreCaseFrom(command, "Remove-Item", idx)) |pos| {
-        const rest_view = command[pos..];
-        if (!containsIgnoreCase(rest_view, "-Recurse") and !containsIgnoreCase(rest_view, "-Force")) {
-            idx = pos + 1;
-            continue;
-        }
-        // $env:SystemRoot / $env:WINDIR resolves to a system root.
-        if (containsIgnoreCase(command, "$env:systemroot") or containsIgnoreCase(command, "$env:windir")) return true;
-        // A well-known system dir.
-        if (containsIgnoreCase(command, "windows\\system32") or
-            containsIgnoreCase(command, "program files") or
-            containsIgnoreCase(command, "\\windows\\")) return true;
-        // A bare drive root: `C:\` followed by end-of-string, whitespace, a
-        // regular quote, or a path separator continuation that is still the root
-        // (e.g. `C:\*` or `C:\Windows` is caught above; here only bare `C:\`).
-        if (hasDriveRootTarget(command)) return true;
-        idx = pos + 1;
+    if (!hasRemoveItemSpelling(command)) return false;
+    if (!containsIgnoreCase(command, "-Recurse") and !containsIgnoreCase(command, "-Force")) return false;
+    return hasPwshSystemTarget(command);
+}
+
+/// True when `command` spells Remove-Item or one of its PowerShell command
+/// aliases (`ri`, `rm`, `rmdir`, `del`, `erase`, `rd`) as a whole token —
+/// `rm` inside `alarm` is not a spelling of Remove-Item.
+fn hasRemoveItemSpelling(command: []const u8) bool {
+    if (containsIgnoreCase(command, "Remove-Item")) return true;
+    const aliases = [_][]const u8{ "ri", "rm", "rmdir", "del", "erase", "rd" };
+    for (aliases) |alias| {
+        if (tokenContains(command, alias)) return true;
     }
     return false;
 }
 
-/// True when `command` contains a bare drive root target (`C:\` followed by
-/// end-of-string, whitespace, a quote, `*`, or nothing) — the `Remove-Item C:\`
-/// / `Remove-Item C:\*` case that nukes the whole drive.
+/// True when `command` names a Windows system target: `$env:SystemRoot` /
+/// `$env:WINDIR`, a well-known system dir, or a bare drive root. Project
+/// paths that merely sit on the C: drive are not targets.
+fn hasPwshSystemTarget(command: []const u8) bool {
+    // $env:SystemRoot / $env:WINDIR resolves to a system root.
+    if (containsIgnoreCase(command, "$env:systemroot") or containsIgnoreCase(command, "$env:windir")) return true;
+    // A well-known system dir (either separator spelling).
+    if (containsIgnoreCase(command, "windows\\system32") or
+        containsIgnoreCase(command, "windows/system32") or
+        containsIgnoreCase(command, "program files") or
+        containsIgnoreCase(command, "\\windows\\") or
+        containsIgnoreCase(command, "/windows/")) return true;
+    return hasDriveRootTarget(command);
+}
+
+/// True when `command` contains a bare drive root target (`C:\` or `C:/`
+/// followed by end-of-string, whitespace, a quote, `*`, or nothing) — the
+/// `Remove-Item C:\` / `Remove-Item C:\*` case that nukes the whole drive.
 fn hasDriveRootTarget(command: []const u8) bool {
     var idx: usize = 0;
     while (idx < command.len) {
-        // A drive letter somewhere, then `:\` right after is the drive root.
+        // A drive letter somewhere, then `:\` or `:/` right after is the
+        // drive root.
         if (idx + 2 < command.len and
             std.ascii.isAlphabetic(command[idx]) and
             command[idx + 1] == ':' and
-            command[idx + 2] == '\\')
+            (command[idx + 2] == '\\' or command[idx + 2] == '/'))
         {
             const after = idx + 3;
             if (after >= command.len) return true; // trailing `C:\`
@@ -298,22 +312,10 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
-/// Case-insensitive search returning the first match position, or null.
-fn findIgnoreCaseFrom(haystack: []const u8, needle: []const u8, from: usize) ?usize {
-    if (from >= haystack.len) return null;
-    return std.ascii.findIgnoreCasePos(haystack, from, needle);
-}
-
 test "containsIgnoreCase: empty needle matches, case folded" {
     try std.testing.expect(containsIgnoreCase("Remove-Item", ""));
     try std.testing.expect(containsIgnoreCase("rm -RF /", "-rf"));
     try std.testing.expect(!containsIgnoreCase("rm", "-rf"));
-}
-
-test "findIgnoreCaseFrom: past-end returns null, finds later occurrence" {
-    try std.testing.expectEqual(@as(?usize, null), findIgnoreCaseFrom("abc", "x", 10));
-    try std.testing.expectEqual(@as(?usize, 2), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 2));
-    try std.testing.expectEqual(@as(?usize, 16), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 3));
 }
 
 /// Characters that may sit directly before an `rm`/`dd` command word while it
@@ -457,12 +459,15 @@ fn isDangerousRedirect(command: []const u8) bool {
 
 /// PowerShell redirect (`>`) into a Windows system root. Case-insensitive on the
 /// ASCII text. Flags well-known system dirs and a bare drive root; a project path
-/// on the C: drive (`> C:\repo\out.txt`) is NOT flagged.
+/// on the C: drive (`> C:\repo\out.txt`) is NOT flagged. Both separators are
+/// accepted (pwsh treats `C:/Windows` and `C:\Windows` identically).
 fn isDangerousPwshRedirect(command: []const u8) bool {
     if (std.mem.indexOf(u8, command, ">") == null) return false;
     if (containsIgnoreCase(command, "windows\\system32") or
+        containsIgnoreCase(command, "windows/system32") or
         containsIgnoreCase(command, "program files") or
         containsIgnoreCase(command, "windows\\") or
+        containsIgnoreCase(command, "windows/") or
         containsIgnoreCase(command, "$env:systemroot"))
     {
         return true;
@@ -474,8 +479,8 @@ fn isDangerousPwshRedirect(command: []const u8) bool {
 }
 
 /// True when `command` contains a `>` redirect to a drive root with nothing but
-/// whitespace/quote/`*`/end after the `C:\` — i.e. writing to the root of a
-/// drive itself, not into a subdirectory.
+/// whitespace/quote/`*`/end after the `C:\` (or `C:/`) — i.e. writing to the
+/// root of a drive itself, not into a subdirectory.
 fn hasBareDriveRootRedirect(command: []const u8) bool {
     var idx: usize = 0;
     while (indexOfScalarPos(command, idx, '>')) |gt| {
@@ -485,7 +490,7 @@ fn hasBareDriveRootRedirect(command: []const u8) bool {
         if (after + 2 <= command.len and
             std.ascii.isAlphabetic(command[after]) and
             command[after + 1] == ':' and
-            command[after + 2] == '\\')
+            (command[after + 2] == '\\' or command[after + 2] == '/'))
         {
             const tail = after + 3;
             if (tail >= command.len) return true;
@@ -957,6 +962,30 @@ test "S2 install phrases match case-insensitively" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("PIP INSTALL requests"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("Winget Install Microsoft.PowerToys"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("winget;install ripgrep"));
+}
+
+test "S3 pwsh Remove-Item aliases on system targets are unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force C:\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("del -Recurse -Force C:\\Windows\\System32\\bad"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rd -Force C:\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("ri -Recurse $env:SystemRoot"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("erase -Force 'C:\\Program Files'"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rmdir -Recurse -Force D:\\"));
+}
+
+test "S3 forward-slash drive roots and windows dirs are recognized" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:/"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force D:/"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:/Windows/System32/x"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Write-Output 'x' > C:/Windows/x.txt"));
+}
+
+test "S3 pwsh alias removals on project paths stay safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("rm -Recurse -Force .\\build"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("del -Recurse -Force C:\\repo\\dist"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("rd -Force D:\\repo\\out"));
+    // Abbreviated flags are out of scope for the conservative matcher.
+    try std.testing.expectEqual(Verdict.safe, localClassify("rm -r .\\node_modules"));
 }
 
 test "RT semicolon" {
