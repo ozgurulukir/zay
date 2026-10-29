@@ -103,7 +103,8 @@ fn localClassify(command: []const u8) Verdict {
 }
 
 /// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
-/// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, ...).
+/// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, and
+/// the Windows installers `winget`/`choco`/`scoop`, ...).
 /// These mutate system-wide install state and must surface for approval rather
 /// than running unattended. The matcher splits on every shell metacharacter
 /// (not just spaces) so syntax tricks like `apt;install`, `/usr/bin/apt`,
@@ -131,13 +132,17 @@ fn isPrivilegedPackageManagement(command: []const u8) bool {
     // `apt-cache show` does not false-positive on `apt` while `apt;install`
     // (no space) still trips the `apt` single-token rule above.
     // Install verbs that require an explicit subcommand; matched only at word
-    // boundaries so "pip show" / "apt-cache show" stay safe reads.
+    // boundaries so "pip show" / "apt-cache show" stay safe reads. The
+    // Windows installers (`winget`, `choco`, `scoop`) are phrase-matched so
+    // read-only subcommands (`winget list`, `choco list`) stay safe; the
+    // Windows shell target is pwsh, where these are the standard managers.
     const phrases = [_][]const u8{
-        "pip install",   "pip3 install",    "npm install -g", "npm i -g",
-        "cargo install", "gem install",     "go install",     "conda install",
-        "snap install",  "flatpak install", "apt install",    "apt-get install",
-        "dnf install",   "yum install",     "pacman -S",      "apk add",
-        "brew install",  "zypper install",  "emerge",
+        "pip install",      "pip3 install",    "npm install -g",  "npm i -g",
+        "cargo install",    "gem install",     "go install",      "conda install",
+        "snap install",     "flatpak install", "apt install",     "apt-get install",
+        "dnf install",      "yum install",     "pacman -S",       "apk add",
+        "brew install",     "zypper install",  "emerge",          "winget install",
+        "winget uninstall", "choco install",   "choco uninstall", "scoop install",
     };
     for (phrases) |phrase| {
         if (phraseAtBoundary(command, phrase)) return true;
@@ -186,14 +191,18 @@ fn tokenContains(command: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Case-insensitive match of `phrase` (may contain spaces) only when bounded
-/// by word boundaries (string edges or any shell metacharacter/whitespace), so
-/// `pip install` inside `pip install --user x` matches but `equip installation`
-/// does not. Advances past the match to avoid infinite loops on overlap.
+/// Case-insensitive match of `phrase` (may contain spaces, expected lowercase)
+/// only when bounded by word boundaries (string edges or any shell
+/// metacharacter/whitespace), so `pip install` inside `pip install --user x`
+/// matches but `equip installation` does not. Case-folds the normalized text
+/// so `PIP INSTALL` classifies the same as the token matcher's
+/// case-insensitive compare. Advances past the match to avoid infinite loops
+/// on overlap.
 fn phraseAtBoundary(command: []const u8, phrase: []const u8) bool {
     // Normalize so `apt\ninstall` still trips the `apt install` phrase.
     var buf: [4096]u8 = undefined;
     const normalized = normalizeShell(command, &buf);
+    for (normalized) |*c| c.* = std.ascii.toLower(c.*);
     var idx: usize = 0;
     while (idx < normalized.len) {
         const at = std.mem.indexOf(u8, normalized[idx..], phrase) orelse return false;
@@ -927,6 +936,27 @@ test "S1 substitution-scoped rm on project paths stays safe" {
     try std.testing.expectEqual(Verdict.safe, localClassify("echo $(rm -rf /tmp/x)"));
     try std.testing.expectEqual(Verdict.safe, localClassify("echo $(rm -rf ./build)"));
     try std.testing.expectEqual(Verdict.safe, localClassify("cat alarm.log; rm -rf ./dist"));
+}
+
+test "S2 windows package managers install and uninstall are unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("winget install Microsoft.PowerToys"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("winget uninstall Microsoft.Edge"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("choco install nginx --yes"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("choco uninstall nginx"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("scoop install ripgrep"));
+}
+
+test "S2 windows package manager reads stay safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("winget list"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("winget search ripgrep"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("choco list --local-only"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("scoop info ripgrep"));
+}
+
+test "S2 install phrases match case-insensitively" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("PIP INSTALL requests"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Winget Install Microsoft.PowerToys"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("winget;install ripgrep"));
 }
 
 test "RT semicolon" {
