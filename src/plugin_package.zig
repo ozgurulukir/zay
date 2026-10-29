@@ -719,7 +719,12 @@ test "loadInventory scans origins and sorts by path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "inv-test" });
+    // globalPluginsDir probes the AppData plugins dir with openDirAbsolute on
+    // Windows, which asserts an absolute path — anchor the scratch tree to
+    // the process cwd like the other global-dir tests.
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const base = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "inv-test" });
     defer gpa.free(base);
 
     const home = try std.fs.path.join(gpa, &.{ base, "home" });
