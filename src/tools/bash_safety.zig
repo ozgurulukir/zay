@@ -223,10 +223,11 @@ fn isBoundary(c: u8) bool {
 
 /// PowerShell fork-bomb equivalents: recursive `while($true){Start-Job ...}`
 /// loops and `ForEach-Object -Parallel`/`Start-ThreadJob` constructs that fan
-/// out unbounded worker processes.
+/// out unbounded worker processes. `Start-Process` in such a loop is the
+/// same shape: one unbounded process spawn per iteration.
 fn isPwshForkBomb(command: []const u8) bool {
     if (containsIgnoreCase(command, "while($true)") or containsIgnoreCase(command, "while ($true)")) {
-        if (containsIgnoreCase(command, "Start-Job")) return true;
+        if (containsIgnoreCase(command, "Start-Job") or containsIgnoreCase(command, "Start-Process")) return true;
     }
     if (containsIgnoreCase(command, "-Parallel") and containsIgnoreCase(command, "Start-ThreadJob")) {
         return true;
@@ -974,6 +975,19 @@ test "local classifier flags Clear-RecycleBin -Force" {
 test "local classifier flags pwsh fork-bomb equivalents" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("while($true){Start-Job { Start-Job { Start-Job {} } }}"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("1..100 | ForEach-Object -Parallel { Start-ThreadJob { } }"));
+}
+
+test "S7 pwsh fork-bomb Start-Process loop still flags" {
+    // `while($true){Start-Process x}` fans out unbounded processes exactly
+    // like the recognized Start-Job forms; the loop + process-spawn
+    // conjunction is the same pathological shape.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("while($true){Start-Process notepad}"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("while ($true) { Start-Process cmd }"));
+    // A loop without process fan-out, or a spawn without a loop, is not a
+    // fork bomb.
+    try std.testing.expectEqual(Verdict.safe, localClassify("while($true){ Write-Output x }"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Start-Process notepad"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("while($true){ Start-Sleep -Seconds 1 }"));
 }
 
 test "local classifier flags pwsh dangerous redirect" {
