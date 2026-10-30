@@ -223,10 +223,11 @@ fn isBoundary(c: u8) bool {
 
 /// PowerShell fork-bomb equivalents: recursive `while($true){Start-Job ...}`
 /// loops and `ForEach-Object -Parallel`/`Start-ThreadJob` constructs that fan
-/// out unbounded worker processes.
+/// out unbounded worker processes. `Start-Process` in such a loop is the
+/// same shape: one unbounded process spawn per iteration.
 fn isPwshForkBomb(command: []const u8) bool {
     if (containsIgnoreCase(command, "while($true)") or containsIgnoreCase(command, "while ($true)")) {
-        if (containsIgnoreCase(command, "Start-Job")) return true;
+        if (containsIgnoreCase(command, "Start-Job") or containsIgnoreCase(command, "Start-Process")) return true;
     }
     if (containsIgnoreCase(command, "-Parallel") and containsIgnoreCase(command, "Start-ThreadJob")) {
         return true;
@@ -311,6 +312,8 @@ fn hasPwshSeparatorRootTarget(command: []const u8) bool {
 /// True when `command` contains a bare drive root target (`C:\` or `C:/`
 /// followed by end-of-string, whitespace, a quote, `*`, or nothing) — the
 /// `Remove-Item C:\` / `Remove-Item C:\*` case that nukes the whole drive.
+/// A trailing no-op dot component (`C:\.`, `C:\..`, `C:\.\`) still names the
+/// root, mirroring the bash matcher's `/.` handling.
 fn hasDriveRootTarget(command: []const u8) bool {
     var idx: usize = 0;
     while (idx < command.len) {
@@ -321,8 +324,15 @@ fn hasDriveRootTarget(command: []const u8) bool {
             command[idx + 1] == ':' and
             (command[idx + 2] == '\\' or command[idx + 2] == '/'))
         {
-            const after = idx + 3;
-            if (after >= command.len) return true; // trailing `C:\`
+            var after = idx + 3;
+            // A no-op dot component (`\.`, `\..`, `\.\`) still names the
+            // root; anything else after it (`.git`, `Users`) is a real path.
+            while (after < command.len and
+                (command[after] == '.' or command[after] == '\\' or command[after] == '/'))
+            {
+                after += 1;
+            }
+            if (after >= command.len) return true; // trailing `C:\` / `C:\.`
             const c = command[after];
             if (std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '*') return true;
         }
@@ -471,22 +481,36 @@ fn isDangerousMkfs(command: []const u8) bool {
 
 /// Check for redirecting into critical system files.
 fn isDangerousRedirect(command: []const u8) bool {
-    // Look for `> /etc/` or `> /boot/` or `> /dev/sd` patterns.
-    const dangerous_paths = [_][]const u8{
-        "> /etc/",
-        "> /boot/",
-        "> /dev/sd",
-        "> /dev/nvme",
-        "> /dev/mmcblk",
-        "> /dev/vda",
-        "> /dev/hd",
-        "> /dev/mapper/",
-        "> /dev/loop",
-        "> /sys/",
-        "> /proc/",
+    // Structural scan: every `>` (including `>>` and `2>`) with any run of
+    // whitespace and one optional quote before the target, so `>/etc/x`,
+    // `>> /etc/x`, and `> "/etc/x"` classify the same as `> /etc/x`. The
+    // adjacent force-clobber spelling `>| /etc/x` is covered too: its `|`
+    // belongs to the operator, and a spaced `> |` is a bash syntax error
+    // rather than an executable redirect. Targets are path prefixes, so a
+    // `>` used as a comparison (`3 > 2`) has no target and stays safe.
+    const dangerous_targets = [_][]const u8{
+        "/etc/",
+        "/boot/",
+        "/dev/sd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+        "/dev/vda",
+        "/dev/hd",
+        "/dev/mapper/",
+        "/dev/loop",
+        "/sys/",
+        "/proc/",
     };
-    for (dangerous_paths) |path| {
-        if (std.mem.indexOf(u8, command, path) != null) return true;
+    var idx: usize = 0;
+    while (indexOfScalarPos(command, idx, '>')) |gt| {
+        var after = gt + 1;
+        if (after < command.len and command[after] == '|') after += 1;
+        while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
+        if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
+        for (dangerous_targets) |target| {
+            if (std.mem.startsWith(u8, command[after..], target)) return true;
+        }
+        idx = gt + 1;
     }
     // PowerShell redirects into system roots: `> C:\Windows\`,
     // `> 'C:\Program Files\'`, etc. Drive-letter roots and the well-known
@@ -533,7 +557,13 @@ fn hasBareDriveRootRedirect(command: []const u8) bool {
             command[after + 1] == ':' and
             (command[after + 2] == '\\' or command[after + 2] == '/'))
         {
-            const tail = after + 3;
+            var tail = after + 3;
+            // A no-op dot component (`\.`, `\..`) still names the root.
+            while (tail < command.len and
+                (command[tail] == '.' or command[tail] == '\\' or command[tail] == '/'))
+            {
+                tail += 1;
+            }
             if (tail >= command.len) return true;
             const c = command[tail];
             if (std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '*' or c == ';') return true;
@@ -890,6 +920,43 @@ test "local classifier flags redirect to /etc/passwd" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo 'hacker::0:0::/:/bin/sh' > /etc/passwd"));
 }
 
+test "S4 unspaced system-file redirects still flag" {
+    // `> /etc/` with no space after the redirect, and the append / fd-prefixed
+    // spellings, are the same critical-file overwrite.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo hacker::0:0::/:/bin/sh >/etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >>/etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("make 2>/dev/sda"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("xargs cat >/sys/kernel/x"));
+}
+
+test "S4 quoted system-file redirect targets still flag" {
+    // A quote between `>` and the target must not hide it: `> "/etc/passwd"`
+    // is the same redirect as `> /etc/passwd`.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/etc/passwd\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >'/etc/passwd'"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/dev/sda\""));
+}
+
+test "S4 force-clobber redirects still flag" {
+    // `>|` is bash's noclobber override; the `|` is part of the redirect
+    // operator, so the target scan must look past it: `echo x >| /etc/passwd`
+    // is the same critical-file overwrite as `> /etc/passwd`.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >| /etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo hacker::0:0::/:/bin/sh >|/etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("make 2>| /dev/sda"));
+    // A clobber into a harmless target stays safe.
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x >| build.log"));
+}
+
+test "S4 ordinary redirect targets stay safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x >/dev/null"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x >>/dev/null"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("git log > out.log"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("zig build test 2>err.txt"));
+    // A `>` that is a comparison, not a redirect, has no path target.
+    try std.testing.expectEqual(Verdict.safe, localClassify("test 3 > 2 && echo bigger"));
+}
+
 test "local classifier flags redirect to /boot" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("dd if=/dev/zero of=/boot/initrd.img"));
 }
@@ -922,6 +989,19 @@ test "local classifier flags Clear-RecycleBin -Force" {
 test "local classifier flags pwsh fork-bomb equivalents" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("while($true){Start-Job { Start-Job { Start-Job {} } }}"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("1..100 | ForEach-Object -Parallel { Start-ThreadJob { } }"));
+}
+
+test "S7 pwsh fork-bomb Start-Process loop still flags" {
+    // `while($true){Start-Process x}` fans out unbounded processes exactly
+    // like the recognized Start-Job forms; the loop + process-spawn
+    // conjunction is the same pathological shape.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("while($true){Start-Process notepad}"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("while ($true) { Start-Process cmd }"));
+    // A loop without process fan-out, or a spawn without a loop, is not a
+    // fork bomb.
+    try std.testing.expectEqual(Verdict.safe, localClassify("while($true){ Write-Output x }"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Start-Process notepad"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("while($true){ Start-Sleep -Seconds 1 }"));
 }
 
 test "local classifier flags pwsh dangerous redirect" {
@@ -1061,6 +1141,27 @@ test "S3 separators attached to words are relative paths, not roots" {
     try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force \\\\server\\share\\build"));
 }
 
+test "S6 pwsh drive-root no-op dot components still flag" {
+    // `C:\.`, `C:\..`, and `C:\.\` resolve to the drive root in pwsh, the
+    // same way `/.` resolves to the filesystem root for the bash matcher —
+    // which already treats the dot as a root-target delimiter. The pwsh
+    // drive-root scan must accept the same no-op components.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\."));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\.."));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force C:\\.\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("ri -Force C:/.."));
+    // The redirect twin: writing to the drive root via a dot component.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Write-Output x > C:\\."));
+}
+
+test "S6 dot-name subdirectories stay safe" {
+    // A dot component followed by a name is a real directory, not the root:
+    // `C:\.git` and `C:\.gitignore` are ordinary targets.
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force C:\\.git"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Write-Output x > C:\\.gitignore"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force C:\\Users"));
+}
+
 test "S1 backslash-escaped rm still flags root wipe" {
     // `\rm` is the bash idiom for bypassing a rm alias; it is still the rm
     // command in command position. `\/` is the same escape applied to the
@@ -1068,6 +1169,18 @@ test "S1 backslash-escaped rm still flags root wipe" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("\\rm -rf /"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("\\dd if=/dev/zero of=/dev/sda"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf \\/"));
+}
+
+test "S5 brace-group rm and dd still flag root wipe" {
+    // `{ rm ...; }` reaches command position through the space after `{` —
+    // bash requires it (`{rm` is a single word), so the existing whitespace
+    // boundary already covers brace groups. Documented so a brace group is
+    // not mistaken for an uncovered introducer.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("{ rm -rf /; }"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sh -c '{ rm -rf /; }'"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("{ dd if=/dev/zero of=/dev/sda; }"));
+    // A rm later in the group, after the initial command, still flags.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("{ echo start; rm -rf /; }"));
 }
 
 test "RT semicolon" {
