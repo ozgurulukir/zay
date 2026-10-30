@@ -35,10 +35,11 @@ separator, and its drive-root targets include the drive-letter forms plus a
 bare `/` or `\`, which resolves to the current drive's root, optionally
 followed by no-op dot components (`C:\.`, `C:\..`)), critical
 system-file redirects (matched wherever a `>` introduces one of the
-dangerous targets, with or without whitespace or a quote between the
-redirect and the target), shell
-fork-bomb forms — including the PowerShell loop + `Start-Job` /
-`Start-ThreadJob` / `Start-Process` fan-out constructs — and privileged
+dangerous targets, with or without whitespace, a quote, or the
+force-clobber `|` between the redirect and the target), shell
+fork-bomb forms — including the PowerShell `while ($true)` loop
+spawning `Start-Job` or `Start-Process`, and the
+`ForEach-Object -Parallel` + `Start-ThreadJob` construct — and privileged
 package-management commands (Unix managers
 and the Windows installers `winget`, `choco`, and `scoop`). It does not
 parse arbitrary commands into a complete security policy and cannot detect
