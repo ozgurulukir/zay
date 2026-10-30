@@ -483,9 +483,11 @@ fn isDangerousMkfs(command: []const u8) bool {
 fn isDangerousRedirect(command: []const u8) bool {
     // Structural scan: every `>` (including `>>` and `2>`) with any run of
     // whitespace and one optional quote before the target, so `>/etc/x`,
-    // `>> /etc/x`, and `> "/etc/x"` classify the same as `> /etc/x`. Targets
-    // are path prefixes, so a `>` used as a comparison (`3 > 2`) has no
-    // target and stays safe.
+    // `>> /etc/x`, and `> "/etc/x"` classify the same as `> /etc/x`. The
+    // adjacent force-clobber spelling `>| /etc/x` is covered too: its `|`
+    // belongs to the operator, and a spaced `> |` is a bash syntax error
+    // rather than an executable redirect. Targets are path prefixes, so a
+    // `>` used as a comparison (`3 > 2`) has no target and stays safe.
     const dangerous_targets = [_][]const u8{
         "/etc/",
         "/boot/",
@@ -502,6 +504,7 @@ fn isDangerousRedirect(command: []const u8) bool {
     var idx: usize = 0;
     while (indexOfScalarPos(command, idx, '>')) |gt| {
         var after = gt + 1;
+        if (after < command.len and command[after] == '|') after += 1;
         while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
         if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
         for (dangerous_targets) |target| {
@@ -932,6 +935,17 @@ test "S4 quoted system-file redirect targets still flag" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/etc/passwd\""));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >'/etc/passwd'"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/dev/sda\""));
+}
+
+test "S4 force-clobber redirects still flag" {
+    // `>|` is bash's noclobber override; the `|` is part of the redirect
+    // operator, so the target scan must look past it: `echo x >| /etc/passwd`
+    // is the same critical-file overwrite as `> /etc/passwd`.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >| /etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo hacker::0:0::/:/bin/sh >|/etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("make 2>| /dev/sda"));
+    // A clobber into a harmless target stays safe.
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x >| build.log"));
 }
 
 test "S4 ordinary redirect targets stay safe" {
