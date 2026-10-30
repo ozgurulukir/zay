@@ -471,22 +471,33 @@ fn isDangerousMkfs(command: []const u8) bool {
 
 /// Check for redirecting into critical system files.
 fn isDangerousRedirect(command: []const u8) bool {
-    // Look for `> /etc/` or `> /boot/` or `> /dev/sd` patterns.
-    const dangerous_paths = [_][]const u8{
-        "> /etc/",
-        "> /boot/",
-        "> /dev/sd",
-        "> /dev/nvme",
-        "> /dev/mmcblk",
-        "> /dev/vda",
-        "> /dev/hd",
-        "> /dev/mapper/",
-        "> /dev/loop",
-        "> /sys/",
-        "> /proc/",
+    // Structural scan: every `>` (including `>>` and `2>`) with any run of
+    // whitespace and one optional quote before the target, so `>/etc/x`,
+    // `>> /etc/x`, and `> "/etc/x"` classify the same as `> /etc/x`. Targets
+    // are path prefixes, so a `>` used as a comparison (`3 > 2`) has no
+    // target and stays safe.
+    const dangerous_targets = [_][]const u8{
+        "/etc/",
+        "/boot/",
+        "/dev/sd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+        "/dev/vda",
+        "/dev/hd",
+        "/dev/mapper/",
+        "/dev/loop",
+        "/sys/",
+        "/proc/",
     };
-    for (dangerous_paths) |path| {
-        if (std.mem.indexOf(u8, command, path) != null) return true;
+    var idx: usize = 0;
+    while (indexOfScalarPos(command, idx, '>')) |gt| {
+        var after = gt + 1;
+        while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
+        if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
+        for (dangerous_targets) |target| {
+            if (std.mem.startsWith(u8, command[after..], target)) return true;
+        }
+        idx = gt + 1;
     }
     // PowerShell redirects into system roots: `> C:\Windows\`,
     // `> 'C:\Program Files\'`, etc. Drive-letter roots and the well-known
@@ -888,6 +899,32 @@ test "local classifier allows mkfs without device" {
 
 test "local classifier flags redirect to /etc/passwd" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo 'hacker::0:0::/:/bin/sh' > /etc/passwd"));
+}
+
+test "S4 unspaced system-file redirects still flag" {
+    // `> /etc/` with no space after the redirect, and the append / fd-prefixed
+    // spellings, are the same critical-file overwrite.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo hacker::0:0::/:/bin/sh >/etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >>/etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("make 2>/dev/sda"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("xargs cat >/sys/kernel/x"));
+}
+
+test "S4 quoted system-file redirect targets still flag" {
+    // A quote between `>` and the target must not hide it: `> "/etc/passwd"`
+    // is the same redirect as `> /etc/passwd`.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/etc/passwd\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x >'/etc/passwd'"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/dev/sda\""));
+}
+
+test "S4 ordinary redirect targets stay safe" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x >/dev/null"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("echo x >>/dev/null"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("git log > out.log"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("zig build test 2>err.txt"));
+    // A `>` that is a comparison, not a redirect, has no path target.
+    try std.testing.expectEqual(Verdict.safe, localClassify("test 3 > 2 && echo bigger"));
 }
 
 test "local classifier flags redirect to /boot" {
