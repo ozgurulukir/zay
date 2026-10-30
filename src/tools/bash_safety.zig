@@ -311,6 +311,8 @@ fn hasPwshSeparatorRootTarget(command: []const u8) bool {
 /// True when `command` contains a bare drive root target (`C:\` or `C:/`
 /// followed by end-of-string, whitespace, a quote, `*`, or nothing) — the
 /// `Remove-Item C:\` / `Remove-Item C:\*` case that nukes the whole drive.
+/// A trailing no-op dot component (`C:\.`, `C:\..`, `C:\.\`) still names the
+/// root, mirroring the bash matcher's `/.` handling.
 fn hasDriveRootTarget(command: []const u8) bool {
     var idx: usize = 0;
     while (idx < command.len) {
@@ -321,8 +323,15 @@ fn hasDriveRootTarget(command: []const u8) bool {
             command[idx + 1] == ':' and
             (command[idx + 2] == '\\' or command[idx + 2] == '/'))
         {
-            const after = idx + 3;
-            if (after >= command.len) return true; // trailing `C:\`
+            var after = idx + 3;
+            // A no-op dot component (`\.`, `\..`, `\.\`) still names the
+            // root; anything else after it (`.git`, `Users`) is a real path.
+            while (after < command.len and
+                (command[after] == '.' or command[after] == '\\' or command[after] == '/'))
+            {
+                after += 1;
+            }
+            if (after >= command.len) return true; // trailing `C:\` / `C:\.`
             const c = command[after];
             if (std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '*') return true;
         }
@@ -544,7 +553,13 @@ fn hasBareDriveRootRedirect(command: []const u8) bool {
             command[after + 1] == ':' and
             (command[after + 2] == '\\' or command[after + 2] == '/'))
         {
-            const tail = after + 3;
+            var tail = after + 3;
+            // A no-op dot component (`\.`, `\..`) still names the root.
+            while (tail < command.len and
+                (command[tail] == '.' or command[tail] == '\\' or command[tail] == '/'))
+            {
+                tail += 1;
+            }
             if (tail >= command.len) return true;
             const c = command[tail];
             if (std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '*' or c == ';') return true;
@@ -1098,6 +1113,27 @@ test "S3 separators attached to words are relative paths, not roots" {
     try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force \\\\server\\share\\build"));
 }
 
+test "S6 pwsh drive-root no-op dot components still flag" {
+    // `C:\.`, `C:\..`, and `C:\.\` resolve to the drive root in pwsh, the
+    // same way `/.` resolves to the filesystem root for the bash matcher —
+    // which already treats the dot as a root-target delimiter. The pwsh
+    // drive-root scan must accept the same no-op components.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\."));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Remove-Item -Recurse -Force C:\\.."));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Recurse -Force C:\\.\\"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("ri -Force C:/.."));
+    // The redirect twin: writing to the drive root via a dot component.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("Write-Output x > C:\\."));
+}
+
+test "S6 dot-name subdirectories stay safe" {
+    // A dot component followed by a name is a real directory, not the root:
+    // `C:\.git` and `C:\.gitignore` are ordinary targets.
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force C:\\.git"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Write-Output x > C:\\.gitignore"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("Remove-Item -Recurse -Force C:\\Users"));
+}
+
 test "S1 backslash-escaped rm still flags root wipe" {
     // `\rm` is the bash idiom for bypassing a rm alias; it is still the rm
     // command in command position. `\/` is the same escape applied to the
@@ -1105,6 +1141,18 @@ test "S1 backslash-escaped rm still flags root wipe" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("\\rm -rf /"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("\\dd if=/dev/zero of=/dev/sda"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -rf \\/"));
+}
+
+test "S5 brace-group rm and dd still flag root wipe" {
+    // `{ rm ...; }` reaches command position through the space after `{` —
+    // bash requires it (`{rm` is a single word), so the existing whitespace
+    // boundary already covers brace groups. Documented so a brace group is
+    // not mistaken for an uncovered introducer.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("{ rm -rf /; }"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sh -c '{ rm -rf /; }'"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("{ dd if=/dev/zero of=/dev/sda; }"));
+    // A rm later in the group, after the initial command, still flags.
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("{ echo start; rm -rf /; }"));
 }
 
 test "RT semicolon" {
