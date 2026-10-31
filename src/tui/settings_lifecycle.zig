@@ -9,6 +9,7 @@ const log = std.log.scoped(.tui);
 const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
+const runtime_mod = @import("../runtime.zig");
 const settings_widget = @import("widgets/settings.zig");
 const toast = @import("toast.zig");
 
@@ -296,6 +297,12 @@ pub fn saveSettings(app: *App) !bool {
     // Update the live cached_config so the running agent picks up the
     // changes without a restart.
     try applyToCachedConfig(app, state);
+    // Push a saved classifier URL into the live agents too (#284): the agent
+    // field is assigned once at runtime construction and the executor
+    // copies it per tool batch, so a save that only reached the config would
+    // leave the running session and existing lanes on the old classification
+    // behavior until restart.
+    try syncClassifierUrls(app, state);
     app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
 
     // Apply the toast toggle live to the global bus.
@@ -398,6 +405,89 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
     }
     // Toast toggle applies regardless of model_selection shape.
     if (state.pending_toast_enabled) |v| app.cached_config.toast.enabled = v;
+}
+
+/// The classifier URL a config currently resolves to — the model_selection
+/// shape when present, the legacy flat field otherwise (partial legacy
+/// config or env-only override). Mirrors how runtime construction reads it
+/// (runtime.zig), so the sync and the constructor arm agents identically.
+fn cachedClassifierUrl(config: *const config_mod.Config) ?[]const u8 {
+    if (config.model_selection) |ms| return ms.bashClassifierUrl();
+    return config.bash_classifier_url;
+}
+
+/// Swap an agent's classifier URL between turns. The agent owns the field
+/// and frees it with the runtime's gpa (`Agent.deinit`), so the new value is
+/// duped with that same allocator; alloc-before-free keeps the old pointer
+/// intact on OOM.
+///
+/// Invariant: `agent.bash_classifier_url` is written at runtime construction
+/// and only between turns. The executor copies the pointer per tool batch
+/// (`agent.zig`) and reads it per tool call, so a mid-turn free would dangle
+/// the running turn's copy. Callers honor that: idle lanes swap immediately,
+/// busy lanes park in `thread.pending_classifier_url` and
+/// `turn_lifecycle.applyPendingClassifierUrl` swaps at the turn boundary
+/// (`spawnTurn`).
+pub fn applyClassifierUrlToRuntime(rt: *runtime_mod.AgentRuntime, url: ?[]const u8) !void {
+    const next: ?[]u8 = if (url) |u| try rt.gpa.dupe(u8, u) else null;
+    if (rt.agent.bash_classifier_url) |old| rt.gpa.free(old);
+    rt.agent.bash_classifier_url = next;
+}
+
+/// Push a saved `bash_classifier_url` into every live agent (#284). Without
+/// this, the running session and already-spawned lanes keep classification
+/// behavior from process start until restart — silently: no error, no prompt,
+/// and a status line that reads the agent field (so it stays truthful to the
+/// old behavior while the config says otherwise).
+///
+/// Race rule: only an idle lane (no turn, no cancel teardown still unwinding)
+/// swaps the agent field. A mid-turn lane parks the raw pending text in
+/// `thread.pending_classifier_url` — "" = clear, the settings-pending
+/// contract — and the next turn boundary (`spawnTurn`, reached directly or
+/// through `convergeFinishedTurn` when a queue restart follows) applies it.
+/// Deferrals are never silent: a transcript notice says why.
+fn syncClassifierUrls(app: *App, state: *const State) !void {
+    // Only a save that actually touched the URL field re-arms agents; the
+    // other settings fields don't feed the agent at all.
+    const pending = state.pending_bash_classifier_url orelse return;
+    // The cached config is already updated; resolve the new value from it
+    // (null = built-in matcher).
+    const next = cachedClassifierUrl(&app.cached_config);
+    var deferred: usize = 0;
+    for (app.threads.slice()) |lane| {
+        const rt = lane.liveRuntime() orelse continue;
+        if (lane.turn.isActive() or lane.cancel_job != null) {
+            // Mid-turn: the running executor still reads the old pointer.
+            // Park the raw pending for the turn boundary (latest save wins).
+            const parked: ?[]u8 = try app.gpa.dupe(u8, pending);
+            if (lane.pending_classifier_url) |old| app.gpa.free(old);
+            lane.pending_classifier_url = parked;
+            deferred += 1;
+            continue;
+        }
+        // Idle lane: apply now, and drop any park an earlier save left —
+        // this save is newer, so the parked value must not resurrect it at
+        // the next boundary.
+        if (lane.pending_classifier_url) |old| {
+            app.gpa.free(old);
+            lane.pending_classifier_url = null;
+        }
+        applyClassifierUrlToRuntime(rt, next) catch |err| {
+            // Say why instead of failing the whole save: the config write
+            // already succeeded, only the live swap rolled back. The notice
+            // is best-effort too — an OOM append must not abort the save
+            // mid-loop and silently skip the lanes after this one.
+            log.warn("settings.classifier_sync.failed err={s}", .{@errorName(err)});
+            _ = app.thread.transcript.append(app.gpa, .notice, "Settings", "Classifier URL sync failed — restart zay to arm running sessions") catch |append_err| {
+                log.warn("settings.classifier_sync.notice_failed err={s}", .{@errorName(append_err)});
+            };
+        };
+    }
+    if (deferred > 0) {
+        _ = app.thread.transcript.append(app.gpa, .notice, "Settings", "Classifier URL saved; busy lane(s) pick it up at their next turn boundary") catch |append_err| {
+            log.warn("settings.classifier_sync.notice_failed err={s}", .{@errorName(append_err)});
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,4 +691,230 @@ test "hasActualChanges includes the toast toggle" {
 
     state.pending_toast_enabled = false;
     try std.testing.expect(!hasActualChanges(state, &app.cached_config));
+}
+
+// The minimal runtime stub the classifier-sync tests need: gpa + a
+// free-standing agent, since syncClassifierUrls touches exactly those.
+// The agent lives inside the runtime (its by-value `agent` field) — that
+// copy is the one production code mutates.
+const ClassifierSyncFixture = struct {
+    runtime: runtime_mod.AgentRuntime = undefined,
+
+    fn init(gpa: std.mem.Allocator) ClassifierSyncFixture {
+        var fixture = ClassifierSyncFixture{};
+        fixture.runtime.gpa = gpa;
+        fixture.runtime.io = std.testing.io;
+        fixture.runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+        return fixture;
+    }
+};
+
+fn attachLiveLane(app: *App, fixture: *ClassifierSyncFixture) void {
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &fixture.runtime, .owns = false } };
+}
+
+test "syncClassifierUrls arms an idle lane's agent without a restart" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fixture = ClassifierSyncFixture.init(gpa);
+    defer fixture.runtime.agent.deinit();
+    attachLiveLane(&app, &fixture);
+
+    // Legacy-shape cached config (model_selection null): the sync resolves
+    // the URL from the flat field.
+    app.cached_config_owned = false;
+    const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+    app.cached_config.bash_classifier_url = url;
+
+    const state = &app.pickers.settings;
+    state.pending_bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+
+    // A park left by an earlier save is stale the moment an idle apply
+    // happens — the sync must drop it, not let it resurrect at the next
+    // turn boundary.
+    const stale_park = try gpa.dupe(u8, "http://old.example/classify");
+    app.thread.pending_classifier_url = stale_park;
+
+    try syncClassifierUrls(&app, state);
+
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", fixture.runtime.agent.bash_classifier_url.?);
+    try std.testing.expect(app.thread.pending_classifier_url == null);
+
+    // The pending belongs to the save-reset path; the test frees it the
+    // same way, together with the borrowed cached config value.
+    gpa.free(state.pending_bash_classifier_url.?);
+    gpa.free(url);
+}
+
+test "syncClassifierUrls parks for a mid-turn lane and the boundary applies it" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fixture = ClassifierSyncFixture.init(gpa);
+    defer fixture.runtime.agent.deinit();
+    attachLiveLane(&app, &fixture);
+
+    app.cached_config_owned = false;
+    const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+    app.cached_config.bash_classifier_url = url;
+
+    const turn_lifecycle = @import("turn_lifecycle.zig");
+    const state = &app.pickers.settings;
+    state.pending_bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+
+    // Mid-turn: the executor holds the old pointer — the agent field must
+    // stay untouched and the value parked for the turn boundary.
+    app.thread.turn.state = .active;
+    try syncClassifierUrls(&app, state);
+    try std.testing.expect(fixture.runtime.agent.bash_classifier_url == null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", app.thread.pending_classifier_url.?);
+
+    // Turn ends; the next turn start (spawnTurn) applies the park and
+    // consumes it.
+    app.thread.turn.state = .idle;
+    try turn_lifecycle.applyPendingClassifierUrl(&app, app.thread);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", fixture.runtime.agent.bash_classifier_url.?);
+    try std.testing.expect(app.thread.pending_classifier_url == null);
+
+    gpa.free(state.pending_bash_classifier_url.?);
+    gpa.free(url);
+}
+
+test "syncClassifierUrls clears the agent URL when the field is cleared" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fixture = ClassifierSyncFixture.init(gpa);
+    defer fixture.runtime.agent.deinit();
+    attachLiveLane(&app, &fixture);
+
+    // Cleared on disk (null in the cached config); the "" pending is the
+    // clear marker. The agent's existing URL must be freed, not leaked.
+    app.cached_config_owned = false;
+    fixture.runtime.agent.bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+
+    const state = &app.pickers.settings;
+    state.pending_bash_classifier_url = try gpa.dupe(u8, "");
+
+    try syncClassifierUrls(&app, state);
+    try std.testing.expect(fixture.runtime.agent.bash_classifier_url == null);
+
+    gpa.free(state.pending_bash_classifier_url.?);
+}
+
+test "syncClassifierUrls ignores a save that did not touch the URL field" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fixture = ClassifierSyncFixture.init(gpa);
+    defer fixture.runtime.agent.deinit();
+    attachLiveLane(&app, &fixture);
+
+    const state = &app.pickers.settings;
+    // No URL pending: other settings fields must not touch the agent.
+    try syncClassifierUrls(&app, state);
+    try std.testing.expect(fixture.runtime.agent.bash_classifier_url == null);
+    try std.testing.expect(app.thread.pending_classifier_url == null);
+}
+
+test "a parked classifier URL survives a normal turn finish for the next spawn" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fixture = ClassifierSyncFixture.init(gpa);
+    defer fixture.runtime.agent.deinit();
+    attachLiveLane(&app, &fixture);
+
+    app.cached_config_owned = false;
+    const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+    app.cached_config.bash_classifier_url = url;
+
+    const turn_lifecycle = @import("turn_lifecycle.zig");
+    const state = &app.pickers.settings;
+    state.pending_bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+
+    // Save while the lane is mid-turn: the value parks, the agent field is
+    // untouched.
+    app.thread.turn.state = .active;
+    try syncClassifierUrls(&app, state);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", app.thread.pending_classifier_url.?);
+    try std.testing.expect(fixture.runtime.agent.bash_classifier_url == null);
+
+    // The turn finishes through the projected (normal) path — no interrupt,
+    // no cancel job. This path does not converge through
+    // `convergeFinishedTurn`, so the park must simply survive it; it applies
+    // at the next turn start (`spawnTurn`), which re-arms the agent field
+    // for the executor's next batches. The fixture runtime only defines gpa/io/agent,
+    // so the finish path's checkpoint snapshot is gated off — it would
+    // otherwise read the fixture's undefined `cwd`.
+    app.checkpoint_state = .unavailable;
+    _ = try turn_lifecycle.applyAgentEvent(&app, app.thread, .turn_finished);
+    try std.testing.expect(app.thread.turn.state == .idle);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", app.thread.pending_classifier_url.?);
+    try std.testing.expect(fixture.runtime.agent.bash_classifier_url == null);
+
+    // The next turn start applies the park; the executor then copies the
+    // saved URL into its batches.
+    try turn_lifecycle.applyPendingClassifierUrl(&app, app.thread);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", fixture.runtime.agent.bash_classifier_url.?);
+    try std.testing.expect(app.thread.pending_classifier_url == null);
+
+    gpa.free(state.pending_bash_classifier_url.?);
+    gpa.free(url);
+}
+
+test "syncClassifierUrls parks while a cancel teardown is still unwinding" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fixture = ClassifierSyncFixture.init(gpa);
+    defer fixture.runtime.agent.deinit();
+    attachLiveLane(&app, &fixture);
+
+    app.cached_config_owned = false;
+    const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+    app.cached_config.bash_classifier_url = url;
+
+    const turn_lifecycle = @import("turn_lifecycle.zig");
+    const turn_cancel = @import("turn_cancel.zig");
+    const state = &app.pickers.settings;
+    state.pending_bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
+
+    // Machine idle but the cancel job has not been drained yet — the
+    // cancelled turn's executor may still be unwinding, so the save must
+    // park instead of swapping the agent field. The sync never touches the
+    // job itself, an undefined stub is enough.
+    var cancel_job: turn_cancel.TurnCancelJob = undefined;
+    app.thread.cancel_job = &cancel_job;
+    try syncClassifierUrls(&app, state);
+    try std.testing.expect(fixture.runtime.agent.bash_classifier_url == null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", app.thread.pending_classifier_url.?);
+
+    // Teardown drains; the next turn boundary applies the park.
+    app.thread.cancel_job = null;
+    try turn_lifecycle.applyPendingClassifierUrl(&app, app.thread);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765/classify", fixture.runtime.agent.bash_classifier_url.?);
+    try std.testing.expect(app.thread.pending_classifier_url == null);
+
+    gpa.free(state.pending_bash_classifier_url.?);
+    gpa.free(url);
 }

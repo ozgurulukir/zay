@@ -12,6 +12,7 @@ const lane_recovery = @import("lanes/recovery.zig");
 const queue_mod = @import("queue.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const runtime_mod = @import("../runtime.zig");
+const settings_lifecycle = @import("settings_lifecycle.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -336,6 +337,20 @@ const SpawnOpts = struct {
 
 fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
     resetTurnState(app, lane);
+    // Apply a classifier URL parked by a settings save while the previous
+    // turn was in flight (#284). The turn boundary is here: the machine is
+    // idle, the previous worker joined, and the executor below copies
+    // `agent.bash_classifier_url` per tool batch (agent.zig) — all reads
+    // happen inside the active turn, so the swap cannot dangle them. Every
+    // turn start funnels through spawnTurn (submit, queued restart,
+    // background delivery, cancel-converge), which makes this the single
+    // convergence point. Best-effort: a failed swap (OOM) keeps the park
+    // for the next boundary and the turn runs on the previous URL — a
+    // bookkeeping swap must never abort a viable turn.
+    applyPendingClassifierUrl(app, lane) catch |err| {
+        log.warn("spawn: classifier url swap deferred err={s}", .{@errorName(err)});
+        _ = lane.transcript.append(app.gpa, .notice, "Settings", "Classifier URL swap deferred — the next turn boundary retries it") catch {};
+    };
     lane.worker_context.?.resetCancel();
     // Free any prompt left over from a failed spawn (the window is
     // theoretical — the spawn is the last step — but the cleanup costs
@@ -389,12 +404,35 @@ pub fn startQueuedTurn(app: *App, lane: *Thread) !bool {
 }
 
 /// Close out a finished turn: snapshot the lane's working tree and deliver
-/// anything queued behind it as a fresh turn. Shared by the worker-event
-/// path and the async-cancel drain so the two convergence orderings cannot
-/// drift.
+/// anything queued behind it as a fresh turn. Called from the interrupting
+/// finish fallback and the async-cancel drain; the projected finish path
+/// inlines the same two steps. A parked classifier URL (#284) applies in
+/// `spawnTurn` — every restart queued here funnels through it.
 pub fn convergeFinishedTurn(app: *App, lane: *Thread) !bool {
     checkpoint_mod.checkpointFinishedTurn(app, lane);
     return startQueuedTurn(app, lane);
+}
+
+/// Apply the classifier URL a settings save parked on this lane while a turn
+/// was in flight (`settings_lifecycle.syncClassifierUrls`). Called from
+/// `spawnTurn`, the single turn-start convergence point: the machine is idle
+/// there and the previous worker joined, so no executor holds the field (the
+/// executor copies `agent.bash_classifier_url` per tool batch, all inside an
+/// active turn) and the swap cannot dangle a reader — the starting turn's
+/// batches copy the new value. The parked raw text keeps the
+/// settings-pending contract: "" = clear. This is the only place besides
+/// runtime construction and the idle-lane sync that writes the field.
+///
+/// On failure (OOM duping the new value) the park survives for the next
+/// boundary to retry; the caller decides whether that is fatal.
+pub fn applyPendingClassifierUrl(app: *App, lane: *Thread) !void {
+    const parked = lane.pending_classifier_url orelse return;
+    const next: ?[]const u8 = if (parked.len > 0) parked else null;
+    if (lane.liveRuntime()) |rt| {
+        try settings_lifecycle.applyClassifierUrlToRuntime(rt, next);
+    }
+    lane.pending_classifier_url = null;
+    app.gpa.free(parked);
 }
 
 /// Start a turn on `lane` with `prompt` (duped into the lane worker's
