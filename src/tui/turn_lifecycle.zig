@@ -339,12 +339,18 @@ fn spawnTurn(app: *App, lane: *Thread, opts: SpawnOpts) !void {
     resetTurnState(app, lane);
     // Apply a classifier URL parked by a settings save while the previous
     // turn was in flight (#284). The turn boundary is here: the machine is
-    // idle, the previous worker joined, and the executor snapshots
-    // `agent.bash_classifier_url` below the imminent `turn.submit()` — so
-    // the new turn classifies with the saved URL. Every turn start funnels
-    // through spawnTurn (submit, queued restart, background delivery,
-    // cancel-converge), which makes this the single convergence point.
-    try applyPendingClassifierUrl(app, lane);
+    // idle, the previous worker joined, and the executor below copies
+    // `agent.bash_classifier_url` per tool batch (agent.zig) — all reads
+    // happen inside the active turn, so the swap cannot dangle them. Every
+    // turn start funnels through spawnTurn (submit, queued restart,
+    // background delivery, cancel-converge), which makes this the single
+    // convergence point. Best-effort: a failed swap (OOM) keeps the park
+    // for the next boundary and the turn runs on the previous URL — a
+    // bookkeeping swap must never abort a viable turn.
+    applyPendingClassifierUrl(app, lane) catch |err| {
+        log.warn("spawn: classifier url swap deferred err={s}", .{@errorName(err)});
+        _ = lane.transcript.append(app.gpa, .notice, "Settings", "Classifier URL swap deferred — the next turn boundary retries it") catch {};
+    };
     lane.worker_context.?.resetCancel();
     // Free any prompt left over from a failed spawn (the window is
     // theoretical — the spawn is the last step — but the cleanup costs
@@ -410,11 +416,15 @@ pub fn convergeFinishedTurn(app: *App, lane: *Thread) !bool {
 /// Apply the classifier URL a settings save parked on this lane while a turn
 /// was in flight (`settings_lifecycle.syncClassifierUrls`). Called from
 /// `spawnTurn`, the single turn-start convergence point: the machine is idle
-/// there and the previous worker joined, so the executor's snapshot of
-/// `agent.bash_classifier_url` is gone and the swap cannot dangle it — the
-/// starting turn re-snapshots the new value. The parked raw text keeps the
+/// there and the previous worker joined, so no executor holds the field (the
+/// executor copies `agent.bash_classifier_url` per tool batch, all inside an
+/// active turn) and the swap cannot dangle a reader — the starting turn's
+/// batches copy the new value. The parked raw text keeps the
 /// settings-pending contract: "" = clear. This is the only place besides
 /// runtime construction and the idle-lane sync that writes the field.
+///
+/// On failure (OOM duping the new value) the park survives for the next
+/// boundary to retry; the caller decides whether that is fatal.
 pub fn applyPendingClassifierUrl(app: *App, lane: *Thread) !void {
     const parked = lane.pending_classifier_url orelse return;
     const next: ?[]const u8 = if (parked.len > 0) parked else null;
