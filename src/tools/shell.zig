@@ -156,6 +156,17 @@ pub fn Impl(comptime B: type) type {
         /// containment guard so the command cannot leave `cwd` into the main
         /// tree. Background launches (when `background` is non-null and the call
         /// asks for one) are guarded too.
+        ///
+        /// These functions never classify. The executor's approval gate
+        /// (`executor_safety.shouldRejectUnsafeShell`) is the sole
+        /// classification point for every contained execution: the executor
+        /// has already classified the call by the time it dispatches here, so
+        /// classifying again inline would double-prompt on remote-classifier
+        /// flaps. A new caller must either route through the executor or run
+        /// `bash_safety.classify` itself first — invoking `runContained*`
+        /// directly on unclassified input silently bypasses the approval
+        /// gate. The intended caller set is the executor (shell tool and
+        /// `skill` command mode) plus these modules' own tests.
         pub fn runContained(
             gpa: std.mem.Allocator,
             io: std.Io,
@@ -166,6 +177,7 @@ pub fn Impl(comptime B: type) type {
             return runContainedWithCancellation(gpa, io, cwd, arguments, background_ctx, null);
         }
 
+        /// See `runContained` for the classification contract.
         pub fn runContainedWithCancellation(
             gpa: std.mem.Allocator,
             io: std.Io,

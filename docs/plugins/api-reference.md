@@ -263,6 +263,10 @@ local r = zay.run_bash("grep -c " .. q .. " src/*.zig")
 | `zay.git_add(files)` | `files` (string or array) | `{success, output}` | Stage specific files or patterns |
 | `zay.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only` | `{success, output}` | Create commit. `opts.files` → `git add -- <files> && git commit -F -`; `opts.staged_only = true` → `git commit -F -` (no add); **neither → `git add -A && git commit -F -` (staging everything is the default).** There is no `stage_all` option. The message is passed over stdin, so it never reaches the shell. |
 
+The git bridges bypass the shell safety classifier — they run fixed `git`
+invocations without prompting; see [Permissions and runtime](permissions-and-runtime.md)
+for why that boundary is safe and the rules future git bridges must follow.
+
 **Result row shapes:** `search_files` rows are `{file, line, content}` (content truncated to 200 bytes per line); `find_files` rows are `{path, name}`; `list_dir`'s `files`/`directories` are **arrays of plain name strings**, not tables. On a mid-walk failure, `search_files`/`find_files` return partial data with an `error` string field and **no** `truncated` field — check `result.error` before trusting `results`.
 
 ### Lane & session awareness
