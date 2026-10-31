@@ -309,6 +309,13 @@ pub const AgentRuntime = struct {
             if (ms.bashClassifierUrl()) |url| {
                 target.agent.bash_classifier_url = try gpa.dupe(u8, url);
             }
+        } else if (config.bash_classifier_url) |url| {
+            // Legacy-shape config (model_selection null — a partial legacy
+            // file or an env-only override): the flat field is the resolved
+            // classifier URL (#284). The settings live-sync resolves the
+            // same way (`settings_lifecycle.cachedClassifierUrl`), so a save
+            // and a restart arm agents identically.
+            target.agent.bash_classifier_url = try gpa.dupe(u8, url);
         }
         if (config.database_server_url) |url| {
             target.agent.database_server_url = try gpa.dupe(u8, url);

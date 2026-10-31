@@ -144,10 +144,11 @@ stall_warned: bool = false,
 turn_failed: ?[]u8 = null,
 /// A `bash_classifier_url` saved in Settings while this lane was mid-turn,
 /// parked until the turn boundary (see `settings_lifecycle.syncClassifierUrls`).
-/// The executor snapshots the agent's URL pointer at turn start and reads it
+/// The executor copies the agent's URL pointer per tool batch and reads it
 /// per tool call, so the field must not be swapped or freed while a turn (or
 /// a cancel teardown) is in flight — a busy lane parks the raw pending text
-/// here instead; `convergeFinishedTurn` applies it once the worker is joined.
+/// here instead; the next turn boundary (`spawnTurn`, reached directly or
+/// through `convergeFinishedTurn` when a queue restart follows) applies it.
 /// Same contract as the settings pending: "" = clear, null = nothing parked.
 /// Owned.
 pending_classifier_url: ?[]u8 = null,
