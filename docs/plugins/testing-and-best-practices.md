@@ -117,7 +117,8 @@ the plugin's tools.
 1. **Use `zay.*` bridge functions** instead of blocked Lua libraries
 2. **Prefer dedicated tools over bash** — `delete_path` over `run_bash("rm")`,
    `find_files` over `run_bash("find")`. The dedicated tools are sandboxed;
-   `run_bash` runs unclassified.
+   `run_bash` is classifier-gated (destructive commands are hard-blocked), but
+   the dedicated tools avoid shell-quoting pitfalls entirely.
 3. **Handle errors gracefully** — return `nil, descriptive_message` for
    operational failures, not a successful string that merely starts with
    `Error:`

@@ -110,6 +110,21 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 | `zay.git_add(files)` | one path `string` or array of paths | `{success, output}` | Stage files for commit |
 | `zay.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only` | `{success, output}` | Create commit; with neither option it runs `git add -A` first (see the API reference) |
 
+Unlike `zay.run_bash`, the git bridges do **not** go through the shell safety
+classifier — they don't prompt. They are safe by construction instead: each
+bridge builds a fixed `git <subcommand>` invocation, plugin-supplied values
+reach the command line only through `zay.shell_quote`-style quoting
+(`quoteShellArg`) or over stdin (the commit message never touches the shell),
+and command injection has regression tests. Mutating bridges still respect
+the manifest permission system.
+
+Rule for future bridges: a new git bridge must either keep this fixed-verb
+shape (fixed subcommand, quoted args or stdin for every plugin value) or
+route through the classified path (`runShellWithBackend`). Do not add a
+bridge that interpolates plugin values into a free-form command line. See
+[Shell Command Safety and Classifier](../wiki/SAFETY_CLASSIFIER.md) for the
+full classified/not-classified surface.
+
 ### Plugin System
 
 | Function | Parameters | Returns | Description |
