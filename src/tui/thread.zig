@@ -142,6 +142,15 @@ stall_warned: bool = false,
 /// spawner honestly (not as "final state: done"), and reset when a new turn
 /// starts on the lane.
 turn_failed: ?[]u8 = null,
+/// A `bash_classifier_url` saved in Settings while this lane was mid-turn,
+/// parked until the turn boundary (see `settings_lifecycle.syncClassifierUrls`).
+/// The executor snapshots the agent's URL pointer at turn start and reads it
+/// per tool call, so the field must not be swapped or freed while a turn (or
+/// a cancel teardown) is in flight — a busy lane parks the raw pending text
+/// here instead; `convergeFinishedTurn` applies it once the worker is joined.
+/// Same contract as the settings pending: "" = clear, null = nothing parked.
+/// Owned.
+pending_classifier_url: ?[]u8 = null,
 
 /// A user message queued behind a running turn. `steer` injects it after the
 /// next tool batch instead of waiting for the turn to go idle. `raw` marks a
@@ -217,6 +226,7 @@ pub fn syncSkillInventorySnapshot(self: *Thread, gpa: std.mem.Allocator, snapsho
 pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
     if (self.title) |title| gpa.free(title);
     if (self.turn_failed) |reason| gpa.free(reason);
+    if (self.pending_classifier_url) |url| gpa.free(url);
     for (self.parent_context) |message| gpa.free(message);
     if (self.parent_context.len > 0) gpa.free(self.parent_context);
     for (self.skill_inventory.items) |name| gpa.free(name);
