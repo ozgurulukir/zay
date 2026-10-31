@@ -52,3 +52,8 @@ before interpreting a failure (output goes to stderr; exit code is authoritative
 ## Commit messages
 
 Use clear, imperative subjects. No co-author trailers are required.
+
+A commit that alters runtime behavior must use a `fix`/`feat`/`perf` subject
+even when the change rides in with tests; `test:` commits are test-only by
+definition. Git archaeology treats `test:` as behavior-neutral, so a reader
+hunting when a behavior changed will skip such a commit.
