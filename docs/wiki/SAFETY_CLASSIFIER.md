@@ -53,6 +53,26 @@ symlink resolution best-effort; this does not sandbox filesystem access
 after a process starts. Use an operating-system container or virtual machine
 when untrusted code needs a stronger boundary.
 
+## What is classified (and what is not)
+
+- **Classified:** model-facing `bash`/`pwsh` tool calls and `skill`
+  command-mode calls — all go through the executor's approval gate
+  (`executor_safety.shouldRejectUnsafeShell`) before dispatch. Lua
+  `zay.run_bash` / `zay.run_shell` (and `os.execute` when the
+  `allow_os_execute` permission is granted) classify through the same
+  `bash_safety.classify` and hard-block `unsafe` verdicts.
+- **Not classified — safe by construction:** the Lua git bridges
+  (`zay.git_status` / `git_diff` / `git_log` / `git_branch` / `git_add` /
+  `git_commit`). Each builds a fixed `git <subcommand>` invocation; plugin
+  values reach it only through `quoteShellArg` or stdin, and injection has
+  regression tests. Mutations are additionally gated by the manifest
+  permission system. See [Plugin permissions and runtime](../plugins/permissions-and-runtime.md).
+- **Not classified — classified by the caller:** `runContained` /
+  `runContainedWithCancellation` (`src/tools/shell.zig`) never classify
+  themselves. The executor gate is the sole classification point for
+  contained execution; any new caller must route through the executor or
+  classify first. This is stated in the function docs in `shell.zig`.
+
 ### External classifier failures and timing
 
 If an external classifier request fails or its response cannot be used, Zay
