@@ -6,8 +6,18 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-11-01
+
 ### Changed
 - Bump `vaxis` to `5b0c724` and `uucode` to `9d55524`, incorporating OSC 7501 Program Status Protocol reports, Unicode 18.0.0, and `multi_slice` packed field bugfixes for the Zig 0.16 toolchain.
+- The release workflow's `version-check` job fails when the tag lacks its changelog entry, closing tag/changelog drift.
+- Docs sync: contributing guide requires behavior-carrying commits to use `fix`/`feat`/`perf` subjects (#289); building guide records the Windows baseline test-suite failure set (#291); reference docs record the 0.11.4-0.11.5 behavior contracts; safety docs describe execution-boundary classification invariants (#288) and the redirect/dot-root/Start-Process scans (#283).
+
+### Fixed
+- Windows remote plugin-store installs no longer fail with `ReadFailed`: no-follow opens are async yet mislabeled blocking on Windows, so reads now repair the file flags first, with the workaround guarded against toolchain drift; environmental install errors surface as environment faults instead of package faults (#281).
+- Safety classifier: flag `rm`/`dd` root wipes inside substitution, quotes, and unspaced separators; Windows package-manager install verbs; `Remove-Item` alias spellings and forward-slash drive roots; bare separator roots and escaped `rm`/`dd` spellings; close an out-of-bounds drive-letter redirect read (#282).
+- Safety classifier: flag force-clobber redirects into critical files (including unspaced and quoted targets), pwsh drive-root targets behind no-op dot components, and `Start-Process` loops as pwsh fork-bomb equivalents (#283).
+- TUI: live agents re-arm when the classifier URL is saved in Settings, and classifier-url live-sync failures are contained at turn boundaries (#290).
 
 ## [0.11.6] - 2026-10-26
 
@@ -95,7 +105,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.6...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.7...HEAD
+[0.11.7]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.7
 [0.11.6]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.6
 [0.11.5]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.5
 [0.11.4]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.4
