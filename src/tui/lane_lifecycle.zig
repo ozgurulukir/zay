@@ -889,16 +889,13 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     );
 }
 
-/// Wire a freshly-created `AgentRuntime`'s agent with the app's shared
-/// subsystems and mark it root-contained. Both spawn paths (a new worktree
-/// lane and waking a parked idle lane) wire identically, so the block lives
-/// here once.
-fn wireSpawnedAgent(app: *App, runtime: *runtime_mod.AgentRuntime) void {
-    runtime.agent.background_manager = app.background;
-    runtime.agent.mcp_manager = &app.mcp_manager;
-    runtime.agent.tool_registry = app.tool_registry;
-    runtime.agent.plugin_manager = &app.plugin_manager;
-    runtime.agent.lane_bridge = app.lane_bridge;
+/// Re-arm a freshly-created `AgentRuntime`'s agent with the app's shared
+/// subsystems and mark it root-contained. Serves all three spawn paths (new
+/// worktree lane, waking a parked idle lane, `/parallel` fork): the attach is
+/// idempotent over `createRuntimeImpl`'s seam — same App pointers — so a
+/// future spawn path that bypasses runtime creation still fully arms.
+pub fn wireSpawnedAgent(app: *App, runtime: *runtime_mod.AgentRuntime) void {
+    runtime.agent.attachSharedSubsystems(app.sharedSubsystems());
     // A spawned worker is root-contained: its bash tool refuses `cd` out of the
     // worktree, so a task prompt leaking the main-tree path can't drift the
     // worker's writes into the main tree (L2).

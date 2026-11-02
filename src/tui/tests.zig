@@ -1999,6 +1999,13 @@ test "createRuntime wires the full tool set into the freshly-attached client" {
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
 
+    // A real manager with a stable heap address, mirroring initRuntime, so
+    // the shared-subsystem parity assert is meaningful rather than
+    // null==null. App.deinit runs manager.deinit() (shutdownAll) and frees.
+    const background = try gpa.create(tui.background_mod.BackgroundManager);
+    background.* = tui.background_mod.BackgroundManager.init(std.testing.io, gpa);
+    app.background = background;
+
     // A plugin tool in the App's registry must reach the new client.
     try app.tool_registry.addPluginTool(gpa, .{
         .name = try gpa.dupe(u8, "lua__p__t"),
@@ -2030,6 +2037,68 @@ test "createRuntime wires the full tool set into the freshly-attached client" {
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, shell_needle) != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "\"name\":\"lane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, client.tools_json, "lua__p__t") != null);
+
+    // Shared-subsystem parity: the runtime seam must arm the full set, not
+    // just the tool surface (regression for the request_limiter drift, where
+    // lane agents could run without the concurrency gate).
+    try std.testing.expect(new_runtime.agent.background_manager == app.background);
+    try std.testing.expect(new_runtime.agent.mcp_manager == &app.mcp_manager);
+    try std.testing.expect(new_runtime.agent.tool_registry == app.tool_registry);
+    try std.testing.expect(new_runtime.agent.plugin_manager == &app.plugin_manager);
+    try std.testing.expect(new_runtime.agent.lane_bridge == app.lane_bridge);
+    try std.testing.expect(new_runtime.agent.request_limiter == app.request_limiter);
+    try std.testing.expect(!new_runtime.agent.contained);
+}
+
+test "wireSpawnedAgent arms the full shared subsystem set and contains the worker" {
+    // Spawn parity for all three lane-birth paths (new worktree lane, waking
+    // a parked idle lane, /parallel fork): the re-arm must attach every App
+    // handle — including request_limiter, whose omission on the lane wiring
+    // was the live drift this seam replaces — and set root containment (L2).
+    const gpa = std.testing.allocator;
+    var home = try isolatedHome(gpa, std.testing.io);
+    defer home.deinit(gpa);
+
+    // Minimal template runtime standing in for a spawned lane worker.
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = home.path;
+    runtime.home_dir = home.path;
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.skills = &.{};
+    runtime.plugin_prompts = &.{};
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, home.path, .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
+    runtime.naming_client = .none;
+
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    defer app.deinit();
+
+    // Same stable-address manager as the seam-parity test above, so the
+    // background assert is meaningful. App.deinit owns teardown.
+    const background = try gpa.create(tui.background_mod.BackgroundManager);
+    background.* = tui.background_mod.BackgroundManager.init(std.testing.io, gpa);
+    app.background = background;
+
+    lane_lifecycle.wireSpawnedAgent(&app, &runtime);
+
+    try std.testing.expect(runtime.agent.background_manager == app.background);
+    try std.testing.expect(runtime.agent.mcp_manager == &app.mcp_manager);
+    try std.testing.expect(runtime.agent.tool_registry == app.tool_registry);
+    try std.testing.expect(runtime.agent.plugin_manager == &app.plugin_manager);
+    try std.testing.expect(runtime.agent.lane_bridge == app.lane_bridge);
+    try std.testing.expect(runtime.agent.request_limiter == app.request_limiter);
+    try std.testing.expect(runtime.agent.contained);
 }
 
 test "switching from codex to catalogue provider resets cached connection" {
