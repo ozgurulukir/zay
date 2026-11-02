@@ -28,34 +28,11 @@ pub const McpToolSchema = struct {
     raw_input_schema: ?[]const u8 = null,
 };
 
-pub const ReasoningEffort = enum {
-    /// Don't override the model's default reasoning behaviour — no
-    /// `reasoning_effort` parameter is sent in the request.
-    default,
-    minimal,
-    low,
-    none,
-    medium,
-    high,
-    xhigh,
-    /// Highest reasoning effort (OpenRouter extension). The official OpenAPI
-    /// enum is `["max","xhigh","high","medium","low","minimal","none"]`; `max`
-    /// is the top level, above `xhigh`. OpenAI-native dialects ignore it.
-    max,
-
-    pub fn label(self: ReasoningEffort) []const u8 {
-        return @tagName(self);
-    }
-
-    /// Parse a persisted effort label back into the enum. Mirrors
-    /// `Role.fromString`: a string match → enum or error. Used to restore
-    /// session-scoped reasoning effort from the DB on resume. An unknown
-    /// label (e.g. from a newer schema or hand-edited data) errors instead
-    /// of silently mapping to a wrong level.
-    pub fn fromString(text: []const u8) !ReasoningEffort {
-        return std.meta.stringToEnum(ReasoningEffort, text) orelse error.InvalidReasoningEffort;
-    }
-};
+/// Reasoning-effort levels live in their own leaf module
+/// (`ai/reasoning_effort.zig`) so config imports the vocabulary without
+/// pulling in the wire stack. The schema enums are cross-checked by that
+/// module's tests.
+pub const ReasoningEffort = @import("ai/reasoning_effort.zig").ReasoningEffort;
 
 pub const ReasoningSummary = enum {
     auto,
@@ -826,16 +803,6 @@ test "clampTokenCount passes through valid values" {
     try std.testing.expectEqual(@as(u32, 100), clampTokenCount(100));
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), clampTokenCount(std.math.maxInt(u32)));
     try std.testing.expectEqual(@as(u32, 1_000_000), clampTokenCount(1_000_000));
-}
-
-test "ReasoningEffort.fromString round-trips labels and rejects unknowns" {
-    try std.testing.expectEqual(ReasoningEffort.default, try ReasoningEffort.fromString("default"));
-    try std.testing.expectEqual(ReasoningEffort.high, try ReasoningEffort.fromString("high"));
-    try std.testing.expectEqual(ReasoningEffort.none, try ReasoningEffort.fromString("none"));
-    try std.testing.expectEqual(ReasoningEffort.max, try ReasoningEffort.fromString("max"));
-    try std.testing.expectEqualStrings("max", ReasoningEffort.max.label());
-    try std.testing.expectError(error.InvalidReasoningEffort, ReasoningEffort.fromString("turbo"));
-    try std.testing.expectError(error.InvalidReasoningEffort, ReasoningEffort.fromString(""));
 }
 
 test "WireDialect.resolve maps builtin providers correctly" {
