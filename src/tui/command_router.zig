@@ -548,10 +548,8 @@ pub const HelpPicker = struct {
         // and mouse clamps must agree or the last items become unreachable.
         const body_height: u16 = help_picker.bodyRows(help_picker.help_overlay_height);
         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{}) or key.matches('q', .{})) {
-            app.mode = .normal;
+            app.setMode(.normal);
             app.pickers.help.reset();
-            app.clearInput();
-            app.clearPaletteInput();
             return true;
         }
         if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {

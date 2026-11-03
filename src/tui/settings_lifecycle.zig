@@ -87,16 +87,12 @@ pub fn openSettings(app: *App) void {
     // place the owned strings can be released.
     if (app.pickers.settings.pending_system_prompt) |old| app.gpa.free(old);
     if (app.pickers.settings.pending_bash_classifier_url) |old| app.gpa.free(old);
-    app.mode = .settings;
+    app.setMode(.settings);
     app.pickers.settings.reset();
-    app.clearInput();
-    app.clearPaletteInput();
 }
 
 pub fn closeSettings(app: *App) void {
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 // ---------------------------------------------------------------------------

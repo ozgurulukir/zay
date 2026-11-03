@@ -218,7 +218,13 @@ pub fn drainDiffRefresh(app: *App) !bool {
                 else => {},
             }
             if (app.metrics.diff_loading()) {
-                app.mode = .normal;
+                app.setMode(.normal);
+                // Tick drains carry no EventContext, so the wrapper-level
+                // syncFocus is unavailable: land on the primary input via the
+                // app-level helper instead (same destination as closeDiff's
+                // mode-aware router; the parked diff-viewer focus would
+                // otherwise leave typed input dead — #313 class).
+                lifecycle.focusPrimaryInput(app);
                 _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "Couldn't load diff.");
                 visible_change = true;
             }
@@ -233,8 +239,10 @@ fn populateDiffFromCache(app: *App) !void {
     var state = try diff_viewer.fromRaw(app.gpa, raw);
     if (state.isEmpty()) {
         state.deinit(app.gpa);
-        app.mode = .normal;
-        app.clearInput();
+        app.setMode(.normal);
+        // Same tick-path focus duty as the failure arm above: no EventContext
+        // here, so land on the primary input directly (#313 class).
+        lifecycle.focusPrimaryInput(app);
         _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "No changes to review.");
         return;
     }
@@ -248,8 +256,7 @@ fn populateDiffFromCache(app: *App) !void {
 
 pub fn openTimelineSelector(app: *App) !void {
     if (app.thread.turn.isActive()) return error.InFlightTurn;
-    app.mode = .tree_picker;
-    app.clearInput();
+    app.setMode(.tree_picker);
     try app.reloadTreeNodes();
 }
 
@@ -264,7 +271,7 @@ pub fn openDiffViewer(app: *App) !void {
         var state = try diff_viewer.fromRaw(app.gpa, raw);
         if (state.isEmpty()) {
             state.deinit(app.gpa);
-            app.mode = .normal;
+            app.setMode(.normal);
             _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "No changes to review.");
             return;
         }
@@ -280,13 +287,11 @@ pub fn openDiffViewer(app: *App) !void {
 }
 
 pub fn enterDiffMode(app: *App) void {
-    app.mode = .diff_viewer;
+    app.setMode(.diff_viewer);
     // The diff viewer never draws the transcript, so the black-hole visibility
     // (recomputed only there) would stay stuck true and drive a pointless
     // continuous redraw/tick loop. Park it off while in the viewer.
     app.metrics.blackhole_visible = false;
-    app.clearInput();
-    app.clearPaletteInput();
     app.inputs.comment.clearRetainingCapacity();
 }
 
@@ -294,9 +299,7 @@ pub fn reportDiffError(app: *App, err: anyerror) !void {
     const message = try std.fmt.allocPrint(app.gpa, "Couldn't open diff: {s}", .{@errorName(err)});
     defer app.gpa.free(message);
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 /// Leave the diff viewer. When `send` is set, composed review comments (if
@@ -306,9 +309,7 @@ pub fn reportDiffError(app: *App, err: anyerror) !void {
 pub fn closeDiffViewer(app: *App, send: bool) !bool {
     const composed = if (send) try app.diff.composeMessage(app.gpa) else null;
     app.diff.deinit(app.gpa);
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
     app.inputs.comment.clearRetainingCapacity();
     if (composed) |message| {
         defer app.gpa.free(message);

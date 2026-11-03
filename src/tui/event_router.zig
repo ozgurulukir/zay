@@ -259,8 +259,7 @@ fn routeKey(
     // it through (verified free across all modes — nothing else binds it).
     if (key.matches('f', .{ .ctrl = true }) and app.isNormalMode()) {
         app.clearPendingQuitAt();
-        try app.openSearch();
-        try root.syncFocus(ctx);
+        _ = try lifecycle.transitionMode(root, ctx, .open_search);
         ctx.consumeAndRedraw();
         return;
     }
@@ -307,14 +306,12 @@ fn routeKey(
     // additional binding; removing slash here would send `/connect` and other
     // commands to the model because normal submit has no command parser.
     if (tui.shouldOpenCommandMenuForSlash(app, key)) {
-        try app.openCommandMenu();
-        try root.syncFocus(ctx);
+        _ = try lifecycle.transitionMode(root, ctx, .open_command_menu);
         ctx.consumeAndRedraw();
         return;
     }
     if (app.isNormalMode() and key.matches('k', .{ .ctrl = true })) {
-        try app.openCommandMenu();
-        try root.syncFocus(ctx);
+        _ = try lifecycle.transitionMode(root, ctx, .open_command_menu);
         ctx.consumeAndRedraw();
         return;
     }
@@ -335,7 +332,7 @@ fn routeKey(
         // list), so routing Enter through the generic chat `submit` would
         // bypass their handlers and leave these forms/actions inert.
         if (app.getMode() == .mcp or app.getMode() == .plugins) {
-            if (try app.handleCommandKey(key)) {
+            if (try handlePerModeKey(app, root, ctx, key)) {
                 ctx.consumeAndRedraw();
             } else {
                 ctx.consumeEvent();
@@ -412,9 +409,22 @@ fn routeKey(
             }
         }
     }
-    if (try app.handleCommandKey(key)) {
+    if (try handlePerModeKey(app, root, ctx, key)) {
         ctx.consumeAndRedraw();
     }
+}
+
+/// Wrapper duty for the per-mode key dispatch (#292): a per-mode handler can
+/// only flip `App.mode` through `App.setMode` — it has no `EventContext`, so
+/// when the dispatch CHANGED the mode (help's `q` close), the wrapper
+/// re-routes focus here. Skipping this leaves the focus path on the old
+/// mode's widget and typed input dead until another key re-syncs (#313
+/// class; the ConPTY smoke's help scenario pins it end to end).
+fn handlePerModeKey(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+    const mode_before = app.getMode();
+    if (!try app.handleCommandKey(key)) return false;
+    if (app.getMode() != mode_before) try root.syncFocus(ctx);
+    return true;
 }
 
 /// Handle Escape key: close modals, overlays, cancel modes, clear input,
@@ -439,8 +449,7 @@ fn handleEscapeSequence(
         ctx.consumeAndRedraw();
         return;
     }
-    if (try app.cancelMode()) {
-        try root.syncFocus(ctx);
+    if (try lifecycle.transitionMode(root, ctx, .cancel)) {
         ctx.consumeAndRedraw();
         return;
     }

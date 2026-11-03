@@ -62,9 +62,7 @@ pub fn openProviderPicker(self: *App) !void {
     // refresh job keeps the registry fresh instead.
     try ensureModelsDevRegistry(self);
     self.pickers.provider.reset();
-    self.mode = .provider_picker;
-    self.clearInput();
-    self.clearPaletteInput();
+    self.setMode(.provider_picker);
     // Background registry refresh: keeps newly added providers visible
     // without a blocking network fetch on the UI thread (the picker is
     // already usable from the disk cache installed above).
@@ -224,12 +222,11 @@ pub fn openProviderEntryForm(self: *App, handle: provider_picker.ProviderHandle)
 }
 
 pub fn openModelPicker(self: *App) !void {
-    self.mode = .model_picker;
+    self.setMode(.model_picker);
     tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(self);
-    self.clearInput();
 
     // Restoring the disk cache needs the models.dev registry so dynamic
     // providers with stored keys are visible (`collectModelCacheConfigured`
@@ -568,8 +565,7 @@ pub fn connectCodex(self: *App) !void {
         self.codex_login_job = null;
         return err;
     };
-    self.mode = .normal;
-    self.clearInput();
+    self.setMode(.normal);
     _ = self.thread.transcript.append(
         self.gpa,
         .notice,
@@ -638,8 +634,7 @@ fn finishCodexConnection(self: *App, credentials: codex.Credentials) !void {
     const runtime = self.liveRuntime() orelse return error.NoActiveRuntime;
     runtime.codex_connection_expired = false;
     try persistModelSelection(self, .openai, null, model.id, effort, .global);
-    self.mode = .normal;
-    self.clearInput();
+    self.setMode(.normal);
     _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
 }
 
@@ -654,8 +649,7 @@ pub fn signOutCodex(self: *App) !void {
     self.thread.agent.?.client = self.liveRuntime().?.client;
     codexModelsClear(self);
     self.pickers.models.models_cached = false;
-    self.mode = .normal;
-    self.clearInput();
+    self.setMode(.normal);
     _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
 }
 
@@ -728,15 +722,13 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
     self.pickers.provider.form_handle = null;
     self.input_buffers.provider_key.clearRetainingCapacity();
 
-    self.mode = .model_picker;
+    self.setMode(.model_picker);
     tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(self);
     self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
     self.pickers.models.model_selection_snapshot = 0;
-    self.clearInput();
-    self.clearPaletteInput();
 }
 
 pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !void {
@@ -793,15 +785,13 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     self.pickers.provider.form_handle = null;
     self.input_buffers.provider_key.clearRetainingCapacity();
 
-    self.mode = .model_picker;
+    self.setMode(.model_picker);
     tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(self);
     self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
     self.pickers.models.model_selection_snapshot = 0;
-    self.clearInput();
-    self.clearPaletteInput();
 }
 
 pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig) !void {
@@ -857,15 +847,13 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
     self.pickers.provider.form_handle = null;
     self.input_buffers.provider_key.clearRetainingCapacity();
 
-    self.mode = .model_picker;
+    self.setMode(.model_picker);
     tui.rebuildReasoningOptsCache(self);
     self.pickers.models.model_column = .model;
     self.pickers.models.model_selection = 0;
     self.pickers.models.model_scope = defaultModelScope(self);
     self.pickers.models.reasoning_snapshot.clearRetainingCapacity();
     self.pickers.models.model_selection_snapshot = 0;
-    self.clearInput();
-    self.clearPaletteInput();
 }
 
 pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, key: []const u8) !void {
@@ -1063,8 +1051,7 @@ pub fn applySelectedModel(self: *App) !void {
             };
         }
     }
-    self.mode = .normal;
-    self.clearInput();
+    self.setMode(.normal);
 }
 
 pub fn persistModelSelection(

@@ -637,8 +637,7 @@ pub fn createParallelLane(self: *App) !void {
     } else {
         self.thread = lane;
     }
-    self.mode = .normal;
-    self.clearInput();
+    self.setMode(.normal);
     self.resetTurnState();
 }
 

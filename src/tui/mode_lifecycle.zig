@@ -35,7 +35,10 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
             // Leaving `.theme_picker` via a leading '/' is a non-commit exit —
             // revert the live preview before entering the command menu (M2).
             if (app.mode == .theme_picker) theme_lifecycle.closeThemePicker(app);
-            app.mode = .command;
+            // The palette text IS the command being typed — flip without the
+            // input pairing (`setModeKeepInput`), or every keystroke would
+            // wipe the buffer it mirrors.
+            app.setModeKeepInput(.command);
             app.nav.command_selection = 0;
             return;
         }
@@ -56,11 +59,11 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
         return;
     }
     if (value.len > 0 and value[0] == command_prefix) {
-        app.mode = .command;
+        app.setModeKeepInput(.command);
         app.nav.command_selection = 0;
         return;
     }
-    app.mode = .normal;
+    app.setModeKeepInput(.normal);
     app.nav.command_selection = 0;
 }
 
@@ -101,16 +104,12 @@ pub fn cancelMode(app: *App) !bool {
     }
     if (app.mode == .lanes) {
         app.clearLanesState();
-        app.mode = .normal;
-        app.clearInput();
-        app.clearPaletteInput();
+        app.setMode(.normal);
         return true;
     }
     if (app.mode == .search) {
         app.pickers.search.reset(app.gpa);
-        app.mode = .normal;
-        app.clearInput();
-        app.clearPaletteInput();
+        app.setMode(.normal);
         return true;
     }
     // Theme picker: Esc reverts the live preview and resets mode. This must
@@ -120,9 +119,7 @@ pub fn cancelMode(app: *App) !bool {
         theme_lifecycle.closeThemePicker(app);
         return true;
     }
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
     app.resumeClear();
     return true;
 }
@@ -228,9 +225,7 @@ pub fn closeRuntimeBoundOverlays(app: *App, lane_id: []const u8) bool {
         },
         else => {},
     }
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
     // Stack-buffer notice with a static fallback: the park must never fail
     // because its explanation didn't fit.
     var buffer: [192]u8 = undefined;
@@ -340,9 +335,7 @@ fn submitTreePicker(app: *App) !bool {
             };
         }
     }
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
     return true;
 }
 
@@ -362,7 +355,7 @@ fn submitThemePicker(app: *App) !bool {
         // (M2) instead of leaving it silently active.
         theme_lifecycle.revertThemePreview(app);
     }
-    app.mode = .normal;
+    app.setMode(.normal);
     return true;
 }
 
@@ -375,9 +368,7 @@ fn submitSaveMessage(app: *App) !bool {
     if (trimmed.len == 0) return true;
     const message = try app.gpa.dupe(u8, trimmed);
     defer app.gpa.free(message);
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
     app.saveActiveLane(message) catch |err| try app.reportLaneError(err);
     return true;
 }
@@ -390,7 +381,7 @@ fn submitLanes(app: *App) !bool {
 }
 
 fn handleStatusNotice(app: *App) !void {
-    app.mode = .normal;
+    app.setMode(.normal);
     var status_buf: [1024]u8 = undefined;
     const ms = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
     const provider_name = if (ms) |m| m.provider else "none";
@@ -420,7 +411,7 @@ fn handleStatusNotice(app: *App) !void {
 }
 
 fn handleSkillsNotice(app: *App) !void {
-    app.mode = .normal;
+    app.setMode(.normal);
     const runtime = app.liveRuntime();
     const list = if (runtime) |rt| try skill_mod.formatSkillsList(app.gpa, rt.skills) else try app.gpa.dupe(u8, "No active runtime.");
     defer app.gpa.free(list);
@@ -428,7 +419,7 @@ fn handleSkillsNotice(app: *App) !void {
 }
 
 fn handleExportSessionNotice(app: *App) !void {
-    app.mode = .normal;
+    app.setMode(.normal);
     const sid: []const u8 = if (app.thread.id) |id| id.slice()[0..@min(8, id.bytes.len)] else "session";
     var export_buf: [256]u8 = undefined;
     const notice_text = try std.fmt.bufPrint(&export_buf, "Exported session conversation transcript ({s}) to Markdown format.", .{sid});
@@ -436,7 +427,7 @@ fn handleExportSessionNotice(app: *App) !void {
 }
 
 fn handleDatabaseNotice(app: *App) !void {
-    app.mode = .normal;
+    app.setMode(.normal);
     const configured_backend = app.cached_config.effectiveDatabaseBackend().asString();
     const runtime = app.liveRuntime();
     const active_backend = if (runtime) |live|
@@ -469,7 +460,7 @@ fn executeCommand(app: *App, command: Command) !void {
         .resume_session => app.openResumePicker() catch |err| try app.reportSessionSwitchError(err),
         .timeline => diff_lifecycle.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
         .undo => {
-            app.mode = .normal;
+            app.setMode(.normal);
             app.undoLastTurn() catch |err| try app.reportSessionSwitchError(err);
         },
         .connect => provider_model.openProviderPicker(app) catch |err| try app.reportConnectionError(err),
@@ -486,11 +477,11 @@ fn executeCommand(app: *App, command: Command) !void {
         .merge => app.createMergePicker() catch |err| try app.reportLaneError(err),
         .lanes => app.openLanesPicker() catch |err| try app.reportLaneError(err),
         .clear => {
-            app.mode = .normal;
+            app.setMode(.normal);
             try app.clearConversation();
         },
         .compact => {
-            app.mode = .normal;
+            app.setMode(.normal);
             // Non-blocking: the summarizer runs on the agent's own
             // thread and the tick loop polls it to completion, so the
             // UI never freezes on the request.
@@ -498,16 +489,14 @@ fn executeCommand(app: *App, command: Command) !void {
         },
         .status => try handleStatusNotice(app),
         .skills => try handleSkillsNotice(app),
-        .help => {
-            app.mode = .help;
-        },
+        .help => app.setMode(.help),
         .export_session => try handleExportSessionNotice(app),
         .copy => {
-            app.mode = .normal;
+            app.setMode(.normal);
             _ = try clipboard_helper.copySelectedTranscriptBlock(app);
         },
         .paste => {
-            app.mode = .normal;
+            app.setMode(.normal);
             _ = try clipboard_helper.pasteFromSystemClipboard(app);
         },
         .exit_cmd => {
@@ -526,9 +515,7 @@ fn submitCommandMode(app: *App) !bool {
     // row (the filter is longer than the name), so without this the arg
     // would be dropped. Must precede `resolveCommand`.
     if (theme_lifecycle.parseThemeArg(filter)) |arg| {
-        app.mode = .normal;
-        app.clearPaletteInput();
-        app.clearInput();
+        app.setMode(.normal);
         theme_lifecycle.applyTheme(app, arg) catch |err| try theme_lifecycle.reportThemeError(app, err);
         return true;
     }
@@ -585,9 +572,7 @@ pub fn submitMode(app: *App) !bool {
 }
 
 pub fn openCommandMenu(app: *App) !void {
-    app.mode = .command;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.command);
     app.nav.command_selection = 0;
 }
 
@@ -1094,4 +1079,52 @@ test "submitMode keeps the session picker open on InFlightTurn" {
     try std.testing.expect(app.nav.session_action == .browsing);
     try std.testing.expectEqual(@as(usize, 1), app.resume_summaries.items.len);
     try std.testing.expect(transcriptNoticeContains(&app, "being delivered"));
+}
+
+test "setMode performs the transition pairing and setModeKeepInput keeps the buffers" {
+    // Contract pin for the #292 transition function: `setMode` flips and
+    // clears BOTH input buffers (buffers belong to the mode being left);
+    // `setModeKeepInput` is the content-surviving escape hatch used where the
+    // buffer IS the content being typed across the flip (`syncModeWithInput`).
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.buf.insertSliceAtCursor("draft text");
+    try app.inputs.palette.buf.insertSliceAtCursor("/stale filter");
+    app.setMode(.help);
+    try std.testing.expectEqual(App.Mode.help, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.palette.buf.realLength());
+
+    try app.inputs.input.buf.insertSliceAtCursor("kept");
+    try app.inputs.palette.buf.insertSliceAtCursor("/also kept");
+    app.setModeKeepInput(.command);
+    try std.testing.expectEqual(App.Mode.command, app.mode);
+    // Cursor sits at the end after the inserts, so firstHalf holds the text.
+    try std.testing.expectEqualStrings("kept", app.inputs.input.buf.firstHalf());
+    try std.testing.expectEqualStrings("/also kept", app.inputs.palette.buf.firstHalf());
+}
+
+test "setMode sweep clears the pairing for every mode transition" {
+    // Drives `App.setMode` over every Mode value (mirrors the
+    // closeRuntimeBoundOverlays sweep): the mode lands and both buffers end
+    // cleared regardless of target — the pairing is unconditional, so a new
+    // transition can't forget half of it.
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    for (std.enums.values(App.Mode)) |m| {
+        try app.inputs.input.buf.insertSliceAtCursor("x");
+        try app.inputs.palette.buf.insertSliceAtCursor("/y");
+        app.setMode(m);
+        try std.testing.expectEqual(m, app.mode);
+        try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
+        try std.testing.expectEqual(@as(usize, 0), app.inputs.palette.buf.realLength());
+    }
 }

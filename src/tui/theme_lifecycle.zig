@@ -20,9 +20,7 @@ const App = tui.App;
 /// Snapshots the resolved current theme so `Esc` can restore the exact
 /// pre-open look (`revertThemePreview`).
 pub fn openThemePicker(app: *App) void {
-    app.mode = .theme_picker;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.theme_picker);
     const active = app.theme_registry.resolve(app.cached_config.theme);
     app.theme_preview_original = active;
     const active_name = active.name;
@@ -57,9 +55,7 @@ pub fn revertThemePreview(app: *App) void {
 /// `applyTheme` reverts (M2).
 pub fn closeThemePicker(app: *App) void {
     revertThemePreview(app);
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 /// Parse a `/theme <name>` argument from the palette value. The leading `/`
@@ -157,8 +153,7 @@ pub fn applyTheme(app: *App, raw_name: []const u8) !void {
 /// Report a failure to switch the theme. The only error `applyTheme` can
 /// propagate is OOM, so this is a last-resort notice, not a primary path.
 pub fn reportThemeError(app: *App, err: anyerror) !void {
-    app.mode = .normal;
-    app.clearInput();
+    app.setMode(.normal);
     var buf: [128]u8 = undefined;
     const message = std.fmt.bufPrint(&buf, "Failed to switch theme: {s}", .{@errorName(err)}) catch "Failed to switch theme";
     _ = try app.thread.transcript.append(app.gpa, .notice, "theme", message);

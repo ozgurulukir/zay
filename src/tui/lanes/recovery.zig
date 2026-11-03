@@ -536,9 +536,7 @@ fn wakeAndShow(app: *App, lane: *Thread, repo: []const u8, session_id: ?[]const 
     } else {
         app.thread = lane;
     }
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
     app.resetTurnState();
 }
 
