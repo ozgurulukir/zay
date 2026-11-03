@@ -11,6 +11,7 @@ const bash_mod = @import("../tools/bash_exec.zig");
 const diff_utils = @import("diff_utils.zig");
 const diff_viewer = @import("diff_viewer.zig");
 const app_state = @import("app_state.zig");
+const lifecycle = @import("lifecycle.zig");
 
 const App = tui.App;
 
@@ -335,15 +336,12 @@ pub fn diffFocusTarget(root: *RootWidget) vxfw.Widget {
     };
 }
 
+/// In-mode focus: identical to `lifecycle.syncFocus` whenever `app.mode` is
+/// still `.diff_viewer` (every caller here is a diff-viewer key handler).
+/// `closeDiff` must NOT use this — the viewer is torn down by then, so the
+/// mode-aware router is the correct target.
 fn syncDiffFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     try ctx.requestFocus(diffFocusTarget(root));
-}
-
-fn ensureDiffTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
-    if (root.app.metrics.loading_tick_active) return;
-    root.app.metrics.loading_tick_active = true;
-    root.spinner_tick_accum = 0;
-    try ctx.tick(RootWidget.drain_tick_ms, root.widget());
 }
 
 /// Dispatch key events to the per-sub-mode diff viewer handlers.
@@ -470,10 +468,15 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
 /// When saved comments exist, begins a turn so the agent sees them.
 pub fn closeDiff(root: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
     const has_comments = try closeDiffViewer(root.app, send);
-    try syncDiffFocus(root, ctx);
+    // The viewer is torn down here (mode is `.normal`, `app.diff` deinit'd),
+    // so the in-mode `syncDiffFocus` would resolve a dead sub-state and pin
+    // focus on the root widget — typed input would stay dead until some
+    // other key re-synced focus (review of #313). The mode-aware router
+    // lands on the primary input, exactly like the pre-relocation code.
+    try lifecycle.syncFocus(root, ctx);
     if (has_comments) {
         _ = try root.app.beginSubmit();
-        try ensureDiffTick(root, ctx);
+        try lifecycle.ensureTick(root, ctx);
     }
     ctx.consumeAndRedraw();
 }
