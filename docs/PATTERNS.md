@@ -13,3 +13,4 @@ The former monolithic content remains in this compatibility page during migratio
 
 
 - [Durable skill context](patterns/plugins-mcp-and-skills.md#durable-skill-context) — activation, branch metadata, request retention, and capacity contracts.
+- [Agent shared-subsystem attach](patterns/architecture-and-layering.md#agent-shared-subsystem-attach-agentsharedsubsystems-2026-11-03) — the sole writer of the six borrowed agent fields; record + projection + spawn re-arm contracts.
