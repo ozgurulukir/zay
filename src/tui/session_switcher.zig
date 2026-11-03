@@ -120,19 +120,12 @@ fn restoreCheckpointForBranch(app: *App, rt: *runtime_mod.AgentRuntime) !void {
 /// against another (INV-BACKEND).
 pub fn currentSessionStore(app: *const App) session_mod.SessionStore {
     const cfg = &app.cached_config;
-    const kind: session_mod.BackendKind = switch (cfg.effectiveDatabaseBackend()) {
-        .local => .local_sqlite,
-        .zay_service => .remote_service,
-        .turso_http => .turso_http,
-        .d1_http => .d1_http,
-        .postgres_native => .postgres_native,
-    };
-    return .{
-        .kind = kind,
-        .url = cfg.effectiveDatabaseUrl(),
-        .token = cfg.effectiveDatabaseAuthToken(),
-        .path = cfg.effectiveDatabasePath(),
-    };
+    return session_mod.SessionStore.fromDatabase(
+        cfg.effectiveDatabaseBackend(),
+        cfg.effectiveDatabaseUrl(),
+        cfg.effectiveDatabaseAuthToken(),
+        cfg.effectiveDatabasePath(),
+    );
 }
 
 fn hostIdOf(app: *const App) []const u8 {
