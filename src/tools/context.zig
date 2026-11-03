@@ -40,6 +40,13 @@ pub const ToolContext = struct {
     /// source of the derived `bash_classifier_url_slot` binding. Null keeps
     /// the always-armed local matcher.
     bash_classifier_url: ?[]const u8 = null,
+    /// Proof-of-classification for a skill command run (#295): the executor's
+    /// approval gate mints one for a skill command call it approved, and the
+    /// skill tool's command mode refuses to run without it. The executor
+    /// sets it for the duration of each dispatch and clears it after; the
+    /// null default means an ungated caller is refused, not allowed — the
+    /// fail-closed direction. Never compared against what executes.
+    shell_gate_mint: ?@import("bash_safety.zig").ClassifiedCommand = null,
     /// External database server / service endpoint and token.
     database_server_url: ?[]const u8 = null,
     database_auth_token: ?[]const u8 = null,
