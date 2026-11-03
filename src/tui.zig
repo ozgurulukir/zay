@@ -366,7 +366,9 @@ pub const App = struct {
         if (app.request_limiter) |limiter| {
             limiter.setPermits(io, config.context.max_concurrent_requests orelse config_mod.default_max_concurrent_requests);
         }
-        app.mcp_manager.syncFromConfig(io, &app.cached_config) catch {};
+        app.mcp_manager.syncFromConfig(io, &app.cached_config) catch |err| {
+            log.warn("mcp.syncFromConfig failed: {s}", .{@errorName(err)});
+        };
         // The placeholder plugin_manager from `App.init` was built with
         // empty `home_dir`/`cwd` (the runtime values weren't available
         // there). Tear it down so the real one below is the only owner
@@ -1394,7 +1396,9 @@ pub fn run(
     // model-catalogue build includes every connected provider. Without this the
     // keys only loaded when the provider picker was opened, so a cold model
     // picker silently skipped (and then cached) every keyed provider.
-    provider_model.refreshProviderApiKeys(&app) catch {};
+    provider_model.refreshProviderApiKeys(&app) catch |err| {
+        log.warn("provider_model.refreshProviderApiKeys failed: {s}", .{@errorName(err)});
+    };
 
     // Rebuild transcript from agent when resuming a session (the agent was
     // rehydrated with messages in runtime.zig initSession). For a new session
@@ -1553,7 +1557,10 @@ pub fn openMcp(app: *App) void {
         // Sync servers and push the resulting tool schemas into the live client.
         provider_model.refreshMcpTools(app);
     } else {
-        app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
+        app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch |err| {
+            log.warn("mcp.syncFromConfig failed: {s}", .{@errorName(err)});
+            toast.global.push(.warn, "MCP sync failed — servers may be missing; see log");
+        };
     }
     app.clearInput();
     app.clearPaletteInput();
