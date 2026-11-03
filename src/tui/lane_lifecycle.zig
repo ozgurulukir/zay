@@ -496,10 +496,12 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
 /// frees the `branch`/`dest` strings. `AgentRuntime.deinit` does not touch the
 /// worktree filesystem — the session DB lives at `session_dir` (the repo root),
 /// and the worktree is only the runtime's `cwd` string — so removing the
-/// worktree is independent of runtime teardown. Mirrors the scoped errdefer
-/// `createParallelLane` registers right after `worktreeAdd`. Without this, a
-/// failed `Thread` alloc / `createRuntime` / `threads.append` would free the
-/// identity strings but orphan the worktree + branch on disk permanently.
+/// worktree is independent of runtime teardown. Every lane-birth failure
+/// path after `worktreeAdd` funnels through here — `registerLaneRuntime`'s
+/// exits and `createParallelLane`'s pre-register errdefer (#293). Without
+/// this, a failed `Thread` alloc / `createRuntime` / `threads.append` would
+/// free the identity strings but orphan the worktree + branch on disk
+/// permanently.
 fn rollbackLaneWorktree(app: *App, repo: []const u8, dest: []const u8, branch: []const u8) void {
     cleanupLaneWorktreeAndBranch(app, repo, dest, branch);
 }
@@ -508,6 +510,136 @@ fn rollbackLaneWorktree(app: *App, repo: []const u8, dest: []const u8, branch: [
 fn freeLaneContext(gpa: std.mem.Allocator, context: [][]u8) void {
     for (context) |message| gpa.free(message);
     if (context.len > 0) gpa.free(context);
+}
+
+/// The shared lane-registration tail of every fresh-worktree birth path
+/// (#293): wire the runtime, build the live `Thread`, assign its generation,
+/// register it with `app.threads`, and record it for crash recovery. One
+/// implementation for the `/parallel` fork and the lane-tool spawn, so the
+/// failure paths cannot drift — on any failure here the (not yet adopted)
+/// caller resources are freed, or the lane is torn down and the worktree
+/// AND branch rolled back via `rollbackLaneWorktree`.
+///
+/// On success the lane owns `runtime`, `context`, `branch`, and `dest`.
+pub fn registerLaneRuntime(
+    app: *App,
+    repo: []const u8,
+    runtime: *runtime_mod.AgentRuntime,
+    context: [][]u8,
+    branch: []u8,
+    dest: []u8,
+) !*Thread {
+    wireSpawnedAgent(app, runtime);
+
+    const lane = app.gpa.create(Thread) catch |err| {
+        // Nothing adopted yet — free every caller resource here so the
+        // failure contract is uniform: after registerLaneRuntime fails, the
+        // caller owns nothing and frees nothing.
+        freeLaneContext(app.gpa, context);
+        runtime.deinit();
+        app.gpa.destroy(runtime);
+        rollbackLaneWorktree(app, repo, dest, branch);
+        app.gpa.free(branch);
+        app.gpa.free(dest);
+        return err;
+    };
+    errdefer app.gpa.destroy(lane);
+    lane.* = Thread.initLive(
+        runtime.session_writer.session.id,
+        &runtime.agent,
+        app.io,
+        runtime.gpa,
+        context, // adopted by the lane
+        branch, // adopted by the lane
+        dest, // adopted by the lane
+        runtime,
+    );
+    _ = app.assignLaneGeneration(lane);
+    app.threads.append(lane) catch |err| {
+        // The lane adopted context/branch/dest via initLive. Remove the
+        // worktree while those strings are still valid, before lane.deinit
+        // frees them (and tears down the runtime); the errdefer destroys the
+        // shell. Safe order because runtime.deinit never touches the
+        // worktree filesystem (the DB lives at the repo root).
+        rollbackLaneWorktree(app, repo, dest, branch);
+        lane.deinit(app.gpa);
+        return err;
+    };
+    // Committed: record the lane for crash recovery (best-effort).
+    lane_recovery.syncLaneOpened(app, lane);
+    return lane;
+}
+
+/// Fork a parallel lane: create a git worktree, new runtime, and a fresh
+/// Thread. Max 4 threads total — the driver's main lane + 3 lanes (2×2 grid).
+/// Called from the command palette (/parallel) and from `App.submitMode`
+/// (command palette dispatch). Birth goes through the shared
+/// `registerLaneRuntime` (#293); this wrapper keeps only the palette-side
+/// presentation (split mode, focus, input reset).
+pub fn createParallelLane(self: *App) !void {
+    std.debug.assert(self.threads.len() > 0);
+    std.debug.assert(self.threads.len() <= max_threads);
+    if (self.threads.len() >= max_threads) return error.TooManyLanes; // driver + 3 lanes, not 4 extra
+    const repo = self.repoRoot() orelse return error.NoActiveRuntime;
+    const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
+    if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
+
+    // Recent parent-lane messages give the branch-naming request context
+    // for vague first prompts ("try the other approach").
+    const context = try self.captureLaneContext(self.thread, tui.lane_naming_context_max);
+    var owned_context: ?[][]u8 = context;
+    errdefer if (owned_context) |c| freeLaneContext(self.gpa, c);
+
+    const wt = try createLaneWorktree(self, repo, home);
+    const branch = wt.branch;
+    const dest = wt.dest;
+    var owned_branch: ?[]u8 = branch;
+    var owned_dest: ?[]u8 = dest;
+    errdefer {
+        if (owned_branch) |b| self.gpa.free(b);
+        if (owned_dest) |d| self.gpa.free(d);
+    }
+    // Until the register hand-off, a failure must remove the on-disk
+    // worktree+branch too (the old code's scoped errdefer covered the
+    // createRuntime path; #293 keeps that coverage).
+    var wt_live = true;
+    errdefer if (wt_live) rollbackLaneWorktree(self, repo, dest, branch);
+
+    const runtime = try self.createRuntime(dest, repo, null);
+    var owned_runtime: ?*runtime_mod.AgentRuntime = runtime;
+    errdefer if (owned_runtime) |rt| {
+        rt.deinit();
+        self.gpa.destroy(rt);
+    };
+
+    // Ownership hand-off: on success the lane owns all four; on failure the
+    // register tail's cleanup consumed them (including the worktree
+    // rollback) — either way the guards above must stay out of the way.
+    wt_live = false;
+    const lane = registerLaneRuntime(self, repo, runtime, context, branch, dest) catch |err| {
+        owned_context = null;
+        owned_branch = null;
+        owned_dest = null;
+        owned_runtime = null;
+        return err;
+    };
+
+    // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
+    // In `.dual` the driver (lane 0) is always the left pane and input routing
+    // stays with it — moving `app.thread` to the new worker would route input
+    // to a lane no pane displays. Instead, reveal the new lane in the right
+    // pane by pointing `focused_worker_index` at it. In `.grid`/`.tab` the new
+    // lane becomes the active one as before.
+    self.split_mode = self.cached_config.tui.split_mode;
+    if (self.split_mode == .dual) {
+        self.thread = self.threads.slice()[0];
+        self.focused_worker_index = self.threads.len() - 1; // the new lane's index
+    } else {
+        self.thread = lane;
+    }
+    self.mode = .normal;
+    self.clearInput();
+    self.resetTurnState();
 }
 
 /// `lane create {purpose}`: open a NEW idle lane (worktree + branch, no
@@ -823,41 +955,16 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.gpa.free(wt_dest);
         return failResp(app.gpa, "lane: runtime create failed: {s}\n", .{@errorName(err)});
     };
-    wireSpawnedAgent(app, runtime);
 
-    const lane = app.gpa.create(Thread) catch {
-        freeLaneContext(app.gpa, context);
-        runtime.deinit();
-        app.gpa.destroy(runtime);
-        rollbackLaneWorktree(app, repo, wt_dest, wt_branch);
-        app.gpa.free(wt_branch);
-        app.gpa.free(wt_dest);
-        return failResp(app.gpa, "lane: out of memory\n", .{});
+    // Registration goes through the shared tail (#293): wire → initLive →
+    // generation → append → crash-recovery record, with the full rollback on
+    // any failure. After the call — success OR failure — the lane (or the
+    // register tail's cleanup) owns runtime/context/branch/dest; the caller
+    // frees nothing.
+    const lane = registerLaneRuntime(app, repo, runtime, context, wt_branch, wt_dest) catch |err| {
+        return failResp(app.gpa, "lane: spawn failed: {s}\n", .{@errorName(err)});
     };
-    lane.* = Thread.initLive(
-        runtime.session_writer.session.id,
-        &runtime.agent,
-        app.io,
-        runtime.gpa,
-        context, // adopted by the lane
-        wt_branch, // adopted by the lane
-        wt_dest, // adopted by the lane
-        runtime,
-    );
-    _ = app.assignLaneGeneration(lane);
     lane.spawned_by_generation = spawner.generation;
-    app.threads.append(lane) catch {
-        // The lane adopted wt_branch/wt_dest via initLive. Remove the worktree
-        // while those strings are still valid, before lane.deinit frees them
-        // (and tears down the runtime). Safe to do first because runtime.deinit
-        // never touches the worktree filesystem (DB lives at the repo root).
-        rollbackLaneWorktree(app, repo, wt_dest, wt_branch);
-        lane.deinit(app.gpa); // frees the adopted runtime, context, branch, path
-        app.gpa.destroy(lane);
-        return failResp(app.gpa, "lane: out of memory\n", .{});
-    };
-    // Committed: record the lane for crash recovery (best-effort).
-    lane_recovery.syncLaneOpened(app, lane);
     // Defensive: if the configured mode is `.dual`, enter it through
     // `enterDual` so `app.thread` is re-rooted to the driver.
     const configured = app.cached_config.tui.split_mode;
