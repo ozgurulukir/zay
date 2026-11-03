@@ -78,6 +78,9 @@ pub const Observation = union(enum) {
 
 pub const Error = error{
     OutOfMemory,
+    /// A contained (lane-worker) shell run was asked to execute without the
+    /// classification gate's mint — the approval gate was bypassed (#295).
+    UnclassifiedContainedRun,
 } || std.Io.Cancelable || std.Io.UnexpectedError;
 
 /// Shared tool-result truncation: a byte-bounded head+tail sandwich. Keeps
