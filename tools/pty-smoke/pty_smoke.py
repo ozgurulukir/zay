@@ -21,7 +21,9 @@ Exit code: 0 iff every check passed.
 
 import os
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import time
 
@@ -35,18 +37,23 @@ results = []
 
 def start_reader(p, q):
     """pywinpty's read() blocks forever when no data flows, so pump it from
-    a thread and let consumers wait on a queue with a timeout."""
+    a thread and let consumers wait on a queue with a timeout. The None EOF
+    sentinel is queued exactly once, on every exit path — a dead child must
+    surface as an aborted run, not as quiet output."""
 
     def pump():
-        while True:
-            try:
+        try:
+            while True:
                 chunk = p.read(65536)
-            except (EOFError, OSError):
-                break
-            if not chunk:
-                break
-            q.put(chunk)
-        q.put(None)  # EOF sentinel
+                if not chunk:
+                    break
+                q.put(chunk)
+        except (EOFError, OSError):
+            pass
+        except Exception as exc:  # unreadable PTY: don't hang the consumer
+            print(f"[WARN] reader thread died: {exc!r}", file=sys.stderr, flush=True)
+        finally:
+            q.put(None)  # EOF sentinel
 
     t = threading.Thread(target=pump, daemon=True)
     t.start()
@@ -62,12 +69,32 @@ def read_for(q, seconds):
         except queue.Empty:
             continue
         if chunk is None:
+            _note_eof()
             break
         buf += chunk
     return buf
 
 
+_eof_noted = False
+
+
+def _note_eof():
+    """The child's output stream ended — it crashed or exited early. Warn once:
+    every check after this point is running against a dead app and must not
+    be trusted as a pass (the negative checks would silently pass)."""
+    global _eof_noted
+    if not _eof_noted:
+        _eof_noted = True
+        print("[WARN] app output ended (EOF) — the child crashed or exited;"
+              " remaining checks will fail with 'app exited'", file=sys.stderr, flush=True)
+
+
 def check(seq, name, blob, *needles):
+    if PROC is not None and not PROC.isalive():
+        results.append(False)
+        print(f"[FAIL] {seq}. {name}  -- app process exited unexpectedly"
+              " (crash?); result unreliable", flush=True)
+        return False
     missing = [n for n in needles if n not in blob]
     ok = not missing
     results.append(ok)
@@ -76,23 +103,33 @@ def check(seq, name, blob, *needles):
     return ok
 
 
+PROC = None
+
+
 def main():
+    global PROC
     print(f"spawning {EXE} (cwd={CWD}) under ConPTY 120x34 ...", flush=True)
     # Isolate the child from the developer's real zay home (roaming session
     # store, MCP servers, plugins): boot the smoke against default config in
     # a throwaway APPDATA so the first frame is fast and side-effect free.
-    import tempfile
+    # The env is copied into the child at spawn, so it is restored afterwards;
+    # the temp dir is removed in the finally block.
     isolated = tempfile.mkdtemp(prefix="zay-pty-smoke-")
+    old_appdata = os.environ.get("APPDATA")
+    old_home = os.environ.get("HOME")
     os.environ["APPDATA"] = isolated
     os.environ["HOME"] = isolated
-    p = PtyProcess.spawn(EXE, dimensions=(34, 120), cwd=CWD)
-    q = queue.Queue()
-    start_reader(p, q)
+    p = None
     try:
+        p = PtyProcess.spawn(EXE, dimensions=(34, 120), cwd=CWD)
+        PROC = p
+        q = queue.Queue()
+        start_reader(p, q)
         # Startup (models.dev registry, session-store resume lookups) can
         # legitimately take ~25s under ConPTY before the first frame.
         boot = read_for(q, 45.0)
         if "\x1b[?1049h" not in boot:
+            results.append(False)
             print(f"[FAIL] 0. app never entered the alternate screen ({len(boot)} bytes)")
             return 1
         print(f"[PASS] 0. app booted and rendered ({len(boot)} bytes)", flush=True)
@@ -139,7 +176,10 @@ def main():
         # typing — a reopen, if any, carries the stale query's results.
         p.write("x")
         after_type = read_for(q, 1.5)
-        clean = "Type a path after @" not in after_type
+        # Negative assertion: only trust "needle absent" while the app is
+        # alive — a crashed child renders nothing and would silently pass.
+        clean = (PROC is not None and PROC.isalive()
+                 and "Type a path after @" not in after_type)
         results.append(clean)
         print(f"[{'PASS' if clean else 'FAIL'}] 4. Esc closes at-search (stale-query"
               f" reopen, if any,{' stayed clean' if clean else ' showed the EMPTY hint'} while typing)",
@@ -217,10 +257,24 @@ def main():
               read_for(q, 1.5), "zpw")
         clear_input()
     finally:
-        try:
-            p.terminate(force=True)
-        except Exception:
-            pass
+        if p is not None and p.isalive():
+            try:
+                p.terminate(force=True)
+            except OSError as exc:
+                # Benign if the child died between the isalive check and here;
+                # anything else leaks a live zay.exe holding the ConPTY.
+                print(f"[WARN] terminate failed: {exc!r}", file=sys.stderr, flush=True)
+        # Restore the harness's own environment (the child took its copy at
+        # spawn) and clean the throwaway config dir.
+        if old_appdata is not None:
+            os.environ["APPDATA"] = old_appdata
+        else:
+            os.environ.pop("APPDATA", None)
+        if old_home is not None:
+            os.environ["HOME"] = old_home
+        else:
+            os.environ.pop("HOME", None)
+        shutil.rmtree(isolated, ignore_errors=True)
 
     passed = sum(results)
     print(f"\n{passed}/{len(results)} checks passed", flush=True)
