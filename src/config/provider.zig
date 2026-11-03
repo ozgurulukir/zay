@@ -6,7 +6,11 @@
 
 const std = @import("std");
 const log = std.log.scoped(.config);
-const ai = @import("../ai.zig");
+/// Leaf vocabulary imports: config reaches into ai leaves directly, never
+/// through the `ai.zig` umbrella (whose graph hangs the whole wire stack).
+const ReasoningEffort = @import("../ai/reasoning_effort.zig").ReasoningEffort;
+const response_policy = @import("../ai/response_policy.zig");
+const provider_headers = @import("../ai/provider_headers.zig");
 const mcp = @import("mcp.zig");
 
 pub const Provider = enum {
@@ -185,7 +189,7 @@ fn providerSpec(provider: Provider) ProviderDef {
 
 pub const Model = struct {
     id: []u8,
-    response_policy: ai.response_policy.Overrides = .{},
+    response_policy: response_policy.Overrides = .{},
     reasoning: ReasoningSetting = .unset,
     /// Explicit context window override for this model (tokens).
     /// When set, overrides the model catalogue lookup.
@@ -195,7 +199,7 @@ pub const Model = struct {
     /// Reasoning efforts this model supports. Empty = all efforts
     /// available (backward compatible). The TUI model picker filters
     /// its reasoning cycle to this list.
-    reasoning_options: []const ai.ReasoningEffort = &.{},
+    reasoning_options: []const ReasoningEffort = &.{},
 
     pub fn deinit(self: *Model, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -212,7 +216,7 @@ pub const Model = struct {
             .max_output_tokens = self.max_output_tokens,
         };
         if (self.reasoning_options.len > 0) {
-            out.reasoning_options = try gpa.dupe(ai.ReasoningEffort, self.reasoning_options);
+            out.reasoning_options = try gpa.dupe(ReasoningEffort, self.reasoning_options);
         }
         return out;
     }
@@ -236,11 +240,11 @@ pub const ReasoningSetting = union(enum) {
     /// Not specified in this config layer — inherit from lower layer.
     unset,
     /// Explicit effort level.
-    effort: ai.ReasoningEffort,
+    effort: ReasoningEffort,
 
     /// Resolve to a concrete effort for the AI client. `.unset` falls
     /// back to `.medium` (the runtime default).
-    pub fn resolve(self: ReasoningSetting) ai.ReasoningEffort {
+    pub fn resolve(self: ReasoningSetting) ReasoningEffort {
         return switch (self) {
             .unset => .medium,
             .effort => |e| e,
@@ -265,18 +269,18 @@ pub const ProviderHeader = mcp.McpHeader;
 /// Parse-time cap on `providers.<name>.headers` entries. Kept in lockstep
 /// with the wire-side budget (`provider_headers.max_user_headers`) so a
 /// full user list always fits every send-site buffer.
-pub const max_provider_headers: usize = ai.provider_headers.max_user_headers;
+pub const max_provider_headers: usize = provider_headers.max_user_headers;
 
 /// Expand `{env:VAR}` in raw provider headers into owned wire specs
 /// (`.literal` values). Caller frees with `provider_headers.freeHeaders`;
 /// empty input yields the empty static slice. Shared by the runtime's
 /// client-attach path and the picker's model probe — the two places raw
 /// config headers become wire headers.
-pub fn expandProviderHeaders(gpa: std.mem.Allocator, raw: []const ProviderHeader) ![]ai.provider_headers.Header {
+pub fn expandProviderHeaders(gpa: std.mem.Allocator, raw: []const ProviderHeader) ![]provider_headers.Header {
     if (raw.len == 0) return &.{};
-    var out: std.ArrayList(ai.provider_headers.Header) = .empty;
+    var out: std.ArrayList(provider_headers.Header) = .empty;
     errdefer {
-        ai.provider_headers.freeHeaderValues(gpa, out.items);
+        provider_headers.freeHeaderValues(gpa, out.items);
         out.deinit(gpa);
     }
     for (raw) |header| {
@@ -285,7 +289,7 @@ pub fn expandProviderHeaders(gpa: std.mem.Allocator, raw: []const ProviderHeader
         // `{env:VAR}` placeholder, so an env var carrying CR/LF (trailing
         // newline from `$(cat token)`, PEMs) would otherwise inject onto the
         // wire. (HeaderSet.append re-checks at send time as backstop.)
-        if (!ai.provider_headers.isValidHeaderValue(value)) {
+        if (!provider_headers.isValidHeaderValue(value)) {
             log.warn("provider header '{s}' expanded to a value with invalid bytes; skipping", .{header.name});
             gpa.free(value);
             continue;
@@ -299,7 +303,7 @@ pub fn expandProviderHeaders(gpa: std.mem.Allocator, raw: []const ProviderHeader
 }
 
 pub const ProviderConfig = struct {
-    response_policy: ai.response_policy.Overrides = .{},
+    response_policy: response_policy.Overrides = .{},
     /// The JSON map key. For builtins this equals `provider.label()`;
     /// for custom providers it's the user-chosen name (e.g. "qwen-cloud").
     name: []u8,
@@ -599,16 +603,16 @@ test "builtin_providers parity and metadata completeness" {
 
 test "resolvesEffort_whenReasoningSettingResolved" {
     const unset_setting: ReasoningSetting = .unset;
-    try std.testing.expectEqual(ai.ReasoningEffort.medium, unset_setting.resolve());
+    try std.testing.expectEqual(ReasoningEffort.medium, unset_setting.resolve());
 
     const explicit_setting: ReasoningSetting = .{ .effort = .high };
-    try std.testing.expectEqual(ai.ReasoningEffort.high, explicit_setting.resolve());
+    try std.testing.expectEqual(ReasoningEffort.high, explicit_setting.resolve());
 }
 
 test "clonesAndDeinitsModel_whenModelLifecycleExecuted" {
     const gpa = std.testing.allocator;
 
-    const reasoning_opts = try gpa.alloc(ai.ReasoningEffort, 2);
+    const reasoning_opts = try gpa.alloc(ReasoningEffort, 2);
     reasoning_opts[0] = .low;
     reasoning_opts[1] = .high;
 
@@ -625,12 +629,12 @@ test "clonesAndDeinitsModel_whenModelLifecycleExecuted" {
     original.deinit(gpa);
 
     try std.testing.expectEqualStrings("gpt-4o", cloned.id);
-    try std.testing.expectEqual(ai.ReasoningEffort.high, cloned.reasoning.resolve());
+    try std.testing.expectEqual(ReasoningEffort.high, cloned.reasoning.resolve());
     try std.testing.expectEqual(@as(?u32, 128000), cloned.context_window);
     try std.testing.expectEqual(@as(?u32, 4096), cloned.max_output_tokens);
     try std.testing.expectEqual(@as(usize, 2), cloned.reasoning_options.len);
-    try std.testing.expectEqual(ai.ReasoningEffort.low, cloned.reasoning_options[0]);
-    try std.testing.expectEqual(ai.ReasoningEffort.high, cloned.reasoning_options[1]);
+    try std.testing.expectEqual(ReasoningEffort.low, cloned.reasoning_options[0]);
+    try std.testing.expectEqual(ReasoningEffort.high, cloned.reasoning_options[1]);
 }
 
 test "clonesAndDeinitsProviderConfig_whenProviderConfigLifecycleExecuted" {
@@ -723,7 +727,7 @@ test "expandProviderHeaders deep-copies and owns expanded values" {
         .{ .name = @constCast("x-b"), .value = @constCast("no {env: placeholder") },
     };
     const expanded = try expandProviderHeaders(gpa, &raw);
-    defer ai.provider_headers.freeHeaders(gpa, expanded);
+    defer provider_headers.freeHeaders(gpa, expanded);
 
     try std.testing.expectEqual(@as(usize, 2), expanded.len);
     try std.testing.expectEqualStrings("x-a", expanded[0].name);
@@ -731,6 +735,6 @@ test "expandProviderHeaders deep-copies and owns expanded values" {
     try std.testing.expectEqualStrings("no {env: placeholder", expanded[1].value.literal);
 
     const empty = try expandProviderHeaders(gpa, &.{});
-    defer ai.provider_headers.freeHeaders(gpa, empty);
+    defer provider_headers.freeHeaders(gpa, empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
