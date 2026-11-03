@@ -407,6 +407,15 @@ pub const ExecutorService = struct {
     /// path (MCP tools are materialized as `Tool` records by
     /// `mcp/registry_bridge.zig` and synced into the registry on connect).
     fn dispatchCall(self: *ExecutorService, call: ai.ToolCall, classified: ?executor_safety.ClassifiedCommand) !ToolResult {
+        // Registry-dispatched tools can't receive the gate's mint as a
+        // parameter (the fixed `Tool.run` signature), so it travels through
+        // the tool context for the duration of this dispatch and is cleared
+        // after — the skill tool's command mode refuses to run without it
+        // (#295). The direct contained shell path passes the mint
+        // positionally inside `produceOutput`; the slot is only the
+        // registry-boundary channel.
+        self.ctx.shell_gate_mint = classified;
+        defer self.ctx.shell_gate_mint = null;
         // Plugin and builtin tool calls share one path: the registry's
         // `all` slice backs a single lookup, and the matched tool's `run`
         // callback routes through whatever `userdata` it carries (bash
@@ -1019,6 +1028,86 @@ test "contained shell run refuses a call that bypassed the classification gate" 
     var shell_call = try makeCall(gpa, "bypass", tools.shell_tool.name, "{\"command\":\"echo should-not-run\",\"description\":\"bypass\"}");
     defer shell_call.deinit(gpa);
     try std.testing.expectError(error.UnclassifiedContainedRun, executor.produceOutput(shell_call, null));
+}
+
+test "contained shell run executes a gate-approved call end to end" {
+    // #295 red test for the POSITIVE path: `runAll` mints for an approved
+    // shell call and the token threads runOne → dispatchCall → produceOutput
+    // into the contained runner. The null-mint refusal test above pins the
+    // refuse half alone — this one fails if the gate stops minting or the
+    // threading drops the token (every lane shell call would then fail with
+    // UnclassifiedContainedRun while the refusal test stays green).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = root_buf[0..root_len], .contained = true, .skills = &.{} });
+    var call = try makeCall(gpa, "minted", tools.shell_tool.name, "{\"command\":\"printf minted-ok\",\"description\":\"ok\"}");
+    defer call.deinit(gpa);
+    const Approval = struct {
+        fn started(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        fn finished(_: *@This(), _: *const ToolResult) anyerror!void {}
+        fn approve(_: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return error.TestUnexpectedCall; // safe command: never consulted
+        }
+    };
+    var approval: Approval = .{};
+    const observer: ToolCallObserver(Approval) = .{
+        .ctx = &approval,
+        .on_started = Approval.started,
+        .on_finished = Approval.finished,
+        .approve_unsafe_bash = Approval.approve,
+    };
+    const results = try executor.runAll(&.{call}, observer);
+    defer {
+        for (results) |*result| result.deinit(gpa);
+        gpa.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(!results[0].failed);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "minted-ok") != null);
+    // The tool context slot is per-dispatch: it must not outlive the batch.
+    try std.testing.expect(executor.ctx.shell_gate_mint == null);
+}
+
+test "skill gate refuses an unverifiable skill directory before approval" {
+    // #295 fail-closed branch: a skill whose base_dir cannot be real-pathed
+    // is REJECTED at the gate (a transient gate failure must not let the
+    // command run unclassified), and the approval hook is never consulted.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const skills = [_]skill_mod.Skill{.{
+        .name = @constCast("ghost"),
+        .description = @constCast(""),
+        .path = @constCast(""),
+        .base_dir = @constCast("Z:/definitely/not/a/real/skill/dir"),
+        .body = @constCast("Instructions"),
+    }};
+    const workspace = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(workspace);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = workspace, .contained = true, .skills = &skills });
+    var call = try makeCall(gpa, "ghost-cmd", "skill", "{\"name\":\"ghost\",\"command\":\"echo should-not-run\"}");
+    defer call.deinit(gpa);
+    const Approval = struct {
+        calls: usize = 0,
+        fn started(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        fn finished(_: *@This(), _: *const ToolResult) anyerror!void {}
+        fn approve(ctx: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            ctx.calls += 1;
+            return true;
+        }
+    };
+    var approval: Approval = .{};
+    const observer: ToolCallObserver(Approval) = .{
+        .ctx = &approval,
+        .on_started = Approval.started,
+        .on_finished = Approval.finished,
+        .approve_unsafe_bash = Approval.approve,
+    };
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(call, observer)) == .rejected);
+    try std.testing.expectEqual(@as(usize, 0), approval.calls);
 }
 
 test "ExecutorService.runAll errdefer cleanup exists" {

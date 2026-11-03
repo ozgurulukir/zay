@@ -73,9 +73,13 @@ when untrusted code needs a stronger boundary.
   contained execution: the runners require a `bash_safety.ClassifiedCommand`
   token minted by the gate (`executor_safety.mintClassified`), and the
   executor's contained path refuses a missing token at runtime
-  (`error.UnclassifiedContainedRun`) (#295). Any new caller must route
-  through the executor or classify and mint honestly first. This is stated
-  in the function docs in `shell.zig`.
+  (`error.UnclassifiedContainedRun`) (#295). The `skill` tool's command mode
+  is gated the same way: the gate's mint travels through the tool context
+  (`ToolContext.shell_gate_mint`, set per dispatch by the executor and
+  cleared after), and an ungated caller is refused
+  (`error.UnclassifiedSkillCommandRun`). Any new caller must route through
+  the executor — minting by hand is the bypass the token exists to expose.
+  This is stated in the function docs in `shell.zig` and `skill.zig`.
 
 ### External classifier failures and timing
 
