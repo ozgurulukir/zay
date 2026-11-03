@@ -219,6 +219,12 @@ pub fn drainDiffRefresh(app: *App) !bool {
             }
             if (app.metrics.diff_loading()) {
                 app.setMode(.normal);
+                // Tick drains carry no EventContext, so the wrapper-level
+                // syncFocus is unavailable: land on the primary input via the
+                // app-level helper instead (same destination as closeDiff's
+                // mode-aware router; the parked diff-viewer focus would
+                // otherwise leave typed input dead — #313 class).
+                lifecycle.focusPrimaryInput(app);
                 _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "Couldn't load diff.");
                 visible_change = true;
             }
@@ -234,6 +240,9 @@ fn populateDiffFromCache(app: *App) !void {
     if (state.isEmpty()) {
         state.deinit(app.gpa);
         app.setMode(.normal);
+        // Same tick-path focus duty as the failure arm above: no EventContext
+        // here, so land on the primary input directly (#313 class).
+        lifecycle.focusPrimaryInput(app);
         _ = try app.thread.transcript.append(app.gpa, .agent, "agent", "No changes to review.");
         return;
     }

@@ -315,12 +315,6 @@ fn routeKey(
         ctx.consumeAndRedraw();
         return;
     }
-    if (app.isNormalMode() and key.matches('k', .{ .ctrl = true })) {
-        try app.openCommandMenu();
-        try root.syncFocus(ctx);
-        ctx.consumeAndRedraw();
-        return;
-    }
     if (app.isNormalMode() and key.matches(vaxis.Key.enter, .{ .shift = true })) {
         try app.insertInputNewline();
         ctx.consumeAndRedraw();

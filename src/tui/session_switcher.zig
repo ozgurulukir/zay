@@ -160,7 +160,11 @@ pub fn openResumePicker(app: *App) !void {
     _ = resume_picker.visibleCount(app.io, summaries, filter, app.resume_folded_projects.items, app.nav.resume_group_by);
     app.nav.resume_selection = 0;
     app.clearBlockNav();
-    app.setMode(.session_picker);
+    // Keep-input variant + explicit palette clear: the main prompt holds the
+    // user's in-progress draft, which survives the picker round-trip (only
+    // the picker's filter buffer resets; it is re-filled from `filter`).
+    app.setModeKeepInput(.session_picker);
+    app.inputs.palette.clearRetainingCapacity();
     if (filter.len > 0) try app.inputs.palette.insertSliceAtCursor(filter);
     syncResumeListCursor(app);
 }
