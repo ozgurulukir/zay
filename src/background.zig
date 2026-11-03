@@ -264,11 +264,11 @@ pub const BackgroundManager = struct {
 
         var win32_job_obj: ?windows.HANDLE = null;
         errdefer if (win32_job_obj) |h| {
-            _ = windows.CloseHandle(h);
+            _ = os.closeWin32Handle(h);
             win32_job_obj = null;
         };
         if (os.is_windows) {
-            win32_job_obj = createWin32JobObject(child.?.id.?);
+            win32_job_obj = os.createKillOnCloseJobForProcess(child.?.id.?);
         }
 
         var command_owned: ?[]u8 = null;
@@ -678,7 +678,7 @@ pub const BackgroundManager = struct {
         }
         if (os.is_windows) {
             if (job.win32_job_object) |h| {
-                _ = windows.CloseHandle(h);
+                _ = os.closeWin32Handle(h);
                 job.win32_job_object = null;
             }
         }
@@ -762,34 +762,13 @@ fn runTaskkillWorker(io: std.Io, pid: i64) bool {
     };
 }
 
-fn createWin32JobObject(process_handle: windows.HANDLE) ?windows.HANDLE {
-    if (!os.is_windows) return null;
-    const h = windows.CreateJobObjectW(null, null) orelse return null;
-    var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
-    info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (windows.SetInformationJobObject(
-        h,
-        windows.JobObjectExtendedLimitInformation,
-        &info,
-        @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
-    ) == 0) {
-        _ = windows.CloseHandle(h);
-        return null;
-    }
-    if (windows.AssignProcessToJobObject(h, process_handle) == 0) {
-        _ = windows.CloseHandle(h);
-        return null;
-    }
-    return h;
-}
-
 /// Synchronously kill a job's whole process tree by pid or Job Object.
 pub fn terminateTreeSync(io: std.Io, gpa: std.mem.Allocator, pid: i64, job_opt: ?*BackgroundManager.Job) void {
     _ = gpa;
     if (os.is_windows) {
         if (job_opt) |job| {
             if (job.win32_job_object) |h| {
-                if (windows.TerminateJobObject(h, 1) != 0) return;
+                if (os.terminateWin32JobObject(h, 1)) return;
             }
         }
         if (runTaskkillWorker(io, pid)) return;
@@ -813,120 +792,21 @@ fn processId(child: std.process.Child) i64 {
     }
 }
 
-/// Win32 surface for process ID and Job Object management (kill-on-close limits).
+/// Win32 surface for process ID reads. The Job-Object FFI lives in `os.zig`
+/// (single declaration site, #296); this module keeps only its teardown
+/// policy (taskkill fallback) on top of the shared attach adapter.
 const windows = if (os.is_windows) struct {
     const HANDLE = std.os.windows.HANDLE;
     const DWORD = std.os.windows.DWORD;
-    const BOOL = i32;
-    const LPVOID = ?*anyopaque;
-    const LPCWSTR = [*:0]const u16;
-    const SIZE_T = usize;
-    const ULONG_PTR = usize;
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
-    const JobObjectExtendedLimitInformation: DWORD = 9;
-
-    const IO_COUNTERS = extern struct {
-        ReadOperationCount: u64,
-        WriteOperationCount: u64,
-        OtherOperationCount: u64,
-        ReadTransferCount: u64,
-        WriteTransferCount: u64,
-        OtherTransferCount: u64,
-    };
-
-    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
-        PerProcessUserTimeLimit: i64,
-        PerJobUserTimeLimit: i64,
-        LimitFlags: DWORD,
-        MinimumWorkingSetSize: SIZE_T,
-        MaximumWorkingSetSize: SIZE_T,
-        ActiveProcessLimit: DWORD,
-        Affinity: ULONG_PTR,
-        PriorityClass: DWORD,
-        SchedulingClass: DWORD,
-    };
-
-    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
-        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        IoInfo: IO_COUNTERS,
-        ProcessMemoryLimit: SIZE_T,
-        JobMemoryLimit: SIZE_T,
-        PeakProcessMemoryLimit: SIZE_T,
-        PeakJobMemoryLimit: SIZE_T,
-    };
 
     extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
-    extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*anyopaque, lpName: ?LPCWSTR) callconv(.winapi) ?HANDLE;
-    extern "kernel32" fn SetInformationJobObject(
-        hJob: HANDLE,
-        JobObjectInformationClass: DWORD,
-        lpJobObjectInformation: LPVOID,
-        cbJobObjectInformationLength: DWORD,
-    ) callconv(.winapi) BOOL;
-    extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
-    extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) callconv(.winapi) BOOL;
-    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
 } else struct {
     // Stub types for non-Windows (same type aliases, available on all platforms)
     pub const HANDLE = std.os.windows.HANDLE;
     pub const DWORD = std.os.windows.DWORD;
-    pub const BOOL = i32;
-    pub const LPVOID = ?*anyopaque;
-    pub const LPCWSTR = [*:0]const u16;
-    pub const SIZE_T = usize;
-    pub const ULONG_PTR = usize;
 
-    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
-    pub const JobObjectExtendedLimitInformation: DWORD = 9;
-
-    pub const IO_COUNTERS = extern struct {
-        ReadOperationCount: u64,
-        WriteOperationCount: u64,
-        OtherOperationCount: u64,
-        ReadTransferCount: u64,
-        WriteTransferCount: u64,
-        OtherTransferCount: u64,
-    };
-
-    pub const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
-        PerProcessUserTimeLimit: i64,
-        PerJobUserTimeLimit: i64,
-        LimitFlags: DWORD,
-        MinimumWorkingSetSize: SIZE_T,
-        MaximumWorkingSetSize: SIZE_T,
-        ActiveProcessLimit: DWORD,
-        Affinity: ULONG_PTR,
-        PriorityClass: DWORD,
-        SchedulingClass: DWORD,
-    };
-
-    pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
-        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        IoInfo: IO_COUNTERS,
-        ProcessMemoryLimit: SIZE_T,
-        JobMemoryLimit: SIZE_T,
-        PeakProcessMemoryLimit: SIZE_T,
-        PeakJobMemoryLimit: SIZE_T,
-    };
-
-    // Stub functions - never called on non-Windows (call sites guarded by comptime)
+    // Stub function - never called on non-Windows (call sites guarded by comptime)
     pub fn GetProcessId(_: HANDLE) DWORD {
-        unreachable;
-    }
-    pub fn CreateJobObjectW(_: ?*anyopaque, _: ?LPCWSTR) ?HANDLE {
-        unreachable;
-    }
-    pub fn SetInformationJobObject(_: HANDLE, _: DWORD, _: LPVOID, _: DWORD) BOOL {
-        unreachable;
-    }
-    pub fn AssignProcessToJobObject(_: HANDLE, _: HANDLE) BOOL {
-        unreachable;
-    }
-    pub fn TerminateJobObject(_: HANDLE, _: DWORD) BOOL {
-        unreachable;
-    }
-    pub fn CloseHandle(_: HANDLE) void {
         unreachable;
     }
 };
