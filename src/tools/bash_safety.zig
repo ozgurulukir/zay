@@ -29,8 +29,29 @@ const classifier_response_buffer_bytes: usize = 16 * 1024;
 pub const Verdict = enum {
     safe,
     unsafe,
-    unavailable,
 };
+
+/// A shell invocation that has passed the executor's classification gate
+/// (#295). `runContained*` requires one so the containment runners receive
+/// classified input by construction. Mint points, all documented: the
+/// executor's gate after `classify` and the approval flow (via
+/// `executor_safety.mintClassified`), the `skill` tool's command mode at the
+/// registry boundary (upstream-classified; the fixed `Tool.run` signature
+/// cannot carry the token), and the containment test fixtures. Zig has no
+/// private fields, so forging the literal remains *possible* — but it is
+/// now a greppable, documented act instead of an invisible default, and the
+/// executor's contained path refuses a missing mint at runtime.
+pub const ClassifiedCommand = struct {
+    /// Diagnostic-only: what the mint point vouches for (the gate mints from
+    /// the call's arguments; the skill boundary from the classified shell
+    /// args). Never compared against what executes.
+    command: []const u8,
+};
+
+/// The single sanctioned mint point for `ClassifiedCommand`.
+pub fn mintClassified(command: []const u8) ClassifiedCommand {
+    return .{ .command = command };
+}
 
 pub fn commandFromArguments(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
     const JsonArgs = struct {

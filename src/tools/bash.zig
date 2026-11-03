@@ -9,6 +9,7 @@
 const std = @import("std");
 const background = @import("../background.zig");
 const bash = @import("bash_exec.zig");
+const bash_safety = @import("bash_safety.zig");
 const common = @import("common.zig");
 const os = @import("../os.zig");
 const pwsh_exec = @import("pwsh_exec.zig");
@@ -431,7 +432,7 @@ test "contained bash refuses cd to a directory outside the workspace root" {
     // The main-tree escape that broke lane isolation: `cd` to an absolute path
     // outside the worktree, then run. The guard must refuse the cd so the
     // command never executes in the escaped directory.
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd /etc && pwd\",\"description\":\"escape\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd /etc && pwd\",\"description\":\"escape\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expect(output.code != 0);
@@ -451,7 +452,7 @@ test "contained bash refuses cd via a symlink that leaves the root" {
     // the guard's `pwd -P` check must catch it (not just the lexical check).
     tmp.dir.symLink(std.testing.io, "/etc", "link", .{}) catch return error.SkipZigTest;
 
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd link && pwd\",\"description\":\"escape\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd link && pwd\",\"description\":\"escape\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expect(output.code != 0);
@@ -473,7 +474,7 @@ test "contained bash allows cd within the workspace root" {
 
     // `cd sub` stays inside the worktree and must be allowed; `$PWD` reports the
     // native path form, so assert the relative segment landed.
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd sub && printf \\\"$PWD\\\"\",\"description\":\"read\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"cd sub && printf \\\"$PWD\\\"\",\"description\":\"read\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
@@ -489,7 +490,7 @@ test "contained bash refuses pushd outright" {
     const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(root_abs);
 
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"pushd /etc\",\"description\":\"escape\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"pushd /etc\",\"description\":\"escape\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expect(output.code != 0);
@@ -508,7 +509,7 @@ test "contained bash still validates a cwd argument escaping the root" {
     // The existing `cwd`-argument containment still applies under `runContained`.
     // The refusal is a tool-level failure (no shell spawned), so the message
     // lands in `stderr`, not the captured stdout.
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"pwd\",\"cwd\":\"/etc\",\"description\":\"read\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"pwd\",\"cwd\":\"/etc\",\"description\":\"read\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expect(output.code != 0);

@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const background = @import("../background.zig");
+const bash_safety = @import("bash_safety.zig");
 const capture_sink = @import("capture_sink.zig");
 const common = @import("common.zig");
 const platform = @import("platform");
@@ -157,24 +158,27 @@ pub fn Impl(comptime B: type) type {
         /// tree. Background launches (when `background` is non-null and the call
         /// asks for one) are guarded too.
         ///
-        /// These functions never classify. The executor's approval gate
-        /// (`executor_safety.shouldRejectUnsafeShell`) is the sole
+        /// These functions never classify — the caller proves classification
+        /// instead. The `classified` token (`bash_safety.ClassifiedCommand`)
+        /// is minted by the executor's approval gate
+        /// (`executor_safety.shouldRejectUnsafeShell`), the sole
         /// classification point for every contained execution: the executor
-        /// has already classified the call by the time it dispatches here, so
+        /// has classified the call by the time it dispatches here, and
         /// classifying again inline would double-prompt on remote-classifier
-        /// flaps. A new caller must either route through the executor or run
-        /// `bash_safety.classify` itself first — invoking `runContained*`
-        /// directly on unclassified input silently bypasses the approval
-        /// gate. The intended caller set is the executor (shell tool and
-        /// `skill` command mode) plus these modules' own tests.
+        /// flaps. Demanding the token makes a bypass a signature mismatch
+        /// rather than a silent default; the contained executor path
+        /// additionally refuses a null token at runtime (#295). The intended
+        /// caller set is the executor plus these modules' own tests, which
+        /// mint a token for their containment fixtures.
         pub fn runContained(
             gpa: std.mem.Allocator,
             io: std.Io,
             cwd: []const u8,
             arguments: []const u8,
             background_ctx: ?BackgroundCtx,
+            classified: bash_safety.ClassifiedCommand,
         ) common.Error!common.Output {
-            return runContainedWithCancellation(gpa, io, cwd, arguments, background_ctx, null);
+            return runContainedWithCancellation(gpa, io, cwd, arguments, background_ctx, null, classified);
         }
 
         /// See `runContained` for the classification contract.
@@ -185,7 +189,9 @@ pub fn Impl(comptime B: type) type {
             arguments: []const u8,
             background_ctx: ?BackgroundCtx,
             cancel_requested: ?*const std.atomic.Value(bool),
+            classified: bash_safety.ClassifiedCommand,
         ) common.Error!common.Output {
+            _ = classified; // Proof-of-classification; execution uses `arguments`.
             return runToolImpl(gpa, io, cwd, arguments, .{ .contained = true, .background = background_ctx, .cancel_requested = cancel_requested });
         }
 

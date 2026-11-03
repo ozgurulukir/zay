@@ -11,6 +11,32 @@ const os = @import("../os.zig");
 const shell_safety = @import("bash_safety.zig");
 const tools = @import("../tools.zig");
 
+/// Re-exports so callers of the gate can mint tokens without importing the
+/// classifier module directly.
+pub const ClassifiedCommand = shell_safety.ClassifiedCommand;
+pub const mintClassified = shell_safety.mintClassified;
+
+/// The verdict of the shell classification gate (#295). The approved case
+/// carries the minted proof that the command was classified — the executor
+/// threads it into `runContained*` so the contained runners receive
+/// classified input by construction.
+pub const Outcome = union(enum) {
+    /// Run the call; `command` was classified (safe, or unsafe-but-approved).
+    allowed: shell_safety.ClassifiedCommand,
+    /// Refuse the call; the reason is surfaced to the model verbatim.
+    /// Static literals only — the executor dupes it, never frees the field.
+    rejected: []const u8,
+    /// Not a classification matter (non-shell call, malformed args dispatch
+    /// will reject, unknown skill) — let the dispatch path produce its own
+    /// structured error.
+    defer_to_dispatch,
+};
+
+/// Rejection reason for a shell/skill call whose arguments cannot be parsed
+/// into a command (#295: fail closed at the gate — refuse, never let
+/// unclassified input reach a contained runner).
+const unclassifiable_reason = "The tool call could not be safety-classified: the shell command arguments are invalid (expected {\"command\": \"...\"}). The call was refused.";
+
 /// Check if a tool call invokes the host shell with a destructive command
 /// and whether the approval hook rejects it.
 pub fn shouldRejectUnsafeShell(
@@ -20,17 +46,29 @@ pub fn shouldRejectUnsafeShell(
     cwd: []const u8,
     call: ai.ToolCall,
     observer: anytype,
-) !bool {
-    if (!std.mem.eql(u8, call.name, tools.shell_tool.name) and !std.mem.eql(u8, call.name, "skill")) return false;
-    const command = shell_safety.commandFromArguments(gpa, call.arguments) catch return false;
+) !Outcome {
+    if (!std.mem.eql(u8, call.name, tools.shell_tool.name) and !std.mem.eql(u8, call.name, "skill")) return .defer_to_dispatch;
+    // Fail closed: an unparseable shell/skill call cannot be classified, so
+    // it is refused outright instead of silently proceeding unclassified.
+    // Gate-level defense-in-depth — dispatch validation would also reject
+    // the call, but that ordering is knowledge no type carries (#295).
+    // OOM propagates: hiding resource exhaustion behind a refusal reason
+    // would misreport the failure class.
+    const command = shell_safety.commandFromArguments(gpa, call.arguments) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{ .rejected = unclassifiable_reason };
+    };
     defer gpa.free(command);
     // The optional URL is threaded straight through: with a classifier set it
     // does the remote+local-fallback dance; with none the local destructive-
     // command matcher runs directly, so `rm -rf /` is always caught.
     const verdict = shell_safety.classify(gpa, io, bash_classifier_url, cwd, command);
-    if (verdict != .unsafe) return false;
+    // The token borrows `call.arguments` — owned by the turn and stable for
+    // the whole batch — never the extracted `command` (freed below).
+    if (verdict != .unsafe) return .{ .allowed = shell_safety.mintClassified(call.arguments) };
     const approved = try observer.approve_unsafe_bash(observer.ctx, call, command);
-    return !approved;
+    if (approved) return .{ .allowed = shell_safety.mintClassified(call.arguments) };
+    return .{ .rejected = "The tool call was rejected by the user for being unsafe. Try something else." };
 }
 
 test "shouldRejectUnsafeShell ignores non-shell tools" {
@@ -59,12 +97,12 @@ test "shouldRejectUnsafeShell ignores non-shell tools" {
         .approve_unsafe_bash = MockCtx.approve,
     };
 
-    const rejected = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
-    try std.testing.expect(!rejected);
+    const outcome = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
+    try std.testing.expect(outcome == .defer_to_dispatch);
     try std.testing.expect(!mock_ctx.approve_called);
 }
 
-test "shouldRejectUnsafeShell ignores invalid arguments JSON gracefully" {
+test "shouldRejectUnsafeShell refuses invalid arguments JSON (fail closed)" {
     const gpa = std.testing.allocator;
     const call: ai.ToolCall = .{
         .call_id = .{ .value = try gpa.dupe(u8, "call_bad_json") },
@@ -89,9 +127,8 @@ test "shouldRejectUnsafeShell ignores invalid arguments JSON gracefully" {
         .ctx = &mock_ctx,
         .approve_unsafe_bash = MockCtx.approve,
     };
-
-    const rejected = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
-    try std.testing.expect(!rejected);
+    const outcome = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
+    try std.testing.expect(outcome == .rejected);
     try std.testing.expect(!mock_ctx.approve_called);
 }
 
@@ -121,8 +158,8 @@ test "shouldRejectUnsafeShell allows safe commands without prompting observer" {
         .approve_unsafe_bash = MockCtx.approve,
     };
 
-    const rejected = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
-    try std.testing.expect(!rejected);
+    const outcome = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
+    try std.testing.expect(outcome == .allowed);
     try std.testing.expect(!mock_ctx.approve_called);
 }
 
@@ -151,9 +188,8 @@ test "shouldRejectUnsafeShell consults observer and rejects when denied" {
         .ctx = &mock_ctx,
         .approve_unsafe_bash = MockCtx.approve,
     };
-
-    const rejected = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
-    try std.testing.expect(rejected);
+    const outcome = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
+    try std.testing.expect(outcome == .rejected);
     try std.testing.expect(mock_ctx.approve_called);
 }
 
@@ -183,8 +219,8 @@ test "shouldRejectUnsafeShell consults observer and allows when approved" {
         .approve_unsafe_bash = MockCtx.approve,
     };
 
-    const rejected = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
-    try std.testing.expect(!rejected);
+    const outcome = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
+    try std.testing.expect(outcome == .allowed);
     try std.testing.expect(mock_ctx.approve_called);
 }
 
@@ -223,8 +259,8 @@ test "shouldRejectUnsafeShell catches chained destructive commands" {
             .approve_unsafe_bash = MockCtx.approve,
         };
 
-        const rejected = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
-        try std.testing.expect(rejected);
+        const outcome = try shouldRejectUnsafeShell(gpa, std.testing.io, null, "/tmp", call, observer);
+        try std.testing.expect(outcome == .rejected);
         try std.testing.expect(mock_ctx.approve_called);
     }
 }
