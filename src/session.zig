@@ -116,7 +116,8 @@ pub const SessionStore = struct {
 
     /// Build the store spec from a config's resolved database settings — the
     /// single site for the config→`BackendKind` vocabulary (was hand-copied
-    /// in root.zig auto-resume and runtime.zig initSession, #297).
+    /// in root.zig auto-resume, runtime.zig initSession, and the session
+    /// switcher's `currentSessionStore`, #297).
     pub fn fromDatabase(
         backend_kind: @import("config/config.zig").DatabaseBackendKind,
         url: ?[]const u8,
