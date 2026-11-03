@@ -335,7 +335,7 @@ fn routeKey(
         // list), so routing Enter through the generic chat `submit` would
         // bypass their handlers and leave these forms/actions inert.
         if (app.getMode() == .mcp or app.getMode() == .plugins) {
-            if (try app.handleCommandKey(key)) {
+            if (try handlePerModeKey(app, root, ctx, key)) {
                 ctx.consumeAndRedraw();
             } else {
                 ctx.consumeEvent();
@@ -412,9 +412,22 @@ fn routeKey(
             }
         }
     }
-    if (try app.handleCommandKey(key)) {
+    if (try handlePerModeKey(app, root, ctx, key)) {
         ctx.consumeAndRedraw();
     }
+}
+
+/// Wrapper duty for the per-mode key dispatch (#292): a per-mode handler can
+/// only flip `App.mode` through `App.setMode` — it has no `EventContext`, so
+/// when the dispatch CHANGED the mode (help's `q` close), the wrapper
+/// re-routes focus here. Skipping this leaves the focus path on the old
+/// mode's widget and typed input dead until another key re-syncs (#313
+/// class; the ConPTY smoke's help scenario pins it end to end).
+fn handlePerModeKey(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+    const mode_before = app.getMode();
+    if (!try app.handleCommandKey(key)) return false;
+    if (app.getMode() != mode_before) try root.syncFocus(ctx);
+    return true;
 }
 
 /// Handle Escape key: close modals, overlays, cancel modes, clear input,
