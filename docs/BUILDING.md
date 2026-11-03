@@ -54,6 +54,7 @@ Run after code changes:
 - `zig fmt` on the changed Zig files
 - `zig build test`
 - `zig build test-plugin` — runs the example Lua plugins' `test.lua` suites. Its exit code is the gate: must be 0. `test_runner.run()` is idempotent; `test_runner.zig` logs at `warn` (not `err`) so the intentional syntax-error test doesn't fail the build. Add a new plugin's `test.lua` to the `test-plugin` arg list in `build.zig`. The Zig runner auto-runs `return test_runner.run()` after loading each file and **fails on 0 tests** — a test file with no `it` blocks is a failure.
+- After TUI changes that touch mode transitions, focus routing, or overlay open/close: `zig build` then `uv run --with pywinpty python tools/pty-smoke/pty_smoke.py` (Windows; `zig-out/bin/zay.exe` is the default target, pass another exe as argv[1]). It drives the real binary under ConPTY and asserts, among other checks, that typed input still echoes after leaving the command menu, transcript search, and help — vxfw focus calls are no-ops under `zig build test`, so this is the only gate for the dead-typed-input crash class (#292, #313). Takes ~2–3 minutes (boot can legitimately take ~25s).
 
 ### Test runner quirks (read before debugging a failure)
 
