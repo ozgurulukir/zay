@@ -30,11 +30,6 @@ pub const ResponseEventSpec = responses_events.ResponseEventSpec;
 pub const response_event_specs = responses_events.response_event_specs;
 pub const responseEventFromString = responses_events.responseEventFromString;
 
-/// Upper bound on an error body we will decompress + log (matches the
-/// chat-completions client's cap). Prevents a hostile/garbage body from
-/// allocating unboundedly.
-const response_bytes_max: u32 = 1 * 1024 * 1024;
-
 pub const ResponsesConfig = struct {
     // Transport-protocol header specs, unified with the provider-header
     // vocabulary in `provider_headers.zig` (INV-RESP-1 sibling leaf).
