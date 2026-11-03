@@ -235,21 +235,6 @@ pub fn Impl(comptime B: type) type {
             return runCapturedWithCancellation(gpa, io, resolved_cwd, command, &env_map, args.timeout_seconds, opts.cancel_requested);
         }
 
-        /// Run `command` under the backend's shell with the tool's standard
-        /// capture limits and shape the result into a tool `Output`
-        /// (merged-output observation, exit-code framing, spill-to-disk on
-        /// overflow). `cwd` must already be resolved to an absolute path.
-        pub fn runCaptured(
-            gpa: std.mem.Allocator,
-            io: std.Io,
-            cwd: []const u8,
-            command: []const u8,
-            env_map: *const std.process.Environ.Map,
-            timeout_seconds: u32,
-        ) common.Error!common.Output {
-            return runCapturedWithCancellation(gpa, io, cwd, command, env_map, timeout_seconds, null);
-        }
-
         fn runCapturedWithCancellation(
             gpa: std.mem.Allocator,
             io: std.Io,
