@@ -70,8 +70,7 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
         }
         app.gpa.free(prompts);
     } else |_| {}
-    app.mode = .normal;
-    app.clearInput();
+    app.setMode(.normal);
     app.resetTurnState();
     app.armGitLabelRefresh();
 }

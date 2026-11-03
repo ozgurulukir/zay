@@ -13,18 +13,14 @@ const App = tui.App;
 /// Open the transcript-search overlay. The palette input owns the query; a
 /// leading `/` in it routes to the command menu (see `shouldOpenCommandMenuForSlash`).
 pub fn openSearch(app: *App) !void {
-    app.mode = .search;
     app.pickers.search.reset(app.gpa);
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.search);
     try rebuildMatches(app, "");
 }
 
 pub fn closeSearch(app: *App) void {
-    app.mode = .normal;
     app.pickers.search.reset(app.gpa);
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 /// Jump to the selected match: pin the transcript selection, disable
@@ -38,10 +34,8 @@ pub fn acceptSearchSelection(app: *App) !void {
         app.thread.transcript.select(match.message_index);
         app.setThreadAutoScroll(false);
     }
-    app.mode = .normal;
     app.pickers.search.reset(app.gpa);
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 /// Rebuild the match list from the current transcript for `filter`, in document

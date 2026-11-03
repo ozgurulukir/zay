@@ -160,8 +160,7 @@ pub fn openResumePicker(app: *App) !void {
     _ = resume_picker.visibleCount(app.io, summaries, filter, app.resume_folded_projects.items, app.nav.resume_group_by);
     app.nav.resume_selection = 0;
     app.clearBlockNav();
-    app.mode = .session_picker;
-    app.inputs.palette.clearRetainingCapacity();
+    app.setMode(.session_picker);
     if (filter.len > 0) try app.inputs.palette.insertSliceAtCursor(filter);
     syncResumeListCursor(app);
 }
@@ -298,8 +297,7 @@ pub fn navigateToEntry(app: *App, entry_id: []const u8) !void {
 }
 
 pub fn reportSessionSwitchError(app: *App, err: anyerror) !void {
-    app.mode = .normal;
-    app.clearInput();
+    app.setMode(.normal);
     var buffer: [128]u8 = undefined;
     const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);

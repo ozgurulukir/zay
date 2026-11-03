@@ -555,7 +555,6 @@ pub fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
     return visible_change;
 }
 
-/// Fork a parallel lane: create a git worktree, new runtime, and a fresh
 /// Pin vxfw focus to the root widget before destroying a runtime. The focused
 /// TextField's userdata can point into the dying runtime's memory; once it is
 /// deinit'd, FocusHandler.update can no longer find it in the surface tree,
@@ -573,6 +572,44 @@ pub fn pinFocusToRoot(app: *App) void {
 /// The input is App-owned (stable across runtimes) and drawn in `.normal`.
 pub fn focusPrimaryInput(app: *App) void {
     if (app.fw_app) |fw| fw.wants_focus = app.inputs.input.widget();
+}
+
+/// The stock mode transitions an event wrapper can request, one arm per
+/// App-level helper. Each arm's follow-up duties (input pairing inside the
+/// helper, focus re-route here) are owned by `transitionMode` — call sites
+/// no longer repeat the flip → syncFocus pair by hand (#292 part 2).
+pub const ModeAction = enum {
+    /// Ctrl+F / `/search`: open transcript search.
+    open_search,
+    /// Slash or Ctrl+K: open the command menu.
+    open_command_menu,
+    /// Esc: leave the current mode.
+    cancel,
+};
+
+/// Perform a stock mode transition and its follow-up duties in one call:
+/// the App-level flip (which owns the input pairing via `App.setMode`) plus
+/// the focus re-route. Returns false when the action declined (Esc in
+/// `.normal` has nothing to cancel), leaving the key for later handlers;
+/// on true the caller consumes and redraws. Sync runs AFTER the helper
+/// returns, so helper-internal re-entries (e.g. `cancelMode` reopening the
+/// command menu from `.lanes`) land on the final mode's widget.
+pub fn transitionMode(root: *RootWidget, ctx: *vxfw.EventContext, action: ModeAction) !bool {
+    const app = root.app;
+    const handled = switch (action) {
+        .open_search => blk: {
+            try app.openSearch();
+            break :blk true;
+        },
+        .open_command_menu => blk: {
+            try app.openCommandMenu();
+            break :blk true;
+        },
+        .cancel => try app.cancelMode(),
+    };
+    if (!handled) return false;
+    try syncFocus(root, ctx);
+    return true;
 }
 
 /// Route focus to the correct widget for the current mode. The provider
