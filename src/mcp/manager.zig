@@ -561,10 +561,13 @@ test "McpManager syncFromConfig surfaces injected allocation failure cleanly" {
     var hit_failure = false;
     var hit_client = false;
     var fail_index: usize = 1;
-    // 512: loadEnvMap allocates per process environment variable, so the
+    // 2048: loadEnvMap allocates per process environment variable, so the
     // indices consumed before the unguarded McpClient.init allocation vary
-    // by machine — the bound must clear the whole expand path with headroom.
-    while (fail_index <= 512) : (fail_index += 1) {
+    // by machine — the bound must clear the whole expand path with headroom
+    // even on dev boxes with very large environments. A bound inside the
+    // env-var count would observe zero failures and fail the sweep's final
+    // assertions (review of #307).
+    while (fail_index <= 2048) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(underlying, .{ .fail_index = fail_index });
         var manager = McpManager.init(failing.allocator());
         defer manager.deinit(std.testing.io);
