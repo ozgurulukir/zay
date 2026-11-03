@@ -10,7 +10,10 @@
 //! live in config.zig; provider/model types in provider.zig; MCP types in mcp.zig.
 
 const std = @import("std");
-const ai = @import("../ai.zig");
+/// Leaf vocabulary imports: config reaches into ai leaves directly, never
+/// through the `ai.zig` umbrella (whose graph hangs the whole wire stack).
+const ReasoningEffort = @import("../ai/reasoning_effort.zig").ReasoningEffort;
+const response_policy = @import("../ai/response_policy.zig");
 const platform = @import("platform");
 const paths = @import("../paths.zig");
 
@@ -419,7 +422,7 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
             }
             if (update.reasoning_options.len > 0) {
                 if (model.reasoning_options.len > 0) gpa.free(model.reasoning_options);
-                model.reasoning_options = try gpa.dupe(ai.ReasoningEffort, update.reasoning_options);
+                model.reasoning_options = try gpa.dupe(ReasoningEffort, update.reasoning_options);
             }
             replaced = true;
             break;
@@ -454,7 +457,7 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
                 model_ptr.max_output_tokens = entry_model.max_output_tokens;
                 if (entry_model.reasoning_options.len > 0) {
                     if (model_ptr.reasoning_options.len > 0) gpa.free(model_ptr.reasoning_options);
-                    model_ptr.reasoning_options = try gpa.dupe(ai.ReasoningEffort, entry_model.reasoning_options);
+                    model_ptr.reasoning_options = try gpa.dupe(ReasoningEffort, entry_model.reasoning_options);
                 }
                 return;
             }
@@ -502,7 +505,7 @@ fn hydrateFromProviderEntry(gpa: std.mem.Allocator, config: *Config, entry: Prov
         config.model.?.max_output_tokens = model.max_output_tokens;
         if (model.reasoning_options.len > 0) {
             if (config.model.?.reasoning_options.len > 0) gpa.free(config.model.?.reasoning_options);
-            config.model.?.reasoning_options = try gpa.dupe(ai.ReasoningEffort, model.reasoning_options);
+            config.model.?.reasoning_options = try gpa.dupe(ReasoningEffort, model.reasoning_options);
         }
         return;
     }
@@ -1179,10 +1182,10 @@ test "response policy configuration survives overlays cloning and serialization"
     var merged = try mergeLayers(gpa, &.{ lower, upper });
     defer merged.deinit(gpa);
     const policy = merged.responsePolicyForModel("proxy", "m", "https://example.invalid/v1");
-    try std.testing.expectEqual(ai.response_policy.TextKind.text, policy.thinking);
-    try std.testing.expectEqual(ai.response_policy.TextKind.text, policy.reasoning_content);
-    try std.testing.expectEqual(ai.response_policy.TextKind.reasoning, policy.reasoning);
-    try std.testing.expectEqual(ai.response_policy.TextKind.ignore, merged.responsePolicyForModel("proxy", "other", "https://example.invalid/v1").reasoning);
+    try std.testing.expectEqual(response_policy.TextKind.text, policy.thinking);
+    try std.testing.expectEqual(response_policy.TextKind.text, policy.reasoning_content);
+    try std.testing.expectEqual(response_policy.TextKind.reasoning, policy.reasoning);
+    try std.testing.expectEqual(response_policy.TextKind.ignore, merged.responsePolicyForModel("proxy", "other", "https://example.invalid/v1").reasoning);
 
     var buffer: std.Io.Writer.Allocating = .init(gpa);
     defer buffer.deinit();
@@ -1203,16 +1206,16 @@ test "response policy configuration rejects misspelled kinds and fields" {
     }
 }
 
-fn parseResponsePolicy(value: std.json.Value) !ai.response_policy.Overrides {
+fn parseResponsePolicy(value: std.json.Value) !response_policy.Overrides {
     if (value != .object) return error.InvalidResponsePolicy;
-    var result: ai.response_policy.Overrides = .{};
+    var result: response_policy.Overrides = .{};
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         var recognized = false;
-        inline for (std.meta.fields(ai.response_policy.Overrides)) |field| {
+        inline for (std.meta.fields(response_policy.Overrides)) |field| {
             if (std.mem.eql(u8, entry.key_ptr.*, field.name)) {
                 if (entry.value_ptr.* != .string) return error.InvalidResponsePolicy;
-                @field(result, field.name) = std.meta.stringToEnum(ai.response_policy.TextKind, entry.value_ptr.string) orelse return error.InvalidResponsePolicy;
+                @field(result, field.name) = std.meta.stringToEnum(response_policy.TextKind, entry.value_ptr.string) orelse return error.InvalidResponsePolicy;
                 recognized = true;
             }
         }
@@ -1221,16 +1224,16 @@ fn parseResponsePolicy(value: std.json.Value) !ai.response_policy.Overrides {
     return result;
 }
 
-fn writeResponsePolicy(writer: *std.Io.Writer, policy: ai.response_policy.Overrides, wrote_field: *bool) !void {
+fn writeResponsePolicy(writer: *std.Io.Writer, policy: response_policy.Overrides, wrote_field: *bool) !void {
     var present = false;
-    inline for (std.meta.fields(ai.response_policy.Overrides)) |field| {
+    inline for (std.meta.fields(response_policy.Overrides)) |field| {
         if (@field(policy, field.name) != null) present = true;
     }
     if (!present) return;
     try writeKeyNoIndent(writer, "responsePolicy", wrote_field);
     try writer.writeByte('{');
     var wrote_kind = false;
-    inline for (std.meta.fields(ai.response_policy.Overrides)) |field| {
+    inline for (std.meta.fields(response_policy.Overrides)) |field| {
         if (@field(policy, field.name)) |kind| {
             try writeKeyNoIndent(writer, field.name, &wrote_kind);
             try std.json.Stringify.value(@tagName(kind), .{}, writer);
@@ -1348,12 +1351,14 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const val = entry.value_ptr.*;
-        const response_policy = if (val.object.get("responsePolicy")) |policy| try parseResponsePolicy(policy) else ai.response_policy.Overrides{};
+        const overrides = if (val.object.get("responsePolicy")) |policy| try parseResponsePolicy(policy) else response_policy.Overrides{};
         var model: ProviderModel = .{
             .id = try gpa.dupe(u8, entry.key_ptr.*),
-            .response_policy = response_policy,
+            .response_policy = overrides,
             .reasoning = if (stringField(val, "reasoningEffort")) |effort|
-                if (reasoning_efforts_by_name.get(effort)) |e| .{ .effort = e } else .unset
+                // Unknown level: skip the override (lenient, forward-compatible),
+                // same leniency as the session-DB restore path.
+                if (ReasoningEffort.fromString(effort)) |e| .{ .effort = e } else |_| .unset
             else
                 .unset,
         };
@@ -1365,13 +1370,13 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
         }
         if (val.object.get("reasoningOptions")) |opts| {
             if (opts == .array) {
-                var list: std.ArrayList(ai.ReasoningEffort) = .empty;
+                var list: std.ArrayList(ReasoningEffort) = .empty;
                 errdefer list.deinit(gpa);
                 for (opts.array.items) |item| {
                     if (item != .string) continue;
-                    if (reasoning_efforts_by_name.get(item.string)) |e| {
-                        try list.append(gpa, e);
-                    }
+                    // Unknown level: skip the entry (lenient, forward-compatible).
+                    const effort = ReasoningEffort.fromString(item.string) catch continue;
+                    try list.append(gpa, effort);
                 }
                 if (list.items.len > 0) {
                     model.reasoning_options = try list.toOwnedSlice(gpa);
@@ -1473,19 +1478,6 @@ pub fn parseSemverMajor(s: []const u8) ?u32 {
     };
     return std.fmt.parseInt(u32, s[0..dot], 10) catch null;
 }
-
-const reasoning_efforts_by_name = std.StaticStringMap(ai.ReasoningEffort).initComptime(.{
-    .{ "default", .default },
-    .{ "minimal", .minimal },
-    .{ "low", .low },
-    .{ "none", .none },
-    .{ "medium", .medium },
-    .{ "high", .high },
-    .{ "xhigh", .xhigh },
-    // OpenRouter-specific top level (above `xhigh`); mirrors `ai.ReasoningEffort.max`
-    // so config can express every level the enum and the session DB already carry.
-    .{ "max", .max },
-});
 
 fn intField(value: std.json.Value, name: []const u8) ?i64 {
     const field = value.object.get(name) orelse return null;
@@ -2479,7 +2471,7 @@ test "parseFile is pure; merge hydrates model reasoningEffort from providers" {
     // Merging hydrates the active model against the parsed providers.
     var merged = try mergeLayers(gpa, &.{cfg});
     defer merged.deinit(gpa);
-    try std.testing.expectEqual(ai.ReasoningEffort.high, merged.model.?.reasoning.effort);
+    try std.testing.expectEqual(ReasoningEffort.high, merged.model.?.reasoning.effort);
 }
 
 test "parseObject: unknown provider resolves to openai_compatible custom" {
@@ -2552,7 +2544,7 @@ test "mergeLayers: later layer overrides earlier" {
     try std.testing.expectEqual(Provider.openai, merged.providerFromName().?);
     try std.testing.expectEqualStrings("http://layer2", merged.base_url.?);
     try std.testing.expectEqualStrings("m1", merged.model.?.id);
-    try std.testing.expectEqual(ai.ReasoningEffort.low, merged.model.?.reasoning.effort);
+    try std.testing.expectEqual(ReasoningEffort.low, merged.model.?.reasoning.effort);
 }
 
 test "mergeLayers: model is indivisible — higher layer's model replaces whole" {
@@ -2705,7 +2697,7 @@ test "mergeLayers: active model is hydrated from the merged provider list" {
 
     // Hydration runs once over the merged providers, so the cross-layer match
     // copies reasoning effort and base_url onto the chosen model.
-    try std.testing.expectEqual(ai.ReasoningEffort.medium, merged.model.?.reasoning.effort);
+    try std.testing.expectEqual(ReasoningEffort.medium, merged.model.?.reasoning.effort);
     try std.testing.expectEqualStrings("https://from-provider", merged.base_url.?);
 }
 
@@ -4342,9 +4334,9 @@ test "reasoningEffort max parses and survives reasoningOptions" {
     defer cfg.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
     const model = cfg.providers[0].models[0];
-    try std.testing.expectEqual(ai.ReasoningEffort.max, model.reasoning.effort);
+    try std.testing.expectEqual(ReasoningEffort.max, model.reasoning.effort);
     try std.testing.expectEqual(@as(usize, 2), model.reasoning_options.len);
-    try std.testing.expectEqual(ai.ReasoningEffort.max, model.reasoning_options[0]);
+    try std.testing.expectEqual(ReasoningEffort.max, model.reasoning_options[0]);
 }
 
 test "provider headers parse with validation and round-trip raw placeholders" {
