@@ -262,22 +262,12 @@ pub const AgentRuntime = struct {
         // `deinit` never runs, so exactly one of them applies.
         errdefer if (target.modelsdev_registry) |*reg| reg.deinit(gpa);
 
-        const db_backend = config.effectiveDatabaseBackend();
-        const db_url = config.effectiveDatabaseUrl();
-        const db_token = config.effectiveDatabaseAuthToken();
-        const db_path = config.effectiveDatabasePath();
-        const store: session_mod.SessionStore = genesis.session_store orelse .{
-            .kind = switch (db_backend) {
-                .local => .local_sqlite,
-                .zay_service => .remote_service,
-                .turso_http => .turso_http,
-                .d1_http => .d1_http,
-                .postgres_native => .postgres_native,
-            },
-            .url = db_url,
-            .token = db_token,
-            .path = db_path,
-        };
+        const store: session_mod.SessionStore = genesis.session_store orelse session_mod.SessionStore.fromDatabase(
+            config.effectiveDatabaseBackend(),
+            config.effectiveDatabaseUrl(),
+            config.effectiveDatabaseAuthToken(),
+            config.effectiveDatabasePath(),
+        );
 
         if (session_id) |id| {
             // Resume never falls back across stores: an unreachable remote

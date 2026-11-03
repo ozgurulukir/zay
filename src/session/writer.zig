@@ -60,7 +60,7 @@ pub const SessionWriter = struct {
         var manager = try SessionManager.initDefault(gpa, io, home_dir);
         errdefer manager.deinit();
         const session = try manager.create(cwd, .{});
-        try target.initWithSession(gpa, io, manager, session, capacity);
+        try target.initWithSessionAndStart(gpa, io, manager, session, capacity);
     }
 
     pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8, capacity: u32) Error!void {
@@ -70,7 +70,7 @@ pub const SessionWriter = struct {
         var manager = try SessionManager.initDefault(gpa, io, home_dir);
         errdefer manager.deinit();
         const session = try manager.@"resume"(session_id);
-        try target.initWithSession(gpa, io, manager, session, capacity);
+        try target.initWithSessionAndStart(gpa, io, manager, session, capacity);
     }
 
     /// Open the session store from an explicit store spec (INV-BACKEND: the
@@ -92,7 +92,7 @@ pub const SessionWriter = struct {
         var manager = try SessionManager.initStore(gpa, io, home_dir, store, host_id, true);
         errdefer manager.deinit();
         const session = try manager.create(cwd, .{});
-        try target.initWithSession(gpa, io, manager, session, queue_capacity_default);
+        try target.initWithSessionAndStart(gpa, io, manager, session, queue_capacity_default);
     }
 
     /// Resume through an explicit store spec. A configured remote store that
@@ -114,10 +114,17 @@ pub const SessionWriter = struct {
         var manager = try SessionManager.initStore(gpa, io, home_dir, store, host_id, false);
         errdefer manager.deinit();
         const session = try manager.@"resume"(session_id);
-        try target.initWithSession(gpa, io, manager, session, queue_capacity_default);
+        try target.initWithSessionAndStart(gpa, io, manager, session, queue_capacity_default);
     }
 
-    fn initWithSession(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
+    /// Mid-level constructor: build a writer over an existing manager +
+    /// session pair. Single home of the construction protocol that four
+    /// store-level constructors and every test used to hand-roll — most
+    /// importantly the `session.manager` backpointer repair, which compiled
+    /// fine when forgotten and failed at the first append (#297). Does NOT
+    /// start the writer thread; production store constructors follow with
+    /// `startWriterThread`, tests drive the writer synchronously.
+    pub fn initWithSession(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
         const queue = try gpa.alloc(QueuedEntry, capacity);
         errdefer gpa.free(queue);
         target.* = .{
@@ -132,7 +139,21 @@ pub const SessionWriter = struct {
         tool_results.maintain(&target.manager.backend, io, tool_results.nowMs(io)) catch |err| {
             log.warn("tool result maintenance failed err={s}", .{@errorName(err)});
         };
-        target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
+    }
+
+    /// Production store constructors: build via `initWithSession`, then
+    /// start the writer thread. The errdefer hands the queue back on a spawn
+    /// failure — `initWithSession`'s own errdefer is already discharged once
+    /// it returns, and the manager (still covered by the constructor's
+    /// errdefer) frees the session with it.
+    fn initWithSessionAndStart(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
+        try target.initWithSession(gpa, io, manager, session, capacity);
+        errdefer gpa.free(target.queue);
+        try target.startWriterThread();
+    }
+
+    fn startWriterThread(self: *SessionWriter) Error!void {
+        self.thread = try std.Thread.spawn(.{}, runWriter, .{self});
     }
 
     pub fn deinit(self: *SessionWriter) void {
@@ -468,14 +489,8 @@ test "session writer skill context projection and failed admission preserve stat
     const gpa = std.testing.allocator;
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     const session = try manager.create("/tmp/zay", .{});
-    var writer: SessionWriter = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .manager = manager,
-        .session = session,
-        .queue = try gpa.alloc(QueuedEntry, 4),
-    };
-    writer.session.manager = &writer.manager;
+    var writer: SessionWriter = undefined;
+    try writer.initWithSession(gpa, std.testing.io, manager, session, 4);
     defer writer.deinit();
     var ledger: SkillContext = .{};
     defer ledger.deinit(gpa);
@@ -512,14 +527,8 @@ fn testWriteFailure(kind: session_mod.BackendKind) !void {
     defer gpa.free(session_cwd);
     var manager = try SessionManager.init(gpa, io, ":memory:");
     const session = try manager.create(session_cwd, .{});
-    var writer: SessionWriter = .{
-        .gpa = gpa,
-        .io = io,
-        .manager = manager,
-        .session = session,
-        .queue = try gpa.alloc(QueuedEntry, 4),
-    };
-    writer.session.manager = &writer.manager;
+    var writer: SessionWriter = undefined;
+    try writer.initWithSession(gpa, io, manager, session, 4);
     defer writer.deinit();
     // A failed batch must stop the common writer for every HTTP backend.
     // Missing clients make the failure deterministic without real sockets.

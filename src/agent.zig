@@ -1998,14 +1998,8 @@ test "skill context metadata enqueue failure retains admitted activation and ret
     const gpa = std.testing.allocator;
     var manager = try session_mod.SessionManager.init(gpa, std.testing.io, ":memory:");
     const session = try manager.create("/tmp/zay", .{});
-    var writer: session_mod.SessionWriter = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .manager = manager,
-        .session = session,
-        .queue = try gpa.alloc(session_mod.QueuedEntry, 4),
-    };
-    writer.session.manager = &writer.manager;
+    var writer: session_mod.SessionWriter = undefined;
+    try writer.initWithSession(gpa, std.testing.io, manager, session, 4);
     defer writer.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
