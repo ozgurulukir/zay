@@ -16,7 +16,7 @@ pub fn countSubstring(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "countSubstring counts overlapping starts and zero-width edge cases" {
+test "countSubstring counts overlapping starts and the empty-haystack edge case" {
     try std.testing.expectEqual(@as(usize, 0), countSubstring("banana", "kiwi"));
     try std.testing.expectEqual(@as(usize, 1), countSubstring("banana", "b"));
     // Overlapping starts: "aa" hits at index 0 and 1.
