@@ -600,13 +600,7 @@ pub fn createParallelLane(self: *App) !void {
         runtime.deinit();
         self.gpa.destroy(runtime);
     }
-    // A lane's agent needs the App's shared handles (the lane bridge among
-    // them) so its own `lane` tool calls can reach the bridge. Mirrors the
-    // wiring in `createRuntime` for the primary/new/resume runtimes.
-    runtime.agent.lane_bridge = self.lane_bridge;
-    // A forked lane worker is root-contained: its bash tool refuses `cd` out
-    // of the worktree (L2), keeping its writes out of the main tree.
-    runtime.agent.contained = true;
+    lane_lifecycle.wireSpawnedAgent(self, runtime);
 
     const lane = try self.gpa.create(Thread);
     errdefer self.gpa.destroy(lane);

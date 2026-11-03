@@ -199,6 +199,35 @@ pub const Agent = struct {
     /// `tool_call_seq` is not in scope.
     text_tool_seq: u64 = 0,
 
+    /// The App-owned subsystems every live agent borrows, as ONE record
+    /// assigned at ONE seam (runtime construction). `attachSharedSubsystems`
+    /// is the only writer of the matching Agent fields; its `inline for` over
+    /// these fields makes a missing Agent counterpart a compile error, so the
+    /// wiring set cannot silently drift between runtime-creation sites (the
+    /// "sending request with NO tools" incident class). Null fields keep the
+    /// documented per-subsystem semantics: headless/tests run with the
+    /// feature disabled (no gate, builtin-only registry, no background path).
+    ///
+    /// The request limiter is shared by every lane's agent (turn, naming, and
+    /// compaction requests all gate on it), so the provider sees at most
+    /// `maxConcurrentRequests` requests in flight across all lanes.
+    pub const SharedSubsystems = struct {
+        background_manager: ?*background_mod.BackgroundManager = null,
+        mcp_manager: ?*mcp_mod.McpManager = null,
+        tool_registry: ?*tools.ToolRegistry = null,
+        plugin_manager: ?*lua_mod.PluginManager = null,
+        lane_bridge: ?*lane_bridge.LaneBridge = null,
+        request_limiter: ?*request_limiter_mod.RequestLimiter = null,
+    };
+
+    /// Sole writer of the shared-subsystem Agent fields. Idempotent: spawning
+    /// paths may call it again after `createRuntimeImpl` (same App pointers).
+    pub fn attachSharedSubsystems(self: *Agent, subsystems: SharedSubsystems) void {
+        inline for (std.meta.fields(SharedSubsystems)) |field| {
+            @field(self, field.name) = @field(subsystems, field.name);
+        }
+    }
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
         return .{
             .gpa = gpa,
@@ -3789,5 +3818,30 @@ test "skill command results neither activate instructions nor become loaded noti
         try std.testing.expectEqualStrings("Script result", agent.messages()[1].text());
         try std.testing.expectEqual(already_active, agent.skill_context.contains("how"));
         if (already_active) try std.testing.expectEqualStrings(fixture.body, agent.skill_context.body("how").?);
+    }
+}
+
+test "shared subsystems record mirrors the Agent fields it wires" {
+    // Compile-time parity: every SharedSubsystems field must have a
+    // same-named, same-typed Agent field, so the record and the fields it
+    // writes cannot drift apart. No runtime assertions — compiling IS the
+    // assertion.
+    inline for (std.meta.fields(Agent.SharedSubsystems)) |record_field| {
+        const matched = comptime blk: {
+            for (std.meta.fields(Agent)) |agent_field| {
+                if (std.mem.eql(u8, agent_field.name, record_field.name)) {
+                    if (agent_field.type != record_field.type) {
+                        @compileError("Agent." ++ record_field.name ++
+                            " type diverged from SharedSubsystems." ++ record_field.name);
+                    }
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (!matched) {
+            @compileError("SharedSubsystems." ++ record_field.name ++
+                " has no same-named Agent field");
+        }
     }
 }
