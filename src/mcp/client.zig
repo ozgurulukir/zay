@@ -312,12 +312,17 @@ pub const McpClient = struct {
     /// manager now constructs Transport unions directly via this path.
     pub fn initStdio(gpa: std.mem.Allocator, name: []const u8, command: []const u8, args: []const []const u8) !McpClient {
         var owned_args = try gpa.alloc([]u8, args.len);
+        var args_done: usize = 0;
         errdefer {
-            for (owned_args) |a| gpa.free(a);
+            // Free only the initialized prefix: when a dupe below fails, the
+            // tail of `owned_args` is still undefined and freeing it reads a
+            // garbage pointer (negative-space sweep test in mcp/manager.zig).
+            for (owned_args[0..args_done]) |a| gpa.free(a);
             gpa.free(owned_args);
         }
         for (args, 0..) |arg, i| {
             owned_args[i] = try gpa.dupe(u8, arg);
+            args_done += 1;
         }
         // Hoisted dupes: a failing `try` inside the struct literal would leave
         // the earlier copies stranded when the return never materializes.
