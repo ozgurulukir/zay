@@ -935,6 +935,27 @@ pub const App = struct {
         return mode_lifecycle.openCommandMenu(self);
     }
 
+    /// The sanctioned mode transition: flips `mode` and performs the
+    /// transition's input pairing (both input buffers clear — buffers belong
+    /// to the mode being left). State only: focus re-route stays at the
+    /// event-wrapper layer, which syncs through `lifecycle.transitionMode`
+    /// for the stock open/close/cancel actions or explicitly
+    /// (`lifecycle.submit`, `diff_lifecycle.closeDiff`). Outside this pair
+    /// and test fixtures, no code writes `mode` directly (#292: the
+    /// transition owns its follow-up duties).
+    pub fn setMode(self: *App, mode: App.Mode) void {
+        self.mode = mode;
+        self.clearInput();
+        self.clearPaletteInput();
+    }
+
+    /// Content-surviving variant for transitions where an input buffer IS
+    /// the content being edited across the flip (the palette text mirrored
+    /// in `syncModeWithInput`). Same contract as `setMode` otherwise.
+    pub fn setModeKeepInput(self: *App, mode: App.Mode) void {
+        self.mode = mode;
+    }
+
     // --- Transcript search (Ctrl+F / /search) -------------------------------
 
     pub fn openSearch(self: *App) !void {
@@ -1039,8 +1060,7 @@ pub const App = struct {
     }
 
     pub fn reportConnectionError(self: *App, err: anyerror) !void {
-        self.mode = .normal;
-        self.clearInput();
+        self.setMode(.normal);
         var buffer: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "Could not connect to provider: {s}", .{@errorName(err)}) catch "Could not connect to provider.";
         _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
@@ -1554,7 +1574,7 @@ pub const commands = [_]CommandEntry{
 };
 
 pub fn openMcp(app: *App) void {
-    app.mode = .mcp;
+    app.setMode(.mcp);
     app.pickers.mcp.reset();
     if (app.liveRuntime() != null) {
         // Sync servers and push the resulting tool schemas into the live client.
@@ -1565,18 +1585,14 @@ pub fn openMcp(app: *App) void {
             toast.global.push(.warn, "MCP sync failed — servers may be missing; see log");
         };
     }
-    app.clearInput();
-    app.clearPaletteInput();
 }
 
 pub fn closeMcp(app: *App) void {
-    app.mode = .normal;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 pub fn openPlugins(app: *App) void {
-    app.mode = .plugins;
+    app.setMode(.plugins);
     app.pickers.plugins.reset();
     app.pickers.plugins.view = .installed;
     app.pickers.plugins.adding = false;
@@ -1596,16 +1612,12 @@ pub fn openPlugins(app: *App) void {
         // Registration is an initRuntime-time and guarded-resume-time operation.
         provider_model.refreshMcpTools(app);
     }
-    app.clearInput();
-    app.clearPaletteInput();
 }
 
 pub fn closePlugins(app: *App) void {
-    app.mode = .normal;
     app.pickers.plugins.reset();
     app.input_buffers.plugin_store_url.clearRetainingCapacity();
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.normal);
 }
 
 /// Whether `entry` should appear in the palette given the current lane count.

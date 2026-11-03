@@ -80,9 +80,7 @@ pub fn beginSave(app: *App) !void {
 
     // Prompt for a commit message; `submitMode` calls `saveActiveLane` on
     // confirm. Prefill the lane title as an editable suggestion.
-    app.mode = .save_message;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.save_message);
     if (app.thread.title) |title| app.inputs.palette.insertSliceAtCursor(title) catch {};
 }
 
