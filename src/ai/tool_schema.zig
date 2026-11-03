@@ -15,6 +15,7 @@ const ai = @import("../ai.zig");
 const wire_json = @import("json.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
+const test_util = @import("../test_util.zig");
 
 /// The only structural difference between the two provider APIs: how a tool
 /// definition is wrapped. Chat Completions (`chat/completions`) nests the
@@ -394,27 +395,17 @@ test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale"
 
     // Her tool adı çıktıda tam olarak bir kez geçmeli — hiçbiri kesilmemiş.
     for (plugin_names) |name| {
-        try std.testing.expectEqual(@as(usize, 1), countSubstr(json, name));
+        try std.testing.expectEqual(@as(usize, 1), test_util.countSubstring(json, name));
     }
     for ([_][]const u8{ tools_mod.shellToolName, "lane", "background", "skill", "database" }) |builtin| {
         const needle = try std.fmt.allocPrint(gpa, "\"name\":\"{s}\"", .{builtin});
         defer gpa.free(needle);
-        try std.testing.expectEqual(@as(usize, 1), countSubstr(json, needle));
+        try std.testing.expectEqual(@as(usize, 1), test_util.countSubstring(json, needle));
     }
     for ([_][]const u8{ "mcp__tavily__search", "mcp__tavily__extract", "mcp__chrome-devtools__click" }) |mcp| {
-        try std.testing.expectEqual(@as(usize, 1), countSubstr(json, mcp));
+        try std.testing.expectEqual(@as(usize, 1), test_util.countSubstring(json, mcp));
     }
-    try std.testing.expectEqual(@as(usize, plugin_names.len + 5 + mcp_tools.len), countSubstr(json, "\"type\":\"function\""));
-}
-
-fn countSubstr(haystack: []const u8, needle: []const u8) usize {
-    var count: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, idx, needle)) |pos| {
-        count += 1;
-        idx = pos + 1;
-    }
-    return count;
+    try std.testing.expectEqual(@as(usize, plugin_names.len + 5 + mcp_tools.len), test_util.countSubstring(json, "\"type\":\"function\""));
 }
 
 test "tool_schema golden: byte-identical output for all envelope × strict combos" {
