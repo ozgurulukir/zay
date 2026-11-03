@@ -20,6 +20,7 @@ const bridge = @import("bridge.zig");
 const tool_snapshot = @import("tool_snapshot.zig");
 const Manifest = @import("manifest.zig").Manifest;
 const plugin_config = @import("../config/plugin.zig");
+const plugin_package = @import("../plugin_package.zig");
 
 /// True when `plugin_dir` is the same as `project_dir` or a subdirectory
 /// of it (separator-boundary checked — never a bare `startsWith`).
@@ -772,14 +773,11 @@ pub const PluginManager = struct {
         }
     }
 
-    /// Read and parse a plugin manifest from a directory.
+    /// Read and parse a plugin manifest from a directory — via the shared
+    /// package reader (#294): one manifest reader across manager/package, so
+    /// the no-follow + file-kind hardening is inherited, not re-earned.
     fn readManifest(self: *Self, dir_path: []const u8) !Manifest {
-        const manifest_path = try std.fs.path.join(self.allocator, &.{ dir_path, "plugin.lua" });
-        defer self.allocator.free(manifest_path);
-
-        const bytes = try self.readFileBytes(manifest_path);
-        defer self.allocator.free(bytes);
-        return @import("manifest.zig").evaluate(self.allocator, bytes);
+        return plugin_package.readManifest(self.allocator, self.io, dir_path);
     }
 
     /// Load a Lua file and execute it, leaving the result on the stack.
