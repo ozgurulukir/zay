@@ -18,6 +18,7 @@ const output_policy = @import("../tools/output_policy.zig");
 const compaction = @import("compaction.zig");
 const os = @import("../os.zig");
 const paths = @import("../paths.zig");
+const test_util = @import("../test_util.zig");
 const plugin_prompt = @import("../plugin_prompt.zig");
 const skill_mod = @import("../skill.zig");
 const SkillContext = @import("skill_context.zig").SkillContext;
@@ -1168,7 +1169,7 @@ test "assembleSystemPrompt injects skills and bounded plugin prompts" {
         defer gpa.free(body_needle);
         try std.testing.expect(std.mem.indexOf(u8, prompt, body_needle) != null);
     }
-    try std.testing.expectEqual(@as(usize, skill_names.len), countStr(prompt, "- **"));
+    try std.testing.expectEqual(@as(usize, skill_names.len), test_util.countSubstring(prompt, "- **"));
 }
 
 test "assembleSystemPrompt enforces aggregate project rule budget (128 KB)" {
@@ -1317,16 +1318,6 @@ test "user AGENTS.md consumes the shared aggregate budget before project rules" 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<user_instructions path=\"AGENTS.md\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<project_instructions path=\"AGENTS.md\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[project rule file omitted: .cursorrules exceeds aggregate rule budget (128 KB)]") != null);
-}
-
-fn countStr(haystack: []const u8, needle: []const u8) usize {
-    var count: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, idx, needle)) |pos| {
-        count += 1;
-        idx = pos + 1;
-    }
-    return count;
 }
 
 /// Writes `content` to `dir/filename` (parent dirs must already exist).

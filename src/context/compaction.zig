@@ -578,11 +578,23 @@ test "keepRecentTokens handles config_keep smaller than minimum floor" {
     try std.testing.expectEqual(@as(u32, 1_000), keepRecentTokens(2_000, 500));
 }
 
-test "contextWindowTokens is pure — same ModelInfo yields same result" {
+test "contextWindowTokens precedence: override wins, model window wins over zero-window fallback" {
+    // Explicit override beats every model-derived answer.
     const m: modelsdev.ModelInfo = .{ .id = "gpt-4o", .reasoning = false, .context_window = 128_000 };
-    const tokens1 = contextWindowTokens(m, null);
-    const tokens2 = contextWindowTokens(m, null);
-    try std.testing.expectEqual(tokens1, tokens2);
+    try std.testing.expectEqual(@as(u32, 77_000), contextWindowTokens(m, 77_000));
+    try std.testing.expectEqual(@as(u32, 77_000), contextWindowTokens(null, 77_000));
+
+    // A model with a known window returns it verbatim.
+    try std.testing.expectEqual(@as(u32, 128_000), contextWindowTokens(m, null));
+
+    // context_window = 0 (missing `limit` in api.json) falls back to the
+    // conservative default — compacts early rather than overshooting.
+    const zero_window: modelsdev.ModelInfo = .{ .id = "unknown", .reasoning = false, .context_window = 0 };
+    try std.testing.expectEqual(@as(u32, 128_000), contextWindowTokens(zero_window, null));
+
+    // No registry entry at all: same conservative default (the null-model
+    // case is also pinned against the constant by the swap tests above).
+    try std.testing.expectEqual(@as(u32, 128_000), contextWindowTokens(null, null));
 }
 
 test "summarizer system prompt is non-empty and small" {

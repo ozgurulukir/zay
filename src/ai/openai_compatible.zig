@@ -13,11 +13,9 @@ const transport_mod = @import("transport.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
+const test_util = @import("../test_util.zig");
 
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
-/// Upper bound on an error body we will decompress + log (matches the models
-/// client's cap). Prevents a hostile/garbage body from allocating unboundedly.
-const response_bytes_max: u32 = 1 * 1024 * 1024;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
@@ -685,14 +683,9 @@ test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byt
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
 }
 
+/// Named assertion helper: number of tool definitions in the wire JSON.
 fn countWireTools(tools_json: []const u8) usize {
-    var count: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, tools_json, idx, "\"type\":\"function\"")) |pos| {
-        count += 1;
-        idx = pos + 1;
-    }
-    return count;
+    return test_util.countSubstring(tools_json, "\"type\":\"function\"");
 }
 
 test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only cache fields differ" {
@@ -782,7 +775,7 @@ test "writeRequestPayload normalizes system messages for qwen model on minimal d
     const body = payload.written();
 
     // Exactly one system message, and it is the merged leading block.
-    const sys_count = countSubstring(body, "\"role\":\"system\"");
+    const sys_count = test_util.countSubstring(body, "\"role\":\"system\"");
     try std.testing.expectEqual(@as(usize, 1), sys_count);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "SYS_A") != null);
@@ -819,23 +812,11 @@ test "writeRequestPayload normalizes system messages and clips effort for vLLM-s
 
     // Single leading merged system block. The join newline is JSON-escaped in
     // the payload, so assert the escaped two-character `\n` sequence.
-    try std.testing.expectEqual(@as(usize, 1), countSubstring(body, "\"role\":\"system\""));
+    try std.testing.expectEqual(@as(usize, 1), test_util.countSubstring(body, "\"role\":\"system\""));
     try std.testing.expect(std.mem.indexOf(u8, body, "SYS_A\\nSYS_B") != null);
     // `high` is invalid for Qwen — clipped to `medium` even on the `.minimal`
     // dialect (dialect passes it through, the model layer clips it).
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
-}
-
-fn countSubstring(haystack: []const u8, needle: []const u8) usize {
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < haystack.len) : (i += 1) {
-        if (std.mem.indexOf(u8, haystack[i..], needle)) |idx| {
-            count += 1;
-            i += idx;
-        } else break;
-    }
-    return count;
 }
 
 test "readStream accepts an SSE line larger than the transfer buffer" {

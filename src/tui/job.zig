@@ -140,7 +140,7 @@ test "job cancel joins a blocked worker and discards the result" {
     try std.testing.expect(job.isDone());
 }
 
-test "adopt consumes the job: a fresh slot is required for the next run" {
+test "adopt yields the worker result and leaves the slot done — the owner must discard it" {
     const Ctx = struct {
         fn worker(_: *@This()) u32 {
             return 42;
@@ -156,10 +156,11 @@ test "adopt consumes the job: a fresh slot is required for the next run" {
         try std.testing.expect(spins < 10_000);
         std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     }
-    _ = job.adopt(std.testing.io);
+    const adopted = job.adopt(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 42), adopted);
 
-    // The slot is consumed -- a second spawn on it is a contract
-    // violation (Debug panics). The owning state discards the slot and
-    // builds a fresh one for the next run.
+    // Consumed: `done` stays true after adopt — the property that makes a
+    // second spawn on this slot a contract violation (Debug panics). The
+    // owning state discards the slot and builds a fresh one for the next run.
     try std.testing.expect(job.isDone());
 }

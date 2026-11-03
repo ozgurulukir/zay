@@ -114,7 +114,6 @@ pub const runToolForTest = impl.runToolForTest;
 pub const runContained = impl.runContained;
 pub const runContainedWithCancellation = impl.runContainedWithCancellation;
 pub const runBackground = impl.runBackground;
-pub const runCaptured = impl.runCaptured;
 pub const wantsBackground = impl.wantsBackground;
 pub const currentEnvMap = impl.currentEnvMap;
 pub const display_diff_begin = impl.display_diff_begin;
