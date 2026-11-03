@@ -401,10 +401,10 @@ pub const App = struct {
         errdefer gpa.destroy(manager);
         manager.* = .init(io, gpa);
         app.background = manager;
-        runtime.agent.background_manager = manager;
-        // mcp_manager pointer is set by the caller after `app` settles in its
-        // final stack frame — setting it here would dangle when `app` is
-        // returned by value.
+        // The primary agent's shared subsystems (this background manager
+        // among them) are armed by one attach in `run` after `app` settles
+        // in its final stack frame — &app.X here would dangle after
+        // return-by-value.
         app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
@@ -1057,6 +1057,21 @@ pub const App = struct {
         return session_switcher.createLaneRuntime(self, cwd, session_dir, session_id);
     }
 
+    /// The App-owned subsystems a freshly created runtime's agent borrows.
+    /// Call only on the App in its final stack frame: the record captures
+    /// `&self.mcp_manager` / `&self.plugin_manager`, which dangle after a
+    /// return-by-value.
+    pub fn sharedSubsystems(self: *App) agent_mod.Agent.SharedSubsystems {
+        return .{
+            .background_manager = self.background,
+            .mcp_manager = &self.mcp_manager,
+            .tool_registry = self.tool_registry,
+            .plugin_manager = &self.plugin_manager,
+            .lane_bridge = self.lane_bridge,
+            .request_limiter = self.request_limiter,
+        };
+    }
+
     pub fn clearInput(self: *App) void {
         input_lifecycle.clearInput(self);
     }
@@ -1369,13 +1384,9 @@ pub fn run(
     tui_style.setActive(tui_style.resolveTheme(config.theme));
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map, host_id);
-    // Set the manager pointers now that `app` is in its final stack frame.
+    // Arm the shared subsystems now that `app` is in its final stack frame.
     // Inside initRuntime, &app.X would dangle after return-by-value.
-    runtime.agent.mcp_manager = &app.mcp_manager;
-    runtime.agent.tool_registry = app.tool_registry;
-    runtime.agent.plugin_manager = &app.plugin_manager;
-    runtime.agent.lane_bridge = app.lane_bridge;
-    runtime.agent.request_limiter = app.request_limiter;
+    runtime.agent.attachSharedSubsystems(app.sharedSubsystems());
     app.bindInputCallbacks();
     defer app.deinit();
 
