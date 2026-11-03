@@ -113,6 +113,29 @@ pub const SessionStore = struct {
     url: ?[]const u8 = null,
     token: ?[]const u8 = null,
     path: ?[]const u8 = null,
+
+    /// Build the store spec from a config's resolved database settings — the
+    /// single site for the config→`BackendKind` vocabulary (was hand-copied
+    /// in root.zig auto-resume and runtime.zig initSession, #297).
+    pub fn fromDatabase(
+        backend_kind: @import("config/config.zig").DatabaseBackendKind,
+        url: ?[]const u8,
+        token: ?[]const u8,
+        path: ?[]const u8,
+    ) SessionStore {
+        return .{
+            .kind = switch (backend_kind) {
+                .local => .local_sqlite,
+                .zay_service => .remote_service,
+                .turso_http => .turso_http,
+                .d1_http => .d1_http,
+                .postgres_native => .postgres_native,
+            },
+            .url = url,
+            .token = token,
+            .path = path,
+        };
+    }
 };
 
 pub const resolveHostId = backend_mod.resolveHostId;
@@ -121,6 +144,13 @@ pub const SessionManager = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     backend: SessionBackend,
+    /// Local-store SQLite handle. For remote backends (remote_service,
+    /// turso_http, d1_http) this is a throwaway `:memory:` placeholder kept
+    /// only so the field is never undefined — `backend` is the sole real I/O
+    /// surface there. Local-only helpers may prepare on it; anything that can
+    /// run against a remote manager must go through `backend` (lane_manifest
+    /// opens its own local manager for exactly this reason). Distinguishable
+    /// by `backend.kind == .local_sqlite` (#297).
     connection: db.Connection,
     host_id: []const u8,
 
@@ -1943,15 +1973,9 @@ test "request usage metadata is durable but never projected into model history" 
     defer gpa.free(session_cwd);
     var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
     const session = try manager.create(session_cwd, .{});
-    var writer: SessionWriter = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .manager = manager,
-        .session = session,
-        .queue = try gpa.alloc(session_type.QueuedEntry, 4),
-    };
+    var writer: SessionWriter = undefined;
+    try writer.initWithSession(gpa, std.testing.io, manager, session, 4);
     defer writer.deinit();
-    writer.session.manager = &writer.manager;
     try writer.recordUsage(.{ .input_tokens = 68000, .output_tokens = 40, .total_tokens = 68040 });
     const entries = try writer.entries(gpa);
     defer {

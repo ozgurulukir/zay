@@ -220,20 +220,12 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // lookup logs — "no resume" must stay distinguishable from "resume
     // lookup failed" in zay.log.
     const resume_session_id = blk: {
-        const db_backend = load_result.config.effectiveDatabaseBackend();
-        const session_backend_kind: ?session.BackendKind = switch (db_backend) {
-            .local => .local_sqlite,
-            .zay_service => .remote_service,
-            .turso_http => .turso_http,
-            .d1_http => .d1_http,
-            .postgres_native => .postgres_native,
-        };
-        const store = session.SessionStore{
-            .kind = session_backend_kind,
-            .url = load_result.config.effectiveDatabaseUrl(),
-            .token = load_result.config.effectiveDatabaseAuthToken(),
-            .path = load_result.config.effectiveDatabasePath(),
-        };
+        const store = session.SessionStore.fromDatabase(
+            load_result.config.effectiveDatabaseBackend(),
+            load_result.config.effectiveDatabaseUrl(),
+            load_result.config.effectiveDatabaseAuthToken(),
+            load_result.config.effectiveDatabasePath(),
+        );
         var manager = session.SessionManager.initStore(
             runtime_gpa,
             init.io,
