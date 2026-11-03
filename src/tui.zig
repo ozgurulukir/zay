@@ -1160,7 +1160,7 @@ pub const App = struct {
     }
 
     pub fn createParallelLane(self: *App) !void {
-        try lifecycle.createParallelLane(self);
+        try lane_lifecycle.createParallelLane(self);
     }
 
     pub fn captureLaneContext(self: *App, lane: *Thread, max: usize) ![][]u8 {
@@ -1491,23 +1491,23 @@ pub const RootWidget = struct {
     // --- Diff viewer ------------------------------------------------------
 
     pub fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        try lifecycle.handleDiffViewerEvent(self, ctx, key);
+        try diff_lifecycle.handleDiffViewerEvent(self, ctx, key);
     }
 
     fn handleDiffBrowseKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        try lifecycle.handleDiffBrowseKey(self, ctx, key);
+        try diff_lifecycle.handleDiffBrowseKey(self, ctx, key);
     }
 
     fn handleDiffSearchKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        try lifecycle.handleDiffSearchKey(self, ctx, key);
+        try diff_lifecycle.handleDiffSearchKey(self, ctx, key);
     }
 
     fn handleDiffCommentKey(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-        try lifecycle.handleDiffCommentKey(self, ctx, key);
+        try diff_lifecycle.handleDiffCommentKey(self, ctx, key);
     }
 
     fn closeDiff(self: *RootWidget, ctx: *vxfw.EventContext, send: bool) !void {
-        try lifecycle.closeDiff(self, ctx, send);
+        try diff_lifecycle.closeDiff(self, ctx, send);
     }
 };
 
