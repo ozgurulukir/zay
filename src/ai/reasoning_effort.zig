@@ -34,6 +34,18 @@ pub const ReasoningEffort = enum {
     pub fn fromString(text: []const u8) !ReasoningEffort {
         return std.meta.stringToEnum(ReasoningEffort, text) orelse error.InvalidReasoningEffort;
     }
+
+    /// Comma-joined vocabulary for diagnostics ("default,minimal,...,max").
+    /// Config parse warnings name the accepted set so a typo'd user config
+    /// explains itself instead of silently falling back.
+    pub const label_csv: []const u8 = blk: {
+        var names: []const u8 = "";
+        for (std.meta.fields(ReasoningEffort), 0..) |field, i| {
+            if (i > 0) names = names ++ ",";
+            names = names ++ field.name;
+        }
+        break :blk names;
+    };
 };
 
 test "ReasoningEffort.fromString round-trips labels and rejects unknowns" {

@@ -1254,7 +1254,7 @@ fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provi
         if (headers_value == .object) out.headers = try parseProviderHeaders(gpa, headers_value);
     }
     if (value.object.get("models")) |models_value| {
-        if (models_value == .object) out.models = try parseProviderModels(gpa, models_value);
+        if (models_value == .object) out.models = try parseProviderModels(gpa, name, models_value);
     }
     return out;
 }
@@ -1341,7 +1341,7 @@ fn writeHeaderMap(writer: *std.Io.Writer, headers: []const McpHeader) !void {
     try writer.writeByte('}');
 }
 
-fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderModel {
+fn parseProviderModels(gpa: std.mem.Allocator, provider_name: []const u8, value: std.json.Value) ![]ProviderModel {
     var models: std.ArrayList(ProviderModel) = .empty;
     errdefer {
         for (models.items) |*model| model.deinit(gpa);
@@ -1355,12 +1355,23 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
         var model: ProviderModel = .{
             .id = try gpa.dupe(u8, entry.key_ptr.*),
             .response_policy = overrides,
-            .reasoning = if (stringField(val, "reasoningEffort")) |effort|
-                // Unknown level: skip the override (lenient, forward-compatible),
-                // same leniency as the session-DB restore path.
-                if (ReasoningEffort.fromString(effort)) |e| .{ .effort = e } else |_| .unset
-            else
-                .unset,
+            .reasoning = blk: {
+                // Unknown level: keep semantics (lenient, forward-compatible —
+                // a config written by a newer Zay must stay loadable), but warn
+                // so the fallback is never silent (#304). `.unset` resolves to
+                // `.medium` at runtime.
+                if (stringField(val, "reasoningEffort")) |effort| {
+                    if (ReasoningEffort.fromString(effort)) |e| {
+                        break :blk .{ .effort = e };
+                    } else |_| {}
+                    log.warn("config.providers.{s}.models.{s}.reasoningEffort: unknown value \"{s}\" — accepted: {s}; keeping unset (medium at runtime)", .{ provider_name, entry.key_ptr.*, effort, ReasoningEffort.label_csv });
+                    break :blk .unset;
+                }
+                if (val.object.get("reasoningEffort") != null) {
+                    log.warn("config.providers.{s}.models.{s}.reasoningEffort: expected a string; keeping unset (medium at runtime)", .{ provider_name, entry.key_ptr.* });
+                }
+                break :blk .unset;
+            },
         };
         if (u32field(val, "contextWindow")) |v| {
             if (v >= context_window_floor_tokens) model.context_window = v;
@@ -1369,17 +1380,39 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
             if (v >= 1) model.max_output_tokens = v;
         }
         if (val.object.get("reasoningOptions")) |opts| {
-            if (opts == .array) {
+            // The model itself is still appended in every branch below — a
+            // malformed restriction degrades to "no restriction" (with a
+            // warn), it never drops the model entry.
+            options: {
+                if (opts != .array) {
+                    log.warn("config.providers.{s}.models.{s}.reasoningOptions: expected an array of strings — the reasoning restriction is ignored and every effort is offered", .{ provider_name, entry.key_ptr.* });
+                    break :options;
+                }
                 var list: std.ArrayList(ReasoningEffort) = .empty;
                 errdefer list.deinit(gpa);
+                var dropped_count: usize = 0;
                 for (opts.array.items) |item| {
-                    if (item != .string) continue;
-                    // Unknown level: skip the entry (lenient, forward-compatible).
-                    const effort = ReasoningEffort.fromString(item.string) catch continue;
+                    if (item != .string) {
+                        dropped_count += 1;
+                        log.warn("config.providers.{s}.models.{s}.reasoningOptions: dropping non-string entry — accepted: {s}", .{ provider_name, entry.key_ptr.*, ReasoningEffort.label_csv });
+                        continue;
+                    }
+                    // Unknown level: drop the entry (lenient, forward-compatible),
+                    // but say so — a fully-dropped list widens the picker (#304).
+                    const effort = ReasoningEffort.fromString(item.string) catch {
+                        dropped_count += 1;
+                        log.warn("config.providers.{s}.models.{s}.reasoningOptions: dropping unknown value \"{s}\" — accepted: {s}", .{ provider_name, entry.key_ptr.*, item.string, ReasoningEffort.label_csv });
+                        continue;
+                    };
                     try list.append(gpa, effort);
                 }
                 if (list.items.len > 0) {
                     model.reasoning_options = try list.toOwnedSlice(gpa);
+                } else if (dropped_count > 0) {
+                    // Every entry was invalid: the parsed list is empty and
+                    // `activeReasoningOptions` falls back to the full
+                    // vocabulary. That is a decision the user must see.
+                    log.warn("config.providers.{s}.models.{s}.reasoningOptions: no valid entries — the reasoning restriction is ignored and every effort is offered", .{ provider_name, entry.key_ptr.* });
                 }
             }
         }
@@ -4337,6 +4370,61 @@ test "reasoningEffort max parses and survives reasoningOptions" {
     try std.testing.expectEqual(ReasoningEffort.max, model.reasoning.effort);
     try std.testing.expectEqual(@as(usize, 2), model.reasoning_options.len);
     try std.testing.expectEqual(ReasoningEffort.max, model.reasoning_options[0]);
+}
+
+test "unknown reasoningEffort stays unset — lenient but the vocabulary is pinned" {
+    // #304 decision: warn + keep semantics. An unknown scalar (typo, or a
+    // level written by a newer Zay) must not fail config load (forward
+    // compatibility); it parses to `.unset`, which resolves to `.medium` at
+    // runtime — and parse.zig logs a warn naming the accepted vocabulary.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", "{\"providers\":{\"openai\":{\"models\":{\"gpt-5\":{\"reasoningEffort\":\"hight\"}}}}}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    const model = cfg.providers[0].models[0];
+    try std.testing.expectEqual(ReasoningSetting.unset, model.reasoning);
+
+    // The vocabulary the warn names must match the enum exactly — a literal
+    // pin, so both an enum addition and a join-order change fail loudly.
+    try std.testing.expectEqualStrings("default,minimal,low,none,medium,high,xhigh,max", ReasoningEffort.label_csv);
+}
+
+test "reasoningOptions drops unknown entries; an all-invalid list means no restriction" {
+    // #304 decision: lenient-with-warning for the list. Valid entries
+    // survive alongside dropped ones; when every entry is invalid the list
+    // stays empty, which widens the picker to the full vocabulary — parse
+    // warns for both the drops and the widening.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "<test>", "{\"providers\":{\"openai\":{\"models\":{\"m\":{\"reasoningOptions\":[\"high\",\"hight\",\"max\"]}}}}}", &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    const model = cfg.providers[0].models[0];
+    try std.testing.expectEqual(@as(usize, 2), model.reasoning_options.len);
+    try std.testing.expectEqual(ReasoningEffort.high, model.reasoning_options[0]);
+    try std.testing.expectEqual(ReasoningEffort.max, model.reasoning_options[1]);
+
+    // All-invalid: empty list → no restriction (widens), still a parse
+    // success — same forward-compatibility contract as the scalar case.
+    var sink2: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink2.items) |*d| d.deinit(gpa);
+        sink2.deinit(gpa);
+    }
+    var cfg2 = try parseFile(gpa, "<test>", "{\"providers\":{\"openai\":{\"models\":{\"m\":{\"reasoningOptions\":[\"hight\",\"turbo\"]}}}}}", &sink2);
+    defer cfg2.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink2.items.len);
+    const model2 = cfg2.providers[0].models[0];
+    try std.testing.expect(model2.reasoning_options.len == 0);
 }
 
 test "provider headers parse with validation and round-trip raw placeholders" {
