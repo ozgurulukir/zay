@@ -596,9 +596,7 @@ pub const Agent = struct {
     /// The typed seam consumers attach to receive `Agent.Event`s. Generic
     /// over the consumer's context type — the `*Ctx` is supplied at the call
     /// site, so callbacks receive their own typed context without
-    /// `@ptrCast`. `nullListener(Ctx)` is the branch-free default for
-    /// callers that don't subscribe; the `Ctx` type is supplied by the
-    /// caller.
+    /// `@ptrCast`. The `Ctx` type is supplied by the caller.
     pub fn Listener(Ctx: type) type {
         return struct {
             ctx: *Ctx,
@@ -609,17 +607,6 @@ pub const Agent = struct {
             }
         };
     }
-
-    /// Build a no-op `Listener(Ctx)`. The ctx pointer is left undefined —
-    /// the callback ignores its argument.
-    pub fn nullListener(Ctx: type) Listener(Ctx) {
-        return .{
-            .ctx = undefined,
-            .on_event = onNothingCtx,
-        };
-    }
-
-    fn onNothingCtx(_: *anyopaque, _: Event) anyerror!void {}
 
     pub fn run(self: *Agent, listener: anytype) !void {
         // Keep the loaded plugin generation alive through the entire turn,
@@ -1359,10 +1346,6 @@ pub const Agent = struct {
         return calls;
     }
 
-    fn collectToolCalls(self: *Agent, assistant: ai.ChatMessage) ![]ai.ToolCall {
-        return self.collectToolCallsAlloc(self.gpa, assistant);
-    }
-
     /// T3: scan the assistant message's text blocks for tool calls a model
     /// emitted as literal text (weak function-calling models do this). Returns
     /// a freshly-allocated `[]ai.ToolCall` (possibly empty) whose element
@@ -1395,7 +1378,7 @@ pub const Agent = struct {
     /// Ownership contract: the recovered `ToolCall`s' owned strings
     /// (call_id/name/arguments) are MOVED into the new blocks — callers must
     /// NOT free those strings, only the `recovered` slice shell. This mirrors
-    /// `collectToolCalls`'s aliasing contract (slice shell caller-freed,
+    /// `collectToolCallsAlloc`'s aliasing contract (slice shell caller-freed,
     /// element strings belong to the message). Existing blocks keep their
     /// strings — only the slice shell is reallocated.
     fn injectRecoveredToolCalls(self: *Agent, assistant: *ai.ChatMessage, recovered: []ai.ToolCall) !void {
@@ -2198,8 +2181,8 @@ test "injectRecoveredToolCalls appends without dropping existing blocks" {
     try std.testing.expect(assistant.assistant.content[1] == .tool_call);
     try std.testing.expectEqualStrings("bash", assistant.assistant.content[1].tool_call.name);
 
-    // collectToolCalls now sees the recovered call (the turn-loop window).
-    const recollected = try agent.collectToolCalls(assistant);
+    // collectToolCallsAlloc now sees the recovered call (the turn-loop window).
+    const recollected = try agent.collectToolCallsAlloc(gpa, assistant);
     defer gpa.free(recollected);
     try std.testing.expectEqual(@as(usize, 1), recollected.len);
     try std.testing.expectEqualStrings("bash", recollected[0].name);
@@ -2223,7 +2206,7 @@ test "T3 turn-loop window: zero structured calls + text recovery yields executab
     defer assistant.deinit(gpa);
 
     // Step 1: collect — zero structured calls.
-    const initial = try agent.collectToolCalls(assistant);
+    const initial = try agent.collectToolCallsAlloc(gpa, assistant);
     defer gpa.free(initial);
     try std.testing.expectEqual(@as(usize, 0), initial.len);
 
