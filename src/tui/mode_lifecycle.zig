@@ -137,6 +137,22 @@ pub fn cancelMode(app: *App) !bool {
 /// lanes never enter this branch — the primary is always live, and a live
 /// worker carries a runtime, so `liveRuntime() == null` only on a focused
 /// idle lane (`lane create` / a rested worker).
+/// The mode→runtime-boundary classifier — the single classifier home
+/// (#292): this exhaustive switch, `commandNeedsRuntime`'s exhaustive
+/// command switch below, and the `refuseOnIdleLane` predicate all answer
+/// "what does this mode/command need from the runtime" in one module.
+/// `App.isRuntimeBound` delegates here; `closeRuntimeBoundOverlays` gates
+/// on it when the focused lane parks. Wiring a new runtime-deref mode?
+/// Update this switch — the `runtime-bound mode set is exhaustive and
+/// stable` test pins the set, and `closeRuntimeBoundOverlays closes
+/// exactly the runtime-bound set` pins the sweep's behavior.
+pub fn isRuntimeBound(mode: App.Mode) bool {
+    return switch (mode) {
+        .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
+        .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker => false,
+    };
+}
+
 fn refuseOnIdleLane(app: *App) bool {
     return lanes_util.requireLiveRuntime(app) == null;
 }
@@ -1013,6 +1029,31 @@ test "runtime-bound mode set is exhaustive and stable" {
     }
     try std.testing.expectEqual(@as(u32, 5), bound);
     try std.testing.expectEqual(@as(u32, 10), free);
+}
+
+test "closeRuntimeBoundOverlays closes exactly the runtime-bound set" {
+    // Behavioral pin for the sweep (#292): the classification set above
+    // stays honest only if `closeRuntimeBoundOverlays` ACTS on exactly that
+    // set — closes (with the park notice) every runtime-bound mode and
+    // leaves every runtime-free mode open.
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    for (std.enums.values(App.Mode)) |m| {
+        app.mode = m;
+        const closed = closeRuntimeBoundOverlays(&app, "lane-under-test");
+        if (App.isRuntimeBound(m)) {
+            try std.testing.expect(closed);
+            try std.testing.expectEqual(App.Mode.normal, app.mode);
+        } else {
+            try std.testing.expect(!closed);
+            try std.testing.expectEqual(m, app.mode);
+        }
+        app.mode = .normal;
+    }
 }
 
 test "submitMode keeps the session picker open on InFlightTurn" {
