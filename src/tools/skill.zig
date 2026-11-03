@@ -10,6 +10,7 @@ const common = @import("common.zig");
 const skill_mod = @import("../skill.zig");
 const paths = @import("../paths.zig");
 const shell = if (@import("../os.zig").is_windows) @import("pwsh.zig") else @import("bash.zig");
+const bash_safety = @import("bash_safety.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.skill_tool);
@@ -157,7 +158,15 @@ pub fn runTool(
                 .env = .{ .ZAY_WORKSPACE_CWD = workspace },
             }, .{});
             defer gpa.free(shell_args);
-            return shell.runContainedWithCancellation(gpa, io, root, shell_args, null, env.ctx.cancel_requested);
+            // #295: the classification gate's mint arrives through the tool
+            // context — the executor sets it for the duration of each
+            // dispatch after its skill branch classified the coerced command.
+            // The registry `Tool.run` signature cannot carry the token as a
+            // parameter, so the context slot is the proof-of-classification
+            // channel; a null slot means the caller bypassed the gate, and
+            // the null default refuses it (fail closed, review of #312).
+            const gate_mint = env.ctx.shell_gate_mint orelse return error.UnclassifiedSkillCommandRun;
+            return shell.runContainedWithCancellation(gpa, io, root, shell_args, null, env.ctx.cancel_requested, gate_mint);
         }
         const stdout = if (args.resource) |resource|
             readResource(gpa, io, skill, resource) catch |err| {
@@ -281,10 +290,19 @@ test "skill command executes a script and assets from its registered cwd" {
         .base_dir = root_buf[0..root_len],
         .body = @constCast("Instructions"),
     }};
-    var ctx: common.ToolContext = .{ .skills = &skills };
+    var ctx: common.ToolContext = .{
+        .skills = &skills,
+        // Command mode runs only on the gate's mint (#295). The executor
+        // sets it per dispatch; tests stand in for the executor here.
+        .shell_gate_mint = bash_safety.mintClassified("executor-mint-fixture"),
+    };
     const command = if (windows) "& ./scripts/check.ps1 'argument with spaces'" else "bash scripts/check.sh 'argument with spaces'";
     const json = try std.json.Stringify.valueAlloc(gpa, .{ .name = "review", .command = command }, .{});
     defer gpa.free(json);
+    // Fail-closed red test (#295): a command-mode run WITHOUT the gate mint
+    // is refused before any process spawns.
+    var ungated_ctx: common.ToolContext = .{ .skills = &skills };
+    try std.testing.expectError(error.UnclassifiedSkillCommandRun, runTool(gpa, io, workspace, json, .{ .ctx = &ungated_ctx }));
     var output = try runTool(gpa, io, workspace, json, .{ .ctx = &ctx });
     defer output.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 0), output.code);

@@ -303,10 +303,10 @@ pub const ExecutorService = struct {
         }
         for (calls, 0..) |call, i| {
             try observer.on_started(observer.ctx, call);
-            if (try self.shouldRejectUnsafeShell(call, observer)) {
-                results[i] = try self.runRejected(call);
-            } else {
-                results[i] = try self.runOne(call);
+            switch (try self.shouldRejectUnsafeShell(call, observer)) {
+                .rejected => |reason| results[i] = try self.runRejected(call, reason),
+                .allowed => |classified| results[i] = try self.runOne(call, classified),
+                .defer_to_dispatch => results[i] = try self.runOne(call, null),
             }
             initialized = i + 1;
             try observer.on_finished(observer.ctx, &results[i]);
@@ -332,27 +332,39 @@ pub const ExecutorService = struct {
         lua_mod.bridge.plugin_cwd_slot = self.cwd;
     }
 
-    fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !bool {
+    fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !executor_safety.Outcome {
+        const skill_unverifiable_reason = "The skill's directory could not be verified, so its command was refused before classification.";
         if (std.mem.eql(u8, call.name, "skill")) {
             // Safety must inspect the same numeric coercions that dispatch accepts.
             var validation_info = try executor_validation.validateAndCoerceCallArgs(self.scratch_allocator, @import("tools/skill.zig").tool.schema, call);
             defer validation_info.deinit(self.scratch_allocator);
-            if (!validation_info.validation.isValid()) return false;
+            if (!validation_info.validation.isValid()) return .defer_to_dispatch;
             var effective = call;
             effective.arguments = validation_info.args;
             var args = @import("tools/skill.zig").parseArgs(self.gpa, effective.arguments) catch |err| {
                 if (err == error.OutOfMemory) return err;
-                return false;
+                return .defer_to_dispatch;
             };
             defer args.deinit(self.gpa);
-            if (args.command == null) return false;
-            const skill = skill_mod.find(self.ctx.skills, args.name) orelse return false;
+            if (args.command == null) return .defer_to_dispatch;
+            const skill = skill_mod.find(self.ctx.skills, args.name) orelse return .defer_to_dispatch;
+            // Fail closed (#295): a skill whose directory cannot be verified
+            // must not have its command run — dispatch re-realpaths and its
+            // own structured error covers persistent failures, but deferring
+            // here would let a TRANSIENT gate failure run the command with
+            // no classification and no approval prompt.
             const root = std.Io.Dir.realPathFileAlloc(.cwd(), self.io, skill.base_dir, self.gpa) catch |err| {
                 if (err == error.OutOfMemory) return err;
-                return false;
+                return .{ .rejected = skill_unverifiable_reason };
             };
             defer self.gpa.free(root);
-            return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.ctx.bash_classifier_url, root, effective, observer);
+            const outcome = try executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.ctx.bash_classifier_url, root, effective, observer);
+            // An allowed token borrows `effective.arguments` — a scratch copy
+            // that dies with `validation_info`. Re-anchor it on the original
+            // call args, which live for the whole batch and coerce to the
+            // same command at dispatch.
+            if (outcome == .allowed) return .{ .allowed = executor_safety.mintClassified(call.arguments) };
+            return outcome;
         }
         return executor_safety.shouldRejectUnsafeShell(self.gpa, self.io, self.ctx.bash_classifier_url, self.cwd, call, observer);
     }
@@ -362,8 +374,10 @@ pub const ExecutorService = struct {
     /// channels (builtin / plugin / MCP): an invalid call returns a structured
     /// validation error to the model instead of letting the tool run on garbage
     /// input. Unknown tools (no schema) skip validation and dispatch — they
-    /// already fail in `produceOutput`.
-    fn runOne(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+    /// already fail in `produceOutput`. `classified` carries the gate's mint
+    /// for a shell call it approved (null for every other tool, and for
+    /// calls the gate deferred to dispatch).
+    fn runOne(self: *ExecutorService, call: ai.ToolCall, classified: ?executor_safety.ClassifiedCommand) !ToolResult {
         if (self.resolveSchema(call)) |schema| {
             var validation_info = try executor_validation.validateAndCoerceCallArgs(self.scratch_allocator, schema, call);
             defer validation_info.deinit(self.scratch_allocator);
@@ -377,9 +391,9 @@ pub const ExecutorService = struct {
             // buffer stays alive for the duration of dispatch.
             var effective = call;
             effective.arguments = validation_info.args;
-            return self.dispatchCall(effective);
+            return self.dispatchCall(effective, classified);
         }
-        return self.dispatchCall(call);
+        return self.dispatchCall(call, classified);
     }
 
     /// Resolve the `tools.Schema` for a call across all three channels.
@@ -392,12 +406,21 @@ pub const ExecutorService = struct {
     /// manager; plugin, builtin, AND MCP calls all share the registry-backed
     /// path (MCP tools are materialized as `Tool` records by
     /// `mcp/registry_bridge.zig` and synced into the registry on connect).
-    fn dispatchCall(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+    fn dispatchCall(self: *ExecutorService, call: ai.ToolCall, classified: ?executor_safety.ClassifiedCommand) !ToolResult {
+        // Registry-dispatched tools can't receive the gate's mint as a
+        // parameter (the fixed `Tool.run` signature), so it travels through
+        // the tool context for the duration of this dispatch and is cleared
+        // after — the skill tool's command mode refuses to run without it
+        // (#295). The direct contained shell path passes the mint
+        // positionally inside `produceOutput`; the slot is only the
+        // registry-boundary channel.
+        self.ctx.shell_gate_mint = classified;
+        defer self.ctx.shell_gate_mint = null;
         // Plugin and builtin tool calls share one path: the registry's
         // `all` slice backs a single lookup, and the matched tool's `run`
         // callback routes through whatever `userdata` it carries (bash
         // ignores it, plugins carry their `(manager, plugin, tool)` key).
-        var output = self.produceOutput(call) catch |err| switch (err) {
+        var output = self.produceOutput(call, classified) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             else => return self.runFailure(call, err),
@@ -549,18 +572,22 @@ pub const ExecutorService = struct {
     /// and everything else through the tool registry (builtin + plugin, looked
     /// up in one shot). Tool context (background manager, lane bridge, skills,
     /// plugin manager) reaches the tool through `Env.ctx` — no ambient state.
-    fn produceOutput(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
+    fn produceOutput(self: *ExecutorService, call: ai.ToolCall, classified: ?executor_safety.ClassifiedCommand) tools.Error!tools.Output {
         if (self.contained) {
             // Lane worker: route through `runContained`, which prepends the
             // shell containment guard before running (background or foreground).
             // This bypasses the registry so the fixed `Tool.run` signature —
             // shared with plugins — stays untouched.
             if (std.mem.eql(u8, call.name, tools.shell_tool.name)) {
+                // The contained runners require classified input (#295): a
+                // shell call here without the gate's mint means the approval
+                // gate was bypassed — refuse loudly instead of running.
+                const gate_mint = classified orelse return error.UnclassifiedContainedRun;
                 const background_ctx: ?shell_impl.BackgroundCtx = if (self.ctx.background_manager) |manager|
                     .{ .manager = manager, .owner_generation = self.ctx.owner_generation }
                 else
                     null;
-                return shell_impl.runContainedWithCancellation(self.gpa, self.io, self.cwd, call.arguments, background_ctx, self.ctx.cancel_requested);
+                return shell_impl.runContainedWithCancellation(self.gpa, self.io, self.cwd, call.arguments, background_ctx, self.ctx.cancel_requested, gate_mint);
             }
         }
         if (self.ctx.background_manager) |manager| {
@@ -646,13 +673,12 @@ pub const ExecutorService = struct {
         return self.runErrorResult(call, content);
     }
 
-    fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
-        const message = "The tool call was rejected by the user for being unsafe. Try something else.";
+    fn runRejected(self: *ExecutorService, call: ai.ToolCall, reason: []const u8) !ToolResult {
         var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
-        const content = try self.gpa.dupe(u8, message);
+        const content = try self.gpa.dupe(u8, reason);
         errdefer self.gpa.free(content);
-        const display_body = try self.gpa.dupe(u8, message);
+        const display_body = try self.gpa.dupe(u8, reason);
         errdefer self.gpa.free(display_body);
         return try ToolResult.init(self.gpa, .{
             .call_id = call.call_id.slice(),
@@ -822,7 +848,7 @@ test "executor rejected shell result is failed and model-facing" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runRejected(call);
+    var result = try executor.runRejected(call, "The tool call was rejected by the user for being unsafe. Try something else.");
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expectEqualStrings("The tool call was rejected by the user for being unsafe. Try something else.", result.content);
@@ -891,7 +917,7 @@ test "ExecutorService shouldRejectUnsafeShell consults the approval hook" {
         gpa.free(non_bash_call.name);
         gpa.free(non_bash_call.arguments);
     }
-    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(non_bash_call, observer)));
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(non_bash_call, observer)) == .defer_to_dispatch);
 
     // 2. The local matcher flags `rm -rf /` unsafe and the observer declines
     //    => the call is rejected.
@@ -906,11 +932,11 @@ test "ExecutorService shouldRejectUnsafeShell consults the approval hook" {
         gpa.free(unsafe_call.arguments);
     }
     ctx.should_approve = false;
-    try std.testing.expect(try executor.shouldRejectUnsafeShell(unsafe_call, observer));
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(unsafe_call, observer)) == .rejected);
 
     // 3. Same unsafe call, but the observer approves => allowed.
     ctx.should_approve = true;
-    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(unsafe_call, observer)));
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(unsafe_call, observer)) == .allowed);
 }
 
 test "skill command uses shell approvals and preserves the lane workspace" {
@@ -962,11 +988,11 @@ test "skill command uses shell approvals and preserves the lane workspace" {
     var coerced_call = try makeCall(gpa, "coerced", "skill", "{\"name\":\"review\",\"command\":\"rm -rf /\",\"timeout\":\"30\"}");
     defer coerced_call.deinit(gpa);
     // Check the safety gate directly so a regression cannot execute this command.
-    try std.testing.expect(try executor.shouldRejectUnsafeShell(coerced_call, observer));
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(coerced_call, observer)) == .rejected);
     try std.testing.expectEqual(@as(usize, 2), approval.calls);
     approval.approved = true;
     // Verify approval without dispatching a destructive command.
-    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(unsafe_call, observer)));
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(unsafe_call, observer)) == .allowed);
     var safe_call = try makeCall(gpa, "safe", "skill", "{\"name\":\"review\",\"command\":\"echo skill-command-executed\"}");
     defer safe_call.deinit(gpa);
     const safe = try executor.runAll(&.{safe_call}, observer);
@@ -979,8 +1005,109 @@ test "skill command uses shell approvals and preserves the lane workspace" {
     try std.testing.expectEqualStrings(workspace, executor.cwd);
     var read_call = try makeCall(gpa, "read", "skill", "{\"name\":\"review\"}");
     defer read_call.deinit(gpa);
-    try std.testing.expect(!(try executor.shouldRejectUnsafeShell(read_call, observer)));
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(read_call, observer)) == .defer_to_dispatch);
     try std.testing.expectEqual(@as(usize, 3), approval.calls);
+}
+
+test "contained shell run refuses a call that bypassed the classification gate" {
+    // #295: the lane-worker contained path demands the gate's mint. A shell
+    // call reaching `produceOutput` without one means the approval gate was
+    // bypassed — refuse loudly (structured tool failure) instead of running
+    // unclassified input. `runAll` always mints for gate-approved shell
+    // calls, so this error is unreachable through the normal path; it fires
+    // exactly when a future caller tries to skip the gate.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const workspace = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(workspace);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = root_buf[0..root_len], .contained = true, .skills = &.{} });
+    var shell_call = try makeCall(gpa, "bypass", tools.shell_tool.name, "{\"command\":\"echo should-not-run\",\"description\":\"bypass\"}");
+    defer shell_call.deinit(gpa);
+    try std.testing.expectError(error.UnclassifiedContainedRun, executor.produceOutput(shell_call, null));
+}
+
+test "contained shell run executes a gate-approved call end to end" {
+    // #295 red test for the POSITIVE path: `runAll` mints for an approved
+    // shell call and the token threads runOne → dispatchCall → produceOutput
+    // into the contained runner. The null-mint refusal test above pins the
+    // refuse half alone — this one fails if the gate stops minting or the
+    // threading drops the token (every lane shell call would then fail with
+    // UnclassifiedContainedRun while the refusal test stays green).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = root_buf[0..root_len], .contained = true, .skills = &.{} });
+    var call = try makeCall(gpa, "minted", tools.shell_tool.name, "{\"command\":\"printf minted-ok\",\"description\":\"ok\"}");
+    defer call.deinit(gpa);
+    const Approval = struct {
+        fn started(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        fn finished(_: *@This(), _: *const ToolResult) anyerror!void {}
+        fn approve(_: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return error.TestUnexpectedCall; // safe command: never consulted
+        }
+    };
+    var approval: Approval = .{};
+    const observer: ToolCallObserver(Approval) = .{
+        .ctx = &approval,
+        .on_started = Approval.started,
+        .on_finished = Approval.finished,
+        .approve_unsafe_bash = Approval.approve,
+    };
+    const results = try executor.runAll(&.{call}, observer);
+    defer {
+        for (results) |*result| result.deinit(gpa);
+        gpa.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(!results[0].failed);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "minted-ok") != null);
+    // The tool context slot is per-dispatch: it must not outlive the batch.
+    try std.testing.expect(executor.ctx.shell_gate_mint == null);
+}
+
+test "skill gate refuses an unverifiable skill directory before approval" {
+    // #295 fail-closed branch: a skill whose base_dir cannot be real-pathed
+    // is REJECTED at the gate (a transient gate failure must not let the
+    // command run unclassified), and the approval hook is never consulted.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const skills = [_]skill_mod.Skill{.{
+        .name = @constCast("ghost"),
+        .description = @constCast(""),
+        .path = @constCast(""),
+        .base_dir = @constCast("Z:/definitely/not/a/real/skill/dir"),
+        .body = @constCast("Instructions"),
+    }};
+    const workspace = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(workspace);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = workspace, .contained = true, .skills = &skills });
+    var call = try makeCall(gpa, "ghost-cmd", "skill", "{\"name\":\"ghost\",\"command\":\"echo should-not-run\"}");
+    defer call.deinit(gpa);
+    const Approval = struct {
+        calls: usize = 0,
+        fn started(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        fn finished(_: *@This(), _: *const ToolResult) anyerror!void {}
+        fn approve(ctx: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            ctx.calls += 1;
+            return true;
+        }
+    };
+    var approval: Approval = .{};
+    const observer: ToolCallObserver(Approval) = .{
+        .ctx = &approval,
+        .on_started = Approval.started,
+        .on_finished = Approval.finished,
+        .approve_unsafe_bash = Approval.approve,
+    };
+    try std.testing.expect((try executor.shouldRejectUnsafeShell(call, observer)) == .rejected);
+    try std.testing.expectEqual(@as(usize, 0), approval.calls);
 }
 
 test "ExecutorService.runAll errdefer cleanup exists" {
@@ -1231,7 +1358,7 @@ test "executor marks a non-zero plugin output as failed" {
     });
     const call = try makeCall(gpa, "plugin_failed", "lua__p__failed", "{}");
     defer freeCall(gpa, call);
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "handler diagnostic") != null);
@@ -1278,7 +1405,7 @@ test "executor stores oversized output and database tool retrieves it" {
     });
     const call = try makeCall(gpa, "large-result-call", "lua__p__large", "{}");
     defer freeCall(gpa, call);
-    var stored = try executor.runOne(call);
+    var stored = try executor.runOne(call, null);
     defer stored.deinit(gpa);
     try std.testing.expect(stored.content.len <= output_policy.minimum_tool_output_cap_bytes);
     try std.testing.expect(std.mem.indexOf(u8, stored.content, "read_tool_result") != null);
@@ -1286,7 +1413,7 @@ test "executor stores oversized output and database tool retrieves it" {
 
     const read_call = try makeCall(gpa, "read-large-result", "database", "{\"action\":\"read_tool_result\",\"result_id\":\"large-result-call\",\"offset\":8216,\"limit\":8}");
     defer freeCall(gpa, read_call);
-    var retrieved = try executor.runOne(read_call);
+    var retrieved = try executor.runOne(read_call, null);
     defer retrieved.deinit(gpa);
     try std.testing.expect(!retrieved.failed);
     try std.testing.expect(std.mem.indexOf(u8, retrieved.content, "TAIL") != null);
@@ -1296,14 +1423,14 @@ test "executor stores oversized output and database tool retrieves it" {
     defer gpa.free(shell_args);
     const shell_call = try makeCall(gpa, "shell-large-call", tools.shell_tool.name, shell_args);
     defer freeCall(gpa, shell_call);
-    var shell_result = try executor.runOne(shell_call);
+    var shell_result = try executor.runOne(shell_call, null);
     defer shell_result.deinit(gpa);
     try std.testing.expect(shell_result.content.len <= output_policy.minimum_tool_output_cap_bytes);
     try std.testing.expect(std.mem.indexOf(u8, shell_result.content, "read_tool_result") != null);
 
     const shell_read_call = try makeCall(gpa, "read-shell-result", "database", "{\"action\":\"read_tool_result\",\"result_id\":\"shell-large-call\",\"offset\":8500,\"limit\":16}");
     defer freeCall(gpa, shell_read_call);
-    var shell_retrieved = try executor.runOne(shell_read_call);
+    var shell_retrieved = try executor.runOne(shell_read_call, null);
     defer shell_retrieved.deinit(gpa);
     try std.testing.expect(!shell_retrieved.failed);
     try std.testing.expect(std.mem.indexOf(u8, shell_retrieved.content, "00000000") != null or std.mem.indexOf(u8, shell_retrieved.content, "xxxxxxxx") != null);
@@ -1413,7 +1540,7 @@ test "valid bash call still dispatches after schema validation" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(!result.failed);
     // The model-facing observation echoes the command first.
@@ -1435,7 +1562,7 @@ test "valid pwsh call still dispatches after schema validation" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(!result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "pwsh-ok") != null);
@@ -1465,7 +1592,7 @@ test "executor replays identical read-only shell calls from the result cache" {
     // First run executes for real — no cache marker.
     const call1 = try makeCall(gpa, "c1", tools.shell_tool.name, pwd_args);
     defer freeCall(gpa, call1);
-    var r1 = try executor.runOne(call1);
+    var r1 = try executor.runOne(call1, null);
     defer r1.deinit(gpa);
     try std.testing.expect(!r1.failed);
     try std.testing.expect(std.mem.indexOf(u8, r1.content, "[cached result") == null);
@@ -1477,7 +1604,7 @@ test "executor replays identical read-only shell calls from the result cache" {
         "{\"description\":\"recheck\",\"command\":\"pwd\"}";
     const call2 = try makeCall(gpa, "c2", tools.shell_tool.name, replay_args);
     defer freeCall(gpa, call2);
-    var r2 = try executor.runOne(call2);
+    var r2 = try executor.runOne(call2, null);
     defer r2.deinit(gpa);
     try std.testing.expect(!r2.failed);
     try std.testing.expect(std.mem.indexOf(u8, r2.content, "[cached result") != null);
@@ -1489,14 +1616,14 @@ test "executor replays identical read-only shell calls from the result cache" {
         "{\"command\":\"mkdir -p .zig-cache/rc-test\",\"description\":\"mkdir\"}";
     const call3 = try makeCall(gpa, "c3", tools.shell_tool.name, mkdir_args);
     defer freeCall(gpa, call3);
-    var r3 = try executor.runOne(call3);
+    var r3 = try executor.runOne(call3, null);
     defer r3.deinit(gpa);
     try std.testing.expect(!r3.failed);
 
     // After the mutation the same read-only call executes for real again.
     const call4 = try makeCall(gpa, "c4", tools.shell_tool.name, pwd_args);
     defer freeCall(gpa, call4);
-    var r4 = try executor.runOne(call4);
+    var r4 = try executor.runOne(call4, null);
     defer r4.deinit(gpa);
     try std.testing.expect(!r4.failed);
     try std.testing.expect(std.mem.indexOf(u8, r4.content, "[cached result") == null);
@@ -1519,7 +1646,7 @@ test "executor rejects bash call with missing required argument" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     const prefix = try std.fmt.allocPrint(gpa, "Invalid arguments for tool '{s}'", .{tools.shell_tool.name});
@@ -1539,7 +1666,7 @@ test "executor rejects bash call with wrong type" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`command` must be string") != null);
@@ -1557,7 +1684,7 @@ test "executor rejects bash call with invalid JSON" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
@@ -1578,7 +1705,7 @@ test "executor rejects plugin tool call with enum violation" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` must be one of: fast, slow") != null);
@@ -1600,7 +1727,7 @@ test "executor rejects plugin tool call with missing required argument" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` is required") != null);
@@ -1621,7 +1748,7 @@ test "executor rejects plugin tool call with wrong type" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`mode` must be string") != null);
@@ -1643,7 +1770,7 @@ test "executor rejects plugin tool call with invalid JSON" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
@@ -1669,7 +1796,7 @@ test "executor rejects MCP tool call with missing required field" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`query` is required") != null);
@@ -1700,7 +1827,7 @@ test "valid MCP tool call reaches the registry bridge, not unknown-tool" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed); // transport failure on the fake child — expected
     try std.testing.expect(std.mem.indexOf(u8, result.content, "unknown tool") == null);
@@ -1798,7 +1925,7 @@ test "executor rejects MCP tool call with wrong type" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "`query` must be string") != null);
@@ -1824,7 +1951,7 @@ test "executor rejects MCP tool call with invalid JSON" {
         gpa.free(call.arguments);
     }
 
-    var result = try executor.runOne(call);
+    var result = try executor.runOne(call, null);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "must be valid JSON") != null);
