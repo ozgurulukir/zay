@@ -149,13 +149,23 @@ fn processExited(pid: std.posix.pid_t) bool {
 }
 
 /// Windows Job Object configured with KILL_ON_JOB_CLOSE for a spawned child.
-/// Returns a handle the caller must `terminateChildTree` (or `CloseHandle`)
+/// Returns a handle the caller must `terminateChildTree` (or `closeWin32Handle`)
 /// later, or null when the kernel refused (child already exited, job limit
 /// reached). POSIX: always null — POSIX teardown already reaches
 /// grandchildren via process-group signals.
 pub fn attachJobObjectKillOnClose(child: *const std.process.Child) ?std.os.windows.HANDLE {
     if (!is_windows) return null;
     const process_handle = child.id orelse return null;
+    return createKillOnCloseJobForProcess(process_handle);
+}
+
+/// The shared Win32 Job-Object surface (#296): `os.zig` is the single FFI
+/// declaration site for the kill-on-close containment contract. The attach
+/// half is common to every containment site; teardown policy stays with the
+/// caller (mcp/client.zig: silent-exit report; background.zig: taskkill
+/// fallback) via `terminateWin32JobObject` / `closeWin32Handle`.
+pub fn createKillOnCloseJobForProcess(process_handle: std.os.windows.HANDLE) ?std.os.windows.HANDLE {
+    if (!is_windows) return null;
     const h = windows.CreateJobObjectW(null, null) orelse return null;
     var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
     info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -173,6 +183,20 @@ pub fn attachJobObjectKillOnClose(child: *const std.process.Child) ?std.os.windo
         return null;
     }
     return h;
+}
+
+/// Terminate every process in the job (kill-on-close handle). Returns true
+/// when the kernel accepted the termination. POSIX: always false.
+pub fn terminateWin32JobObject(job_handle: std.os.windows.HANDLE, exit_code: u32) bool {
+    if (!is_windows) return false;
+    return windows.TerminateJobObject(job_handle, exit_code) != 0;
+}
+
+/// Close a Win32 kernel handle obtained from this module (e.g. a Job Object).
+/// Returns true when the handle was closed. POSIX: always false.
+pub fn closeWin32Handle(handle: std.os.windows.HANDLE) bool {
+    if (!is_windows) return false;
+    return windows.CloseHandle(handle) != 0;
 }
 
 /// Kill the whole process tree of a foreground capture child. On Windows,
@@ -388,9 +412,9 @@ const windows = if (is_windows) struct {
     extern "kernel32" fn GetConsoleCP() callconv(.winapi) UINT;
     extern "kernel32" fn FlushConsoleInputBuffer(hConsoleInput: HANDLE) callconv(.winapi) BOOL;
 
-    // Job Object surface (kill-on-close process trees). Byte-identical to the
-    // definitions in `background.zig` — foreground capture teardown and
-    // background-job teardown converge onto the same kernel handle shape.
+    // Job Object surface (kill-on-close process trees). Single FFI declaration
+    // site (#296); background.zig and mcp/client.zig consume it via the pub
+    // wrappers above.
     const HANDLE = std.os.windows.HANDLE;
     const DWORD = std.os.windows.DWORD;
     const LPVOID = ?*anyopaque;
