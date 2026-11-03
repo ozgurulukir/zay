@@ -1114,6 +1114,35 @@ test "validRelativePath rejects empty and traversal segments" {
     try std.testing.expect(!validRelativePath("nested//init.lua"));
 }
 
+test "validPluginId is a subset of package.safeDirectoryName" {
+    // #294: the write path (id law, stricter — lowercase/digit, single
+    // hyphens) and the read path (directory-name law — alnum + `-` + `_`)
+    // validate the same installed directories. Pin the subset relation so
+    // the two laws cannot silently diverge: everything the store accepts
+    // on install, the package scanner must accept on read.
+    const ids = [_][]const u8{
+        "hello-world", "a", "0", "a1-b2-c3", "123",
+    };
+    for (ids) |id| {
+        try std.testing.expect(validPluginId(id));
+        try std.testing.expect(package.safeDirectoryName(id));
+    }
+    // Length bounds line up exactly (both 64) — a longer id that the store
+    // rejects must also be rejected by the reader.
+    const at_limit = "a" ++ ("b" ** 62) ++ "c"; // 64 chars
+    const over_limit = "a" ++ ("b" ** 63) ++ "c"; // 65 chars
+    try std.testing.expect(validPluginId(at_limit));
+    try std.testing.expect(package.safeDirectoryName(at_limit));
+    try std.testing.expect(!validPluginId(over_limit));
+    try std.testing.expect(!package.safeDirectoryName(over_limit));
+    // The reader's extra allowance (`_`, uppercase) shows the direction of
+    // the subset: accepted by safeDirectoryName, rejected by validPluginId.
+    try std.testing.expect(package.safeDirectoryName("snake_case"));
+    try std.testing.expect(package.safeDirectoryName("CamelCase"));
+    try std.testing.expect(!validPluginId("snake_case"));
+    try std.testing.expect(!validPluginId("CamelCase"));
+}
+
 test "staged synced write then no-follow manifest read survives the Windows async handle" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
