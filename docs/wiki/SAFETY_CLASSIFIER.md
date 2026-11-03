@@ -70,8 +70,12 @@ when untrusted code needs a stronger boundary.
 - **Not classified — classified by the caller:** `runContained` /
   `runContainedWithCancellation` (`src/tools/shell.zig`) never classify
   themselves. The executor gate is the sole classification point for
-  contained execution; any new caller must route through the executor or
-  classify first. This is stated in the function docs in `shell.zig`.
+  contained execution: the runners require a `bash_safety.ClassifiedCommand`
+  token minted by the gate (`executor_safety.mintClassified`), and the
+  executor's contained path refuses a missing token at runtime
+  (`error.UnclassifiedContainedRun`) (#295). Any new caller must route
+  through the executor or classify and mint honestly first. This is stated
+  in the function docs in `shell.zig`.
 
 ### External classifier failures and timing
 

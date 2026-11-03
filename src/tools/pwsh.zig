@@ -16,6 +16,7 @@ const background = @import("../background.zig");
 const common = @import("common.zig");
 const os = @import("../os.zig");
 const pws = @import("pwsh_exec.zig");
+const bash_safety = @import("bash_safety.zig");
 const paths = @import("../paths.zig");
 const shell = @import("shell.zig");
 
@@ -194,7 +195,7 @@ test "contained pwsh refuses Set-Location to a directory outside the workspace r
     const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(root_abs);
 
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Set-Location C:\\\\Windows; Write-Output escaped\",\"description\":\"escape\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Set-Location C:\\\\Windows; Write-Output escaped\",\"description\":\"escape\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expect(output.code != 0);
@@ -211,7 +212,7 @@ test "contained pwsh allows Set-Location within the workspace root" {
     const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(root_abs);
     // A workspace-relative subdir inside the root is allowed.
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Set-Location .; Write-Output ok\",\"description\":\"read\"}", null);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Set-Location .; Write-Output ok\",\"description\":\"read\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);

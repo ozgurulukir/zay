@@ -10,6 +10,7 @@ const common = @import("common.zig");
 const skill_mod = @import("../skill.zig");
 const paths = @import("../paths.zig");
 const shell = if (@import("../os.zig").is_windows) @import("pwsh.zig") else @import("bash.zig");
+const bash_safety = @import("bash_safety.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.skill_tool);
@@ -157,7 +158,14 @@ pub fn runTool(
                 .env = .{ .ZAY_WORKSPACE_CWD = workspace },
             }, .{});
             defer gpa.free(shell_args);
-            return shell.runContainedWithCancellation(gpa, io, root, shell_args, null, env.ctx.cancel_requested);
+            // #295: the contained runner demands a classification mint. For
+            // skill command mode that gate already ran — the executor's
+            // skill branch classifies the coerced command before dispatch —
+            // but the fixed registry `Tool.run` signature cannot carry the
+            // token across that boundary, so the classified shell_args are
+            // minted here. Minting anything else in a new caller is the
+            // bypass the token exists to expose.
+            return shell.runContainedWithCancellation(gpa, io, root, shell_args, null, env.ctx.cancel_requested, bash_safety.mintClassified(shell_args));
         }
         const stdout = if (args.resource) |resource|
             readResource(gpa, io, skill, resource) catch |err| {
