@@ -137,12 +137,23 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
         .name = try gpa.dupe(u8, server.name),
         .enabled = server.enabled,
         .request_timeout_ms = server.request_timeout_ms,
-        .transport = undefined,
+        // Owns nothing: a failure between here and the real transport
+        // assignment below (args/command expansion) fires the errdefer while
+        // `transport` would otherwise be undefined — deinit switched on a
+        // garbage union tag and crashed (negative-space test in
+        // mcp/manager.zig #303).
+        .transport = .{ .stdio = .{ .command = &.{} } },
     };
     errdefer out.deinit(gpa);
 
     switch (server.transport) {
+        // Each prong expands the single scalar field first, under an
+        // arm-scoped errdefer, before the list expansion: the lists' own
+        // errdefers are block-scoped, so a failure in a fallible call AFTER
+        // their block exits would leak the already-expanded entries.
         .stdio => |t| {
+            const command = try expandEnvVars(gpa, t.command, &env_map);
+            errdefer gpa.free(command);
             var args: [][]u8 = &.{};
             if (t.args.len > 0) {
                 const expanded = try gpa.alloc([]u8, t.args.len);
@@ -158,11 +169,13 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
                 args = expanded;
             }
             out.transport = .{ .stdio = .{
-                .command = try expandEnvVars(gpa, t.command, &env_map),
+                .command = command,
                 .args = args,
             } };
         },
         .sse => |t| {
+            const url = try expandEnvVars(gpa, t.url, &env_map);
+            errdefer gpa.free(url);
             var headers: []McpHeader = &.{};
             if (t.headers.len > 0) {
                 const expanded = try gpa.alloc(McpHeader, t.headers.len);
@@ -184,7 +197,7 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
                 headers = expanded;
             }
             out.transport = .{ .sse = .{
-                .url = try expandEnvVars(gpa, t.url, &env_map),
+                .url = url,
                 .headers = headers,
             } };
         },

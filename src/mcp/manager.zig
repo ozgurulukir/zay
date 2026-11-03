@@ -60,8 +60,11 @@ pub const McpManager = struct {
             // The config keeps the raw placeholders so serialize() never writes
             // resolved secrets to disk; only this expanded copy — owned by the
             // client — carries them.
-            var expanded = config_mod.expandMcpServer(self.gpa, server_cfg) catch {
-                log.warn("MCP server '{s}': failed to resolve env vars, skipping", .{server_cfg.name});
+            var expanded = config_mod.expandMcpServer(self.gpa, server_cfg) catch |err| {
+                // Causal-neutral label: expandEnvVars handles unset variables
+                // itself (empty substitute + warn), so the realistic failure
+                // here is allocation, not a bad env var.
+                log.warn("MCP server '{s}': expansion failed err={s}; skipping", .{ server_cfg.name, @errorName(err) });
                 continue;
             };
             defer expanded.deinit(self.gpa);
@@ -115,7 +118,12 @@ pub const McpManager = struct {
         io: std.Io,
         config: *const config_mod.Config,
     ) void {
-        self.syncFromConfig(io, config) catch {};
+        // Keep going when the reconcile fails (never OOM in practice): the
+        // connect sweep below must still run so existing clients converge.
+        // The warn keeps the failure from being invisible.
+        self.syncFromConfig(io, config) catch |err| {
+            log.warn("mcp.syncFromConfigEx.reconcile_failed err={s}", .{@errorName(err)});
+        };
         for (self.clients.items) |c| {
             if (c.status() != .connecting) continue;
             if (c.tools.items.len > 0) continue;
@@ -537,6 +545,56 @@ test "McpManager removes stale clients not in config" {
     try manager.syncFromConfig(std.testing.io, &cfg2);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
     try std.testing.expectEqualStrings("alpha", manager.clients.items[0].name);
+}
+
+test "McpManager syncFromConfig surfaces injected allocation failure cleanly" {
+    // #303: the UI-layer config-apply sites wrap syncFromConfig in
+    // `catch |err| log.warn(...)` (startup must boot with a broken config).
+    // This pins the contract those catches rely on: an injected allocation
+    // failure surfaces as an error (never a panic or a silent success),
+    // leaves no partial client behind, and tears down without leaks — the
+    // warn is the only visible trace. The config side is built with the real
+    // allocator; only the code-under-test sees the failing one. The expand
+    // step swallows OOM into skip-with-warn, so a fixed fail_index cannot
+    // target the unguarded McpClient.init allocation — sweep until it does.
+    const underlying = std.testing.allocator;
+    var hit_failure = false;
+    var hit_client = false;
+    var fail_index: usize = 1;
+    // 512: loadEnvMap allocates per process environment variable, so the
+    // indices consumed before the unguarded McpClient.init allocation vary
+    // by machine — the bound must clear the whole expand path with headroom.
+    while (fail_index <= 512) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(underlying, .{ .fail_index = fail_index });
+        var manager = McpManager.init(failing.allocator());
+        defer manager.deinit(std.testing.io);
+
+        var servers = try underlying.alloc(config_mod.McpServerConfig, 1);
+        const arg_storage = try underlying.alloc([]u8, 1);
+        arg_storage[0] = try underlying.dupe(u8, "--hello");
+        servers[0] = .{
+            .name = try underlying.dupe(u8, "alpha"),
+            .enabled = true,
+            .transport = .{ .stdio = .{
+                .command = try underlying.dupe(u8, "echo"),
+                .args = arg_storage,
+            } },
+        };
+        var cfg: config_mod.Config = .{ .mcp_servers = servers };
+        defer cfg.deinit(underlying);
+
+        if (manager.syncFromConfig(std.testing.io, &cfg)) |_| {
+            // Success means either the client registered or an early index
+            // was consumed by the expand path, which skips with its own warn.
+            if (manager.clients.items.len == 1) hit_client = true;
+        } else |err| {
+            hit_failure = true;
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), manager.clients.items.len);
+        }
+    }
+    try std.testing.expect(hit_failure);
+    try std.testing.expect(hit_client);
 }
 
 test "McpManager does not reconnect already connected clients" {

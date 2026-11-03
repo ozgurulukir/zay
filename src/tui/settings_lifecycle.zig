@@ -303,7 +303,10 @@ pub fn saveSettings(app: *App) !bool {
     // leave the running session and existing lanes on the old classification
     // behavior until restart.
     try syncClassifierUrls(app, state);
-    app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
+    app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch |err| {
+        log.warn("mcp.syncFromConfig failed: {s}", .{@errorName(err)});
+        toast.global.push(.warn, "MCP config not applied — sync failed; see log");
+    };
 
     // Apply the toast toggle live to the global bus.
     if (state.pending_toast_enabled) |v| toast.global.enabled = v;
