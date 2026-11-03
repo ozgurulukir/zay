@@ -206,8 +206,7 @@ pub fn abandonLane(app: *App, index: u32) !void {
 }
 
 pub fn reportLaneError(app: *App, err: anyerror) !void {
-    app.mode = .normal;
-    app.clearInput();
+    app.setMode(.normal);
     clearLanesState(app);
     var buf: [256]u8 = undefined;
     const message = std.fmt.bufPrint(&buf, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)}) catch blk: {
@@ -264,8 +263,7 @@ pub fn createMergePicker(app: *App) !void {
             clearLanesState(app);
         }
         try mergeLane(app, source, dest);
-        app.mode = .normal;
-        app.clearInput();
+        app.setMode(.normal);
         return;
     }
 
@@ -279,9 +277,7 @@ pub fn createMergePicker(app: *App) !void {
     app.merge_source_index = src_index;
     app.nav.lanes_purpose = .merge_dest;
     app.nav.lanes_selection = 0;
-    app.mode = .lanes;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.lanes);
 }
 
 pub fn confirmMergeDest(app: *App) !void {
@@ -290,14 +286,12 @@ pub fn confirmMergeDest(app: *App) !void {
         clearLanesState(app);
     }
     if (app.merge_dest_indices.len == 0 or app.nav.lanes_selection >= app.merge_dest_indices.len) {
-        app.mode = .normal;
-        app.clearInput();
+        app.setMode(.normal);
         return;
     }
     const dest = app.threads.slice()[app.merge_dest_indices[app.nav.lanes_selection]];
     const src = lanes_util.workingLaneOf(app.threads.slice()[app.merge_source_index]) orelse {
-        app.mode = .normal;
-        app.clearInput();
+        app.setMode(.normal);
         return;
     };
     const source: lanes_util.MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = app.merge_source_index };
@@ -305,8 +299,7 @@ pub fn confirmMergeDest(app: *App) !void {
         try reportLaneError(app, err);
         return;
     };
-    app.mode = .normal;
-    app.clearInput();
+    app.setMode(.normal);
 }
 
 pub fn openLanesPicker(app: *App) !void {
@@ -315,9 +308,7 @@ pub fn openLanesPicker(app: *App) !void {
     app.parked_lanes = try collectParkedLanes(app, repo);
     app.nav.lanes_purpose = .manage;
     app.nav.lanes_selection = 0;
-    app.mode = .lanes;
-    app.clearInput();
-    app.clearPaletteInput();
+    app.setMode(.lanes);
 }
 
 pub fn mergeSelectedParked(app: *App) !void {

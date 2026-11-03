@@ -259,8 +259,7 @@ fn routeKey(
     // it through (verified free across all modes — nothing else binds it).
     if (key.matches('f', .{ .ctrl = true }) and app.isNormalMode()) {
         app.clearPendingQuitAt();
-        try app.openSearch();
-        try root.syncFocus(ctx);
+        _ = try lifecycle.transitionMode(root, ctx, .open_search);
         ctx.consumeAndRedraw();
         return;
     }
@@ -307,8 +306,12 @@ fn routeKey(
     // additional binding; removing slash here would send `/connect` and other
     // commands to the model because normal submit has no command parser.
     if (tui.shouldOpenCommandMenuForSlash(app, key)) {
-        try app.openCommandMenu();
-        try root.syncFocus(ctx);
+        _ = try lifecycle.transitionMode(root, ctx, .open_command_menu);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.isNormalMode() and key.matches('k', .{ .ctrl = true })) {
+        _ = try lifecycle.transitionMode(root, ctx, .open_command_menu);
         ctx.consumeAndRedraw();
         return;
     }
@@ -452,8 +455,7 @@ fn handleEscapeSequence(
         ctx.consumeAndRedraw();
         return;
     }
-    if (try app.cancelMode()) {
-        try root.syncFocus(ctx);
+    if (try lifecycle.transitionMode(root, ctx, .cancel)) {
         ctx.consumeAndRedraw();
         return;
     }
