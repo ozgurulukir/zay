@@ -1581,8 +1581,10 @@ pub fn openMcp(app: *App) void {
         provider_model.refreshMcpTools(app);
     } else {
         app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch |err| {
-            log.warn("mcp.syncFromConfig failed: {s}", .{@errorName(err)});
-            toast.global.push(.warn, "MCP sync failed — servers may be missing; see log");
+            // One failure, one toast: the logger's warn→toast sink routes this
+            // line to the bus (#316), so the user-facing wording lives here and
+            // no manual push duplicates it.
+            log.warn("MCP sync failed — servers may be missing; see log ({s})", .{@errorName(err)});
         };
     }
 }
