@@ -341,32 +341,66 @@ pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !vo
 }
 
 fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpServerConfig) !void {
+    const Transport = @FieldType(McpServerConfig, "transport");
     for (target.mcp_servers, 0..) |*server, index| {
         if (!std.mem.eql(u8, server.name, updates.name)) continue;
         server.enabled = updates.enabled;
         server.request_timeout_ms = updates.request_timeout_ms;
-        server.transport = switch (updates.transport) {
+        const new_transport: Transport = switch (updates.transport) {
             .stdio => |t| blk: {
                 var args = try gpa.alloc([]u8, t.args.len);
-                errdefer gpa.free(args);
-                for (t.args, 0..) |arg, i| args[i] = try gpa.dupe(u8, arg);
+                var done: usize = 0;
+                errdefer {
+                    for (args[0..done]) |arg| gpa.free(arg);
+                    gpa.free(args);
+                }
+                for (t.args, 0..) |arg, i| {
+                    args[i] = try gpa.dupe(u8, arg);
+                    done += 1;
+                }
+                const cmd = try gpa.dupe(u8, t.command);
                 break :blk .{ .stdio = .{
-                    .command = try gpa.dupe(u8, t.command),
+                    .command = cmd,
                     .args = args,
                 } };
             },
-            .sse => |t| .{ .sse = .{ .url = try gpa.dupe(u8, t.url) } },
+            .sse => |t| blk: {
+                const url = try gpa.dupe(u8, t.url);
+                errdefer gpa.free(url);
+                const headers = try cloneHeaders(gpa, t.headers);
+                break :blk .{ .sse = .{
+                    .url = url,
+                    .headers = headers,
+                } };
+            },
         };
+        switch (server.transport) {
+            .stdio => |t| {
+                gpa.free(t.command);
+                for (t.args) |arg| gpa.free(arg);
+                if (t.args.len > 0) gpa.free(t.args);
+            },
+            .sse => |t| {
+                gpa.free(t.url);
+                freeHeaders(gpa, t.headers);
+            },
+        }
+        server.transport = new_transport;
         target.mcp_servers[index] = server.*;
         return;
     }
 
+    const cloned = try updates.clone(gpa);
+    errdefer {
+        var c = cloned;
+        c.deinit(gpa);
+    }
     const next = if (target.mcp_servers.len == 0)
         try gpa.alloc(McpServerConfig, 1)
     else
         try gpa.realloc(target.mcp_servers, target.mcp_servers.len + 1);
     target.mcp_servers = next;
-    target.mcp_servers[target.mcp_servers.len - 1] = try updates.clone(gpa);
+    target.mcp_servers[target.mcp_servers.len - 1] = cloned;
 }
 
 fn applyPluginOverlay(gpa: std.mem.Allocator, target: *Config, updates: PluginConfig) !void {
@@ -374,19 +408,25 @@ fn applyPluginOverlay(gpa: std.mem.Allocator, target: *Config, updates: PluginCo
         if (!std.mem.eql(u8, plugin.name, updates.name)) continue;
         plugin.enabled = updates.enabled;
         if (updates.settings.len > 0) {
+            const new_settings = try gpa.dupe(u8, updates.settings);
             if (plugin.settings.len > 0) gpa.free(plugin.settings);
-            plugin.settings = try gpa.dupe(u8, updates.settings);
+            plugin.settings = new_settings;
         }
         target.plugins[index] = plugin.*;
         return;
     }
 
+    const cloned = try updates.clone(gpa);
+    errdefer {
+        var c = cloned;
+        c.deinit(gpa);
+    }
     const next = if (target.plugins.len == 0)
         try gpa.alloc(PluginConfig, 1)
     else
         try gpa.realloc(target.plugins, target.plugins.len + 1);
     target.plugins = next;
-    target.plugins[target.plugins.len - 1] = try updates.clone(gpa);
+    target.plugins[target.plugins.len - 1] = cloned;
 }
 
 fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
@@ -416,12 +456,17 @@ fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: Provid
         return;
     }
 
+    const cloned = try updates.clone(gpa);
+    errdefer {
+        var c = cloned;
+        c.deinit(gpa);
+    }
     const next = if (target.providers.len == 0)
         try gpa.alloc(ProviderConfig, 1)
     else
         try gpa.realloc(target.providers, target.providers.len + 1);
     target.providers = next;
-    target.providers[target.providers.len - 1] = try updates.clone(gpa);
+    target.providers[target.providers.len - 1] = cloned;
 }
 
 fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, updates: []const ProviderModel) !void {
@@ -435,19 +480,25 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
                 .unset => {},
             }
             if (update.reasoning_options.len > 0) {
+                const next_options = try gpa.dupe(ReasoningEffort, update.reasoning_options);
                 if (model.reasoning_options.len > 0) gpa.free(model.reasoning_options);
-                model.reasoning_options = try gpa.dupe(ReasoningEffort, update.reasoning_options);
+                model.reasoning_options = next_options;
             }
             replaced = true;
             break;
         }
         if (replaced) continue;
+        const cloned = try update.clone(gpa);
+        errdefer {
+            var c = cloned;
+            c.deinit(gpa);
+        }
         const next = if (target.models.len == 0)
             try gpa.alloc(ProviderModel, 1)
         else
             try gpa.realloc(target.models, target.models.len + 1);
         target.models = next;
-        target.models[target.models.len - 1] = try update.clone(gpa);
+        target.models[target.models.len - 1] = cloned;
     }
 }
 
@@ -470,8 +521,9 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
                 model_ptr.context_window = entry_model.context_window;
                 model_ptr.max_output_tokens = entry_model.max_output_tokens;
                 if (entry_model.reasoning_options.len > 0) {
+                    const next_options = try gpa.dupe(ReasoningEffort, entry_model.reasoning_options);
                     if (model_ptr.reasoning_options.len > 0) gpa.free(model_ptr.reasoning_options);
-                    model_ptr.reasoning_options = try gpa.dupe(ReasoningEffort, entry_model.reasoning_options);
+                    model_ptr.reasoning_options = next_options;
                 }
                 return;
             }
@@ -4966,4 +5018,85 @@ test "validate captures both invalid semver and invalid base_url without early r
     }
 
     try std.testing.expectEqual(@as(usize, 2), diags.len);
+}
+
+test "applyMcpServerOverlay updates existing server transport without memory leaks" {
+    const gpa = std.testing.allocator;
+    var target: Config = .{};
+    defer target.deinit(gpa);
+
+    var initial_args = try gpa.alloc([]u8, 1);
+    initial_args[0] = try gpa.dupe(u8, "run");
+    var initial_server: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "test-mcp"),
+        .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "python"),
+            .args = initial_args,
+        } },
+    };
+    defer initial_server.deinit(gpa);
+    try applyMcpServerOverlay(gpa, &target, initial_server);
+
+    // Now update the same server to SSE with headers
+    var sse_headers = try gpa.alloc(McpHeader, 1);
+    sse_headers[0] = .{
+        .name = try gpa.dupe(u8, "Authorization"),
+        .value = try gpa.dupe(u8, "Bearer token"),
+    };
+    var update_server: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "test-mcp"),
+        .enabled = false,
+        .transport = .{ .sse = .{
+            .url = try gpa.dupe(u8, "https://mcp.example.com"),
+            .headers = sse_headers,
+        } },
+    };
+    defer update_server.deinit(gpa);
+    try applyMcpServerOverlay(gpa, &target, update_server);
+
+    try std.testing.expectEqual(@as(usize, 1), target.mcp_servers.len);
+    try std.testing.expectEqual(false, target.mcp_servers[0].enabled);
+    switch (target.mcp_servers[0].transport) {
+        .sse => |s| {
+            try std.testing.expectEqualStrings("https://mcp.example.com", s.url);
+            try std.testing.expectEqual(@as(usize, 1), s.headers.len);
+            try std.testing.expectEqualStrings("Authorization", s.headers[0].name);
+        },
+        .stdio => unreachable,
+    }
+}
+
+test "applyProviderModelsOverlay updates reasoning options without memory leak" {
+    const gpa = std.testing.allocator;
+    var target: ProviderConfig = .{
+        .name = try gpa.dupe(u8, "provider"),
+        .provider = .openai,
+    };
+    defer target.deinit(gpa);
+
+    var init_opts = try gpa.alloc(ReasoningEffort, 1);
+    init_opts[0] = .low;
+    var init_models = try gpa.alloc(ProviderModel, 1);
+    init_models[0] = .{
+        .id = try gpa.dupe(u8, "model-1"),
+        .reasoning_options = init_opts,
+    };
+    target.models = init_models;
+
+    const new_opts = [_]ReasoningEffort{ .high, .max };
+    const update_models = [_]ProviderModel{
+        .{
+            .id = try gpa.dupe(u8, "model-1"),
+            .reasoning_options = &new_opts,
+        },
+    };
+    defer gpa.free(update_models[0].id);
+
+    try applyProviderModelsOverlay(gpa, &target, &update_models);
+
+    try std.testing.expectEqual(@as(usize, 1), target.models.len);
+    try std.testing.expectEqual(@as(usize, 2), target.models[0].reasoning_options.len);
+    try std.testing.expectEqual(ReasoningEffort.high, target.models[0].reasoning_options[0]);
+    try std.testing.expectEqual(ReasoningEffort.max, target.models[0].reasoning_options[1]);
 }
