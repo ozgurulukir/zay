@@ -488,7 +488,7 @@ pub const Config = struct {
             }
         }
         if (self.base_url) |url| {
-            if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
+            if (url.len > 0 and !std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
                 try appendConfigError(gpa, &list, "base_url", "invalid URL scheme in '{s}'", .{url});
             }
         }

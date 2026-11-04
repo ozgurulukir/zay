@@ -307,10 +307,10 @@ pub const AgentRuntime = struct {
             // and a restart arm agents identically.
             target.agent.bash_classifier_url = try gpa.dupe(u8, url);
         }
-        if (config.database_server_url) |url| {
+        if (config.effectiveDatabaseUrl()) |url| {
             target.agent.database_server_url = try gpa.dupe(u8, url);
         }
-        if (config.database_auth_token) |token| {
+        if (config.effectiveDatabaseAuthToken()) |token| {
             target.agent.database_auth_token = try gpa.dupe(u8, token);
         }
         target.agent.attachSessionWriter(&target.session_writer);
@@ -1741,4 +1741,41 @@ test "runtime agent aliases the owned cwd, not the borrowed input" {
     // The agent must alias the runtime's owned dupe — never the borrowed
     // parameter the caller may free.
     try std.testing.expect(runtime.agent.cwd.ptr == runtime.cwd.ptr);
+}
+
+test "initNew arms agent database_server_url from canonical database block" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: AgentRuntime = undefined;
+    var cfg: config_mod.Config = .{};
+    cfg.database = .{
+        .url = try gpa.dupe(u8, "http://db-companion:8766"),
+        .auth_token = try gpa.dupe(u8, "test-auth-token"),
+    };
+    defer cfg.deinit(gpa);
+
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
+        .config = cfg,
+        .diagnostics = &.{},
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.agent.database_server_url != null);
+    try std.testing.expectEqualStrings("http://db-companion:8766", runtime.agent.database_server_url.?);
+    try std.testing.expect(runtime.agent.database_auth_token != null);
+    try std.testing.expectEqualStrings("test-auth-token", runtime.agent.database_auth_token.?);
 }
