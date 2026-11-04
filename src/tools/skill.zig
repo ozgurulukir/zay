@@ -358,7 +358,14 @@ test "skill resource reads a registered root and rejects paths outside it" {
     try std.testing.expectEqualStrings("Review rubric", text);
     try std.testing.expectError(error.PathTraversal, readResource(gpa, io, &source, "../outside"));
     try std.testing.expectError(error.PathTraversal, readResource(gpa, io, &source, root_buf[0..root_len]));
-    try std.testing.expectError(error.InvalidPath, readResource(gpa, io, &source, "C:\\outside"));
+    // A drive-letter path is rejected by whichever defense fires first on the
+    // host: absolute on Windows (PathTraversal), forbidden `\` / `:` bytes on
+    // POSIX (InvalidPath). Both refusals stay covered.
+    if (@import("../os.zig").is_windows) {
+        try std.testing.expectError(error.PathTraversal, readResource(gpa, io, &source, "C:\\outside"));
+    } else {
+        try std.testing.expectError(error.InvalidPath, readResource(gpa, io, &source, "C:\\outside"));
+    }
 
     var skills = [_]skill_mod.Skill{source};
     var ctx: common.ToolContext = .{ .skills = &skills };
