@@ -1352,28 +1352,36 @@ test "plugin load diagnostics prune departed projects and removed packages" {
     defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
     const old_root = root ++ "/old/plugins";
     const legacy_root = root ++ "/old/.zay/plugins";
-    const global_root = root ++ "/home/.config/zay/plugins";
-    try writeFixturePlugin(old_root, "old_bad", "error('broken')");
-    try writeFixturePlugin(legacy_root, "legacy_bad", "error('broken')");
-    try writeFixturePlugin(global_root, "global_bad", "error('broken')");
     var manager = PluginManager.init(testing.allocator, testing.io, root ++ "/home", root ++ "/old");
     defer manager.deinit();
+    // Exact-key lookups must use the manager's own root construction: on
+    // Windows globalPluginsDir joins native separators (and may pick the
+    // AppData branch when a stale run left that tree behind), so a
+    // forward-slash literal never matches the recorded failure keys.
+    const global_dir = manager.global_dir;
+    try writeFixturePlugin(old_root, "old_bad", "error('broken')");
+    try writeFixturePlugin(legacy_root, "legacy_bad", "error('broken')");
+    try writeFixturePlugin(global_dir, "global_bad", "error('broken')");
+    const global_bad_key = try std.fs.path.join(testing.allocator, &.{ global_dir, "global_bad" });
+    defer testing.allocator.free(global_bad_key);
+    const missing_key = try std.fs.path.join(testing.allocator, &.{ global_dir, "missing" });
+    defer testing.allocator.free(missing_key);
     _ = try manager.loadAll();
     try testing.expectEqual(@as(u32, 3), manager.load_failures.count());
     // A sibling with a shared path prefix must not be pruned.
     try manager.recordLoadFailure(old_root ++ "-other/keep", error.PluginInitFailed);
     try manager.repointProjectDir(root ++ "/new");
     try testing.expectEqual(@as(u32, 2), manager.load_failures.count());
-    try testing.expect(manager.load_failures.contains(global_root ++ "/global_bad"));
+    try testing.expect(manager.load_failures.contains(global_bad_key));
     try testing.expect(manager.load_failures.contains(old_root ++ "-other/keep"));
 
-    try std.Io.Dir.cwd().deleteTree(testing.io, global_root ++ "/global_bad");
-    try manager.loadFromDir(global_root, false);
-    try testing.expect(!manager.load_failures.contains(global_root ++ "/global_bad"));
-    try manager.recordLoadFailure(global_root ++ "/missing", error.PluginInitFailed);
-    try std.Io.Dir.cwd().deleteTree(testing.io, global_root);
-    try manager.loadFromDir(global_root, false);
-    try testing.expect(!manager.load_failures.contains(global_root ++ "/missing"));
+    try std.Io.Dir.cwd().deleteTree(testing.io, global_bad_key);
+    try manager.loadFromDir(global_dir, false);
+    try testing.expect(!manager.load_failures.contains(global_bad_key));
+    try manager.recordLoadFailure(missing_key, error.PluginInitFailed);
+    try std.Io.Dir.cwd().deleteTree(testing.io, global_dir);
+    try manager.loadFromDir(global_dir, false);
+    try testing.expect(!manager.load_failures.contains(missing_key));
     try testing.expectEqual(@as(u32, 1), manager.load_failures.count());
 }
 
