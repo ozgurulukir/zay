@@ -300,8 +300,10 @@ pub fn saveSettings(app: *App) !bool {
     // behavior until restart.
     try syncClassifierUrls(app, state);
     app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch |err| {
-        log.warn("mcp.syncFromConfig failed: {s}", .{@errorName(err)});
-        toast.global.push(.warn, "MCP config not applied — sync failed; see log");
+        // One failure, one toast: the logger's warn→toast sink routes this
+        // line to the bus (#316), so the user-facing wording lives here and
+        // no manual push duplicates it.
+        log.warn("MCP config not applied — sync failed; see log ({s})", .{@errorName(err)});
     };
 
     // Apply the toast toggle live to the global bus.

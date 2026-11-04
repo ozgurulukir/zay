@@ -10,7 +10,6 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
 const paths = @import("../paths.zig");
-const toast = @import("toast.zig");
 const provider_model = @import("provider_model.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
@@ -729,8 +728,10 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
         // which code path touches the picker next.
         provider_model.invalidateProviderEntries(app);
         app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch |err| {
-            log.warn("mcp.syncFromConfig failed: {s}", .{@errorName(err)});
-            toast.global.push(.warn, "Session switch: MCP config not applied — sync failed; see log");
+            // One failure, one toast: the logger's warn→toast sink routes this
+            // line to the bus (#316), so the user-facing wording lives here and
+            // no manual push duplicates it.
+            log.warn("Session switch: MCP config not applied — sync failed; see log ({s})", .{@errorName(err)});
         };
     }
 
