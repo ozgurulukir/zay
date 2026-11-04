@@ -131,6 +131,58 @@ pub fn shellQuote(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// The plugin shell bridge's single spawn route (#315, #295 residual):
+/// classify → hard-block `.unsafe` → cooperative-stop check → backend spawn,
+/// fused so a caller cannot reach execution without classification having
+/// happened. The raw `runWithOptions` calls stay private to this helper —
+/// a new Lua entry point in this module must route through here, mirroring
+/// the `UnclassifiedContainedRun` / `UnclassifiedSkillCommandRun` contract
+/// on the model-facing paths (see docs/wiki/SAFETY_CLASSIFIER.md).
+/// Plugins cannot show the interactive approval prompt, so `.unsafe`
+/// hard-blocks instead of prompting; `safe` runs without a prompt.
+fn spawnClassifiedShell(
+    L_ptr: *c.lua_State,
+    io: std.Io,
+    backend: ShellBackend,
+    resolved_cwd: []const u8,
+    cmd: []const u8,
+    stdin_bytes: ?[]const u8,
+    timeout_seconds: u32,
+) !bash_exec.Result {
+    const verdict = bash_safety.classify(std.heap.page_allocator, io, bridge.bash_classifier_url_slot, resolved_cwd, cmd);
+    if (verdict == .unsafe) {
+        const backend_name = if (backend == .pwsh) "pwsh" else "bash";
+        // Warn→toast copy: the sink pushes this line verbatim in TUI mode, so
+        // it reads as user-facing text with log detail in parens (#316).
+        std.log.warn("Plugin shell command blocked by Zay's safety classifier ({s} backend; plugin dir {s}; command: \"{s}\")", .{
+            backend_name,
+            pluginDirBestEffort(L_ptr),
+            cmd[0..@min(cmd.len, 80)],
+        });
+        return error.UnsafeShellBlocked;
+    }
+
+    execution.check(L_ptr);
+    if (execution.stopped(L_ptr)) return error.PluginExecutionStopped;
+
+    return switch (backend) {
+        .bash => bash_exec.runWithOptions(std.heap.page_allocator, io, .{
+            .cwd = resolved_cwd,
+            .command = cmd,
+            .stdin = stdin_bytes,
+            .cancel_requested = bridge.cancel_requested_slot,
+            .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
+        }),
+        .pwsh => pwsh_exec.runWithOptions(std.heap.page_allocator, io, .{
+            .cwd = resolved_cwd,
+            .command = cmd,
+            .stdin = stdin_bytes,
+            .cancel_requested = bridge.cancel_requested_slot,
+            .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
+        }),
+    };
+}
+
 fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
@@ -179,72 +231,34 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
     };
     defer std.heap.page_allocator.free(resolved_cwd);
 
-    const verdict = bash_safety.classify(std.heap.page_allocator, io, bridge.bash_classifier_url_slot, resolved_cwd, cmd);
-    if (verdict == .unsafe) {
-        const backend_name = if (backend == .pwsh) "pwsh" else "bash";
-        std.log.warn("plugin.shell.blocked plugin_dir={s} backend={s} cmd=\"{s}\"", .{
-            pluginDirBestEffort(L_ptr),
-            backend_name,
-            cmd[0..@min(cmd.len, 80)],
-        });
-        state.pushNil();
-        state.pushString("UnsafeShellBlocked: command rejected by Zay's shell safety classifier; use the built-in bash tool for destructive commands");
-        return 2;
-    }
-
-    execution.check(L_ptr);
-    if (execution.stopped(L_ptr)) {
-        state.pushNil();
-        state.pushString("plugin execution stopped before shell spawn");
-        return 2;
-    }
-    if (backend == .pwsh) {
-        var result = pwsh_exec.runWithOptions(std.heap.page_allocator, io, .{
-            .cwd = resolved_cwd,
-            .command = cmd,
-            .stdin = stdin_bytes,
-            .cancel_requested = bridge.cancel_requested_slot,
-            .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
-        }) catch |err| {
+    var result = spawnClassifiedShell(L_ptr, io, backend, resolved_cwd, cmd, stdin_bytes, timeout_seconds) catch |err| switch (err) {
+        error.UnsafeShellBlocked => {
+            state.pushNil();
+            state.pushString("UnsafeShellBlocked: command rejected by Zay's shell safety classifier; use the built-in bash tool for destructive commands");
+            return 2;
+        },
+        error.PluginExecutionStopped => {
+            state.pushNil();
+            state.pushString("plugin execution stopped before shell spawn");
+            return 2;
+        },
+        else => {
             execution.noteError(L_ptr, err);
             state.pushNil();
             state.pushString(shellBackendErrorMessage(err, backend));
             return 2;
-        };
-        defer result.deinit(std.heap.page_allocator);
+        },
+    };
+    defer result.deinit(std.heap.page_allocator);
 
-        state.newTable();
-        state.pushString(result.stdout);
-        _ = c.lua_setfield(L_ptr, -2, "stdout");
-        state.pushString(result.stderr);
-        _ = c.lua_setfield(L_ptr, -2, "stderr");
-        state.pushInteger(@as(i64, @intCast(result.code)));
-        _ = c.lua_setfield(L_ptr, -2, "code");
-        return 1;
-    } else {
-        var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
-            .cwd = resolved_cwd,
-            .command = cmd,
-            .stdin = stdin_bytes,
-            .cancel_requested = bridge.cancel_requested_slot,
-            .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
-        }) catch |err| {
-            execution.noteError(L_ptr, err);
-            state.pushNil();
-            state.pushString(shellBackendErrorMessage(err, backend));
-            return 2;
-        };
-        defer result.deinit(std.heap.page_allocator);
-
-        state.newTable();
-        state.pushString(result.stdout);
-        _ = c.lua_setfield(L_ptr, -2, "stdout");
-        state.pushString(result.stderr);
-        _ = c.lua_setfield(L_ptr, -2, "stderr");
-        state.pushInteger(@as(i64, @intCast(result.code)));
-        _ = c.lua_setfield(L_ptr, -2, "code");
-        return 1;
-    }
+    state.newTable();
+    state.pushString(result.stdout);
+    _ = c.lua_setfield(L_ptr, -2, "stdout");
+    state.pushString(result.stderr);
+    _ = c.lua_setfield(L_ptr, -2, "stderr");
+    state.pushInteger(@as(i64, @intCast(result.code)));
+    _ = c.lua_setfield(L_ptr, -2, "code");
+    return 1;
 }
 
 pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
