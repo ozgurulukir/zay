@@ -208,17 +208,20 @@ pub const Model = struct {
     }
 
     pub fn clone(self: Model, gpa: std.mem.Allocator) !Model {
-        var out: Model = .{
-            .id = try gpa.dupe(u8, self.id),
+        const id = try gpa.dupe(u8, self.id);
+        errdefer gpa.free(id);
+        var reasoning_options: []const ReasoningEffort = &.{};
+        if (self.reasoning_options.len > 0) {
+            reasoning_options = try gpa.dupe(ReasoningEffort, self.reasoning_options);
+        }
+        return .{
+            .id = id,
             .reasoning = self.reasoning,
             .response_policy = self.response_policy,
             .context_window = self.context_window,
             .max_output_tokens = self.max_output_tokens,
+            .reasoning_options = reasoning_options,
         };
-        if (self.reasoning_options.len > 0) {
-            out.reasoning_options = try gpa.dupe(ReasoningEffort, self.reasoning_options);
-        }
-        return out;
     }
 };
 
@@ -339,8 +342,19 @@ pub const ProviderConfig = struct {
             .default => {},
         }
         out.headers = try mcp.cloneHeaders(gpa, self.headers);
-        out.models = try gpa.alloc(ProviderModel, self.models.len);
-        for (self.models, 0..) |model, index| out.models[index] = try model.clone(gpa);
+        if (self.models.len > 0) {
+            const models = try gpa.alloc(ProviderModel, self.models.len);
+            var done: usize = 0;
+            errdefer {
+                for (models[0..done]) |*model| model.deinit(gpa);
+                gpa.free(models);
+            }
+            for (self.models, 0..) |model, index| {
+                models[index] = try model.clone(gpa);
+                done += 1;
+            }
+            out.models = models;
+        }
         return out;
     }
 };
@@ -508,13 +522,21 @@ const BuiltinSelection = struct {
     }
 
     pub fn clone(self: BuiltinSelection, gpa: std.mem.Allocator) !BuiltinSelection {
+        const provider_name = try gpa.dupe(u8, self.provider_name);
+        errdefer gpa.free(provider_name);
+        var model = try self.model.clone(gpa);
+        errdefer model.deinit(gpa);
+        const system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null;
+        errdefer if (system_prompt) |s| gpa.free(s);
+        const bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null;
+        errdefer if (bash_classifier_url) |s| gpa.free(s);
         return .{
             .provider = self.provider,
-            .provider_name = try gpa.dupe(u8, self.provider_name),
-            .model = try self.model.clone(gpa),
+            .provider_name = provider_name,
+            .model = model,
             .use_responses_endpoint = self.use_responses_endpoint,
-            .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,
-            .bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
+            .system_prompt = system_prompt,
+            .bash_classifier_url = bash_classifier_url,
         };
     }
 };
@@ -539,14 +561,26 @@ const CustomSelection = struct {
     }
 
     pub fn clone(self: CustomSelection, gpa: std.mem.Allocator) !CustomSelection {
+        const provider_name = try gpa.dupe(u8, self.provider_name);
+        errdefer gpa.free(provider_name);
+        const base_url = try gpa.dupe(u8, self.base_url);
+        errdefer gpa.free(base_url);
+        const api_key = try gpa.dupe(u8, self.api_key);
+        errdefer gpa.free(api_key);
+        var model = try self.model.clone(gpa);
+        errdefer model.deinit(gpa);
+        const system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null;
+        errdefer if (system_prompt) |s| gpa.free(s);
+        const bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null;
+        errdefer if (bash_classifier_url) |s| gpa.free(s);
         return .{
-            .provider_name = try gpa.dupe(u8, self.provider_name),
-            .base_url = try gpa.dupe(u8, self.base_url),
-            .api_key = try gpa.dupe(u8, self.api_key),
-            .model = try self.model.clone(gpa),
+            .provider_name = provider_name,
+            .base_url = base_url,
+            .api_key = api_key,
+            .model = model,
             .use_responses_endpoint = self.use_responses_endpoint,
-            .system_prompt = if (self.system_prompt) |s| try gpa.dupe(u8, s) else null,
-            .bash_classifier_url = if (self.bash_classifier_url) |s| try gpa.dupe(u8, s) else null,
+            .system_prompt = system_prompt,
+            .bash_classifier_url = bash_classifier_url,
         };
     }
 };
