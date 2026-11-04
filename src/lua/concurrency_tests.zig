@@ -5,6 +5,7 @@ const manager_mod = @import("manager.zig");
 const registry_bridge = @import("registry_bridge.zig");
 const bridge = @import("bridge.zig");
 const sandbox = @import("sandbox.zig");
+const execution = @import("execution.zig");
 const snapshot_mod = @import("tool_snapshot.zig");
 const ai = @import("../ai.zig");
 const agent_mod = @import("../agent.zig");
@@ -396,17 +397,30 @@ test "Lua concurrency: wall-clock timeout resets and leaves the execution mutex 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writePlugin(tmp.dir, "concurrent", source);
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plugin.lua", .data = "return {name='concurrent',version='1',permissions={instruction_limit=4294967295,timeout_ms=1}}" });
+    // Init shares the manifest timeout with dispatches and must run under a
+    // comfortable deadline; the tight budget under test is armed only for the
+    // dispatch phase, after the plugin has loaded.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plugin.lua", .data = "return {name='concurrent',version='1',permissions={instruction_limit=4294967295,timeout_ms=5000}}" });
     const path = try tmpPath(gpa, &tmp);
     defer gpa.free(path);
     var manager = manager_mod.PluginManager.init(gpa, testing.io, "", "");
     defer manager.deinit();
     const instance = try manager.loadOne(path, false);
+    sandbox.setWallClockTimeoutMs(instance.state.handle, 1);
+    // Pin the setter→reset wiring: dispatches re-arm from this field, so a
+    // regression that stopped reading it would otherwise only show up as a
+    // silent slow-down (the 5s manifest budget still times the loop out
+    // with identical assertions).
+    try testing.expectEqual(@as(u32, 1), execution.budget(instance.state.handle).?.timeout_ms);
     var timeout = try manager.callTool("concurrent", "loop", "{}");
     defer timeout.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), timeout.code);
     try testing.expect(std.mem.indexOf(u8, timeout.text, "timeout exceeded") != null);
     try testing.expectEqual(@as(c_int, 0), instance.state.getTop());
+    // Release the deadline before the usability probe: a host descheduled for
+    // longer than 1ms must not flake a trivial call. A wedged mutex or an
+    // uncleared stop_reason would fail this call at any budget size.
+    sandbox.setWallClockTimeoutMs(instance.state.handle, 5000);
     var next = try manager.callTool("concurrent", "test", "{}");
     defer next.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), next.code);

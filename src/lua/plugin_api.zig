@@ -259,7 +259,6 @@ fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
     return dir;
 }
 
-
 pub const quoteShellArg = git_bridge.quoteShellArg;
 pub const appendQuotedArg = git_bridge.appendQuotedArg;
 pub const gitErrorString = git_bridge.gitErrorString;
@@ -1591,6 +1590,17 @@ test "RunOptions.stdin bypasses shell interpretation" {
 
 test "searchFiles clamps a negative max_results without panicking" {
     const sandbox = @import("sandbox.zig");
+    // Hermetic root: without a plugin_cwd_slot the search would walk the
+    // whole process CWD (the repo during suite runs) and the wall-clock
+    // budget could expire under load before the clamp path is exercised.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "needle here\nplain line\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const prev_cwd_slot = bridge.plugin_cwd_slot;
+    bridge.plugin_cwd_slot = root_buf[0..root_len];
+    defer bridge.plugin_cwd_slot = prev_cwd_slot;
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
         sandbox.freeHookData(L.handle);
@@ -1607,6 +1617,14 @@ test "searchFiles clamps a negative max_results without panicking" {
 
 test "findFiles clamps a negative max_results without panicking" {
     const sandbox = @import("sandbox.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "needle here\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const prev_cwd_slot = bridge.plugin_cwd_slot;
+    bridge.plugin_cwd_slot = root_buf[0..root_len];
+    defer bridge.plugin_cwd_slot = prev_cwd_slot;
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
         sandbox.freeHookData(L.handle);
