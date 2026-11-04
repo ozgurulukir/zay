@@ -1754,7 +1754,7 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
         // An empty string never serializes: a cleared field is null by the
         // time it reaches here, and the `s.len` guard keeps a hand-built
         // Config from writing `"systemPrompt": ""` to disk.
-        if (ms.systemPrompt()) |s| {
+        if (ms.systemPrompt() orelse config.system_prompt) |s| {
             if (s.len > 0) {
                 try writeKey(writer, "systemPrompt", &wrote_any);
                 try std.json.Stringify.value(s, .{}, writer);
@@ -1806,7 +1806,11 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             }
         }
     }
-    if (config.base_url) |url| {
+    const out_base_url = if (config.model_selection) |ms|
+        (ms.baseUrl() orelse config.base_url)
+    else
+        config.base_url;
+    if (out_base_url) |url| {
         if (url.len > 0) {
             try writeKey(writer, "baseURL", &wrote_any);
             try std.json.Stringify.value(url, .{}, writer);
@@ -4738,4 +4742,60 @@ test "load preserves user systemPrompt when model_selection is null (cold start)
 
     try std.testing.expectEqual(@as(?ModelSelection, null), res.config.model_selection);
     try std.testing.expectEqualStrings("You are custom Zay agent.", res.config.system_prompt.?);
+}
+
+test "serialize preserves config.system_prompt when model_selection systemPrompt is null" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var cfg: Config = .{
+        .system_prompt = try gpa.dupe(u8, "User configured prompt"),
+        .model_selection = .{
+            .builtin = .{
+                .provider = .anthropic,
+                .provider_name = try gpa.dupe(u8, "anthropic"),
+                .model = .{ .id = try gpa.dupe(u8, "claude-3-5-sonnet") },
+                .system_prompt = null,
+            },
+        },
+    };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+
+    try std.testing.expectEqualStrings("User configured prompt", parsed.system_prompt.?);
+}
+
+test "serialize preserves custom baseUrl when model_selection is custom" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var cfg: Config = .{
+        .model_selection = .{
+            .custom = .{
+                .provider_name = try gpa.dupe(u8, "local-proxy"),
+                .base_url = try gpa.dupe(u8, "http://proxy.local:8000/v1"),
+                .api_key = try gpa.dupe(u8, "dummy-key"),
+                .model = .{ .id = try gpa.dupe(u8, "llama3") },
+            },
+        },
+    };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+
+    try std.testing.expect(parsed.base_url != null);
+    try std.testing.expectEqualStrings("http://proxy.local:8000/v1", parsed.base_url.?);
 }
