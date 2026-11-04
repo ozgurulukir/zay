@@ -22,6 +22,7 @@ pub const executor = @import("executor.zig");
 pub const image_resize = @import("image_resize.zig");
 pub const os = @import("os.zig");
 pub const paths = @import("paths.zig");
+pub const models = @import("models/registry.zig");
 pub const plugin_store = @import("plugin_store.zig");
 pub const result_cache = @import("tools/result_cache.zig");
 pub const search = @import("search.zig");
@@ -114,16 +115,17 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     defer search.deinit(runtime_gpa, init.io);
 
     const system_prompt = if (load_result.config.model_selection) |ms|
-        (ms.systemPrompt() orelse defaultSystemPrompt())
+        (ms.systemPrompt() orelse load_result.config.system_prompt orelse defaultSystemPrompt())
     else
-        defaultSystemPrompt();
+        (load_result.config.system_prompt orelse defaultSystemPrompt());
     const agent_runtime = try tui_gpa.create(runtime.AgentRuntime);
     errdefer tui_gpa.destroy(agent_runtime);
 
     // Auth integrity: prune orphan keys that no longer correspond to any
     // known provider. Builtin labels are always valid; config provider
-    // names and the current dynamic_provider_id are collected as the
-    // valid set. Idempotent — running again after a prune removes nothing.
+    // names, current provider_name/dynamic_provider_id, and dynamic providers
+    // from the models.dev registry are collected as the valid set.
+    // Idempotent — running again after a prune removes nothing.
     {
         var valid_names: std.ArrayList([]const u8) = .empty;
         defer valid_names.deinit(runtime_gpa);
@@ -133,8 +135,16 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         for (load_result.config.providers) |p| {
             valid_names.append(runtime_gpa, p.name) catch continue;
         }
+        if (load_result.config.provider_name) |name| {
+            valid_names.append(runtime_gpa, name) catch {};
+        }
         if (load_result.config.dynamic_provider_id) |id| {
             valid_names.append(runtime_gpa, id) catch {};
+        }
+        var reg = models.loadRegistryCached(runtime_gpa, init.io, home_dir);
+        defer reg.deinit(runtime_gpa);
+        for (reg.providers) |p| {
+            valid_names.append(runtime_gpa, p.id) catch continue;
         }
         const pruned = auth.pruneOrphanKeys(runtime_gpa, init.io, home_dir, valid_names.items) catch 0;
         if (pruned > 0) {
