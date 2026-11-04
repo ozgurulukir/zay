@@ -6,6 +6,21 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-11-04
+
+### Changed
+- Mode transitions route through a single `App.setMode` entry with explicit follow-up duties: focus resync when a per-mode key handler closes its mode, draft retention, and drain hand-off; the ConPTY smoke harness is promoted into repo tooling with focus scenarios (#292, #317).
+- Architecture-review sync: shared subsystems arm through one agent attach seam and the reasoning-effort vocabulary moves to an `ai` leaf module (#299, #300); diff-key routing relocates with the lane-birth tail unified (#293); the mode runtime boundary gets a single classifier home (#292); the classify-before-run shell contract is enforced in code (#295); the mid-level session writer constructor is published with single-sourced store mapping (#297); plugin manifests load through one reader pinning the id/name law (#294); Win32 Job-Object FFI declarations consolidate in `os.zig` (#296); slop-audit leftovers swept (dead symbols, a substring counter, honest test names) (#305).
+- Plugin Lua shell bridge: classify and spawn fuse into one path (#315).
+- Docs sync: TUI field-privacy facade premise corrected (#298); patterns docs corrected from review (#301, #302); session docs name the de-duplicated backend-mapping sites.
+
+### Fixed
+- Windows: DB connect refusals surface as `ConnectionRefused` in `http_transport` instead of the raw Windows NTSTATUS `error.Unexpected`, normalizing remote-session connect errors across platforms (#322).
+- Config: unknown reasoning-effort values warn instead of silently degrading (#304); config-apply failures surface instead of being swallowed (#303); the reasoning-effort cross-check names the drifted schema key (#302).
+- TUI: manual MCP-sync toasts no longer double into the warn sink (#316); blocked-shell warnings read as toast copy (#315); focus lands on the primary input when the diff viewer closes.
+- Safety: the skill command path is gated in code, not prose (#305).
+- Tests: the Windows baseline failure set is cleared; the suite runs with zero expected failures (#287, #321).
+
 ## [0.11.7] - 2026-11-01
 
 ### Changed
@@ -105,7 +120,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.7...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.8...HEAD
+[0.11.8]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.8
 [0.11.7]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.7
 [0.11.6]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.6
 [0.11.5]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.5
