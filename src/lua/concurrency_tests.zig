@@ -5,6 +5,7 @@ const manager_mod = @import("manager.zig");
 const registry_bridge = @import("registry_bridge.zig");
 const bridge = @import("bridge.zig");
 const sandbox = @import("sandbox.zig");
+const execution = @import("execution.zig");
 const snapshot_mod = @import("tool_snapshot.zig");
 const ai = @import("../ai.zig");
 const agent_mod = @import("../agent.zig");
@@ -406,6 +407,11 @@ test "Lua concurrency: wall-clock timeout resets and leaves the execution mutex 
     defer manager.deinit();
     const instance = try manager.loadOne(path, false);
     sandbox.setWallClockTimeoutMs(instance.state.handle, 1);
+    // Pin the setter→reset wiring: dispatches re-arm from this field, so a
+    // regression that stopped reading it would otherwise only show up as a
+    // silent slow-down (the 5s manifest budget still times the loop out
+    // with identical assertions).
+    try testing.expectEqual(@as(u32, 1), execution.budget(instance.state.handle).?.timeout_ms);
     var timeout = try manager.callTool("concurrent", "loop", "{}");
     defer timeout.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), timeout.code);

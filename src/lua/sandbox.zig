@@ -90,7 +90,9 @@ pub fn resetInstructionBudget(L: *c.lua_State) void {
 /// arm. Plugin init shares the manifest timeout with dispatches (a huge
 /// instruction limit makes the wall clock the only init bound), so callers
 /// that need a tight *dispatch* deadline must tighten it only after init
-/// succeeded and release it again for coarse follow-up calls.
+/// succeeded and release it again for coarse follow-up calls. No-op for
+/// states without hook data (states not created by this module's
+/// constructors), like `resetInstructionBudget`.
 pub fn setWallClockTimeoutMs(L: *c.lua_State, timeout_ms: u32) void {
     const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
     const data = slot.* orelse return;
