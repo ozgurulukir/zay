@@ -1806,6 +1806,12 @@ fn serialize(gpa: std.mem.Allocator, writer: *std.Io.Writer, config: Config) !vo
             }
         }
     }
+    if (config.base_url) |url| {
+        if (url.len > 0) {
+            try writeKey(writer, "baseURL", &wrote_any);
+            try std.json.Stringify.value(url, .{}, writer);
+        }
+    }
     if (config.database_server_url) |url| {
         if (url.len > 0) {
             try writeKey(writer, "databaseServerUrl", &wrote_any);
@@ -4675,4 +4681,61 @@ test "readProject_whenFileHasInvalidJson_cleansUpDiagnosticsAndReturnsEmptyConfi
     // Assert
     try std.testing.expectEqual(@as(?Provider, null), cfg.providerFromName());
     try std.testing.expectEqual(@as(?Model, null), cfg.model);
+}
+
+test "serialize then parse roundtrips top-level baseURL without provider entry" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var cfg: Config = .{
+        .base_url = try gpa.dupe(u8, "http://127.0.0.1:11434"),
+    };
+    defer cfg.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+
+    try std.testing.expect(parsed.base_url != null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:11434", parsed.base_url.?);
+}
+
+test "load preserves user systemPrompt when model_selection is null (cold start)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const fake_home = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(fake_home);
+    const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(fake_cwd);
+
+    const config_dir = try globalConfigPath(gpa, io, fake_home);
+    defer gpa.free(config_dir);
+    const dirname = std.fs.path.dirname(config_dir).?;
+    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
+
+    const json = "{\"systemPrompt\":\"You are custom Zay agent.\"}";
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, config_dir, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(json);
+        try writer.interface.flush();
+    }
+
+    const env: TestEnv = .{ .entries = &.{} };
+    var res = try load(gpa, io, fake_cwd, fake_home, env);
+    defer res.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?ModelSelection, null), res.config.model_selection);
+    try std.testing.expectEqualStrings("You are custom Zay agent.", res.config.system_prompt.?);
 }
