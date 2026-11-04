@@ -134,7 +134,15 @@ fn fetchUnbounded(
                 .authorization = if (auth_header) |header| .{ .override = header } else .omit,
             },
         },
-    ) catch |err| return mapError(err);
+    ) catch |err| {
+        // Windows surfaces a refused loopback connect as the coarse
+        // error.Unexpected (NTSTATUS 0xc0000236; http.zig's headPhaseFailure
+        // documents the same accommodation). No other error.Unexpected source
+        // is expected while opening the connection, so normalizing here keeps
+        // the DB's ConnectionRefused taxonomy exact on every platform.
+        if (os.is_windows and err == error.Unexpected) return error.ConnectionRefused;
+        return mapError(err);
+    };
     defer request.deinit();
 
     // Apply POSIX send/receive timeouts before the first byte is written so
@@ -391,5 +399,12 @@ test "returnsConnectionRefused_whenServerNotListening" {
         .url = endpoint,
     };
 
-    try std.testing.expectError(error.ConnectionRefused, fetch(gpa, io, &options));
+    if (fetch(gpa, io, &options)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        // Strict on every platform: the connect phase normalizes the Windows
+        // NTSTATUS refusal (error.Unexpected) to ConnectionRefused before
+        // mapError runs (#287).
+        try std.testing.expectEqual(error.ConnectionRefused, err);
+    }
 }

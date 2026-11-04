@@ -37,7 +37,11 @@ fn runSingleTestFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool
 /// boolean result is the pass/fail verdict. A file passes iff the chunk runs
 /// cleanly AND run() returns true (which is false for zero tests).
 fn runTestSource(gpa: std.mem.Allocator, io: std.Io, content: []const u8) !bool {
-    var L = try sandbox.createSandboxedStateWithIo(.{ .full_access = true }, io);
+    // The default 5s wall-clock budget is sized for a single tool dispatch;
+    // plugin suites that exercise REAL subprocess bridges (search-tools'
+    // pwsh→rg chain, #321) legitimately need longer on a loaded Windows box.
+    // The harness still bounds a hung run, just at a minute instead.
+    var L = try sandbox.createSandboxedStateWithIo(.{ .full_access = true, .timeout_ms = 60_000 }, io);
     defer {
         sandbox.freeHookData(L.handle);
         L.deinit();
