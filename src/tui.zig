@@ -455,9 +455,11 @@ pub const App = struct {
         self.inputs.palette.onChange = event_callbacks.paletteInputChanged;
     }
 
-    // --- Accessors for cross-module access (R1: event_router needs these
-    // because Zig 0.16 forbids `pub` on struct fields). Pure read/write
-    // forwarding — prefer existing semantic methods when one fits. ----------
+    // --- Accessors for cross-module access (R1: event_router needs these).
+    // Convention, not a language requirement: Zig puts no visibility on
+    // struct fields, and direct `app.<field>` access is permitted and widely
+    // used (#298 tracks the facade's future). Pure read/write forwarding —
+    // prefer existing semantic methods when one fits. ----------
 
     pub fn getIo(self: *const App) std.Io {
         return self.io;
