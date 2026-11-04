@@ -59,8 +59,14 @@ when untrusted code needs a stronger boundary.
   command-mode calls — all go through the executor's approval gate
   (`executor_safety.shouldRejectUnsafeShell`) before dispatch. Lua
   `zay.run_bash` / `zay.run_shell` (and `os.execute` when the
-  `allow_os_execute` permission is granted) classify through the same
-  `bash_safety.classify` and hard-block `unsafe` verdicts.
+  `allow_os_execute` permission is granted, which dispatches through
+  `zay.run_shell`) classify and spawn through one fused bridge helper
+  (`spawnClassifiedShell` in `src/lua/bridges/shell.zig`):
+  `bash_safety.classify` → hard-block `unsafe` verdicts → spawn, with the
+  raw backend spawn calls private to that helper so a new bridge entry
+  point cannot reach execution without classification (#315). Plugins
+  cannot show the interactive approval prompt, so the block is a hard
+  error (`UnsafeShellBlocked`) rather than a prompt.
 - **Not classified — safe by construction:** the Lua git bridges
   (`zay.git_status` / `git_diff` / `git_log` / `git_branch` / `git_add` /
   `git_commit`). Each builds a fixed `git <subcommand>` invocation; plugin
