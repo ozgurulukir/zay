@@ -152,9 +152,11 @@ fn spawnClassifiedShell(
     const verdict = bash_safety.classify(std.heap.page_allocator, io, bridge.bash_classifier_url_slot, resolved_cwd, cmd);
     if (verdict == .unsafe) {
         const backend_name = if (backend == .pwsh) "pwsh" else "bash";
-        std.log.warn("plugin.shell.blocked plugin_dir={s} backend={s} cmd=\"{s}\"", .{
-            pluginDirBestEffort(L_ptr),
+        // Warn→toast copy: the sink pushes this line verbatim in TUI mode, so
+        // it reads as user-facing text with log detail in parens (#316).
+        std.log.warn("Plugin shell command blocked by Zay's safety classifier ({s} backend; plugin dir {s}; command: \"{s}\")", .{
             backend_name,
+            pluginDirBestEffort(L_ptr),
             cmd[0..@min(cmd.len, 80)],
         });
         return error.UnsafeShellBlocked;
