@@ -9,10 +9,11 @@
 //! Behavioural identity is preserved: every key combo, every side effect
 //! matches the pre-refactor implementation. Only the location changed.
 //!
-//! Note: Zig 0.16 forbids `pub` on struct fields, so this module reads and
-//! writes `App` state through dedicated `pub fn` accessors on `App` (added
-//! alongside the extraction; see `tui.zig`). R3 will move those accessors
-//! into proper sub-structs.
+//! Note: this module reads and writes `App` state through dedicated `pub fn`
+//! accessors on `App` (added alongside the extraction; see `tui.zig`). That
+//! is a convention, not a language requirement — Zig puts no visibility on
+//! struct fields and direct access is widely used (#298). R3 will move
+//! those accessors into proper sub-structs.
 
 const std = @import("std");
 const os = @import("../os.zig");
