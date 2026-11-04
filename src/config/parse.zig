@@ -122,6 +122,17 @@ pub fn load(
     var merged = try mergeLayers(gpa, &.{ global, project, env_layer });
     errdefer merged.deinit(gpa);
 
+    const validation_diags = try merged.validate(gpa);
+    defer gpa.free(validation_diags);
+    var moved: usize = 0;
+    errdefer {
+        for (validation_diags[moved..]) |*d| d.deinit(gpa);
+    }
+    for (validation_diags) |d| {
+        try diagnostics.append(gpa, d);
+        moved += 1;
+    }
+
     return .{
         .config = merged,
         .diagnostics = try diagnostics.toOwnedSlice(gpa),
@@ -201,6 +212,9 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
     try applyTuiOverlay(gpa, target, updates.tui);
     // Theme is independent of model selection, so it merges unconditionally.
     if (updates.theme) |s| try replaceOptionalSlice(gpa, &target.theme, s);
+    if (updates.version) |s| try replaceOptionalSlice(gpa, &target.version, s);
+    if (updates.dynamic_provider_id) |s| try replaceOptionalSlice(gpa, &target.dynamic_provider_id, s);
+    if (updates.dynamic_provider_name) |s| try replaceOptionalSlice(gpa, &target.dynamic_provider_name, s);
 }
 
 fn applyDatabaseOverlay(gpa: std.mem.Allocator, target: *DatabaseConfig, updates: DatabaseConfig) !void {
@@ -668,7 +682,13 @@ fn loadFile(
         try appendConfigError(gpa, diagnostics, path, "{s}", .{@errorName(err)});
         return .{};
     };
-    return parseFile(gpa, path, bytes, diagnostics);
+    return parseFile(gpa, path, bytes, diagnostics) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try appendConfigError(gpa, diagnostics, path, "failed to parse config file: {s}", .{@errorName(err)});
+            return .{};
+        },
+    };
 }
 
 fn parseFile(
@@ -789,7 +809,7 @@ fn parseObject(
 
     // Database backend configuration.
     if (value.object.get("database")) |db_val| {
-        if (db_val == .object) out.database = try parseDatabase(gpa, db_val);
+        if (db_val == .object) out.database = try parseDatabase(gpa, path, db_val, diagnostics);
     }
 
     // Populate the typed `model_selection` when all required fields
@@ -942,11 +962,20 @@ const toast_duration_max: u32 = 30_000;
 const toast_max_visible_min: u8 = 1;
 const toast_max_visible_max: u8 = 5;
 
-fn parseDatabase(gpa: std.mem.Allocator, value: std.json.Value) !DatabaseConfig {
+fn parseDatabase(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    value: std.json.Value,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !DatabaseConfig {
     var db_cfg: DatabaseConfig = .{};
     errdefer db_cfg.deinit(gpa);
     if (stringFieldCompat(value, "backend", "backend")) |s| {
-        db_cfg.backend = DatabaseBackendKind.fromString(s) orelse return error.InvalidDatabaseBackend;
+        if (DatabaseBackendKind.fromString(s)) |b| {
+            db_cfg.backend = b;
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "invalid database backend '{s}'", .{s});
+        }
     }
     if (stringFieldCompat(value, "url", "url")) |s| {
         if (s.len > 0) db_cfg.url = try gpa.dupe(u8, s);
@@ -1444,7 +1473,13 @@ fn loadEnv(
         }
     }
     if (env.get("ZAY_DATABASE_BACKEND")) |s| {
-        if (s.len > 0) out.database.backend = DatabaseBackendKind.fromString(s) orelse return error.InvalidDatabaseBackend;
+        if (s.len > 0) {
+            if (DatabaseBackendKind.fromString(s)) |b| {
+                out.database.backend = b;
+            } else {
+                try appendConfigError(gpa, diagnostics, "ZAY_DATABASE_BACKEND", "invalid database backend '{s}'", .{s});
+            }
+        }
     }
     if (env.get("ZAY_DATABASE_URL")) |s| {
         if (s.len > 0) out.database.url = try gpa.dupe(u8, s);
@@ -4798,4 +4833,137 @@ test "serialize preserves custom baseUrl when model_selection is custom" {
 
     try std.testing.expect(parsed.base_url != null);
     try std.testing.expectEqualStrings("http://proxy.local:8000/v1", parsed.base_url.?);
+}
+
+test "parseDatabase records diagnostic on unknown backend without throwing error" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const json = "{\"backend\":\"bogus_backend\",\"url\":\"http://localhost:8766\"}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+
+    var db_cfg = try parseDatabase(gpa, "<test>", parsed.value, &sink);
+    defer db_cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?DatabaseBackendKind, null), db_cfg.backend);
+    try std.testing.expect(sink.items.len == 1);
+}
+
+test "loadEnv records diagnostic on unknown ZAY_DATABASE_BACKEND without throwing error" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const entries = [_]TestEnv.Entry{
+        .{ .key = "ZAY_DATABASE_BACKEND", .value = "bogus_backend" },
+    };
+    const env: TestEnv = .{ .entries = &entries };
+    var env_cfg = try loadEnv(gpa, env, &sink);
+    defer env_cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?DatabaseBackendKind, null), env_cfg.database.backend);
+    try std.testing.expect(sink.items.len == 1);
+}
+
+test "loadFile catches invalid MCP configuration fail-soft and records diagnostic" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const test_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(test_dir);
+
+    const file_path = try std.fs.path.join(gpa, &.{ test_dir, "bad_mcp.json" });
+    defer gpa.free(file_path);
+
+    const bad_mcp_json = "{\"mcpServers\":{\"bad\":{\"enabled\":true}}}";
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, file_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(bad_mcp_json);
+        try writer.interface.flush();
+    }
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diags.items) |*d| d.deinit(gpa);
+        diags.deinit(gpa);
+    }
+    var loaded = try loadFile(gpa, io, file_path, &diags);
+    defer loaded.deinit(gpa);
+
+    try std.testing.expect(diags.items.len > 0);
+}
+
+test "load executes validate and surfaces diagnostics for invalid schema version" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const fake_home = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(fake_home);
+    const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(fake_cwd);
+
+    const config_dir = try globalConfigPath(gpa, io, fake_home);
+    defer gpa.free(config_dir);
+    const dirname = std.fs.path.dirname(config_dir).?;
+    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
+
+    const v3_json = "{\"version\":\"3.0.0\"}";
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, config_dir, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(v3_json);
+        try writer.interface.flush();
+    }
+
+    const env: TestEnv = .{ .entries = &.{} };
+    var res = try load(gpa, io, fake_cwd, fake_home, env);
+    defer res.deinit(gpa);
+
+    try std.testing.expect(res.diagnostics.len > 0);
+    var found_version_diag = false;
+    for (res.diagnostics) |d| {
+        switch (d) {
+            .config_parse_error => |e| {
+                if (std.mem.eql(u8, e.path, "version")) found_version_diag = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_version_diag);
+}
+
+test "validate captures both invalid semver and invalid base_url without early return" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{
+        .version = try gpa.dupe(u8, "not-a-semver"),
+        .base_url = try gpa.dupe(u8, "ftp://example.com"),
+    };
+    defer cfg.deinit(gpa);
+
+    const diags = try cfg.validate(gpa);
+    defer {
+        for (diags) |*d| d.deinit(gpa);
+        gpa.free(diags);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), diags.len);
 }
