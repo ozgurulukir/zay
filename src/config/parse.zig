@@ -364,10 +364,15 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
                     .args = args,
                 } };
             },
-            .sse => |t| .{ .sse = .{
-                .url = try gpa.dupe(u8, t.url),
-                .headers = try cloneHeaders(gpa, t.headers),
-            } },
+            .sse => |t| blk: {
+                const url = try gpa.dupe(u8, t.url);
+                errdefer gpa.free(url);
+                const headers = try cloneHeaders(gpa, t.headers);
+                break :blk .{ .sse = .{
+                    .url = url,
+                    .headers = headers,
+                } };
+            },
         };
         switch (server.transport) {
             .stdio => |t| {
@@ -475,8 +480,9 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
                 .unset => {},
             }
             if (update.reasoning_options.len > 0) {
+                const next_options = try gpa.dupe(ReasoningEffort, update.reasoning_options);
                 if (model.reasoning_options.len > 0) gpa.free(model.reasoning_options);
-                model.reasoning_options = try gpa.dupe(ReasoningEffort, update.reasoning_options);
+                model.reasoning_options = next_options;
             }
             replaced = true;
             break;
@@ -515,8 +521,9 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
                 model_ptr.context_window = entry_model.context_window;
                 model_ptr.max_output_tokens = entry_model.max_output_tokens;
                 if (entry_model.reasoning_options.len > 0) {
+                    const next_options = try gpa.dupe(ReasoningEffort, entry_model.reasoning_options);
                     if (model_ptr.reasoning_options.len > 0) gpa.free(model_ptr.reasoning_options);
-                    model_ptr.reasoning_options = try gpa.dupe(ReasoningEffort, entry_model.reasoning_options);
+                    model_ptr.reasoning_options = next_options;
                 }
                 return;
             }
@@ -5059,4 +5066,37 @@ test "applyMcpServerOverlay updates existing server transport without memory lea
         .stdio => unreachable,
     }
 }
+
+test "applyProviderModelsOverlay updates reasoning options without memory leak" {
+    const gpa = std.testing.allocator;
+    var target: ProviderConfig = .{
+        .name = try gpa.dupe(u8, "provider"),
+        .provider = .openai,
+    };
+    defer target.deinit(gpa);
+
+    var init_opts = try gpa.alloc(ReasoningEffort, 1);
+    init_opts[0] = .low;
+    var init_models = try gpa.alloc(ProviderModel, 1);
+    init_models[0] = .{
+        .id = try gpa.dupe(u8, "model-1"),
+        .reasoning_options = init_opts,
+    };
+    target.models = init_models;
+
+    const new_opts = [_]ReasoningEffort{ .high, .max };
+    const update_models = [_]ProviderModel{
+        .{
+            .id = try gpa.dupe(u8, "model-1"),
+            .reasoning_options = &new_opts,
+        },
+    };
+    defer gpa.free(update_models[0].id);
+
+    try applyProviderModelsOverlay(gpa, &target, &update_models);
+
+    try std.testing.expectEqual(@as(usize, 1), target.models.len);
+    try std.testing.expectEqual(@as(usize, 2), target.models[0].reasoning_options.len);
+    try std.testing.expectEqual(ReasoningEffort.high, target.models[0].reasoning_options[0]);
+    try std.testing.expectEqual(ReasoningEffort.max, target.models[0].reasoning_options[1]);
 }

@@ -29,9 +29,12 @@ pub fn cloneHeaders(gpa: std.mem.Allocator, headers: []const McpHeader) ![]McpHe
         gpa.free(out);
     }
     for (headers, 0..) |h, i| {
+        const name = try gpa.dupe(u8, h.name);
+        errdefer gpa.free(name);
+        const value = try gpa.dupe(u8, h.value);
         out[i] = .{
-            .name = try gpa.dupe(u8, h.name),
-            .value = try gpa.dupe(u8, h.value),
+            .name = name,
+            .value = value,
         };
         done += 1;
     }
@@ -88,25 +91,45 @@ pub const McpServerConfig = struct {
     }
 
     pub fn clone(self: McpServerConfig, gpa: std.mem.Allocator) !McpServerConfig {
+        const Transport = @FieldType(McpServerConfig, "transport");
+        const name = try gpa.dupe(u8, self.name);
+        errdefer gpa.free(name);
+        const transport: Transport = switch (self.transport) {
+            .stdio => |t| blk: {
+                var args: [][]u8 = &.{};
+                if (t.args.len > 0) {
+                    args = try gpa.alloc([]u8, t.args.len);
+                    var done: usize = 0;
+                    errdefer {
+                        for (args[0..done]) |arg| gpa.free(arg);
+                        gpa.free(args);
+                    }
+                    for (t.args, 0..) |arg, i| {
+                        args[i] = try gpa.dupe(u8, arg);
+                        done += 1;
+                    }
+                }
+                const cmd = try gpa.dupe(u8, t.command);
+                break :blk .{ .stdio = .{
+                    .command = cmd,
+                    .args = args,
+                } };
+            },
+            .sse => |t| blk: {
+                const url = try gpa.dupe(u8, t.url);
+                errdefer gpa.free(url);
+                const headers = try cloneHeaders(gpa, t.headers);
+                break :blk .{ .sse = .{
+                    .url = url,
+                    .headers = headers,
+                } };
+            },
+        };
         return .{
-            .name = try gpa.dupe(u8, self.name),
+            .name = name,
             .enabled = self.enabled,
             .request_timeout_ms = self.request_timeout_ms,
-            .transport = switch (self.transport) {
-                .stdio => |t| blk: {
-                    var args = try gpa.alloc([]u8, t.args.len);
-                    errdefer gpa.free(args);
-                    for (t.args, 0..) |arg, i| args[i] = try gpa.dupe(u8, arg);
-                    break :blk .{ .stdio = .{
-                        .command = try gpa.dupe(u8, t.command),
-                        .args = args,
-                    } };
-                },
-                .sse => |t| .{ .sse = .{
-                    .url = try gpa.dupe(u8, t.url),
-                    .headers = try cloneHeaders(gpa, t.headers),
-                } },
-            },
+            .transport = transport,
         };
     }
 };
@@ -357,4 +380,50 @@ test "expandMcpServer expands stdio command and arguments from the environment" 
         .stdio => |t| try std.testing.expectEqualStrings("val-{env:PATH}", t.args[1]),
         .sse => return error.Unexpected,
     }
+}
+
+test "McpServerConfig.clone clones stdio and sse without leaks" {
+    const gpa = std.testing.allocator;
+
+    var args = try gpa.alloc([]u8, 1);
+    args[0] = try gpa.dupe(u8, "arg1");
+    var s1: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "server-stdio"),
+        .enabled = true,
+        .transport = .{ .stdio = .{
+            .command = try gpa.dupe(u8, "run.sh"),
+            .args = args,
+        } },
+    };
+    defer s1.deinit(gpa);
+
+    var c1 = try s1.clone(gpa);
+    defer c1.deinit(gpa);
+
+    try std.testing.expectEqualStrings("server-stdio", c1.name);
+    try std.testing.expectEqualStrings("run.sh", c1.transport.stdio.command);
+    try std.testing.expectEqualStrings("arg1", c1.transport.stdio.args[0]);
+
+    var headers = try gpa.alloc(McpHeader, 1);
+    headers[0] = .{
+        .name = try gpa.dupe(u8, "X-Auth"),
+        .value = try gpa.dupe(u8, "token"),
+    };
+    var s2: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "server-sse"),
+        .enabled = false,
+        .transport = .{ .sse = .{
+            .url = try gpa.dupe(u8, "https://example.com/sse"),
+            .headers = headers,
+        } },
+    };
+    defer s2.deinit(gpa);
+
+    var c2 = try s2.clone(gpa);
+    defer c2.deinit(gpa);
+
+    try std.testing.expectEqualStrings("server-sse", c2.name);
+    try std.testing.expectEqualStrings("https://example.com/sse", c2.transport.sse.url);
+    try std.testing.expectEqualStrings("X-Auth", c2.transport.sse.headers[0].name);
+    try std.testing.expectEqualStrings("token", c2.transport.sse.headers[0].value);
 }
