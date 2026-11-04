@@ -479,12 +479,12 @@ pub const Config = struct {
             list.deinit(gpa);
         }
         if (self.version) |v| {
-            const major = parse_mod.parseSemverMajor(v) orelse {
+            if (parse_mod.parseSemverMajor(v)) |major| {
+                if (major > 2) {
+                    try appendConfigError(gpa, &list, "version", "unsupported schema version {s}", .{v});
+                }
+            } else {
                 try appendConfigError(gpa, &list, "version", "invalid semver '{s}'", .{v});
-                return try list.toOwnedSlice(gpa);
-            };
-            if (major > 2) {
-                try appendConfigError(gpa, &list, "version", "unsupported schema version {s}", .{v});
             }
         }
         if (self.base_url) |url| {

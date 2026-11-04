@@ -124,8 +124,13 @@ pub fn load(
 
     const validation_diags = try merged.validate(gpa);
     defer gpa.free(validation_diags);
+    var moved: usize = 0;
+    errdefer {
+        for (validation_diags[moved..]) |*d| d.deinit(gpa);
+    }
     for (validation_diags) |d| {
         try diagnostics.append(gpa, d);
+        moved += 1;
     }
 
     return .{
@@ -4944,4 +4949,21 @@ test "load executes validate and surfaces diagnostics for invalid schema version
         }
     }
     try std.testing.expect(found_version_diag);
+}
+
+test "validate captures both invalid semver and invalid base_url without early return" {
+    const gpa = std.testing.allocator;
+    var cfg: Config = .{
+        .version = try gpa.dupe(u8, "not-a-semver"),
+        .base_url = try gpa.dupe(u8, "ftp://example.com"),
+    };
+    defer cfg.deinit(gpa);
+
+    const diags = try cfg.validate(gpa);
+    defer {
+        for (diags) |*d| d.deinit(gpa);
+        gpa.free(diags);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), diags.len);
 }
