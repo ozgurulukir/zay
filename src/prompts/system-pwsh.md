@@ -14,6 +14,7 @@ explicit UTF-8 encoding for file creation:
 '@ | Set-Content -Encoding utf8 -Path path\to\file.ext
 ```
 
-For exact replacements, escape the source text with `[regex]::Escape`. Use
+If you use the regex `-replace` operator, escape the source text with
+`[regex]::Escape`; the `.Replace()` method is already literal. Use
 full-word PowerShell options (`-Force`, `-Recurse`) and set
 `$ErrorActionPreference = 'Stop'` for multi-statement scripts.

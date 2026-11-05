@@ -5,10 +5,18 @@
 //! only structural difference is the outer envelope: Chat Completions wraps
 //! each definition in a `"function"` object while the Responses API keeps it
 //! flat. Everything else — property kinds, nullable unions, enum constraints,
-//! raw-JSON defaults, object/array markers, the strict-gated `required` list,
-//! and the `{{hsep}}` → `~` description substitution — is byte-identical
-//! across both. This module is the single implementation, parameterized by
-//! `Envelope`, so a tool-schema change lands in one place instead of two.
+//! raw-JSON defaults, object/array markers, and the strict-gated `required` list —
+//! is byte-identical across both. This module is the single implementation,
+//! parameterized by `Envelope`, so a tool-schema change lands in one place
+//! instead of two.
+//!
+//! Conditional requirements (`tools_common.Schema.requirements`) are deliberately
+//! executor-enforced rather than wire-serialized. Neither OpenAI strict structured
+//! outputs nor common OpenAI-compatible gateways provide a portable conditional
+//! requirement syntax without introducing complex `if`/`then` constraints that
+//! providers reject. Local pre-dispatch validation (`tools/schema.zig:checkRequirements`)
+//! validates arguments before any tool callback runs, guaranteeing consistent
+//! behavior across all model providers.
 
 const std = @import("std");
 const ai = @import("../ai.zig");
@@ -36,8 +44,7 @@ pub const ToolSpec = struct {
     raw_input_schema: ?[]const u8 = null,
 };
 
-/// Convert a `tools.Tool` record. The description template still carries
-/// `{{hsep}}` placeholders — `writeToolDefinition` substitutes them.
+/// Convert a `tools.Tool` record.
 pub fn specFromTool(t: tools_common.Tool) ToolSpec {
     return .{
         .name = t.name,
@@ -62,8 +69,8 @@ pub fn specFromTool(t: tools_common.Tool) ToolSpec {
 ///   `required`, so the provider contract forces a transformation. This is
 ///   the only reshaping path, and it never claims constraints the projection
 ///   cannot model: `kind_unconstrained` properties lose their `type` rather
-///   than fabricate one. The MCP server remains the validation authority
-///   either way.
+///   than fabricate one (as verified in tests and documented in the schema
+///   contract). The MCP server remains the validation authority either way.
 fn parametersPassThrough(raw_input_schema: ?[]const u8, strict: bool) bool {
     // Strict structured outputs is the one provider contract that rejects
     // arbitrary JSON Schema; every other dialect passes the raw form through.
@@ -96,7 +103,6 @@ pub fn buildToolsJson(
 
 /// Build the OpenAI `tools` JSON array from builtin tools, registry plugin
 /// tools, and MCP tool schemas, for the given wire-format envelope.
-/// Substitutes `{{hsep}}` → `~` in each tool's description template.
 /// The caller owns the returned slice.
 pub fn buildAllToolsJson(
     gpa: std.mem.Allocator,
@@ -143,15 +149,13 @@ fn writeToolDefinition(
     strict: bool,
     envelope: Envelope,
 ) !void {
-    const desc = try std.mem.replaceOwned(u8, gpa, description, "{{hsep}}", "~");
-    defer gpa.free(desc);
     switch (envelope) {
         .completions => try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":"),
         .responses => try writer.writeAll("{\"type\":\"function\",\"name\":"),
     }
     try wire_json.writeString(writer, gpa, name);
     try writer.writeAll(",\"description\":");
-    try wire_json.writeString(writer, gpa, desc);
+    try wire_json.writeString(writer, gpa, description);
     // Strict structured-outputs mode is OpenAI-only. Gateways that don't
     // support it silently break function-calling, so it's opt-in via
     // `ai.Config.strict`. The leading comma is always written so the next
@@ -344,7 +348,7 @@ test "tool schema omits unsupported projection constraints" {
 const test_tools = [_]tools_common.Tool{
     .{
         .name = "configure",
-        .description = "Configure a {{hsep}} server",
+        .description = "Configure a ~ server",
         .schema = .{
             .properties = &.{
                 .{ .name = "mode", .kind = .string, .description = "Run mode", .required = true, .nullable = false, .enum_values = &.{ "fast", "slow" }, .default_value = "\"fast\"" },
@@ -393,7 +397,7 @@ test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale"
     };
     for (plugin_names) |name| {
         const owned_name = try gpa.dupe(u8, name);
-        const owned_desc = try std.fmt.allocPrint(gpa, "Plugin tool {{hsep}} for {{hsep}} testing", .{});
+        const owned_desc = try std.fmt.allocPrint(gpa, "Plugin tool for testing", .{});
         try registry.addPluginTool(gpa, .{
             .name = owned_name,
             .description = owned_desc,
@@ -435,8 +439,8 @@ test "tool_schema golden: byte-identical output for all envelope × strict combo
     // Locks the serialized bytes for the canonical tool set so any future
     // drift (wrong closing brace count, dropped nullable union, missing enum)
     // is caught exactly here. Expected strings cover: completions/responses
-    // envelopes × strict on/off, nullable unions, enum + raw-default, nested
-    // object/array markers, and the {{hsep}} → ~ substitution.
+    // envelopes × strict on/off, nullable unions, enum + raw-default, and nested
+    // object/array markers.
     const gpa = std.testing.allocator;
 
     const completions_strict =
