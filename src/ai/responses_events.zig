@@ -594,7 +594,10 @@ fn onArgumentsDelta(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.
     const delta = stringField(value, "delta") orelse return;
     const index = toolIndexForEvent(value, tools.items) orelse return;
     try tools.items[index].arguments.appendSlice(gpa, delta);
-    try syncOneToolBlock(gpa, blocks, &tools.items[index]);
+    if (tools.items[index].block_index < blocks.items.len and blocks.items[tools.items[index].block_index] == .tool_call) {
+        const block = &blocks.items[tools.items[index].block_index].tool_call;
+        block.arguments = try appendOwned(gpa, block.arguments, delta);
+    }
     try observer.on_tool_delta(observer.ctx, .{ .index = index, .name = tools.items[index].name.items, .arguments = tools.items[index].arguments.items });
     try observer.on_delta_end(observer.ctx);
 }

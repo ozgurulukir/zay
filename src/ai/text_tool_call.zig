@@ -60,6 +60,31 @@ pub fn extractFromText(gpa: std.mem.Allocator, text: []const u8, seq: *u64) ![]a
     return calls.toOwnedSlice(gpa);
 }
 
+/// Strip all `<tool_call>...</tool_call>` envelopes from `text`.
+/// Returns an allocated slice of the remaining prose with surrounding whitespace trimmed.
+pub fn stripToolCalls(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var cursor: usize = 0;
+    while (true) {
+        const open = findOpenTagIgnoreCase(text, cursor) orelse break;
+        const body_start = open + open_tag.len;
+        const close = findCloseTagIgnoreCase(text, body_start) orelse break;
+        try out.appendSlice(gpa, text[cursor..open]);
+        cursor = close + close_tag.len;
+    }
+    try out.appendSlice(gpa, text[cursor..]);
+    const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
+    if (trimmed.len == 0) {
+        out.deinit(gpa);
+        return try gpa.alloc(u8, 0);
+    }
+    const result = try gpa.dupe(u8, trimmed);
+    out.deinit(gpa);
+    return result;
+}
+
 /// Case-insensitive scan for the next `<tool_call>` opening tag.
 fn findOpenTagIgnoreCase(text: []const u8, start: usize) ?usize {
     var i: usize = start;
@@ -515,4 +540,23 @@ test "extractFromText function-tag variant with quoted name and repeated keys" {
         "{\"command\":\"ls\",\"flag\":[\"-a\",\"-l\"]}",
         calls[0].arguments,
     );
+}
+
+test "stripToolCalls excises single and multiple tool call envelopes" {
+    const gpa = std.testing.allocator;
+
+    const text1 = "I will run bash:\n<tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\nAll done!";
+    const stripped1 = try stripToolCalls(gpa, text1);
+    defer gpa.free(stripped1);
+    try std.testing.expectEqualStrings("I will run bash:\n\nAll done!", stripped1);
+
+    const text2 = "  <tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call>  ";
+    const stripped2 = try stripToolCalls(gpa, text2);
+    defer gpa.free(stripped2);
+    try std.testing.expectEqualStrings("", stripped2);
+
+    const text3 = "No tags here";
+    const stripped3 = try stripToolCalls(gpa, text3);
+    defer gpa.free(stripped3);
+    try std.testing.expectEqualStrings("No tags here", stripped3);
 }

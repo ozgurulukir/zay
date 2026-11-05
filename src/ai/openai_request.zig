@@ -126,30 +126,8 @@ pub const PayloadOptions = struct {
     dialect: ai.WireDialect = .minimal,
     disable_prompt_cache: bool = false,
     is_reasoning_model: bool = false,
+    parallel_tool_calls: ?bool = null,
 };
-
-/// Config-struct entry point; see `PayloadOptions`.
-pub fn writePayload(
-    gpa: std.mem.Allocator,
-    out: *std.Io.Writer,
-    opts: PayloadOptions,
-    messages: []const ai.MessageView,
-    tools_json: []const u8,
-) !void {
-    return writeRequestPayload(
-        gpa,
-        out,
-        opts.model,
-        opts.session_id,
-        messages,
-        tools_json,
-        opts.reasoning,
-        opts.max_output_tokens,
-        opts.dialect,
-        opts.disable_prompt_cache,
-        opts.is_reasoning_model,
-    );
-}
 
 pub fn writeRequestPayload(
     gpa: std.mem.Allocator,
@@ -164,6 +142,33 @@ pub fn writeRequestPayload(
     disable_prompt_cache: bool,
     is_reasoning_model: bool,
 ) !void {
+    return writePayload(gpa, out, .{
+        .model = model,
+        .session_id = session_id,
+        .reasoning = reasoning,
+        .max_output_tokens = max_output_tokens,
+        .dialect = dialect,
+        .disable_prompt_cache = disable_prompt_cache,
+        .is_reasoning_model = is_reasoning_model,
+        .parallel_tool_calls = null,
+    }, messages, tools_json);
+}
+
+/// Config-struct entry point; see `PayloadOptions`.
+pub fn writePayload(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    opts: PayloadOptions,
+    messages: []const ai.MessageView,
+    tools_json: []const u8,
+) !void {
+    const model = opts.model;
+    const session_id = opts.session_id;
+    const reasoning = opts.reasoning;
+    const max_output_tokens = opts.max_output_tokens;
+    const dialect = opts.dialect;
+    const disable_prompt_cache = opts.disable_prompt_cache;
+    const is_reasoning_model = opts.is_reasoning_model;
     // Real early returns — these MUST survive into the ReleaseFast install
     // build. `std.debug.assert` compiles to `unreachable` (UB) in ReleaseFast,
     // so it asserts nothing there (AGENTS.md §Safety). An empty model id is a
@@ -235,6 +240,9 @@ pub fn writeRequestPayload(
         try out.writeAll(",\"tools\":");
         try out.writeAll(tools_json);
         try out.writeAll(",\"tool_choice\":\"auto\"");
+        if (opts.parallel_tool_calls) |ptc| {
+            try out.writeAll(if (ptc) ",\"parallel_tool_calls\":true" else ",\"parallel_tool_calls\":false");
+        }
     } else {
         log.warn("openai_compatible: sending request with NO tools (tools_json is empty) model={s}", .{model});
     }
@@ -792,4 +800,28 @@ test "writeRequestPayload escapes a user image data URI with special characters"
     try std.testing.expect(std.mem.indexOf(u8, body, "image/\"") == null);
     // The JSON-escaped quote (backslash-quote) must be present instead.
     try std.testing.expect(std.mem.indexOf(u8, body, "image/\\\"") != null);
+}
+
+test "writePayload emits parallel_tool_calls when configured" {
+    const gpa = std.testing.allocator;
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+
+    try writePayload(gpa, &payload.writer, .{
+        .model = "gpt-4o",
+        .parallel_tool_calls = false,
+    }, &.{}, "[{\"type\":\"function\"}]");
+
+    try std.testing.expect(std.mem.indexOf(u8, payload.written(), ",\"parallel_tool_calls\":false") != null);
+
+    var payload_true: std.Io.Writer.Allocating = .init(gpa);
+    defer payload_true.deinit();
+
+    try writePayload(gpa, &payload_true.writer, .{
+        .model = "gpt-4o",
+        .parallel_tool_calls = true,
+    }, &.{}, "[{\"type\":\"function\"}]");
+
+    try std.testing.expect(std.mem.indexOf(u8, payload_true.written(), ",\"parallel_tool_calls\":true") != null);
 }

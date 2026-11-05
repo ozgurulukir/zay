@@ -176,6 +176,7 @@ pub const Client = struct {
                 .dialect = self.config.wire_dialect,
                 .disable_prompt_cache = self.config.disable_prompt_cache,
                 .is_reasoning_model = self.config.is_reasoning_model,
+                .parallel_tool_calls = if (self.config.max_parallel_tool_calls <= 1) false else null,
             },
             .messages = messages,
             .tools_json = self.tools_json,
@@ -1143,7 +1144,9 @@ test "sanitizeToolArguments strips markdown backticks and falls back to empty ob
     try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments("   "));
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream_parser.sanitizeToolArguments("{\"command\":\"ls\"}"));
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream_parser.sanitizeToolArguments("```json\n{\"command\":\"ls\"}\n```"));
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream_parser.sanitizeToolArguments("// Running command:\n{\"command\":\"ls\"}\n// done"));
     try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments("not a json string"));
+    try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments("{\"comm"));
 }
 
 test "parse streaming parallel tool calls with reused index does not concatenate names" {
