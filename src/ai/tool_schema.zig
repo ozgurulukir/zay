@@ -197,6 +197,7 @@ fn writeParameters(
         } else {
             try writer.writeAll("\"type\":");
             const kind_str = kindName(prop.kind);
+            const wire_nullable = if (strict) prop.acceptsNull() else prop.nullable;
             if (prop.kind_alternatives.len > 0) {
                 try writer.writeByte('[');
                 try std.json.Stringify.value(kind_str, .{}, writer);
@@ -204,9 +205,9 @@ fn writeParameters(
                     try writer.writeByte(',');
                     try std.json.Stringify.value(kindName(alternative), .{}, writer);
                 }
-                if (prop.acceptsNull()) try writer.writeAll(",\"null\"");
+                if (wire_nullable) try writer.writeAll(",\"null\"");
                 try writer.writeByte(']');
-            } else if (prop.acceptsNull()) {
+            } else if (wire_nullable) {
                 try std.json.Stringify.value(&[_][]const u8{ kind_str, "null" }, .{}, writer);
             } else {
                 try std.json.Stringify.value(kind_str, .{}, writer);
@@ -217,12 +218,13 @@ fn writeParameters(
         // Emit enum constraint when present.
         if (prop.enum_values) |ev| {
             if (!prop.kind_unconstrained and ev.len > 0) {
+                const wire_nullable = if (strict) prop.acceptsNull() else prop.nullable;
                 try writer.writeAll(",\"enum\":[");
                 for (ev, 0..) |v, ei| {
                     if (ei > 0) try writer.writeByte(',');
                     try wire_json.writeString(writer, gpa, v);
                 }
-                if (prop.acceptsNull()) try writer.writeAll(",null");
+                if (wire_nullable) try writer.writeAll(",null");
                 try writer.writeByte(']');
             }
         }
@@ -281,6 +283,7 @@ test "tool schema emits mixed union types" {
         .kind = .array,
         .description = "Mixed field",
         .required = false,
+        .nullable = true,
         .kind_alternatives = &.{.string},
     }};
     const schema = tools_common.Schema{ .properties = &props };
@@ -291,6 +294,26 @@ test "tool schema emits mixed union types" {
     }}, false, .completions);
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":{\"type\":[\"array\",\"string\",\"null\"]") != null);
+}
+
+test "tool schema non-strict omits null for optional non-nullable properties" {
+    const gpa = std.testing.allocator;
+    const props = [_]tools_common.Schema.Property{.{
+        .name = "field",
+        .kind = .string,
+        .description = "Optional text",
+        .required = false,
+        .nullable = false,
+    }};
+    const schema = tools_common.Schema{ .properties = &props };
+    const json = try buildToolsJson(gpa, &.{.{
+        .name = "opt",
+        .description = "Optional",
+        .schema = schema,
+    }}, false, .completions);
+    defer gpa.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[]") != null);
 }
 
 test "tool schema omits unsupported projection constraints" {

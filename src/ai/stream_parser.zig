@@ -76,6 +76,17 @@ pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
     if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
         return trimmed;
     }
+
+    // When a model wraps a JSON object with conversational text or comments,
+    // extract the slice between the first '{' and last '}'.
+    if (std.mem.indexOfScalar(u8, trimmed, '{')) |start| {
+        if (std.mem.lastIndexOfScalar(u8, trimmed, '}')) |end| {
+            if (end > start) {
+                return trimmed[start .. end + 1];
+            }
+        }
+    }
+
     return "{}";
 }
 
@@ -1541,4 +1552,11 @@ test "processStreamChunk does not call on_delta_end for empty chunks" {
     try std.testing.expectEqualStrings("", observer_ctx.reasoning.items);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.tool_calls.items.len);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.delta_ends);
+}
+
+test "sanitizeToolArguments extracts json object from conversational prose or fences" {
+    try std.testing.expectEqualStrings("{\"command\":\"echo 1\"}", sanitizeToolArguments("```json\n{\"command\":\"echo 1\"}\n```"));
+    try std.testing.expectEqualStrings("{\"key\":\"value\"}", sanitizeToolArguments("Calling tool: {\"key\":\"value\"} finished"));
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("no json here"));
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("{ unclosed"));
 }
