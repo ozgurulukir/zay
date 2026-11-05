@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-11-05
+
+### Fixed
+- Auth/config: dynamic-provider API keys survive config re-apply, custom `baseUrl` and the fallback system prompt serialize from model selection, and the cold-start system prompt is restored (#323).
+- Runtime/config: the agent database arms from the canonical config, and the fail-soft config loader hardens its fallback paths (#324).
+- Config memory safety: partial-clone leaks and double-free hazards eliminated across providers and transports; MCP transport leaks plugged and slice reallocations secured; validation-diagnostic leaks on append failure fixed and the full schema check completed (#325).
+- Config load: the merge phase runs on a `LoadResult`-owned arena, releasing the whole merged tree in one shot and structurally removing the clone-before-free ordering hazards the last six patches patched one by one (#326).
+
+### Changed
+- Lua: the no-op `rebindPluginToolKey` shim is deleted; the manager indirection it marked no longer exists and it had zero callers (#327).
+
 ## [0.11.8] - 2026-11-04
 
 ### Changed
@@ -120,7 +131,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.8...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.9...HEAD
+[0.11.9]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.9
 [0.11.8]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.8
 [0.11.7]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.7
 [0.11.6]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.6
