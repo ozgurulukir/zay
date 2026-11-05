@@ -318,7 +318,11 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .host_id = host_id,
         });
     }
-    load_result.config.deinit(gpa);
+    // Release via LoadResult.deinit: the merged config is arena-owned (see
+    // parse.zig load), so Config.deinit here would free arena-backed slices
+    // with the real allocator. takeDiagnostics above already detached the
+    // gpa-owned diagnostics, so this only tears down the arena.
+    load_result.deinit(gpa);
 
     // Record this run's driver session so the NEXT launch resumes it. The
     // session row is already inserted synchronously by initSession; the pin

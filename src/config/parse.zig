@@ -119,8 +119,23 @@ pub fn load(
     var env_layer = try loadEnv(gpa, env, &diagnostics);
     defer env_layer.deinit(gpa);
 
-    var merged = try mergeLayers(gpa, &.{ global, project, env_layer });
-    errdefer merged.deinit(gpa);
+    // The merge phase runs against an arena owned by the returned
+    // LoadResult. Diagnostics stay gpa-owned (they outlive the LoadResult
+    // via takeDiagnostics), but every allocation the merge algebra makes
+    // — overlay dupes, clones, list growth — lands in the arena, so every
+    // `free` inside it becomes an arena no-op. The clone-before-free
+    // ordering and errdefer juggling the merge path needs under a real
+    // allocator (see dc8797fa/eeb9342b/6b918d58) are structurally inert
+    // here: no intermediate can dangle or double-free, and one
+    // arena.deinit() at LoadResult.deinit releases the whole merged tree.
+    // The gpa merge algebra itself is untouched — `mergeAndWriteGlobal`
+    // and the leak-checking merge tests still mutate live configs with a
+    // real allocator, which is where those orderings actually matter.
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_state.deinit();
+    const merged = try mergeLayers(arena_state.allocator(), &.{ global, project, env_layer });
 
     const validation_diags = try merged.validate(gpa);
     defer gpa.free(validation_diags);
@@ -136,6 +151,7 @@ pub fn load(
     return .{
         .config = merged,
         .diagnostics = try diagnostics.toOwnedSlice(gpa),
+        .arena_state = arena_state,
     };
 }
 
@@ -341,52 +357,22 @@ pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !vo
 }
 
 fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpServerConfig) !void {
-    const Transport = @FieldType(McpServerConfig, "transport");
-    for (target.mcp_servers, 0..) |*server, index| {
+    for (target.mcp_servers) |*server| {
         if (!std.mem.eql(u8, server.name, updates.name)) continue;
         server.enabled = updates.enabled;
         server.request_timeout_ms = updates.request_timeout_ms;
-        const new_transport: Transport = switch (updates.transport) {
-            .stdio => |t| blk: {
-                var args = try gpa.alloc([]u8, t.args.len);
-                var done: usize = 0;
-                errdefer {
-                    for (args[0..done]) |arg| gpa.free(arg);
-                    gpa.free(args);
-                }
-                for (t.args, 0..) |arg, i| {
-                    args[i] = try gpa.dupe(u8, arg);
-                    done += 1;
-                }
-                const cmd = try gpa.dupe(u8, t.command);
-                break :blk .{ .stdio = .{
-                    .command = cmd,
-                    .args = args,
-                } };
-            },
-            .sse => |t| blk: {
-                const url = try gpa.dupe(u8, t.url);
-                errdefer gpa.free(url);
-                const headers = try cloneHeaders(gpa, t.headers);
-                break :blk .{ .sse = .{
-                    .url = url,
-                    .headers = headers,
-                } };
-            },
-        };
-        switch (server.transport) {
-            .stdio => |t| {
-                gpa.free(t.command);
-                for (t.args) |arg| gpa.free(arg);
-                if (t.args.len > 0) gpa.free(t.args);
-            },
-            .sse => |t| {
-                gpa.free(t.url);
-                freeHeaders(gpa, t.headers);
-            },
+        // Reuse McpServerConfig.clone for the transport (and every other
+        // owned field) instead of a hand-inlined copy of it: error-handling
+        // fixes to the clone then land in exactly one place. Clone BEFORE
+        // freeing the old server (the replaceBaseUrl ordering: freeing
+        // first leaves a dangling pointer behind on OOM).
+        const fresh = try updates.clone(gpa);
+        errdefer {
+            var c = fresh;
+            c.deinit(gpa);
         }
-        server.transport = new_transport;
-        target.mcp_servers[index] = server.*;
+        server.deinit(gpa);
+        server.* = fresh;
         return;
     }
 
@@ -395,12 +381,7 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
         var c = cloned;
         c.deinit(gpa);
     }
-    const next = if (target.mcp_servers.len == 0)
-        try gpa.alloc(McpServerConfig, 1)
-    else
-        try gpa.realloc(target.mcp_servers, target.mcp_servers.len + 1);
-    target.mcp_servers = next;
-    target.mcp_servers[target.mcp_servers.len - 1] = cloned;
+    try appendConfigEntry(McpServerConfig, gpa, &target.mcp_servers, cloned);
 }
 
 fn applyPluginOverlay(gpa: std.mem.Allocator, target: *Config, updates: PluginConfig) !void {
@@ -421,12 +402,7 @@ fn applyPluginOverlay(gpa: std.mem.Allocator, target: *Config, updates: PluginCo
         var c = cloned;
         c.deinit(gpa);
     }
-    const next = if (target.plugins.len == 0)
-        try gpa.alloc(PluginConfig, 1)
-    else
-        try gpa.realloc(target.plugins, target.plugins.len + 1);
-    target.plugins = next;
-    target.plugins[target.plugins.len - 1] = cloned;
+    try appendConfigEntry(PluginConfig, gpa, &target.plugins, cloned);
 }
 
 fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: ProviderConfig) !void {
@@ -461,12 +437,20 @@ fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: Provid
         var c = cloned;
         c.deinit(gpa);
     }
-    const next = if (target.providers.len == 0)
-        try gpa.alloc(ProviderConfig, 1)
+    try appendConfigEntry(ProviderConfig, gpa, &target.providers, cloned);
+}
+
+/// Grow a config-owned list by one and store `item` at the end. Callers
+/// keep the item's `errdefer` — this helper owns the slice, never the
+/// item's contents. Shared by the provider/MCP/plugin/model overlay
+/// upserts, which previously re-typed the alloc-or-realloc dance per site.
+fn appendConfigEntry(comptime T: type, gpa: std.mem.Allocator, list: *[]T, item: T) !void {
+    const next = if (list.len == 0)
+        try gpa.alloc(T, 1)
     else
-        try gpa.realloc(target.providers, target.providers.len + 1);
-    target.providers = next;
-    target.providers[target.providers.len - 1] = cloned;
+        try gpa.realloc(list.*, list.len + 1);
+    next[next.len - 1] = item;
+    list.* = next;
 }
 
 fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, updates: []const ProviderModel) !void {
@@ -493,12 +477,7 @@ fn applyProviderModelsOverlay(gpa: std.mem.Allocator, target: *ProviderConfig, u
             var c = cloned;
             c.deinit(gpa);
         }
-        const next = if (target.models.len == 0)
-            try gpa.alloc(ProviderModel, 1)
-        else
-            try gpa.realloc(target.models, target.models.len + 1);
-        target.models = next;
-        target.models[target.models.len - 1] = cloned;
+        try appendConfigEntry(ProviderModel, gpa, &target.models, cloned);
     }
 }
 
