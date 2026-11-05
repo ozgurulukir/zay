@@ -1553,3 +1553,10 @@ test "processStreamChunk does not call on_delta_end for empty chunks" {
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.tool_calls.items.len);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.delta_ends);
 }
+
+test "sanitizeToolArguments extracts json object from conversational prose or fences" {
+    try std.testing.expectEqualStrings("{\"command\":\"echo 1\"}", sanitizeToolArguments("```json\n{\"command\":\"echo 1\"}\n```"));
+    try std.testing.expectEqualStrings("{\"key\":\"value\"}", sanitizeToolArguments("Calling tool: {\"key\":\"value\"} finished"));
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("no json here"));
+    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("{ unclosed"));
+}

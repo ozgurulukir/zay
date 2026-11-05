@@ -1378,12 +1378,19 @@ pub const Agent = struct {
         for (assistant.assistant.content) |*block| {
             if (block.* != .text) continue;
             const found = try text_tool_call.extractFromText(self.gpa, block.text.text, &self.text_tool_seq);
-            defer self.gpa.free(found);
+            var moved = false;
+            defer {
+                if (!moved) {
+                    for (found) |*c| c.deinit(self.gpa);
+                }
+                self.gpa.free(found);
+            }
             if (found.len > 0) {
                 const stripped = try text_tool_call.stripToolCalls(self.gpa, block.text.text);
                 self.gpa.free(block.text.text);
                 block.text.text = stripped;
                 try all.appendSlice(self.gpa, found);
+                moved = true;
             }
         }
         return all.toOwnedSlice(self.gpa);
