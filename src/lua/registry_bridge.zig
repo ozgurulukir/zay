@@ -43,16 +43,6 @@ pub fn freePluginToolKey(gpa: std.mem.Allocator, ud: *anyopaque) void {
     gpa.destroy(key);
 }
 
-/// Update the manager pointer inside an already-allocated `PluginToolKey`
-/// to track the App's `plugin_manager` field across reassignments. The
-/// slot allocated in `allocPluginToolKey` stays at the same address; only
-/// its `.*` is rewritten. Called from `registerPluginTools` after every
-/// `app.plugin_manager = PluginManager.init(...)`.
-/// No-op retained as a marker so callers can still use a uniform rebind
-/// pattern; kept here only to make it obvious that the manager indirection
-/// was removed on purpose.
-pub fn rebindPluginToolKey(_: *PluginToolKey, _: *PluginManager) void {}
-
 /// Build the `lua__<plugin>__<tool>` full name for a tool. Returns an
 /// owned slice the caller must free.
 pub fn buildPluginToolName(
