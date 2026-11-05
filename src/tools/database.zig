@@ -24,6 +24,7 @@ pub const tool: common.Tool = .{
                 .kind = .string,
                 .description = "The database action: 'query', 'exec', 'schema', 'health', 'search_tool_result' to find literal text in a saved result, or 'read_tool_result' to inspect it by chunk and character offset.",
                 .required = true,
+                .enum_values = &.{ "query", "exec", "schema", "health", "search_tool_result", "read_tool_result" },
             },
             .{
                 .name = "sql",
@@ -1272,4 +1273,17 @@ test "database tool operates on session_backend fallback" {
     var verify_out = try runTool(gpa, io, ".", "{\"action\":\"query\",\"sql\":\"SELECT count(*) FROM sessions\"}", env);
     defer verify_out.deinit(gpa);
     try std.testing.expect(std.mem.indexOf(u8, verify_out.stdout, "2") != null);
+}
+
+test "database tool schema carries enum_values for action" {
+    const action_prop = for (tool.schema.properties) |prop| {
+        if (std.mem.eql(u8, prop.name, "action")) break prop;
+    } else return error.TestFailed;
+
+    try std.testing.expect(action_prop.enum_values != null);
+    const expected = [_][]const u8{ "query", "exec", "schema", "health", "search_tool_result", "read_tool_result" };
+    try std.testing.expectEqual(expected.len, action_prop.enum_values.?.len);
+    for (expected, action_prop.enum_values.?) |exp, act| {
+        try std.testing.expectEqualStrings(exp, act);
+    }
 }

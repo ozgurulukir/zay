@@ -5,8 +5,8 @@ configured external service.
 Actions:
 - `query`: Execute a read-only SELECT query. Select only needed columns and use
   LIMIT or keyset pagination for large tables.
-- `exec`: Execute INSERT, UPDATE, DELETE, or DDL statements. Returns changes and
-  `last_insert_rowid`.
+- `exec`: Execute SQL statements (INSERT, UPDATE, DELETE, DDL, etc.). Returns changes
+  and `last_insert_rowid`. Protected tool-result tables cannot be accessed.
 - `schema`: Inspect tables and columns; optionally pass `table`.
 - `health`: Probe the backend service, engine, and health metrics.
 - `search_tool_result`: Find a case-sensitive literal in a saved tool result.
