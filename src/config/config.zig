@@ -569,9 +569,15 @@ pub fn appendConfigError(
 pub const LoadResult = struct {
     config: Config,
     diagnostics: []Diagnostic,
+    /// Owns `config`'s memory when this result came from `load`: the merge
+    /// phase allocates from this arena, so `deinit` releases the whole
+    /// merged tree in one shot instead of walking `Config.deinit`. Never
+    /// call `Config.deinit` on such a config — its slices are arena-owned.
+    arena_state: *std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadResult, gpa: std.mem.Allocator) void {
-        self.config.deinit(gpa);
+        self.arena_state.deinit();
+        gpa.destroy(self.arena_state);
         for (self.diagnostics) |*d| d.deinit(gpa);
         gpa.free(self.diagnostics);
         self.* = undefined;
