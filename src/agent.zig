@@ -62,8 +62,9 @@ const length_cut_continuation_hint =
 /// model's request is NOT executed, so the model must re-emit the call with
 /// its arguments intact. The consumer sees this as a normal user message.
 const tool_call_truncation_hint =
-    "[zay] Your tool call(s) arrived without their arguments — the provider " ++
-    "truncated the tool_call section before the arguments payload streamed. " ++
+    "[zay] Your tool call(s) arrived without their arguments — or no tool call " ++
+    "arrived at all despite your finish reason. The provider truncated the " ++
+    "tool_call section before the arguments payload streamed. " ++
     "The call was not executed. Re-emit the SAME tool call(s) with full arguments " ++
     "in a single request; avoid sending many parallel tool calls at once if " ++
     "truncation persists.";
@@ -762,9 +763,18 @@ pub const Agent = struct {
                 // were truncated and retry ONCE (bounded like the length-cut
                 // auto-continue) — a pathological endpoint cannot bill an
                 // unbounded retry loop.
-                if (tool_calls_truncated > 0) {
+                // The fully-severed shape (`finish_reason=tool_calls`, zero
+                // calls parsed or recovered) sets no `tool_calls_truncated`
+                // count — the parser saw nothing to drop. Cover it under the
+                // same one-shot retry so the warn-only path above doesn't
+                // strand the turn.
+                if (tool_calls_truncated > 0 or finish_reason == .tool_calls) {
                     if (!truncation_retried) {
-                        log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{tool_calls_truncated});
+                        if (tool_calls_truncated > 0) {
+                            log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{tool_calls_truncated});
+                        } else {
+                            log.warn("finish_reason=tool_calls with no tool call parsed or recovered — retrying once with hint", .{});
+                        }
                         truncation_retried = true;
                         try self.addUser(tool_call_truncation_hint);
                         continue;
@@ -2953,6 +2963,45 @@ test "run ends the turn when tool-call arguments truncate on the retry too" {
         if (event == .length_cut and event.length_cut == .stopped) stopped += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), stopped);
+}
+
+test "run retries once when finish_reason=tool_calls arrives with no tool call" {
+    // Fully-severed twin of the truncation guard: the provider ends the
+    // response with finish_reason=tool_calls but streamed NO call at all —
+    // nothing to count as `tool_calls_truncated`, so the original guard
+    // (`truncated > 0`) never fired and the turn died silently behind the
+    // warn-only log. The same one-shot hint retry must cover this shape.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.text("", .tool_calls),
+        ai.scripted_client.step.toolCall("pwsh", "{\"command\":\"echo hi\"}"),
+        ai.scripted_client.step.text("Done", .stop),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    try agent.addUser("list the directory");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Three prompts: severed response, hint retry executing the call the
+    // second response emits, final post-tool answer.
+    try std.testing.expectEqual(@as(u32, 3), client.prompts_answered);
+    try std.testing.expectEqualStrings("Done", agent.messages()[agent.messages().len - 1].text());
+    var hint_found = false;
+    for (agent.messages()) |m| {
+        if (m.role() == .user and std.mem.startsWith(u8, m.text(), "[zay] Your tool call(s) arrived without their arguments")) {
+            hint_found = true;
+        }
+    }
+    try std.testing.expect(hint_found);
 }
 
 test "run auto-continues once after a scripted length-cut (socket-free)" {
