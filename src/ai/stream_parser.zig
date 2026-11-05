@@ -76,6 +76,17 @@ pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
     if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
         return trimmed;
     }
+
+    // When a model wraps a JSON object with conversational text or comments,
+    // extract the slice between the first '{' and last '}'.
+    if (std.mem.indexOfScalar(u8, trimmed, '{')) |start| {
+        if (std.mem.lastIndexOfScalar(u8, trimmed, '}')) |end| {
+            if (end > start) {
+                return trimmed[start .. end + 1];
+            }
+        }
+    }
+
     return "{}";
 }
 
