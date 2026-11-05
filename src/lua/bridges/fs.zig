@@ -461,14 +461,7 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(clean_path);
 
-    var file = std.Io.Dir.openFileAbsolute(io, clean_path, .{}) catch |err| {
-        state.pushNil();
-        state.pushString(@errorName(err));
-        return 2;
-    };
-    defer file.close(io);
-
-    const stat = file.stat(io) catch |err| {
+    const stat = std.Io.Dir.cwd().statFile(io, clean_path, .{}) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -495,4 +488,16 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
     state.pushString(getMimeType(clean_path));
     _ = c.lua_setfield(L_ptr, -2, "mime_type");
     return 1;
+}
+
+test "bridges.fs: file_info returns directory type for directories" {
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try std.testing.expect(L.doString("info = zay.file_info('.')"));
+    try std.testing.expect(L.doString("assert(info ~= nil, 'info should not be nil')"));
+    try std.testing.expect(L.doString("assert(info.type == 'directory', 'type should be directory')"));
 }

@@ -69,6 +69,10 @@ pub fn jsonEncode(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// Maximum recursion depth allowed when encoding Lua values to JSON.
+/// Prevents stack overflow on circular tables or deeply nested structures.
+pub const max_json_depth: usize = 32;
+
 /// Recursively serialize the Lua value at `index` into a JSON string.
 pub fn luaValueToJsonString(
     gpa: std.mem.Allocator,
@@ -92,6 +96,11 @@ fn writeLuaValueJson(
     pretty: bool,
     depth: usize,
 ) JsonWriteError!void {
+    if (depth >= max_json_depth) {
+        try writer.writeAll("null");
+        return;
+    }
+
     switch (c.lua_type(L, index)) {
         c.LUA_TNIL => try writer.writeAll("null"),
         c.LUA_TBOOLEAN => try writer.writeAll(if (c.lua_toboolean(L, index) != 0) "true" else "false"),
@@ -145,11 +154,16 @@ fn writeTableJson(
     pretty: bool,
     depth: usize,
 ) JsonWriteError!void {
-    const array_len = c.lua_rawlen(L, index);
+    if (depth >= max_json_depth or c.lua_checkstack(L, 8) == 0) {
+        try writer.writeAll("null");
+        return;
+    }
+    const abs_idx = c.lua_absindex(L, index);
+    const array_len = c.lua_rawlen(L, abs_idx);
 
     var total: usize = 0;
     c.lua_pushnil(L);
-    while (c.lua_next(L, index) != 0) : (total += 1) {
+    while (c.lua_next(L, abs_idx) != 0) : (total += 1) {
         c.lua_pop(L, 1);
     }
 
@@ -159,9 +173,9 @@ fn writeTableJson(
     }
 
     if (array_len == total) {
-        try writeTableAsArray(writer, L, index, pretty, depth, @intCast(array_len));
+        try writeTableAsArray(writer, L, abs_idx, pretty, depth, @intCast(array_len));
     } else {
-        try writeTableAsObject(writer, L, index, pretty, depth);
+        try writeTableAsObject(writer, L, abs_idx, pretty, depth);
     }
 }
 
@@ -174,12 +188,13 @@ fn writeTableAsArray(
     depth: usize,
     len: c_int,
 ) JsonWriteError!void {
+    const abs_idx = c.lua_absindex(L, index);
     try writer.writeByte('[');
     var i: c_int = 1;
     while (i <= len) : (i += 1) {
         if (i > 1) try writer.writeByte(',');
         if (pretty) try writeIndent(writer, depth + 1);
-        _ = c.lua_rawgeti(L, index, i);
+        _ = c.lua_rawgeti(L, abs_idx, i);
         try writeLuaValueJson(writer, L, c.lua_gettop(L), pretty, depth + 1);
         c.lua_pop(L, 1);
     }
@@ -195,28 +210,55 @@ fn writeTableAsObject(
     pretty: bool,
     depth: usize,
 ) JsonWriteError!void {
+    const abs_idx = c.lua_absindex(L, index);
     try writer.writeByte('{');
     var first = true;
     c.lua_pushnil(L);
-    while (c.lua_next(L, index) != 0) {
+    while (c.lua_next(L, abs_idx) != 0) {
+        const key_type = c.lua_type(L, -2);
+        var num_buf: [64]u8 = undefined;
+        var key_buf: ?[]const u8 = null;
+
+        switch (key_type) {
+            c.LUA_TSTRING => {
+                var klen: usize = 0;
+                const kptr = c.lua_tolstring(L, -2, &klen);
+                if (kptr) |p| key_buf = p[0..klen];
+            },
+            c.LUA_TNUMBER => {
+                // Do NOT call lua_tolstring directly on key at -2: Lua mutates
+                // the key in-place to string on the stack, which corrupts subsequent
+                // lua_next calls. Push a temporary copy to convert, copy bytes,
+                // and pop the copy immediately.
+                c.lua_pushvalue(L, -2);
+                var klen: usize = 0;
+                const kptr = c.lua_tolstring(L, -1, &klen);
+                if (kptr) |p| {
+                    const slice = p[0..klen];
+                    if (slice.len <= num_buf.len) {
+                        @memcpy(num_buf[0..slice.len], slice);
+                        key_buf = num_buf[0..slice.len];
+                    }
+                }
+                c.lua_pop(L, 1);
+            },
+            c.LUA_TBOOLEAN => {
+                key_buf = if (c.lua_toboolean(L, -2) != 0) "true" else "false";
+            },
+            else => {},
+        }
+
+        const valid_key = key_buf orelse {
+            // Unserializable key: pop value so key remains at top for next lua_next.
+            c.lua_pop(L, 1);
+            continue;
+        };
+
         if (!first) try writer.writeByte(',');
         first = false;
         if (pretty) try writeIndent(writer, depth + 1);
 
-        const key_type = c.lua_type(L, -2);
-        switch (key_type) {
-            c.LUA_TSTRING, c.LUA_TNUMBER => {
-                var klen: usize = 0;
-                const kptr = c.lua_tolstring(L, -2, &klen) orelse continue;
-                try writeJsonString(writer, kptr[0..klen]);
-            },
-            c.LUA_TBOOLEAN => {
-                const s = if (c.lua_toboolean(L, -2) != 0) "true" else "false";
-                try writeJsonString(writer, s);
-            },
-            else => continue,
-        }
-
+        try writeJsonString(writer, valid_key);
         if (pretty) try writer.writeAll(": ") else try writer.writeByte(':');
         try writeLuaValueJson(writer, L, c.lua_gettop(L), pretty, depth + 1);
         c.lua_pop(L, 1);
@@ -241,7 +283,7 @@ pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Va
         .float => |f| c.lua_pushnumber(L, f),
         .number_string => |s| {
             const num = std.fmt.parseFloat(f64, s) catch {
-                _ = c.lua_pushstring(L, s.ptr);
+                _ = c.lua_pushlstring(L, s.ptr, s.len);
                 return;
             };
             c.lua_pushnumber(L, num);
@@ -339,6 +381,41 @@ test "bridges.json: round-trip preserves structure" {
         \\assert(redecoded.id == 7, "top-level scalar preserved")
         \\assert(redecoded.steps[1].text == "a", "nested object.text preserved")
         \\assert(redecoded.steps[1].done == true, "nested object.done preserved")
+        \\return "OK"
+    );
+}
+
+test "bridges.json: table with numeric and mixed keys does not corrupt lua_next" {
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local t = { [10] = "ten", [20] = "twenty", foo = "bar" }
+        \\local encoded = zay.json_encode(t)
+        \\local decoded = zay.json_decode(encoded)
+        \\assert(decoded["10"] == "ten", "numeric key 10 should be encoded as string key")
+        \\assert(decoded["20"] == "twenty", "numeric key 20 should be encoded as string key")
+        \\assert(decoded["foo"] == "bar", "string key foo should be encoded")
+        \\return "OK"
+    );
+}
+
+test "bridges.json: circular table bounds recursion without host crash" {
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local t = { name = "node" }
+        \\t.self = t
+        \\local encoded = zay.json_encode(t)
+        \\assert(type(encoded) == "string", "should encode to a string")
+        \\assert(string.find(encoded, "null"), "circular reference should terminate with null")
         \\return "OK"
     );
 }

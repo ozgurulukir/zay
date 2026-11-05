@@ -57,14 +57,9 @@ pub fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
     defer resolved_cwd.deinit();
     const raw_cwd = resolved_cwd.path;
 
-    var abs_cwd_buf: ?[]u8 = null;
-    defer if (abs_cwd_buf) |b| std.heap.page_allocator.free(b);
-    const cwd = if (std.fs.path.isAbsolute(raw_cwd))
-        raw_cwd
-    else blk: {
-        abs_cwd_buf = try std.fs.path.resolve(std.heap.page_allocator, &.{raw_cwd});
-        break :blk abs_cwd_buf.?;
-    };
+    // Unconditionally normalize cwd through resolve so separators match resolved path.
+    const cwd = try std.fs.path.resolve(std.heap.page_allocator, &.{raw_cwd});
+    defer std.heap.page_allocator.free(cwd);
 
     const resolved = try std.fs.path.resolve(std.heap.page_allocator, &.{ cwd, path });
     errdefer std.heap.page_allocator.free(resolved);
