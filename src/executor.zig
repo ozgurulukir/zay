@@ -302,6 +302,9 @@ pub const ExecutorService = struct {
             self.gpa.free(results);
         }
         for (calls, 0..) |call, i| {
+            if (self.ctx.cancel_requested) |flag| {
+                if (flag.load(.acquire)) return error.Canceled;
+            }
             try observer.on_started(observer.ctx, call);
             switch (try self.shouldRejectUnsafeShell(call, observer)) {
                 .rejected => |reason| results[i] = try self.runRejected(call, reason),
@@ -402,6 +405,13 @@ pub const ExecutorService = struct {
         return executor_validation.resolveSchema(self.tool_registry, self.ctx.mcp_manager, self.gpa, call);
     }
 
+    /// Look up a tool across the active registry (builtin + plugin + MCP) with
+    /// fallback to static builtins in test/headless environments.
+    fn lookupTool(self: *ExecutorService, name: []const u8) ?tools.Tool {
+        if (self.tool_registry) |r| return r.lookup(name);
+        return tools.lookupIn(tools.builtinRegistry(), name);
+    }
+
     /// Dispatch a call that passed validation. MCP calls route through the
     /// manager; plugin, builtin, AND MCP calls all share the registry-backed
     /// path (MCP tools are materialized as `Tool` records by
@@ -439,10 +449,7 @@ pub const ExecutorService = struct {
             self.gpa.free(content);
             content = bounded;
         }
-        const looked_up = if (self.tool_registry) |r|
-            r.lookup(call.name)
-        else
-            tools.lookupIn(tools.builtinRegistry(), call.name);
+        const looked_up = self.lookupTool(call.name);
         var display = try tool_display.lookupDisplay(self.gpa, looked_up, call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         var display_body = try tool_display.makeDisplayBody(self.gpa, output);
@@ -653,7 +660,7 @@ pub const ExecutorService = struct {
             bounded_content = pruned;
         }
 
-        var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, self.lookupTool(call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const display_body = try self.gpa.dupe(u8, bounded_content);
         errdefer self.gpa.free(display_body);
@@ -674,7 +681,7 @@ pub const ExecutorService = struct {
     }
 
     fn runRejected(self: *ExecutorService, call: ai.ToolCall, reason: []const u8) !ToolResult {
-        var display = try tool_display.lookupDisplay(self.gpa, tools.lookupIn(tools.builtinRegistry(), call.name), call.name, call.arguments);
+        var display = try tool_display.lookupDisplay(self.gpa, self.lookupTool(call.name), call.name, call.arguments);
         errdefer display.deinit(self.gpa);
         const content = try self.gpa.dupe(u8, reason);
         errdefer self.gpa.free(content);
@@ -2219,4 +2226,107 @@ test "freesAllAllocatedFields_whenDeinitedWithoutOptionalFields" {
     });
 
     res.deinit(gpa);
+}
+
+test "ExecutorService.runAll halts with error.Canceled when cancel_requested is set mid-batch" {
+    const gpa = std.testing.allocator;
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = "/tmp",
+        .cancel_requested = &cancelled,
+    });
+
+    const call1 = try makeCall(gpa, "call_1", tools.shellToolName, "{\"command\":\"echo 1\"}");
+    defer {
+        gpa.free(call1.call_id.value);
+        gpa.free(call1.name);
+        gpa.free(call1.arguments);
+    }
+    const call2 = try makeCall(gpa, "call_2", tools.shellToolName, "{\"command\":\"echo 2\"}");
+    defer {
+        gpa.free(call2.call_id.value);
+        gpa.free(call2.name);
+        gpa.free(call2.arguments);
+    }
+
+    const TestObs = struct {
+        cancel_ptr: *std.atomic.Value(bool),
+        finished_count: usize = 0,
+
+        pub fn onStarted(_: *@This(), _: ai.ToolCall) anyerror!void {}
+        pub fn onFinished(self: *@This(), _: *const ToolResult) anyerror!void {
+            self.finished_count += 1;
+            // Trip cancellation after call 1 finishes
+            self.cancel_ptr.store(true, .release);
+        }
+        pub fn approve(_: *@This(), _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+
+    var obs = TestObs{ .cancel_ptr = &cancelled };
+    const observer_val = ToolCallObserver(TestObs){
+        .ctx = &obs,
+        .on_started = TestObs.onStarted,
+        .on_finished = TestObs.onFinished,
+        .approve_unsafe_bash = TestObs.approve,
+    };
+
+    const err = executor.runAll(&.{ call1, call2 }, observer_val);
+    try std.testing.expectError(error.Canceled, err);
+    try std.testing.expectEqual(@as(usize, 1), obs.finished_count);
+}
+
+test "ExecutorService runErrorResult resolves custom display via tool_registry" {
+    const gpa = std.testing.allocator;
+
+    const custom_display_fn = struct {
+        fn display(alloc: std.mem.Allocator, _: []const u8, _: tool_common.Env) std.mem.Allocator.Error!tool_common.ToolDisplay {
+            return .{ .label = try alloc.dupe(u8, "Plugin Display Formatter") };
+        }
+    }.display;
+
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const plugin_name = try gpa.dupe(u8, "lua__custom__tool");
+    const plugin_desc = try gpa.dupe(u8, "Custom plugin tool");
+    const schema_props = [_]tools.Schema.Property{.{
+        .name = "required_field",
+        .kind = .string,
+        .description = "Must be provided",
+        .required = true,
+    }};
+
+    try reg.addPluginTool(gpa, .{
+        .name = plugin_name,
+        .description = plugin_desc,
+        .schema = .{ .properties = &schema_props },
+        .run = undefined,
+        .display = custom_display_fn,
+    });
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = "/tmp",
+        .tool_registry = &reg,
+    });
+
+    // Send invalid call missing `required_field`
+    const call = try makeCall(gpa, "call_invalid", "lua__custom__tool", "{}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try executor.runOne(call, null);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(result.failed);
+    try std.testing.expectEqualStrings("Plugin Display Formatter", result.display_label);
 }
