@@ -330,8 +330,7 @@ pub const Env = struct {
 /// state without ambient globals.
 pub const Tool = struct {
     name: []const u8,
-    /// Raw description template. May contain `{{hsep}}` placeholders that
-    /// each LanguageModel adapter substitutes with `~` before sending.
+    /// Human-readable tool description.
     description: []const u8,
     schema: Schema,
     run: *const fn (

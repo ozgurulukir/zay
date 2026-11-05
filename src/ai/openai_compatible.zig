@@ -252,12 +252,12 @@ test "buildToolsJson produces a valid JSON array for the registry" {
     try std.testing.expect(std.mem.indexOf(u8, json, "Shell command to run.") != null);
 }
 
-test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
+test "buildToolsJson serializes tool description directly" {
     const gpa = std.testing.allocator;
     const tools = [_]tools_common.Tool{
         .{
             .name = "demo",
-            .description = "uses {{hsep}} marker",
+            .description = "demo tool description",
             .schema = .{ .properties = &.{} },
             .run = undefined,
             .display = undefined,
@@ -265,8 +265,7 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
     };
     const json = try tool_schema.buildAllToolsJson(gpa, &tools, &.{}, null, false, .completions);
     defer gpa.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\":\"demo tool description\"") != null);
 }
 
 test "buildAllToolsJson includes MCP tools alongside builtin tools" {
@@ -631,7 +630,7 @@ test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byt
     for (plugin_names) |name| {
         try registry.addPluginTool(gpa, .{
             .name = try gpa.dupe(u8, name),
-            .description = try std.fmt.allocPrint(gpa, "Plugin tool {{hsep}} for {s}", .{name}),
+            .description = try std.fmt.allocPrint(gpa, "Plugin tool for {s}", .{name}),
             .schema = .{
                 .properties = &.{
                     .{ .name = "path", .kind = .string, .description = "A path", .required = true, .nullable = false },
