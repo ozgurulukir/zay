@@ -88,6 +88,8 @@ fn parseOne(gpa: std.mem.Allocator, body: []const u8, seq: *u64) !?ai.ToolCall {
     if (try tryJsonVariant(gpa, body, seq)) |call| return call;
     // XML-arg variant: NAME<key="value">…</key>…
     if (try tryXmlArgVariant(gpa, body, seq)) |call| return call;
+    // Function-tag variant: <function=NAME><parameter=KEY>VALUE</parameter>…
+    if (try tryFunctionTagVariant(gpa, body, seq)) |call| return call;
     return null;
 }
 
@@ -120,6 +122,102 @@ fn tryJsonVariant(gpa: std.mem.Allocator, body: []const u8, seq: *u64) !?ai.Tool
         else => return null,
     }
     return try buildCall(gpa, name_val.string, args_buf.written(), seq);
+}
+
+/// Try the `<function=NAME><parameter=KEY>VALUE</parameter>…</function>`
+/// form. Returns null when the body doesn't start with a `<function=` tag or
+/// no parameter pairs are found; never errors on shape (only on OOM).
+fn tryFunctionTagVariant(gpa: std.mem.Allocator, body: []const u8, seq: *u64) !?ai.ToolCall {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (!startsWithIgnoreCase(trimmed, "<function=")) return null;
+
+    // Name between '=' and the tag's '>' — optional surrounding quotes.
+    var i: usize = "<function=".len;
+    while (i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '"')) i += 1;
+    const name_start = i;
+    while (i < trimmed.len and trimmed[i] != '>' and trimmed[i] != '"') i += 1;
+    const name = std.mem.trim(u8, trimmed[name_start..i], " \t\r\n");
+    if (name.len == 0) return null;
+    // Skip to the '>' closing the function tag (past an optional quote).
+    while (i < trimmed.len and trimmed[i] != '>') i += 1;
+    if (i >= trimmed.len) return null;
+    i += 1;
+
+    // Scan `<parameter=KEY>VALUE</parameter>` pairs. A pair missing its
+    // closing tag stops the scan — everything after it is unverifiable.
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(gpa);
+    var vals: std.ArrayList([]const u8) = .empty;
+    defer vals.deinit(gpa);
+    var scan = i;
+    while (scan < trimmed.len) {
+        const p_open = indexOfIgnoreCase(trimmed[scan..], "<parameter=") orelse break;
+        var j = scan + p_open + "<parameter=".len;
+        while (j < trimmed.len and (trimmed[j] == ' ' or trimmed[j] == '"')) j += 1;
+        const key_start = j;
+        while (j < trimmed.len and trimmed[j] != '>' and trimmed[j] != '"') j += 1;
+        const key = std.mem.trim(u8, trimmed[key_start..j], " \t\r\n");
+        if (key.len == 0) break;
+        while (j < trimmed.len and trimmed[j] != '>') j += 1;
+        if (j >= trimmed.len) break;
+        j += 1; // consume '>'
+        const val_start = j;
+        const p_close = indexOfIgnoreCase(trimmed[val_start..], "</parameter>") orelse break;
+        const val = trimmed[val_start .. val_start + p_close];
+        try keys.append(gpa, key);
+        try vals.append(gpa, val);
+        scan = val_start + p_close + "</parameter>".len;
+    }
+    if (keys.items.len == 0) return null;
+
+    // Build a compact JSON object. A repeated key promotes to an array —
+    // silently dropping a duplicate parameter would lose model intent.
+    var args_buf: std.Io.Writer.Allocating = .init(gpa);
+    defer args_buf.deinit();
+    try args_buf.writer.writeByte('{');
+    var written: usize = 0;
+    key_loop: for (keys.items, 0..) |key, k| {
+        // An identical earlier key already emitted this slot (as part of its
+        // array or as a scalar) — skip.
+        for (keys.items[0..k]) |prior| {
+            if (std.ascii.eqlIgnoreCase(prior, key)) continue :key_loop;
+        }
+        // Does an identical later key exist? Then emit a value array.
+        var repeated = false;
+        for (keys.items[k + 1 ..]) |succ| {
+            if (std.ascii.eqlIgnoreCase(succ, key)) repeated = true;
+        }
+        if (written > 0) try args_buf.writer.writeByte(',');
+        try std.json.Stringify.value(key, .{}, &args_buf.writer);
+        try args_buf.writer.writeByte(':');
+        if (repeated) try args_buf.writer.writeByte('[');
+        var emitted: usize = 0;
+        for (keys.items[k..], k..) |_, m| {
+            if (!std.ascii.eqlIgnoreCase(keys.items[m], key)) continue;
+            if (emitted > 0) try args_buf.writer.writeByte(',');
+            try std.json.Stringify.value(vals.items[m], .{}, &args_buf.writer);
+            emitted += 1;
+        }
+        if (repeated) try args_buf.writer.writeByte(']');
+        written += 1;
+    }
+    try args_buf.writer.writeByte('}');
+    return try buildCall(gpa, name, args_buf.written(), seq);
+}
+
+/// Case-insensitive prefix test.
+fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    return haystack.len >= prefix.len and std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
+}
+
+/// Case-insensitive substring search (index is into `haystack`).
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return i;
+    }
+    return null;
 }
 
 /// Try the `NAME<key="value">…</key>…` XML-arg form. Returns null when no
@@ -367,4 +465,54 @@ test "extractFromText XML-arg unescapes quoted values" {
     }
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("{\"arg\":\"a\\\"b\"}", calls[0].arguments);
+}
+
+test "extractFromText function-tag variant recovers the mimo shell-call shape" {
+    // The exact shape a weak model emitted in the field: <function=NAME>
+    // wrapper with <parameter=KEY>VALUE</parameter> child elements. Before
+    // the function-tag variant existed, the XML-arg parser saw an empty name
+    // (body starts with '<') and returned null — the call stayed as inert
+    // text and the turn went idle.
+    const gpa = std.testing.allocator;
+    var seq: u64 = 0;
+    const text =
+        "<tool_call><function=pwsh>" ++
+        "<parameter=command>code-tandem health 2>&1; code-tandem stats 2>&1</parameter>" ++
+        "<parameter=description>Check code-tandem health and stats</parameter>" ++
+        "<parameter=timeout>60</parameter>" ++
+        "</function></tool_call>";
+    const calls = try extractFromText(gpa, text, &seq);
+    defer {
+        for (calls) |*c| c.deinit(gpa);
+        gpa.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("pwsh", calls[0].name);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"code-tandem health 2>&1; code-tandem stats 2>&1\",\"description\":\"Check code-tandem health and stats\",\"timeout\":\"60\"}",
+        calls[0].arguments,
+    );
+}
+
+test "extractFromText function-tag variant with quoted name and repeated keys" {
+    const gpa = std.testing.allocator;
+    var seq: u64 = 5;
+    // Quoted function name and a repeated parameter key (promoted to an
+    // array, since discarding duplicates would silently drop intent).
+    const text =
+        "<tool_call><function=\"bash\">" ++
+        "<parameter=command>ls</parameter>" ++
+        "<parameter=flag>-a</parameter><parameter=flag>-l</parameter>" ++
+        "</function></tool_call>";
+    const calls = try extractFromText(gpa, text, &seq);
+    defer {
+        for (calls) |*c| c.deinit(gpa);
+        gpa.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("bash", calls[0].name);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"ls\",\"flag\":[\"-a\",\"-l\"]}",
+        calls[0].arguments,
+    );
 }
