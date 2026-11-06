@@ -8,7 +8,6 @@ pub const State = @import("state.zig").State;
 pub const bridge = @import("bridge.zig");
 pub const execution = @import("execution.zig");
 pub const sandbox = @import("sandbox.zig");
-pub const plugin = @import("plugin.zig");
 pub const Manifest = @import("manifest.zig").Manifest;
 pub const PluginManager = @import("manager.zig").PluginManager;
 pub const PluginInstance = @import("manager.zig").PluginInstance;
@@ -22,7 +21,6 @@ test {
     std.testing.refAllDecls(bridge);
     std.testing.refAllDecls(execution);
     std.testing.refAllDecls(sandbox);
-    std.testing.refAllDecls(plugin);
     std.testing.refAllDecls(Manifest);
     std.testing.refAllDecls(PluginManager);
     std.testing.refAllDecls(PluginInstance);
