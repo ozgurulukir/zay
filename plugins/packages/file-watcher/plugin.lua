@@ -3,7 +3,7 @@ return {
   name = "file-watcher",
   version = "1.0.0",
   author = "Zay",
-  description = "Listens for file changes and notifies the agent",
+  description = "Counts session file-operation tool calls (write/edit/delete/rename/copy) and reports them on request",
   license = "MIT",
   -- require_others is advisory pending enforcement (T3); file_access is
   -- omitted because this plugin does no file I/O of its own.

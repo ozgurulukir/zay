@@ -72,6 +72,7 @@ zay.register_tool({
     operation = {
       type = "string",
       description = "The operation type (read, write, delete, rename)",
+      enum = { "read", "write", "delete", "rename" },
     },
     path = {
       type = "string",

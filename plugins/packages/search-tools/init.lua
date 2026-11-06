@@ -312,7 +312,7 @@ zay.register_tool({
     },
     max_results = {
       type = "integer",
-      description = "Maximum results (default 100)",
+      description = "Maximum results (default 100, max 200)",
       optional = true,
     },
   },

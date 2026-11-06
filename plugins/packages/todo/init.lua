@@ -635,7 +635,7 @@ zay.register_tool({
 -- todo_prioritize: set or change a task's priority.
 zay.register_tool({
   name = "todo_prioritize",
-  description = "Set or change a task's priority (A=high through Z=low). Pass priority as a single uppercase letter. Pass empty string or nil to remove priority. Returns the updated list.",
+  description = "Set or change a task's priority (A=high through Z=low). The priority parameter must be provided: pass a single letter A-Z (lowercase accepted; the handler uppercases it) or an empty string to remove priority. Returns the updated list.",
   parameters = {
     id = {
       type = "integer",
