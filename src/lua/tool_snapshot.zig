@@ -91,6 +91,14 @@ fn buildToolSchemaFromLua(
 
     c.lua_pushnil(L);
     while (c.lua_next(L, -2) != 0) {
+        // Enforce that parameter keys must be strings. If a plugin specifies
+        // parameters as an array instead of a dictionary, calling lua_tolstring on
+        // a numeric key mutates it in-place to string on the stack, corrupting lua_next.
+        if (c.lua_type(L, -2) != c.LUA_TSTRING) {
+            c.lua_pop(L, 1);
+            continue;
+        }
+
         var key_len: usize = 0;
         const key_ptr = c.lua_tolstring(L, -2, &key_len);
         const param_name = if (key_ptr) |p| try gpa.dupe(u8, p[0..key_len]) else {

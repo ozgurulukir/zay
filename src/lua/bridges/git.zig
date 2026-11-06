@@ -69,7 +69,7 @@ pub fn gitErrorString(stderr: []const u8, code: u32) []const u8 {
     return std.fmt.bufPrint(&git_err_buf, "git exited with code {d}", .{code}) catch "git failed";
 }
 
-var git_err_buf: [64]u8 = undefined;
+pub threadlocal var git_err_buf: [64]u8 = undefined;
 
 /// Find git repository root by walking up from `cwd`.
 pub fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
@@ -79,9 +79,9 @@ pub fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
     const abs_cwd = if (std.fs.path.isAbsolute(cwd))
         cwd
     else blk: {
-        const proc_cwd = try std.process.currentPathAlloc(io, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(proc_cwd);
-        abs_cwd_buf = try std.fs.path.resolve(std.heap.page_allocator, &.{ proc_cwd, cwd });
+        var resolved_cwd = bridge.resolvePluginCwd(io) orelse return error.OutOfMemory;
+        defer resolved_cwd.deinit();
+        abs_cwd_buf = try std.fs.path.resolve(std.heap.page_allocator, &.{ resolved_cwd.path, cwd });
         break :blk abs_cwd_buf.?;
     };
 
