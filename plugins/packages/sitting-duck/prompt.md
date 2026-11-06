@@ -43,8 +43,9 @@ re-run `ast_outline` before another `ast_get_source`.
 
 ## Output contract
 
-- Every tool bounds its output: `limit` defaults to 50 and clamps to 1-200;
-  `ast_query` expects its own LIMIT in the SQL. Output above 512KB fails
+- The outline and pattern tools bound output via `limit` (default 50, clamps
+  1-200); `ast_query` must carry its own LIMIT in the SQL; `ast_get_source`
+  returns one node span (+ optional context). Output above 512KB fails
   outright (StreamTooLong) — narrow the query and retry rather than re-reading
   a giant result.
 - `ast_query` accepts one READ-ONLY statement per call — it must start with

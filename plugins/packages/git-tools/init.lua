@@ -1,7 +1,7 @@
 -- init.lua — Git Tools
--- Registers git_status / git_diff / git_log / git_branch / git_commit. These
--- wrap Zay's git bridge functions. The behavioral guidance (when to commit,
--- what to inspect first) lives in prompt.md, not in code.
+-- Registers git_status / git_diff / git_log / git_branch / git_add /
+-- git_commit. These wrap Zay's git bridge functions. The behavioral guidance
+-- (when to commit, what to inspect first) lives in prompt.md, not in code.
 
 local function fail(message)
   return nil, "Error: " .. message
@@ -67,7 +67,7 @@ zay.register_tool({
   parameters = {
     n = {
       type = "integer",
-      description = "Number of commits to show (default 10)",
+      description = "Number of commits to show (default 10; values outside 1-1000 fall back to 10)",
       optional = true,
     },
   },

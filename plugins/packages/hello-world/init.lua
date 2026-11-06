@@ -9,7 +9,8 @@ zay.register_tool({
   parameters = {
     name = {
       type = "string",
-      description = "The name to greet",
+      description = "The name to greet (optional; defaults to \"World\")",
+      optional = true,
     },
   },
   handler = function(params)

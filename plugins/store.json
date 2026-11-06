@@ -38,7 +38,7 @@
       "id": "todo",
       "name": "Todo",
       "version": "1.0.0",
-      "description": "A small persistent todo-list example.",
+      "description": "todo.txt-format task tracking with priorities, projects, and dates.",
       "sourceDir": "plugins/packages/todo",
       "files": [
         {
@@ -71,7 +71,7 @@
       "id": "file-tools",
       "name": "File Tools",
       "version": "1.0.0",
-      "description": "Safe file inspection and editing examples.",
+      "description": "Read, write, edit, and list files safely.",
       "sourceDir": "plugins/packages/file-tools",
       "files": [
         {

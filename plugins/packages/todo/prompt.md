@@ -33,6 +33,10 @@ and you only pull a plan into context when you actually need its steps.
 
 ## Tools
 
+The `id` argument for `todo_done`, `todo_delete`, `todo_prioritize`,
+`todo_get_plan`, `todo_set_plan`, and `todo_check_step` is the task's list
+number from the left column of `todo_list` — **not** the `id:N` tag value.
+
 ### List operations
 
 - `lua__todo__todo_list` — Show the current list (open tasks, sorted by
