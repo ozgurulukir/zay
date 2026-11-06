@@ -34,6 +34,7 @@ const bridge = @import("bridge.zig");
 const bash_exec = @import("../tools/bash_exec.zig");
 const pwsh_exec = @import("../tools/pwsh_exec.zig");
 const bash_safety = @import("../tools/bash_safety.zig");
+const events_mod = @import("events.zig");
 const sandbox_mod = @import("sandbox.zig");
 pub const json_bridge = @import("bridges/json.zig");
 pub const git_bridge = @import("bridges/git.zig");
@@ -329,22 +330,11 @@ fn isValidToolName(name: []const u8) bool {
     return true;
 }
 
-/// Validate an event name against the seven names emitted by
-/// `events.Event.name()`. Unknown names would silently never fire.
+/// True when `name` is an event the runtime can emit. Unknown names would
+/// silently never fire. Delegates to the derived check in events.zig — the
+/// Event tag set is the single source of truth.
 fn isValidEventName(name: []const u8) bool {
-    const valid = [_][]const u8{
-        "turn_started",
-        "turn_ended",
-        "tool_call_started",
-        "tool_call_finished",
-        "response_received",
-        "plugin_loaded",
-        "plugin_unloaded",
-    };
-    for (valid) |v| {
-        if (std.mem.eql(u8, name, v)) return true;
-    }
-    return false;
+    return events_mod.isValidName(name);
 }
 
 pub fn registerTool(L: ?*c.lua_State) callconv(.c) c_int {
@@ -465,7 +455,7 @@ pub fn onEvent(L: ?*c.lua_State) callconv(.c) c_int {
     };
 
     // Fail fast on unknown event names — a typo would otherwise silently
-    // never fire. Validate against the seven names in events.Event.name().
+    // never fire. Validated against the Event tag set (events.zig SSOT).
     if (!isValidEventName(event_name)) {
         const msg = std.fmt.allocPrint(std.heap.page_allocator, "unknown event '{s}' (valid: turn_started, turn_ended, tool_call_started, tool_call_finished, response_received, plugin_loaded, plugin_unloaded)", .{event_name}) catch {
             state.pushNil();
