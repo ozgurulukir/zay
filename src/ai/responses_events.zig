@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const stream_part = @import("stream_part.zig");
-const stream_parser = @import("stream_parser.zig");
+const tool_call_args = @import("tool_call_args.zig");
 const http = @import("../http.zig");
 const log = std.log.scoped(.ai);
 
@@ -29,8 +29,8 @@ pub const ToolBuilder = struct {
     }
 };
 
-/// Terminal-event accumulators shared by `StreamState` and direct
-/// `processEvent` callers. `completed` and `incomplete` are distinct on
+/// Terminal-event accumulators shared by `StreamState` and the codex
+/// websocket loop. `completed` and `incomplete` are distinct on
 /// purpose: a stream that ends with NEITHER is truncated
 /// (`error.ResponseIncomplete`), while `response.incomplete` is a
 /// deliberate provider termination that must surface as a normal Turn —
@@ -130,20 +130,6 @@ pub const StreamState = struct {
         return .{ .assistant = .{ .assistant = .{ .content = content } }, .usage = self.terminal.usage, .finish_reason = self.terminal.finish_reason, .tool_calls_truncated = truncated };
     }
 };
-
-pub fn processEvent(
-    gpa: std.mem.Allocator,
-    data: []const u8,
-    blocks: *std.ArrayList(ai.ContentBlock),
-    tools: *std.ArrayList(ToolBuilder),
-    observer: anytype,
-    call_seq: *u64,
-    terminal: *Terminal,
-    limits: stream_part.StreamLimits,
-    dropped: *u32,
-) !void {
-    return processEventRouted(gpa, data, blocks, tools, observer, call_seq, terminal, limits, dropped, null);
-}
 
 fn processEventRouted(
     gpa: std.mem.Allocator,
@@ -365,10 +351,9 @@ fn onItemAdded(gpa: std.mem.Allocator, value: std.json.Value, blocks: *std.Array
             try builder.arguments.appendSlice(gpa, args);
         }
         if (builder.call_id.items.len == 0) {
-            const minted = try std.fmt.allocPrint(gpa, "call_{d}", .{call_seq.*});
+            const minted = try tool_call_args.mintSyntheticCallId(gpa, call_seq);
             defer gpa.free(minted);
             try builder.call_id.appendSlice(gpa, minted);
-            call_seq.* += 1;
         }
         builder.block_index = @intCast(blocks.items.len);
         try blocks.append(gpa, .{ .tool_call = .{
@@ -802,10 +787,9 @@ fn syncToolBlocks(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock
     for (tools) |*tool| {
         if (tool.name.items.len == 0) continue;
         if (tool.call_id.items.len == 0) {
-            const minted = try std.fmt.allocPrint(gpa, "call_{d}", .{call_seq.*});
+            const minted = try tool_call_args.mintSyntheticCallId(gpa, call_seq);
             defer gpa.free(minted);
             try tool.call_id.appendSlice(gpa, minted);
-            call_seq.* += 1;
         }
         try syncOneToolBlock(gpa, blocks, tool);
     }
@@ -842,7 +826,7 @@ fn dropIncompleteToolBlocks(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.Co
         if (blocks.items[tool.block_index] != .tool_call) continue;
         if (tool.name.items.len == 0) {
             nameless += 1;
-        } else if (!stream_parser.argumentsAreExecutable(tool.arguments.items)) {
+        } else if (!tool_call_args.argumentsAreExecutable(tool.arguments.items)) {
             truncated += 1;
         }
     }
@@ -863,7 +847,7 @@ fn dropIncompleteToolBlocks(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.Co
     for (tools) |*tool| {
         if (tool.block_index >= blocks.items.len) continue;
         if (blocks.items[tool.block_index] != .tool_call) continue;
-        if (tool.name.items.len == 0 or !stream_parser.argumentsAreExecutable(tool.arguments.items)) {
+        if (tool.name.items.len == 0 or !tool_call_args.argumentsAreExecutable(tool.arguments.items)) {
             keep[tool.block_index] = false;
         }
     }
@@ -1395,48 +1379,37 @@ test "openresponses drops function calls above the parallel-call cap" {
 
 test "processEvent ignores malformed JSON payloads gracefully" {
     const gpa = std.testing.allocator;
-    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
-    defer blocks.deinit(gpa);
-    var tools: std.ArrayList(ToolBuilder) = .empty;
-    defer tools.deinit(gpa);
-    var terminal: Terminal = .{};
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
     var call_seq: u64 = 0;
-    var dropped: u32 = 0;
-    _ = &dropped;
 
     // Truncated / broken JSON should not error or crash
-    try processEvent(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
-    try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
-    try std.testing.expectEqual(false, terminal.completed);
+    try state.processJson(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", ai.streamNoop(), &call_seq);
+    try std.testing.expectEqual(@as(usize, 0), state.blocks.items.len);
+    try std.testing.expectEqual(false, state.terminal.completed);
 }
 
 test "processEvent ignores unknown event types without error" {
     const gpa = std.testing.allocator;
-    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
-    defer blocks.deinit(gpa);
-    var tools: std.ArrayList(ToolBuilder) = .empty;
-    defer tools.deinit(gpa);
-    var terminal: Terminal = .{};
-    var call_seq: u64 = 0;
-    var dropped: u32 = 0;
-    _ = &dropped;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
 
-    try processEvent(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
-    try std.testing.expectEqual(false, terminal.completed);
-    try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
+    var call_seq: u64 = 0;
+    try state.processJson(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", ai.streamNoop(), &call_seq);
+    try std.testing.expectEqual(false, state.terminal.completed);
+    try std.testing.expectEqual(@as(usize, 0), state.blocks.items.len);
 }
 
 test "processEvent treats Codex lifecycle events as recognized no-ops" {
     const gpa = std.testing.allocator;
-    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
-    defer blocks.deinit(gpa);
-    var tools: std.ArrayList(ToolBuilder) = .empty;
-    defer tools.deinit(gpa);
-    var terminal: Terminal = .{};
-    var call_seq: u64 = 0;
-    var dropped: u32 = 0;
-    _ = &dropped;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
 
+    var call_seq: u64 = 0;
     const events = [_][]const u8{
         "{\"type\":\"response.created\"}",
         "{\"type\":\"response.in_progress\"}",
@@ -1452,24 +1425,20 @@ test "processEvent treats Codex lifecycle events as recognized no-ops" {
         const type_start = std.mem.indexOf(u8, event, "\"type\":\"").? + "\"type\":\"".len;
         const type_end = std.mem.indexOfPos(u8, event, type_start, "\"").?;
         try std.testing.expectEqual(ResponseEvent.lifecycle, responseEventFromString(event[type_start..type_end]).?);
-        try processEvent(gpa, event, &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
+        try state.processJson(gpa, event, ai.streamNoop(), &call_seq);
     }
-    try std.testing.expect(!terminal.completed);
-    try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
+    try std.testing.expect(!state.terminal.completed);
+    try std.testing.expectEqual(@as(usize, 0), state.blocks.items.len);
 }
 
 test "processEvent returns ProviderError on error event" {
     const gpa = std.testing.allocator;
-    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
-    defer blocks.deinit(gpa);
-    var tools: std.ArrayList(ToolBuilder) = .empty;
-    defer tools.deinit(gpa);
-    var terminal: Terminal = .{};
-    var call_seq: u64 = 0;
-    var dropped: u32 = 0;
-    _ = &dropped;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
 
-    const result = processEvent(gpa, "{\"type\": \"error\", \"error\": {\"message\": \"Rate limit exceeded\"}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
+    var call_seq: u64 = 0;
+    const result = state.processJson(gpa, "{\"type\": \"error\", \"error\": {\"message\": \"Rate limit exceeded\"}}", ai.streamNoop(), &call_seq);
     try std.testing.expectError(error.ProviderError, result);
 }
 
@@ -1558,16 +1527,12 @@ test "finish returns ResponseIncomplete error when stream ends before completed 
 
 test "processEvent handles response.failed as ProviderError" {
     const gpa = std.testing.allocator;
-    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
-    defer blocks.deinit(gpa);
-    var tools: std.ArrayList(ToolBuilder) = .empty;
-    defer tools.deinit(gpa);
-    var terminal: Terminal = .{};
-    var call_seq: u64 = 0;
-    var dropped: u32 = 0;
-    _ = &dropped;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
 
-    const result = processEvent(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", &blocks, &tools, ai.streamNoop(), &call_seq, &terminal, .{}, &dropped);
+    var call_seq: u64 = 0;
+    const result = state.processJson(gpa, "{\"type\":\"response.failed\",\"response\":{\"status_details\":{\"error\":{\"message\":\"Server overload\"}}}}", ai.streamNoop(), &call_seq);
     try std.testing.expectError(error.ProviderError, result);
 }
 
