@@ -148,6 +148,28 @@ pub fn isValidName(name: []const u8) bool {
     return false;
 }
 
+/// Comptime-rendered `", "`-joined list of valid event names for
+/// human-facing error hints — derived from the tag set so it cannot go
+/// stale when the Event set grows. Take its address for a `[]const u8`.
+pub const valid_names_hint = hint_blk: {
+    const fields = @typeInfo(Event).@"union".fields;
+    var total: usize = 0;
+    for (fields) |field| total += field.name.len;
+    total += (fields.len - 1) * 2;
+
+    var buf: [total]u8 = undefined;
+    var offset: usize = 0;
+    for (fields, 0..) |field, i| {
+        @memcpy(buf[offset..][0..field.name.len], field.name);
+        offset += field.name.len;
+        if (i + 1 < fields.len) {
+            @memcpy(buf[offset..][0..2], ", ");
+            offset += 2;
+        }
+    }
+    break :hint_blk buf;
+};
+
 pub fn subscribed(subscriptions: *const Subscriptions, event: Event) bool {
     return subscriptions.load(.acquire) & bit(event.name()) != 0;
 }
