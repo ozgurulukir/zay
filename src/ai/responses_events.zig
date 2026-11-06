@@ -131,7 +131,7 @@ pub const StreamState = struct {
     }
 };
 
-pub fn processEventRouted(
+fn processEventRouted(
     gpa: std.mem.Allocator,
     data: []const u8,
     blocks: *std.ArrayList(ai.ContentBlock),
