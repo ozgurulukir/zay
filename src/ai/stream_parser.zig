@@ -10,6 +10,7 @@ const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
 const stream_part = @import("stream_part.zig");
+const tool_call_args = @import("tool_call_args.zig");
 
 const Scanner = std.json.Scanner;
 
@@ -34,7 +35,7 @@ fn joinSeveredArguments(builders: *std.ArrayList(ToolCallBuilder), gpa: std.mem.
     for (builders.items, 0..) |*call, i| {
         // A call that never received executable arguments may have its payload
         // living in a later bare-arguments builder.
-        if (argumentsAreExecutable(call.arguments.items)) continue;
+        if (tool_call_args.argumentsAreExecutable(call.arguments.items)) continue;
         for (builders.items[(i + 1)..], 0..) |*orphan, k| {
             const j = i + 1 + k;
             if (orphan.name.items.len > 0 or orphan.id.items.len > 0) continue;
@@ -46,50 +47,6 @@ fn joinSeveredArguments(builders: *std.ArrayList(ToolCallBuilder), gpa: std.mem.
         }
     }
 }
-/// True when `raw` will dispatch as a valid tool-call arguments JSON object.
-/// `sanitizeToolArguments` collapses empty/severed input to "{}"; this tells
-/// the two apart: a literal (trimmed) `{}` is an intentional no-argument call,
-/// anything else that sanitize cannot round-trip to a `{...}` object is a
-/// provider truncation (no args delivered, or the JSON cut mid-stream).
-pub fn argumentsAreExecutable(raw: []const u8) bool {
-    const sanitized = sanitizeToolArguments(raw);
-    if (!std.mem.eql(u8, sanitized, "{}")) return true;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    return trimmed.len == 2 and trimmed[0] == '{' and trimmed[1] == '}';
-}
-
-pub fn sanitizeToolArguments(raw: []const u8) []const u8 {
-    var trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return "{}";
-
-    if (std.mem.startsWith(u8, trimmed, "```")) {
-        if (std.mem.indexOf(u8, trimmed, "\n")) |newline_pos| {
-            trimmed = std.mem.trim(u8, trimmed[newline_pos + 1 ..], " \t\r\n");
-        } else {
-            trimmed = std.mem.trim(u8, trimmed[3..], " \t\r\n");
-        }
-        if (std.mem.endsWith(u8, trimmed, "```")) {
-            trimmed = std.mem.trim(u8, trimmed[0 .. trimmed.len - 3], " \t\r\n");
-        }
-    }
-
-    if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
-        return trimmed;
-    }
-
-    // When a model wraps a JSON object with conversational text or comments,
-    // extract the slice between the first '{' and last '}'.
-    if (std.mem.indexOfScalar(u8, trimmed, '{')) |start| {
-        if (std.mem.lastIndexOfScalar(u8, trimmed, '}')) |end| {
-            if (end > start) {
-                return trimmed[start .. end + 1];
-            }
-        }
-    }
-
-    return "{}";
-}
-
 const ToolCallBuilder = struct {
     id: std.ArrayList(u8) = .empty,
     name: std.ArrayList(u8) = .empty,
@@ -110,13 +67,10 @@ const ToolCallBuilder = struct {
     fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, id_seq: *u64) !ai.ToolCall {
         const id = if (self.id.items.len > 0)
             try self.id.toOwnedSlice(gpa)
-        else id_blk: {
-            const minted = try std.fmt.allocPrint(gpa, "call_{d}", .{id_seq.*});
-            id_seq.* += 1;
-            break :id_blk minted;
-        };
+        else
+            try tool_call_args.mintSyntheticCallId(gpa, id_seq);
         const raw_args = try self.arguments.toOwnedSlice(gpa);
-        const sanitized = sanitizeToolArguments(raw_args);
+        const sanitized = tool_call_args.sanitizeToolArguments(raw_args);
         const arguments = if (sanitized.ptr == raw_args.ptr and sanitized.len == raw_args.len)
             raw_args
         else blk: {
@@ -246,7 +200,7 @@ pub fn readStream(
         // dispatch a bare `{}` call and loop forever — drop it like the
         // nameless path and surface the count to the caller so the model can
         // be told its arguments were severed.
-        if (!argumentsAreExecutable(builder.arguments.items)) {
+        if (!tool_call_args.argumentsAreExecutable(builder.arguments.items)) {
             log.warn(
                 "readStream.truncated_tool_call_dropped builder[{d}] name={s} id_len={d} model={s} — tool_call section likely truncated by the provider (no arguments streamed)",
                 .{ i, builder.name.items, builder.id.items.len, stream.limits.model_label },
@@ -1281,7 +1235,7 @@ test "readStream routes index-less continuation arguments to the last named call
 
 test "readStream drops a named call whose arguments JSON is cut mid-stream" {
     // The provider streamed partial arguments (`{"comm`) then closed with
-    // finish_reason=tool_calls. sanitizeToolArguments would collapse this to
+    // finish_reason=tool_calls. tool_call_args.sanitizeToolArguments would collapse this to
     // `{}`; the call must be treated as truncated, not dispatched as a bare
     // no-arg call.
     const gpa = std.testing.allocator;
@@ -1552,11 +1506,4 @@ test "processStreamChunk does not call on_delta_end for empty chunks" {
     try std.testing.expectEqualStrings("", observer_ctx.reasoning.items);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.tool_calls.items.len);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.delta_ends);
-}
-
-test "sanitizeToolArguments extracts json object from conversational prose or fences" {
-    try std.testing.expectEqualStrings("{\"command\":\"echo 1\"}", sanitizeToolArguments("```json\n{\"command\":\"echo 1\"}\n```"));
-    try std.testing.expectEqualStrings("{\"key\":\"value\"}", sanitizeToolArguments("Calling tool: {\"key\":\"value\"} finished"));
-    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("no json here"));
-    try std.testing.expectEqualStrings("{}", sanitizeToolArguments("{ unclosed"));
 }

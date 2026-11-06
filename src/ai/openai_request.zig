@@ -15,7 +15,7 @@ const log = std.log.scoped(.ai);
 const ai = @import("../ai.zig");
 const wire_json = @import("json.zig");
 const model_compat = @import("model_compat.zig");
-const stream_parser = @import("stream_parser.zig");
+const tool_call_args = @import("tool_call_args.zig");
 
 const isQwenModel = model_compat.isQwenModel;
 const normalizeMessagesForQwen = model_compat.normalizeMessagesForQwen;
@@ -108,7 +108,7 @@ fn writeToolCall(out: *std.Io.Writer, gpa: std.mem.Allocator, tool_call: ai.Tool
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
     try wire_json.writeString(out, gpa, tool_call.name);
     try out.writeAll(",\"arguments\":");
-    const args = stream_parser.sanitizeToolArguments(tool_call.arguments);
+    const args = tool_call_args.sanitizeToolArguments(tool_call.arguments);
     try wire_json.writeString(out, gpa, args);
     try out.writeAll("}}");
 }
