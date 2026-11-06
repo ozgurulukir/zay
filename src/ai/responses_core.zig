@@ -22,13 +22,6 @@ pub const responses_events = @import("responses_events.zig");
 // Re-exports for backwards compatibility
 pub const writeRequestPayload = responses_request.writeRequestPayload;
 pub const StreamState = responses_events.StreamState;
-pub const ToolBuilder = responses_events.ToolBuilder;
-pub const processEvent = responses_events.processEvent;
-pub const parseResponseUsage = responses_events.parseResponseUsage;
-pub const ResponseEvent = responses_events.ResponseEvent;
-pub const ResponseEventSpec = responses_events.ResponseEventSpec;
-pub const response_event_specs = responses_events.response_event_specs;
-pub const responseEventFromString = responses_events.responseEventFromString;
 
 pub const ResponsesConfig = struct {
     // Transport-protocol header specs, unified with the provider-header

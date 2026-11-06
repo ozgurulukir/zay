@@ -20,7 +20,6 @@ const transfer_buffer_bytes = http.transfer_buffer_bytes;
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
 pub const openaiV1Root = openai_endpoint.v1Root;
-pub const sanitizeToolArguments = stream_parser.sanitizeToolArguments;
 
 // Model- and dialect-compat quirks (two-layer effort clipping, Qwen
 // system-message normalization) live in the sibling leaf `model_compat.zig`,
@@ -1136,16 +1135,6 @@ test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)
     try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
     try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream.builders.items[0].arguments.items);
-}
-
-test "sanitizeToolArguments strips markdown backticks and falls back to empty object" {
-    try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments(""));
-    try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments("   "));
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream_parser.sanitizeToolArguments("{\"command\":\"ls\"}"));
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream_parser.sanitizeToolArguments("```json\n{\"command\":\"ls\"}\n```"));
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream_parser.sanitizeToolArguments("// Running command:\n{\"command\":\"ls\"}\n// done"));
-    try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments("not a json string"));
-    try std.testing.expectEqualStrings("{}", stream_parser.sanitizeToolArguments("{\"comm"));
 }
 
 test "parse streaming parallel tool calls with reused index does not concatenate names" {

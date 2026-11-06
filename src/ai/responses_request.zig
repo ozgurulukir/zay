@@ -10,7 +10,7 @@ const ai = @import("../ai.zig");
 const wire_json = @import("json.zig");
 const model_compat = @import("model_compat.zig");
 const responses_core = @import("responses_core.zig");
-const stream_parser = @import("stream_parser.zig");
+const tool_call_args = @import("tool_call_args.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_mod = @import("../tools.zig");
 
@@ -261,7 +261,7 @@ fn writeFunctionCall(out: *std.Io.Writer, gpa: std.mem.Allocator, call: ai.ToolC
     try out.writeAll(",\"name\":");
     try wire_json.writeString(out, gpa, call.name);
     try out.writeAll(",\"arguments\":");
-    const args = stream_parser.sanitizeToolArguments(call.arguments);
+    const args = tool_call_args.sanitizeToolArguments(call.arguments);
     try wire_json.writeString(out, gpa, args);
     try out.writeByte('}');
 }

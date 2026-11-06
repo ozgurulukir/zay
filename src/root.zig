@@ -602,6 +602,9 @@ test {
     // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
     _ = @import("ai/text_tool_call.zig");
     _ = @import("ai/model_compat.zig");
+    // Cross-dialect tool-call argument hygiene leaf; referenced explicitly so
+    // its inline tests run (silent-drop guard per AGENTS.md §Test runner quirks).
+    _ = @import("ai/tool_call_args.zig");
     // The scripted provider seam is imported lazily through `ai.zig`; import
     // it directly so its socket-free agent tests are part of this test root.
     _ = @import("ai/scripted_client.zig");
