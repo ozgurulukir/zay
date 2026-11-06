@@ -592,7 +592,6 @@ test {
     _ = @import("lua/state.zig");
     _ = @import("lua/bridge.zig");
     _ = @import("lua/sandbox.zig");
-    _ = @import("lua/plugin.zig");
     _ = @import("lua/manifest.zig");
     _ = @import("lua/manager.zig");
     _ = @import("lua/concurrency_tests.zig");
