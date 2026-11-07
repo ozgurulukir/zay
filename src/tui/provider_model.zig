@@ -136,7 +136,7 @@ fn buildMergedProviderList(self: *App, all_providers: []const modelsdev.Provider
     // array but whose identity (name, base_url) comes from the registry.
     // Without this guard the config entry shadows the .dynamic handle and
     // the picker shows the provider as a custom/config provider.
-    if (self.cached_config_owned) {
+    if (self.config_arena != null) {
         for (self.cached_config.providers) |cp| {
             if (self.provider_state.modelsdev_registry) |*reg| {
                 if (reg.lookup(cp.name) != null) continue;
@@ -698,18 +698,15 @@ pub fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
     // Clear stale connection state when switching to a builtin. Without
     // this, legacy fields from a previous dynamic/config provider linger
     // and hasOpenAICompatibleCredentials (or any direct legacy reader)
-    // sees the wrong provider's URL and key.
-    if (self.cached_config_owned) {
-        if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
+    // sees the wrong provider's URL and key. Overwrite-in-arena: the old
+    // values stay valid in `config_arena` until the arena is released, so
+    // only the replacement is allocated — no frees here.
+    if (self.config_arena) |config_arena| {
         self.cached_config.dynamic_provider_name = null;
-        if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
         self.cached_config.dynamic_provider_id = null;
-        if (self.cached_config.base_url) |prev| self.gpa.free(prev);
         self.cached_config.base_url = null;
-        if (self.cached_config.api_key) |prev| self.gpa.free(prev);
         self.cached_config.api_key = null;
-        if (self.cached_config.provider_name) |prev| self.gpa.free(prev);
-        self.cached_config.provider_name = try self.gpa.dupe(u8, provider.label());
+        self.cached_config.provider_name = try config_arena.allocator().dupe(u8, provider.label());
     }
 
     // With no key, connect via the provider's anonymous sentinel (e.g.
@@ -756,26 +753,17 @@ pub fn submitDynamicProviderSetup(self: *App, provider: modelsdev.Provider) !voi
     // (tryAttachOpenAiCompatibleFromConfig) and hasOpenAICompatibleCredentials.
     // updateCachedModelSelection keeps them consistent with the entry values
     // at selection time.
-    if (self.cached_config_owned) {
-        const owned_url = try self.gpa.dupe(u8, provider.base_url);
-        if (self.cached_config.base_url) |prev| self.gpa.free(prev);
-        self.cached_config.base_url = owned_url;
-
-        const owned_key = try self.gpa.dupe(u8, key);
-        if (self.cached_config.api_key) |prev| self.gpa.free(prev);
-        self.cached_config.api_key = owned_key;
-
-        if (self.cached_config.provider_name) |prev| self.gpa.free(prev);
+    if (self.config_arena) |config_arena| {
+        self.cached_config.base_url = try config_arena.allocator().dupe(u8, provider.base_url);
+        self.cached_config.api_key = try config_arena.allocator().dupe(u8, key);
         self.cached_config.provider_name = null;
 
         // Stash the human-readable provider name for the status bar.
-        if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
-        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
+        self.cached_config.dynamic_provider_name = try config_arena.allocator().dupe(u8, provider.name);
 
         // Stash the provider id (auth.json key, e.g. "stepfun-ai") so
         // model_selection.provider_name and auth lookups resolve correctly.
-        if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
-        self.cached_config.dynamic_provider_id = try self.gpa.dupe(u8, provider.id);
+        self.cached_config.dynamic_provider_id = try config_arena.allocator().dupe(u8, provider.id);
     }
 
     const connect_key = if (key.len > 0) key else (provider.anonymous_key orelse key);
@@ -819,24 +807,14 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
         .default => provider.provider.defaultBaseUrl() orelse "",
     };
 
-    if (self.cached_config_owned) {
-        const owned_url = try self.gpa.dupe(u8, base_url);
-        if (self.cached_config.base_url) |prev| self.gpa.free(prev);
-        self.cached_config.base_url = owned_url;
-
-        const owned_key = try self.gpa.dupe(u8, key);
-        if (self.cached_config.api_key) |prev| self.gpa.free(prev);
-        self.cached_config.api_key = owned_key;
-
-        if (self.cached_config.provider_name) |prev| self.gpa.free(prev);
+    if (self.config_arena) |config_arena| {
+        self.cached_config.base_url = try config_arena.allocator().dupe(u8, base_url);
+        self.cached_config.api_key = try config_arena.allocator().dupe(u8, key);
         self.cached_config.provider_name = null;
-
-        if (self.cached_config.dynamic_provider_name) |prev| self.gpa.free(prev);
-        self.cached_config.dynamic_provider_name = try self.gpa.dupe(u8, provider.name);
+        self.cached_config.dynamic_provider_name = try config_arena.allocator().dupe(u8, provider.name);
 
         // For config providers, the auth.json key equals the config map key.
-        if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
-        self.cached_config.dynamic_provider_id = try self.gpa.dupe(u8, provider.name);
+        self.cached_config.dynamic_provider_id = try config_arena.allocator().dupe(u8, provider.name);
     }
 
     // For config providers, the auth.json key equals the config map key
@@ -1085,58 +1063,32 @@ pub fn updateCachedModelSelection(
     model_id: []const u8,
     effort: ai.ReasoningEffort,
 ) !void {
-    const new_id = try self.gpa.dupe(u8, model_id);
-    errdefer self.gpa.free(new_id);
-    if (self.cached_config_owned) {
-        const resolved = resolveConn(provider, conn);
-        if (self.cached_config.model_selection) |*ms| {
-            ms.deinit(self.gpa);
-            if (provider == .openai_compatible) {
-                self.cached_config.model_selection = .{
-                    .custom = .{
-                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
-                        .base_url = try self.gpa.dupe(u8, resolved.base_url),
-                        .api_key = try self.gpa.dupe(u8, ""),
-                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
-                    },
-                };
-            } else {
-                self.cached_config.model_selection = .{
-                    .builtin = .{
-                        .provider = provider,
-                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
-                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
-                    },
-                };
-            }
-            try updateCachedProviderConnection(self, provider, resolved);
-        } else {
-            // No selection yet — bootstrap a minimal one from the resolved
-            // connection (provider default for builtins, entry values for
-            // compatible).
-            if (provider == .openai_compatible) {
-                self.cached_config.model_selection = .{
-                    .custom = .{
-                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
-                        .base_url = try self.gpa.dupe(u8, resolved.base_url),
-                        .api_key = try self.gpa.dupe(u8, ""),
-                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
-                    },
-                };
-            } else {
-                self.cached_config.model_selection = .{
-                    .builtin = .{
-                        .provider = provider,
-                        .provider_name = try self.gpa.dupe(u8, resolved.auth_key_id),
-                        .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
-                    },
-                };
-            }
-            try updateCachedProviderConnection(self, provider, resolved);
-        }
+    // Overwrite-in-arena: the previous selection's slices stay valid inside
+    // `config_arena` until the arena is released — no `deinit`, no frees.
+    // Whether a selection already existed is irrelevant: both shapes build
+    // the same replacement, so one path serves bootstrap and update.
+    const config_arena = self.config_arena orelse return;
+    const resolved = resolveConn(provider, conn);
+    const new_id = try config_arena.allocator().dupe(u8, model_id);
+    if (provider == .openai_compatible) {
+        self.cached_config.model_selection = .{
+            .custom = .{
+                .provider_name = try config_arena.allocator().dupe(u8, resolved.auth_key_id),
+                .base_url = try config_arena.allocator().dupe(u8, resolved.base_url),
+                .api_key = try config_arena.allocator().dupe(u8, ""),
+                .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
+            },
+        };
     } else {
-        self.gpa.free(new_id);
+        self.cached_config.model_selection = .{
+            .builtin = .{
+                .provider = provider,
+                .provider_name = try config_arena.allocator().dupe(u8, resolved.auth_key_id),
+                .model = .{ .id = new_id, .reasoning = .{ .effort = effort } },
+            },
+        };
     }
+    try updateCachedProviderConnection(self, provider, resolved);
 }
 
 /// A resolved connection for one selection: the provider default URL/key
@@ -1174,81 +1126,59 @@ pub fn updateCachedProviderConnection(self: *App, provider: config_mod.Provider,
         }
         return;
     }
-    if (self.cached_config.dynamic_provider_name) |previous| self.gpa.free(previous);
+    // Overwrite-in-arena: the stashed values stay valid in `config_arena`
+    // until the arena is released — no frees here.
     self.cached_config.dynamic_provider_name = null;
-    if (self.cached_config.dynamic_provider_id) |previous| self.gpa.free(previous);
     self.cached_config.dynamic_provider_id = null;
     if (provider.defaultBaseUrl()) |base_url| try replaceCachedBaseUrl(self, base_url);
     clearCachedApiKey(self);
 }
 
+/// Overwrite the custom selection's base URL in the App config arena. A
+/// builtin selection (or no selection) has no custom base URL to replace,
+/// so this is a no-op there.
 pub fn replaceCachedBaseUrl(self: *App, base_url: []const u8) !void {
-    const owned = try self.gpa.dupe(u8, base_url);
-    if (self.cached_config.model_selection) |*ms| {
-        switch (ms.*) {
-            .builtin => {
-                self.gpa.free(owned);
-            },
-            .custom => |*c| {
-                self.gpa.free(c.base_url);
-                c.base_url = owned;
-            },
-        }
-    } else {
-        self.gpa.free(owned);
-    }
+    const config_arena = self.config_arena orelse return;
+    if (self.cached_config.model_selection) |*ms| switch (ms.*) {
+        .custom => |*c| c.base_url = try config_arena.allocator().dupe(u8, base_url),
+        .builtin => {},
+    };
 }
 
+/// Overwrite the selection's provider name in the App config arena. With no
+/// selection there is nothing to name, so this is a no-op.
 pub fn replaceCachedProviderName(self: *App, name: []const u8) !void {
-    const owned = try self.gpa.dupe(u8, name);
-    errdefer self.gpa.free(owned);
-    if (self.cached_config.model_selection) |*ms| {
-        switch (ms.*) {
-            .builtin => |*b| {
-                self.gpa.free(b.provider_name);
-                b.provider_name = owned;
-            },
-            .custom => |*c| {
-                self.gpa.free(c.provider_name);
-                c.provider_name = owned;
-            },
-        }
-    } else {
-        self.gpa.free(owned);
-    }
+    const config_arena = self.config_arena orelse return;
+    if (self.cached_config.model_selection) |*ms| switch (ms.*) {
+        .builtin => |*b| b.provider_name = try config_arena.allocator().dupe(u8, name),
+        .custom => |*c| c.provider_name = try config_arena.allocator().dupe(u8, name),
+    };
 }
 
 pub fn clearCachedApiKey(self: *App) void {
-    if (self.cached_config.model_selection) |*ms| {
+    const config_arena = self.config_arena orelse return;
+    if (self.cached_config.model_selection) |*ms| switch (ms.*) {
         // Replace with empty string (api_key is non-optional in
         // ModelSelection; clearing means the user will be prompted
-        // again). The previous key is freed.
-        switch (ms.*) {
-            .custom => |*c| {
-                const new_key = self.gpa.dupe(u8, "") catch return;
-                self.gpa.free(c.api_key);
-                c.api_key = new_key;
-            },
-            .builtin => {},
-        }
-    }
+        // again). The previous key stays valid in the arena.
+        .custom => |*c| c.api_key = config_arena.allocator().dupe(u8, "") catch return,
+        .builtin => {},
+    };
 }
 
 /// Replace the legacy `cached_config.base_url` field (runtime-only, never
 /// serialized) with the new value. Session resume and
 /// hasOpenAICompatibleCredentials still read it.
 pub fn stashCachedBaseUrl(self: *App, base_url: []const u8) !void {
-    const owned = try self.gpa.dupe(u8, base_url);
-    if (self.cached_config.base_url) |prev| self.gpa.free(prev);
-    self.cached_config.base_url = owned;
+    const config_arena = self.config_arena orelse return;
+    self.cached_config.base_url = try config_arena.allocator().dupe(u8, base_url);
 }
 
 /// Replace the legacy `cached_config.dynamic_provider_id` field (runtime-only)
 /// with the new value. compatibleApiKey and the status bar read it.
 pub fn stashCachedDynamicId(self: *App, id: []const u8) !void {
-    const owned = try self.gpa.dupe(u8, id);
-    if (self.cached_config.dynamic_provider_id) |prev| self.gpa.free(prev);
-    self.cached_config.dynamic_provider_id = owned;
+    const config_arena = self.config_arena orelse return;
+    self.cached_config.dynamic_provider_id = try config_arena.allocator().dupe(u8, id);
 }
 
 pub fn modelSelectionUpdates(
@@ -1891,18 +1821,23 @@ pub fn drainMcpNotifications(self: *App) bool {
 /// immediately via `refreshMcpTools`, and persisted to config.json so it
 /// survives a restart. Best-effort — an append or connect failure leaves the
 /// config unchanged; a persistence failure keeps the in-memory addition but
-/// logs a warning.
+/// logs a warning. Requires an App-owned config arena (always present in
+/// production); a bare test App gets `error.ConfigArenaUnavailable`.
 pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
     const runtime = self.liveRuntime() orelse return;
+    // `cached_config.mcp_servers` is the merged runtime list, arena-backed by
+    // `config_arena`: build the entry and the replacement slice there and
+    // never free the old slice. `gpa.realloc` on arena storage would foreign-
+    // free the whole merged config tree whenever resize-in-place fails; a
+    // bare test App without an arena has no App-owned config to append to.
+    const config_arena = self.config_arena orelse return error.ConfigArenaUnavailable;
+    const arena = config_arena.allocator();
     const name = try deriveMcpServerName(self.gpa, raw_url);
     defer self.gpa.free(name);
-    const server = try config_mod.mcpServerFromUrl(self.gpa, name, raw_url);
+    const server = try config_mod.mcpServerFromUrl(arena, name, raw_url);
     const new_len = self.cached_config.mcp_servers.len + 1;
-    const new_servers = self.gpa.realloc(self.cached_config.mcp_servers, new_len) catch |err| {
-        var owned = server;
-        owned.deinit(self.gpa);
-        return err;
-    };
+    const new_servers = try arena.alloc(config_mod.McpServerConfig, new_len);
+    @memcpy(new_servers[0..self.cached_config.mcp_servers.len], self.cached_config.mcp_servers);
     new_servers[new_len - 1] = server;
     self.cached_config.mcp_servers = new_servers;
     refreshMcpTools(self);
@@ -1915,7 +1850,7 @@ pub fn addMcpServerByUrl(self: *App, raw_url: []const u8) !void {
     // silently copy project- and environment-scoped MCP servers into the
     // user's global config.json — mirror saveSettings, which builds updates
     // field-by-field for exactly this reason. The appended entry's storage is
-    // owned by cached_config (moved in by the realloc above), so we borrow it.
+    // owned by the App config arena (allocated above), so we borrow it.
     const updates: config_mod.Config = .{
         .mcp_servers = self.cached_config.mcp_servers[self.cached_config.mcp_servers.len - 1 ..],
     };
