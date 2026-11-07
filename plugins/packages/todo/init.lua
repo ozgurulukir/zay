@@ -644,7 +644,6 @@ zay.register_tool({
     priority = {
       type = "string",
       description = "Single letter A-Z, or empty to remove priority",
-      optional = true,
     },
   },
   handler = function(params)
