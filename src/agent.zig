@@ -609,6 +609,58 @@ pub const Agent = struct {
         };
     }
 
+    /// Turn-finalization policy for `run` (issue #340): what a completed
+    /// model turn becomes. The decision order IS the recovery policy — the
+    /// user's queued message takes the turn before any automatic wire-shape
+    /// recovery (drain beats retry), then the one-shot truncation retry,
+    /// then the length-cut continuation. This order must never be reordered.
+    const TurnFinalizationOutcome = enum {
+        /// Tool calls parsed or recovered: dispatch the batch.
+        dispatch,
+        /// A queued user message is waiting: drain it and continue the loop
+        /// with it as the next prompt.
+        continue_after_queued_drain,
+        /// Provider-severed tool_call section with the one-shot retry still
+        /// unspent: inject the hint and re-request.
+        retry_truncation_hint,
+        /// The one-shot truncation retry is already spent: end the run.
+        retry_exhausted_stop,
+        /// `finish_reason=length` with no tool calls: run the length-cut
+        /// policy (`handleLengthCut` owns its side effects — the history
+        /// write on auto-continue, the `.stopped` emit otherwise).
+        length_cut_pending,
+        /// Nothing left to recover from: end the turn.
+        end_turn,
+    };
+
+    /// Pure turn-finalization decision for `run`. No side effects: reads
+    /// only its arguments and returns the outcome; `run` performs it —
+    /// the warns, emits, history writes, and one-shot flag flips stay in
+    /// the parent.
+    fn runTurnFinalizationOutcome(
+        finish_reason: ?ai.FinishReason,
+        calls_present: bool,
+        queued_message_waiting: bool,
+        calls_truncated: u32,
+        truncation_retried: bool,
+    ) TurnFinalizationOutcome {
+        if (calls_present) return .dispatch;
+        if (queued_message_waiting) return .continue_after_queued_drain;
+        // Provider-severed tool_call arguments (name+id arrived, the
+        // arguments payload never streamed). The parser dropped the calls,
+        // so nothing dispatched. The fully-severed shape
+        // (`finish_reason=tool_calls`, zero calls parsed or recovered) sets
+        // no `tool_calls_truncated` count — the parser saw nothing to drop;
+        // cover it under the same one-shot retry so the warn-only path
+        // doesn't strand the turn.
+        if (calls_truncated > 0 or finish_reason == .tool_calls) {
+            if (!truncation_retried) return .retry_truncation_hint;
+            return .retry_exhausted_stop;
+        }
+        if (finish_reason == .length) return .length_cut_pending;
+        return .end_turn;
+    }
+
     pub fn run(self: *Agent, listener: anytype) !void {
         // Keep the loaded plugin generation alive through the entire turn,
         // including model waits and gaps between tool batches.
@@ -746,55 +798,74 @@ pub const Agent = struct {
             // for everything up to and including it; later appends are trailing.
             self.recordUsage(usage);
 
-            if (tool_calls.len == 0) {
+            // Turn finalization (issue #340): one pure policy read decides
+            // what this turn becomes; every side effect below stays in the
+            // parent. The decision order — queued drain, then truncation
+            // retry, then length-cut — is the recovery policy; see
+            // `runTurnFinalizationOutcome`.
+            var finalization = Agent.runTurnFinalizationOutcome(
+                finish_reason,
+                tool_calls.len > 0,
+                self.hasQueuedMessages(),
+                tool_calls_truncated,
+                truncation_retried,
+            );
+            if (finalization == .continue_after_queued_drain) {
                 try self.emitPendingSkillInventory(L, l);
                 // Turn would otherwise go idle: drain the front queued message
                 // (steer or not) and continue, so anything still waiting is
                 // handled at the natural turn end. The user's queued message
-                // takes precedence over the automatic continuation below.
+                // takes precedence over the automatic continuations below.
                 const drained_count = try self.drainQueuedUserMessage(false);
                 if (drained_count > 0) {
                     try l.emit(.{ .queued_messages_flushed = drained_count });
                     continue;
                 }
-                // Provider-severed tool_call arguments (name+id arrived, the
-                // arguments payload never streamed). The parser dropped the
-                // calls, so nothing dispatched. Tell the model its arguments
-                // were truncated and retry ONCE (bounded like the length-cut
-                // auto-continue) — a pathological endpoint cannot bill an
-                // unbounded retry loop.
-                // The fully-severed shape (`finish_reason=tool_calls`, zero
-                // calls parsed or recovered) sets no `tool_calls_truncated`
-                // count — the parser saw nothing to drop. Cover it under the
-                // same one-shot retry so the warn-only path above doesn't
-                // strand the turn.
-                if (tool_calls_truncated > 0 or finish_reason == .tool_calls) {
-                    if (!truncation_retried) {
-                        if (tool_calls_truncated > 0) {
-                            log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{tool_calls_truncated});
-                        } else {
-                            log.warn("finish_reason=tool_calls with no tool call parsed or recovered — retrying once with hint", .{});
-                        }
-                        truncation_retried = true;
-                        try self.addUser(tool_call_truncation_hint);
-                        continue;
+                // The queue emptied between the presence read and the drain
+                // (a concurrent `clearQueue`, or a lost mutex lock): the
+                // drain no longer owns the turn, so re-decide without it
+                // and let the wire-shape recovery below run.
+                finalization = Agent.runTurnFinalizationOutcome(finish_reason, false, false, tool_calls_truncated, truncation_retried);
+            }
+            if (finalization != .dispatch) {
+                try self.emitPendingSkillInventory(L, l);
+            }
+            switch (finalization) {
+                .dispatch => {},
+                .continue_after_queued_drain => unreachable, // re-decided above
+                .retry_truncation_hint => {
+                    // Tell the model its arguments were truncated and retry
+                    // ONCE (bounded like the length-cut auto-continue) — a
+                    // pathological endpoint cannot bill an unbounded retry
+                    // loop. The two warns cover the same condition with
+                    // different messages; do not merge them.
+                    if (tool_calls_truncated > 0) {
+                        log.warn("tool_call arguments truncated by provider ({d} calls dropped) — retrying once with hint", .{tool_calls_truncated});
+                    } else {
+                        log.warn("finish_reason=tool_calls with no tool call parsed or recovered — retrying once with hint", .{});
                     }
+                    truncation_retried = true;
+                    try self.addUser(tool_call_truncation_hint);
+                    continue;
+                },
+                .retry_exhausted_stop => {
                     log.warn("tool_call arguments truncated by provider on retry — ending turn", .{});
                     try l.emit(.{ .length_cut = .stopped });
                     return;
-                }
-                // A provider output-token cap severed the response before the
-                // tool_call section (observed: prose announcing an action,
-                // then a clean close). The partial prose is already in
-                // history (`takeAssistantMessage` ran above), so the wire
-                // shape for the continuation stays [.., assistant, user-hint].
-                if (finish_reason == .length) {
+                },
+                .length_cut_pending => {
+                    // A provider output-token cap severed the response before the
+                    // tool_call section (observed: prose announcing an action,
+                    // then a clean close). The partial prose is already in
+                    // history (`takeAssistantMessage` ran above), so the wire
+                    // shape for the continuation stays [.., assistant, user-hint].
                     if (try self.handleLengthCut(l, length_continued)) {
                         length_continued = true;
                         continue;
                     }
-                }
-                return;
+                    return;
+                },
+                .end_turn => return,
             }
             if (self.tool_access == .none) return error.ToolAccessDenied;
             const calls_remaining: usize = @intCast(self.tool_call_limit_per_turn - tool_calls_executed);
@@ -3040,6 +3111,61 @@ test "run retries once when finish_reason=tool_calls arrives with no tool call" 
         }
     }
     try std.testing.expect(hint_found);
+}
+
+test "run drains a queued user message before spending the truncation retry" {
+    // Precedence pin for the turn-finalization decision table: a queued user
+    // message and a severed tool_call section arriving in the same turn must
+    // hand the turn to the DRAIN, not to the hint retry. The one-shot stays
+    // unspent, so the NEXT severed response still gets its retry.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try ai.scripted_client.Client.init(gpa, io, "scripted-model");
+    defer client.deinit();
+    try client.enqueue(.{
+        ai.scripted_client.step.truncatedToolCalls(1),
+        ai.scripted_client.step.truncatedToolCalls(1),
+        ai.scripted_client.step.text("done after retry", .stop),
+    });
+
+    var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
+    defer agent.deinit();
+    try agent.addUser("list the directory");
+    try agent.enqueueUser("queued while busy");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+
+    try agent.run(Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent });
+
+    // Three prompts: the drained turn, the hint retry, the closing text. A
+    // retry-first ordering would spend the one-shot on turn 1, push the
+    // queued delivery to turn 3, and exhaust the script before the closing
+    // text.
+    try std.testing.expectEqual(@as(u32, 3), client.prompts_answered);
+
+    // Exactly one flush of the queued message, and the queue ends empty.
+    var flushed: usize = 0;
+    for (seen.events.items) |event| switch (event) {
+        .queued_messages_flushed => |count| {
+            try std.testing.expectEqual(@as(u32, 1), count);
+            flushed += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), flushed);
+    try std.testing.expect(!agent.hasQueuedMessages());
+
+    // History pins the ordering: the drained message landed BEFORE the hint
+    // (a retry-wins turn would put the hint first). The empty severed
+    // assistants store nothing, so the shape is exactly four messages.
+    const messages = agent.messages();
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("list the directory", messages[0].text());
+    try std.testing.expectEqualStrings("queued while busy", messages[1].text());
+    try std.testing.expect(std.mem.startsWith(u8, messages[2].text(), "[zay] Your tool call(s) arrived without their arguments"));
+    try std.testing.expectEqualStrings("done after retry", messages[3].text());
 }
 
 test "run auto-continues once after a scripted length-cut (socket-free)" {
