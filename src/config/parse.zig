@@ -37,6 +37,7 @@ const SplitMode = config_mod.SplitMode;
 const Diagnostic = config_mod.Diagnostic;
 const appendConfigError = config_mod.appendConfigError;
 const LoadResult = config_mod.LoadResult;
+const LoadedConfig = config_mod.LoadedConfig;
 
 /// Default `TuiSettings` — the single source for the "still at its default?"
 /// sentinels in `applyTuiOverlay`, `hasNonDefaultTui`, and `writeTui` (same
@@ -98,6 +99,32 @@ pub fn load(
     home_dir: []const u8,
     env: anytype,
 ) !LoadResult {
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_state.deinit();
+    const loaded = try loadInto(gpa, io, cwd, home_dir, env, arena_state.allocator());
+    return .{
+        .config = loaded.config,
+        .diagnostics = loaded.diagnostics,
+        .arena_state = arena_state,
+    };
+}
+
+/// Variant of `load` that merges the config layers into a caller-owned
+/// arena. Used by the TUI's cross-project resume: the App's long-lived
+/// config arena receives the freshly merged tree directly, so installing
+/// it (`app.cached_config = loaded.config`) needs no ownership transfer
+/// and no per-load arena teardown — the old tree's slices simply stay
+/// valid inside the arena until the owner releases it.
+pub fn loadInto(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    home_dir: []const u8,
+    env: anytype,
+    arena: std.mem.Allocator,
+) !LoadedConfig {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     errdefer {
         for (diagnostics.items) |*d| d.deinit(gpa);
@@ -119,23 +146,19 @@ pub fn load(
     var env_layer = try loadEnv(gpa, env, &diagnostics);
     defer env_layer.deinit(gpa);
 
-    // The merge phase runs against an arena owned by the returned
-    // LoadResult. Diagnostics stay gpa-owned (they outlive the LoadResult
-    // via takeDiagnostics), but every allocation the merge algebra makes
-    // — overlay dupes, clones, list growth — lands in the arena, so every
-    // `free` inside it becomes an arena no-op. The clone-before-free
-    // ordering and errdefer juggling the merge path needs under a real
-    // allocator (see dc8797fa/eeb9342b/6b918d58) are structurally inert
-    // here: no intermediate can dangle or double-free, and one
-    // arena.deinit() at LoadResult.deinit releases the whole merged tree.
-    // The gpa merge algebra itself is untouched — `mergeAndWriteGlobal`
-    // and the leak-checking merge tests still mutate live configs with a
-    // real allocator, which is where those orderings actually matter.
-    const arena_state = try gpa.create(std.heap.ArenaAllocator);
-    errdefer gpa.destroy(arena_state);
-    arena_state.* = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena_state.deinit();
-    const merged = try mergeLayers(arena_state.allocator(), &.{ global, project, env_layer });
+    // The merge phase runs against the caller's arena (for `load`, an arena
+    // owned by the returned LoadResult). Diagnostics stay gpa-owned (they
+    // outlive the result via takeDiagnostics), but every allocation the
+    // merge algebra makes — overlay dupes, clones, list growth — lands in
+    // the arena, so every `free` inside it becomes an arena no-op. The
+    // clone-before-free ordering and errdefer juggling the merge path needs
+    // under a real allocator (see dc8797fa/eeb9342b/6b918d58) are
+    // structurally inert here: no intermediate can dangle or double-free,
+    // and one arena.deinit() releases the whole merged tree. The gpa merge
+    // algebra itself is untouched — `mergeAndWriteGlobal` and the
+    // leak-checking merge tests still mutate live configs with a real
+    // allocator, which is where those orderings actually matter.
+    const merged = try mergeLayers(arena, &.{ global, project, env_layer });
 
     const validation_diags = try merged.validate(gpa);
     defer gpa.free(validation_diags);
@@ -151,7 +174,6 @@ pub fn load(
     return .{
         .config = merged,
         .diagnostics = try diagnostics.toOwnedSlice(gpa),
-        .arena_state = arena_state,
     };
 }
 
@@ -4808,6 +4830,72 @@ test "load preserves user systemPrompt when model_selection is null (cold start)
 
     try std.testing.expectEqual(@as(?ModelSelection, null), res.config.model_selection);
     try std.testing.expectEqualStrings("You are custom Zay agent.", res.config.system_prompt.?);
+}
+
+test "loadInto merges into a caller-owned arena twice without leaking (cross-project reload)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const fake_home = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(fake_home);
+    const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(fake_cwd);
+
+    const config_dir = try globalConfigPath(gpa, io, fake_home);
+    defer gpa.free(config_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, std.fs.path.dirname(config_dir).?);
+
+    const env: TestEnv = .{ .entries = &.{} };
+    // One long-lived arena mirroring the TUI App's config arena: a
+    // cross-project resume reloads INTO it (previously each resume went
+    // through `load`, whose per-result arena was never released — a leak
+    // per switch). Two reloads in one process must leave nothing for the
+    // gpa to reclaim except the diagnostics.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    {
+        const json = "{\"systemPrompt\":\"first reload\"}";
+        var file = try std.Io.Dir.createFile(.cwd(), io, config_dir, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(json);
+        try writer.interface.flush();
+    }
+
+    const first = try loadInto(gpa, io, fake_cwd, fake_home, env, arena_state.allocator());
+    for (first.diagnostics) |*d| d.deinit(gpa);
+    gpa.free(first.diagnostics);
+    try std.testing.expectEqualStrings("first reload", first.config.system_prompt.?);
+
+    // The first tree stays valid inside the arena while the second one is
+    // merged alongside it (overwrite-in-arena, no frees).
+    const first_prompt = first.config.system_prompt.?;
+
+    {
+        const json = "{\"systemPrompt\":\"second reload\"}";
+        var file = try std.Io.Dir.createFile(.cwd(), io, config_dir, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(json);
+        try writer.interface.flush();
+    }
+
+    const second = try loadInto(gpa, io, fake_cwd, fake_home, env, arena_state.allocator());
+    for (second.diagnostics) |*d| d.deinit(gpa);
+    gpa.free(second.diagnostics);
+    try std.testing.expectEqualStrings("second reload", second.config.system_prompt.?);
+    // The superseded tree is still readable: it was never freed early.
+    try std.testing.expectEqualStrings("first reload", first_prompt);
+
+    // `arena_state.deinit` releases both trees in one shot; the testing
+    // allocator asserts nothing else leaked (the old leak path is gone).
 }
 
 test "serialize preserves config.system_prompt when model_selection systemPrompt is null" {

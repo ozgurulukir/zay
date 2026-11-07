@@ -109,7 +109,6 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // panics with "incorrect alignment"; `PageAllocator` is the safe fallback:
     // thread-safe, actually frees memory, but each allocation maps a whole page.
     const tui_gpa = gpa;
-    const tui_config = try load_result.config.clone(tui_gpa);
     const runtime_gpa = gpa;
 
     defer search.deinit(runtime_gpa, init.io);
@@ -318,18 +317,26 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .host_id = host_id,
         });
     }
-    // Release via LoadResult.deinit: the merged config is arena-owned (see
-    // parse.zig load), so Config.deinit here would free arena-backed slices
-    // with the real allocator. takeDiagnostics above already detached the
-    // gpa-owned diagnostics, so this only tears down the arena.
+    // The TUI borrows the merged config and its backing arena for its whole
+    // lifetime (`App.config_arena` is a non-owning pointer): provider/theme/
+    // settings/plugin mutations overwrite slices in the arena and a
+    // cross-project resume merges the reloaded tree into it. Keep the load
+    // result alive until after `tui.run` — and therefore App teardown — has
+    // completed, then release the whole arena-backed tree in one shot (see
+    // parse.zig loadInto). takeDiagnostics above already detached the
+    // gpa-owned diagnostics, so this only tears down the arena. Ordering is
+    // pinned by the tui arena-hand-off regression test.
+    {
+        errdefer load_result.deinit(gpa);
+
+        // Record this run's driver session so the NEXT launch resumes it. The
+        // session row is already inserted synchronously by initSession; the pin
+        // is kept fresh mid-run by installRuntime (via recovery.syncDriverPin).
+        lane_recovery.recordStartupDriverPin(runtime_gpa, init.io, home_dir, cwd, &agent_runtime.session_writer);
+
+        try tui.run(init, agent_runtime, load_result.config, load_result.arena_state, tui_gpa, host_id, recovered);
+    }
     load_result.deinit(gpa);
-
-    // Record this run's driver session so the NEXT launch resumes it. The
-    // session row is already inserted synchronously by initSession; the pin
-    // is kept fresh mid-run by installRuntime (via recovery.syncDriverPin).
-    lane_recovery.recordStartupDriverPin(runtime_gpa, init.io, home_dir, cwd, &agent_runtime.session_writer);
-
-    try tui.run(init, agent_runtime, tui_config, tui_gpa, host_id, recovered);
 
     // Clean exit: park every still-'open' manifest row, so `state='open'`
     // later can only mean "open when the crash hit" — never a lane from an
