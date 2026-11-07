@@ -699,6 +699,7 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             .home_dir = current.home_dir,
             .base_system_prompt = current.base_system_prompt,
             .config = config.*,
+            .config_arena = if (app.config_arena) |a| a.allocator() else null,
             .diagnostics = diagnostics,
             .host_id = host_id,
             .session_id = id,

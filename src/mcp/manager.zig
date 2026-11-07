@@ -460,16 +460,16 @@ fn runConnect(job: *ConnectJob) ConnectResult {
 }
 
 /// Build a stdio MCP server config for the deterministic Zig mock server.
-/// Caller owns the returned config (free via `McpServerConfig.deinit`).
-fn mockStdioConfig(gpa: std.mem.Allocator, name: []const u8, mode: []const u8) !config_mod.McpServerConfig {
-    var args = try gpa.alloc([]u8, 1);
-    errdefer gpa.free(args);
-    args[0] = try gpa.dupe(u8, mode);
+/// The returned config lives in `arena` (the test's config fixture arena) —
+/// released with the arena, never freed per-field.
+fn mockStdioConfig(arena: std.mem.Allocator, name: []const u8, mode: []const u8) !config_mod.McpServerConfig {
+    var args = try arena.alloc([]u8, 1);
+    args[0] = try arena.dupe(u8, mode);
     return .{
-        .name = try gpa.dupe(u8, name),
+        .name = try arena.dupe(u8, name),
         .enabled = true,
         .transport = .{ .stdio = .{
-            .command = try gpa.dupe(u8, @import("mcp_mock_server").path),
+            .command = try arena.dupe(u8, @import("mcp_mock_server").path),
             .args = args,
         } },
     };
@@ -491,16 +491,22 @@ test "McpManager syncs servers from config and counts tools" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
     servers[0] = .{
-        .name = try gpa.dupe(u8, "memory"),
+        .name = try arena.dupe(u8, "memory"),
         .enabled = true,
         .transport = .{ .stdio = .{
-            .command = try gpa.dupe(u8, "npx"),
+            .command = try arena.dupe(u8, "npx"),
         } },
     };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     try manager.syncFromConfig(std.testing.io, &cfg);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
@@ -514,33 +520,38 @@ test "McpManager removes stale clients not in config" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     // First sync: add two servers
-    var servers1 = try gpa.alloc(config_mod.McpServerConfig, 2);
+    var servers1 = try arena.alloc(config_mod.McpServerConfig, 2);
     servers1[0] = .{
-        .name = try gpa.dupe(u8, "alpha"),
+        .name = try arena.dupe(u8, "alpha"),
         .enabled = true,
-        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "echo") } },
+        .transport = .{ .stdio = .{ .command = try arena.dupe(u8, "echo") } },
     };
     servers1[1] = .{
-        .name = try gpa.dupe(u8, "beta"),
+        .name = try arena.dupe(u8, "beta"),
         .enabled = true,
-        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "cat") } },
+        .transport = .{ .stdio = .{ .command = try arena.dupe(u8, "cat") } },
     };
     var cfg1: config_mod.Config = .{ .mcp_servers = servers1 };
-    defer cfg1.deinit(gpa);
 
     try manager.syncFromConfig(std.testing.io, &cfg1);
     try std.testing.expectEqual(@as(usize, 2), manager.clients.items.len);
 
     // Second sync: only "alpha" remains — "beta" should be removed
-    var servers2 = try gpa.alloc(config_mod.McpServerConfig, 1);
+    var servers2 = try arena.alloc(config_mod.McpServerConfig, 1);
     servers2[0] = .{
-        .name = try gpa.dupe(u8, "alpha"),
+        .name = try arena.dupe(u8, "alpha"),
         .enabled = true,
-        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "echo") } },
+        .transport = .{ .stdio = .{ .command = try arena.dupe(u8, "echo") } },
     };
     var cfg2: config_mod.Config = .{ .mcp_servers = servers2 };
-    defer cfg2.deinit(gpa);
 
     try manager.syncFromConfig(std.testing.io, &cfg2);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
@@ -605,16 +616,22 @@ test "McpManager does not reconnect already connected clients" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
     servers[0] = .{
-        .name = try gpa.dupe(u8, "stable"),
+        .name = try arena.dupe(u8, "stable"),
         .enabled = true,
         .transport = .{ .stdio = .{
-            .command = try gpa.dupe(u8, "echo"),
+            .command = try arena.dupe(u8, "echo"),
         } },
     };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     // First sync: registers as .connecting
     try manager.syncFromConfig(std.testing.io, &cfg);
@@ -633,23 +650,29 @@ test "McpManager skips duplicate server names in config" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 2);
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 2);
     servers[0] = .{
-        .name = try gpa.dupe(u8, "dup"),
+        .name = try arena.dupe(u8, "dup"),
         .enabled = true,
         .transport = .{ .stdio = .{
-            .command = try gpa.dupe(u8, "echo"),
+            .command = try arena.dupe(u8, "echo"),
         } },
     };
     servers[1] = .{
-        .name = try gpa.dupe(u8, "dup"),
+        .name = try arena.dupe(u8, "dup"),
         .enabled = true,
         .transport = .{ .stdio = .{
-            .command = try gpa.dupe(u8, "cat"),
+            .command = try arena.dupe(u8, "cat"),
         } },
     };
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     try manager.syncFromConfig(std.testing.io, &cfg);
     // Only the first "dup" should be registered
@@ -665,10 +688,16 @@ test "McpManager async connect spawns, handshakes, discovers, and installs" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "mock", "default");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "mock", "default");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try std.testing.expect(manager.hasPendingConnects());
@@ -687,10 +716,16 @@ test "McpManager buildMcpToolSchemas carries the raw inputSchema" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "rich", "rich_schema");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "rich", "rich_schema");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try drainUntilConnected(&manager, std.testing.io);
@@ -710,10 +745,16 @@ test "McpManager reconnect frees and re-captures raw inputSchemas" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "rich", "rich_schema");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "rich", "rich_schema");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try drainUntilConnected(&manager, std.testing.io);
@@ -742,10 +783,16 @@ test "McpManager async connect failure marks the client failed with a reason" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "dead", "fail");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "dead", "fail");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try std.testing.expect(manager.hasPendingConnects());
@@ -767,10 +814,16 @@ test "McpManager async connect fails on a malformed tool discovery response" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "bad-tools", "malformed_tools");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "bad-tools", "malformed_tools");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try drainUntilConnected(&manager, std.testing.io);
@@ -787,10 +840,16 @@ test "McpManager discards a connect outcome when the client is disconnected mid-
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "flaky", "slow");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "flaky", "slow");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try std.testing.expect(manager.hasPendingConnects());
@@ -810,11 +869,17 @@ test "McpManager does not launch a second connect while one is pending" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(std.testing.io);
 
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     // A silent server keeps the job pending long enough to double-sync.
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "slow", "hang");
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "slow", "hang");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     manager.syncFromConfigEx(std.testing.io, &cfg);
@@ -827,10 +892,16 @@ test "launchConnect initializes every ConnectJob field" {
     var manager = McpManager.init(gpa);
     defer manager.deinit(io);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "lazy", "hang");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "lazy", "hang");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     try manager.syncFromConfig(io, &cfg);
     manager.launchConnect(io, "lazy");
@@ -851,12 +922,18 @@ test "McpManager deinit while a connect is in flight joins and tears down" {
     var manager = McpManager.init(gpa);
     // `deinit` is the code under test — no defer.
 
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     // A server that never speaks JSON-RPC keeps the handshake in flight until
     // teardown terminates the child process.
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "hang", "hang");
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "hang", "hang");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     try manager.syncFromConfig(io, &cfg);
     manager.clients.items[0].read_timeout_ms = 60_000;
@@ -877,10 +954,16 @@ test "McpManager deinit cancels a partial stdio response" {
     const io = std.testing.io;
     var manager = McpManager.init(gpa);
 
-    var servers = try gpa.alloc(config_mod.McpServerConfig, 1);
-    servers[0] = try mockStdioConfig(gpa, "partial", "partial");
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "partial", "partial");
     var cfg: config_mod.Config = .{ .mcp_servers = servers };
-    defer cfg.deinit(gpa);
 
     try manager.syncFromConfig(io, &cfg);
     manager.clients.items[0].read_timeout_ms = 60_000;

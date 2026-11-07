@@ -287,6 +287,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .home_dir = home_dir,
             .base_system_prompt = system_prompt,
             .config = load_result.config,
+            .config_arena = load_result.arena_state.allocator(),
             .diagnostics = load_result.takeDiagnostics(),
             .host_id = host_id,
             .session_id = id,
