@@ -199,7 +199,17 @@ pub const App = struct {
     /// Inline edit buffers for text fields across overlays.
     input_buffers: app_state.InputBuffers = .{},
     cached_config: config_mod.Config = .{},
-    cached_config_owned: bool = false,
+    /// Backing arena of `cached_config`, handed over non-owning by root.zig
+    /// (the `config.load` result arena) and installed in `initRuntime`. The
+    /// App never frees it: root releases the load arena after `tui.run`
+    /// returns, i.e. after `deinitApp` has already torn down every borrower.
+    /// All config mutations — provider switches, theme/settings applies,
+    /// plugin toggles, cross-project reloads — overwrite slices IN this
+    /// arena; the old values stay valid until the arena dies, so there is
+    /// never a free of `cached_config` storage during the App's lifetime.
+    /// Null only in bare test Apps built with `App.init` (no runtime
+    /// config): config-mutating paths then skip the in-memory mirror.
+    config_arena: ?*std.heap.ArenaAllocator = null,
     /// Registry-aware theme catalogue (builtins seeded in `App.init`, custom
     /// JSON themes loaded by `initRuntime`). Owned; freed in `deinitApp`.
     theme_registry: tui_style.ThemeRegistry = .{},
@@ -356,12 +366,14 @@ pub const App = struct {
         gpa: std.mem.Allocator,
         runtime: *runtime_mod.AgentRuntime,
         config: config_mod.Config,
+        config_arena: *std.heap.ArenaAllocator,
         environ_map: ?*std.process.Environ.Map,
         host_id: []const u8,
     ) !App {
         std.debug.assert(host_id.len > 0);
         var app = try init(io, gpa, &runtime.agent);
         app.cached_config = config;
+        app.config_arena = config_arena;
         app.environ_map = environ_map;
         app.host_id = try gpa.dupe(u8, host_id);
         // Size the shared request limiter from the config knob (default 2 —
@@ -382,8 +394,8 @@ pub const App = struct {
         app.plugin_manager.deinit();
         app.plugin_manager = lua_mod.PluginManager.init(gpa, io, runtime.home_dir, runtime.cwd);
         // Clone plugin config entries into the manager before loadAll: the
-        // manager outlives cached_config swaps (a session switch frees the old
-        // Config mid-session), so borrowed slices would dangle.
+        // manager outlives config swaps (a cross-project resume overwrites
+        // `cached_config` mid-session), so borrowed slices would dangle.
         app.plugin_manager.syncPluginConfig(app.cached_config.plugins) catch |err| {
             log.warn("plugin_manager.syncPluginConfig failed: {s}", .{@errorName(err)});
         };
@@ -414,7 +426,6 @@ pub const App = struct {
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
-        app.cached_config_owned = true;
         // Load custom themes and re-apply the theme registry-aware (M1). The
         // earlier `setActive(resolveTheme(...))` at tui.zig:~1160 is
         // builtin-only and runs before initRuntime; this second pass resolves
@@ -423,6 +434,17 @@ pub const App = struct {
         try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
         tui_style.setActive(app.theme_registry.resolve(app.cached_config.theme));
         return app;
+    }
+
+    /// Test seam mirroring root.zig's hand-off: install a caller-owned
+    /// config arena. The App borrows it non-owning (`config_arena` is never
+    /// freed by `deinitApp`); the caller releases it after `deinit`, exactly
+    /// like root releases the load arena after `tui.run` returns.
+    pub fn installConfigArena(self: *App) !*std.heap.ArenaAllocator {
+        const arena_state = try self.gpa.create(std.heap.ArenaAllocator);
+        arena_state.* = std.heap.ArenaAllocator.init(self.gpa);
+        self.config_arena = arena_state;
+        return arena_state;
     }
 
     /// The live lane's runtime, or null when no engine is attached (idle/test).
@@ -1382,6 +1404,7 @@ pub fn run(
     init: std.process.Init,
     runtime: *runtime_mod.AgentRuntime,
     config: config_mod.Config,
+    config_arena: *std.heap.ArenaAllocator,
     gpa: std.mem.Allocator,
     host_id: []const u8,
     recovery: ?[]lane_recovery.RecoveredLane,
@@ -1389,8 +1412,11 @@ pub fn run(
     // Allocator is provided by root.zig as `PageAllocator`. Thread-safe and
     // correct, but each allocation maps a whole page — traded off to avoid
     // `SmpAllocator`'s multi-threaded free-list corruption panic in Zig 0.16.
-    // Must match `tui_gpa` in root.zig since `runtime`/`cached_config` cross
-    // the seam and are freed in `App.deinit`.
+    // Must match `tui_gpa` in root.zig since `runtime` crosses the seam and
+    // is freed in `App.deinit`. The config arena also crosses the seam, but
+    // as a non-owning borrow: root keeps releasing it after `run` returns,
+    // so the merged tree always outlives the App and every overwrite-in-arena
+    // mutation stays valid until then.
     var tty_buffer: [8192]u8 = undefined;
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer {
@@ -1410,7 +1436,7 @@ pub fn run(
     // Install the active color theme before the first frame is drawn.
     tui_style.setActive(tui_style.resolveTheme(config.theme));
 
-    var app = try App.initRuntime(init.io, gpa, runtime, config, init.environ_map, host_id);
+    var app = try App.initRuntime(init.io, gpa, runtime, config, config_arena, init.environ_map, host_id);
     // Arm the shared subsystems now that `app` is in its final stack frame.
     // Inside initRuntime, &app.X would dangle after return-by-value.
     runtime.agent.attachSharedSubsystems(app.sharedSubsystems());
@@ -1705,7 +1731,7 @@ pub fn reasoningOptions() []const model_picker.ReasoningOption {
 /// changes. Empty cache → fall back to the global hardcoded list.
 pub fn rebuildReasoningOptsCache(self: *App) void {
     self.provider_state.reasoning_opts_len = 0;
-    if (!self.cached_config_owned) return;
+    if (self.config_arena == null) return;
     const ms = self.cached_config.model_selection orelse return;
     for (ms.model().reasoning_options) |effort| {
         if (self.provider_state.reasoning_opts_len >= self.provider_state.reasoning_opts_cache.len) break;

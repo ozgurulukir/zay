@@ -24,6 +24,7 @@ const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
 const at_search_mod = @import("at_search.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
+const mcp_client_mod = @import("../mcp/client.zig");
 const lifecycle = @import("lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const turn_view_mod = @import("turn_view.zig");
@@ -54,6 +55,8 @@ const reasoningOptions = tui.reasoningOptions;
 const commandMatchesCountForFilter = tui.commandMatchesCountForFilter;
 
 const provider_model = @import("provider_model.zig");
+const theme_lifecycle = @import("theme_lifecycle.zig");
+const tui_style = @import("style.zig");
 const search_lifecycle = @import("search_lifecycle.zig");
 const diff_utils = @import("diff_utils.zig");
 const model_loader = @import("model_loader.zig");
@@ -1940,19 +1943,23 @@ test "codex sign-in survives selecting local compatible provider" {
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    // The App borrows a caller-owned config arena (root.zig hand-off); the
+    // arena is released only after `app.deinit` (LIFO defers).
+    const arena_state = try app.installConfigArena();
+    defer gpa.destroy(arena_state);
+    defer arena_state.deinit();
     defer app.deinit();
     defer runtime.disconnectClient();
 
     app.codex_signed_in = true;
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") });
     app.pickers.models.model_selection = 0;
-    app.cached_config_owned = true;
     app.cached_config.model_selection = .{
         .custom = .{
-            .provider_name = try gpa.dupe(u8, "openai_compatible"),
-            .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
-            .api_key = try gpa.dupe(u8, "ollama"),
-            .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+            .provider_name = try arena_state.allocator().dupe(u8, "openai_compatible"),
+            .base_url = try arena_state.allocator().dupe(u8, "http://localhost:11434/v1"),
+            .api_key = try arena_state.allocator().dupe(u8, "ollama"),
+            .model = .{ .id = try arena_state.allocator().dupe(u8, "placeholder") },
         },
     };
 
@@ -1960,6 +1967,144 @@ test "codex sign-in survives selecting local compatible provider" {
 
     try std.testing.expect(app.isCodexSignedIn());
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.model_selection.?.provider());
+}
+
+test "config arena handed to App outlives deinitApp and is released by the owner" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    errdefer app.deinit();
+    // Mirror root.zig's hand-off: the `config.load` arena is created by the
+    // caller and the App borrows it non-owning.
+    const arena_state = try app.installConfigArena();
+    errdefer {
+        arena_state.deinit();
+        gpa.destroy(arena_state);
+    }
+    app.cached_config.theme = try arena_state.allocator().dupe(u8, "cappuccino");
+    app.cached_config.system_prompt = try arena_state.allocator().dupe(u8, "stay valid");
+    const borrowed_theme = app.cached_config.theme.?;
+    const borrowed_prompt = app.cached_config.system_prompt.?;
+
+    app.deinit();
+
+    // Arena outlives App: config slices read after `deinitApp` are still
+    // valid — the App never frees the arena it borrowed.
+    try std.testing.expectEqualStrings("cappuccino", borrowed_theme);
+    try std.testing.expectEqualStrings("stay valid", borrowed_prompt);
+
+    // Teardown ordering: the owner releases the arena only after the App is
+    // fully torn down (root.zig releases the load arena after `tui.run`
+    // returns). The testing allocator fails this test if `deinitApp` or any
+    // teardown step freed a config slice with `gpa` along the way.
+    arena_state.deinit();
+    gpa.destroy(arena_state);
+}
+
+test "config mutations overwrite in the App arena without foreign frees (provider switch, theme apply, MCP add)" {
+    const gpa = std.testing.allocator;
+    var home = try isolatedHome(gpa, std.testing.io);
+    defer home.deinit(gpa);
+
+    // Minimal stub runtime standing in for the primary lane: the MCP add
+    // path and the settings/theme applies need a live runtime, and the MCP
+    // persist step writes into `home_dir`.
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = home.path;
+    runtime.home_dir = home.path;
+    runtime.client = .none;
+    runtime.base_system_prompt = "test";
+    runtime.system_prompt = "test";
+    runtime.session_writer = undefined;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer runtime.agent.deinit();
+    runtime.diagnostics = &.{};
+    runtime.codex_connection_expired = false;
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
+    runtime.naming_client = .none;
+
+    var app = try App.init(std.testing.io, gpa, &runtime.agent);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    defer app.deinit();
+    // The App borrows a caller-owned config arena (root.zig hand-off); the
+    // arena is released only after `app.deinit` (LIFO defers).
+    const arena_state = try app.installConfigArena();
+    defer gpa.destroy(arena_state);
+    defer arena_state.deinit();
+    // applyTheme mutates the global active palette; restore it for the rest
+    // of the suite (same contract as the theme_lifecycle tests).
+    defer tui_style.setActive(tui_style.default_theme);
+
+    // Seed the shapes the mutation sites overwrite: a custom model selection
+    // plus the legacy stash fields, all arena-backed like a real load.
+    const arena = arena_state.allocator();
+    app.cached_config.base_url = try arena.dupe(u8, "http://old.example/v1");
+    app.cached_config.api_key = try arena.dupe(u8, "old-key");
+    app.cached_config.dynamic_provider_name = try arena.dupe(u8, "provider-a");
+    app.cached_config.dynamic_provider_id = try arena.dupe(u8, "provider-a");
+    app.cached_config.model_selection = .{
+        .custom = .{
+            .provider_name = try arena.dupe(u8, "provider-a"),
+            .base_url = try arena.dupe(u8, "http://old.example/v1"),
+            .api_key = try arena.dupe(u8, "old-key"),
+            .model = .{ .id = try arena.dupe(u8, "old-model") },
+        },
+    };
+    app.cached_config.theme = try arena.dupe(u8, "default");
+
+    // Free-of-arena-slice detector: every mutation below allocates the
+    // replacement from `config_arena` and must never free the old slice
+    // with `gpa` — a foreign free would trip the testing allocator here.
+    const conn = model_loader.Compatible{
+        .provider = .openai_compatible,
+        .base_url = try gpa.dupe(u8, "http://new.example/v1"),
+        .auth_key_id = try gpa.dupe(u8, "provider-b"),
+    };
+    defer gpa.free(conn.base_url);
+    defer gpa.free(conn.auth_key_id);
+    try provider_model.updateCachedModelSelection(&app, conn.provider, conn, "new-model", .medium);
+    try provider_model.stashCachedBaseUrl(&app, "http://new.example/v1");
+    try provider_model.stashCachedDynamicId(&app, "provider-b");
+    try provider_model.replaceCachedBaseUrl(&app, "http://new.example/v1");
+    try provider_model.replaceCachedProviderName(&app, "provider-b");
+    provider_model.clearCachedApiKey(&app);
+
+    try theme_lifecycle.applyTheme(&app, "cappuccino");
+
+    // The swaps landed: config now describes the new provider.
+    const ms = app.cached_config.model_selection.?.custom;
+    try std.testing.expectEqualStrings("new-model", ms.model.id);
+    try std.testing.expectEqualStrings("http://new.example/v1", ms.base_url);
+    try std.testing.expectEqualStrings("provider-b", ms.provider_name);
+    try std.testing.expectEqualStrings("", ms.api_key);
+    try std.testing.expectEqualStrings("http://new.example/v1", app.cached_config.base_url.?);
+    try std.testing.expectEqualStrings("provider-b", app.cached_config.dynamic_provider_id.?);
+    try std.testing.expectEqualStrings("cappuccino", app.cached_config.theme.?);
+
+    // MCP add path (the arena append): the merged runtime list lives in the
+    // App arena — the replacement slice is arena-allocated and the old slice
+    // is never freed (a `gpa.realloc` of arena storage would foreign-free
+    // the whole merged config tree when resize-in-place fails). Point the
+    // added server at a refused port so the async connect this triggers
+    // fails immediately, then drain it so App teardown is clean.
+    try provider_model.addMcpServerByUrl(&app, "http://127.0.0.1:1/mcp");
+    try std.testing.expectEqual(@as(usize, 1), app.cached_config.mcp_servers.len);
+    try std.testing.expectEqualStrings("127.0.0.1:1", app.cached_config.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("http://127.0.0.1:1/mcp", app.cached_config.mcp_servers[0].transport.sse.url);
+
+    var spins: usize = 0;
+    while (app.mcp_manager.hasPendingConnects()) : (spins += 1) {
+        try std.testing.expect(spins < 2000);
+        _ = app.mcp_manager.drainConnects(std.testing.io);
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(mcp_client_mod.ServerStatus.failed, app.mcp_manager.clients.items[0].status());
 }
 
 test "createRuntime wires the full tool set into the freshly-attached client" {
@@ -2128,19 +2273,23 @@ test "switching from codex to catalogue provider resets cached connection" {
 
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    // The App borrows a caller-owned config arena (root.zig hand-off); the
+    // arena is released only after `app.deinit` (LIFO defers).
+    const arena_state = try app.installConfigArena();
+    defer gpa.destroy(arena_state);
+    defer arena_state.deinit();
     defer app.deinit();
 
     app.pickers.models.model_scope = .session;
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "zen"), .label = try gpa.dupe(u8, "zen") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .opencode_zen, "https://opencode.ai/zen/v1", "opencode_zen") });
     app.pickers.models.model_selection = 0;
-    app.cached_config_owned = true;
-    app.cached_config.dynamic_provider_name = try gpa.dupe(u8, "provider-a");
-    app.cached_config.dynamic_provider_id = try gpa.dupe(u8, "provider-a");
+    app.cached_config.dynamic_provider_name = try arena_state.allocator().dupe(u8, "provider-a");
+    app.cached_config.dynamic_provider_id = try arena_state.allocator().dupe(u8, "provider-a");
     app.cached_config.model_selection = .{
         .builtin = .{
             .provider = .openai,
-            .provider_name = try gpa.dupe(u8, "openai"),
-            .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+            .provider_name = try arena_state.allocator().dupe(u8, "openai"),
+            .model = .{ .id = try arena_state.allocator().dupe(u8, "placeholder") },
         },
     };
 
@@ -2884,18 +3033,22 @@ test "model selection is allowed after interrupt" {
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    // The App borrows a caller-owned config arena (root.zig hand-off); the
+    // arena is released only after `app.deinit` (LIFO defers).
+    const arena_state = try app.installConfigArena();
+    defer gpa.destroy(arena_state);
+    defer arena_state.deinit();
     defer app.deinit();
     defer runtime.disconnectClient();
 
     try app.pickers.models.append(gpa, .{ .id = try gpa.dupe(u8, "llama3"), .label = try gpa.dupe(u8, "llama3") }, .{ .openai_compatible = try model_loader.compatibleSource(gpa, .ollama, "http://localhost:11434/v1", "ollama") });
     app.pickers.models.model_selection = 0;
-    app.cached_config_owned = true;
     app.cached_config.model_selection = .{
         .custom = .{
-            .provider_name = try gpa.dupe(u8, "openai_compatible"),
-            .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
-            .api_key = try gpa.dupe(u8, "ollama"),
-            .model = .{ .id = try gpa.dupe(u8, "placeholder") },
+            .provider_name = try arena_state.allocator().dupe(u8, "openai_compatible"),
+            .base_url = try arena_state.allocator().dupe(u8, "http://localhost:11434/v1"),
+            .api_key = try arena_state.allocator().dupe(u8, "ollama"),
+            .model = .{ .id = try arena_state.allocator().dupe(u8, "placeholder") },
         },
     };
     app.thread.turn.submit();

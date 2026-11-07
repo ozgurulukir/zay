@@ -128,10 +128,10 @@ fn deinitSharedServices(self: *App) void {
     self.tool_registry.deinit(self.gpa);
     self.gpa.destroy(self.tool_registry);
     self.theme_registry.deinit(self.gpa);
-    if (self.cached_config_owned) {
-        self.cached_config.deinit(self.gpa);
-        self.cached_config_owned = false;
-    }
+    // `cached_config` is arena-backed (`config_arena`) and freed by its owner
+    // (root.zig) only after `tui.run` — and therefore this teardown — has
+    // completed. No config deinit here: every borrow above has already been
+    // released, and freeing arena slices with `gpa` would be a foreign free.
 
     if (self.async_worktree_job) |job| {
         job.deinit();
