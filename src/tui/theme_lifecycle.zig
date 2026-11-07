@@ -125,9 +125,10 @@ pub fn applyTheme(app: *App, raw_name: []const u8) !void {
     }
 
     // Reconcile the in-memory value so a later read matches what we persisted.
-    if (app.cached_config_owned) {
-        if (app.cached_config.theme) |old| app.gpa.free(old);
-        app.cached_config.theme = try app.gpa.dupe(u8, theme.name);
+    // Overwrite-in-arena: the previous theme name stays valid inside the App
+    // config arena until the arena is released — no free of the old slice.
+    if (app.config_arena) |config_arena| {
+        app.cached_config.theme = try config_arena.allocator().dupe(u8, theme.name);
     }
 
     // User notification reflecting persistence status
@@ -223,16 +224,22 @@ test "openThemePicker clears inputs and selects active theme" {
     try std.testing.expectEqual(@as(u32, 3), app.pickers.theme.selection);
 }
 
-test "applyTheme updates live palette, cached_config_owned, and transcript" {
+test "applyTheme updates live palette, config arena theme, and transcript" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
+    // Mirror root.zig's hand-off: the App borrows a caller-owned arena; the
+    // previous theme name stays valid inside it (overwrite-in-arena). Defers
+    // run LIFO, so the arena is released only after `app.deinit` — same
+    // ordering as root releasing the load arena after `tui.run`.
+    const arena_state = try app.installConfigArena();
+    defer gpa.destroy(arena_state);
+    defer arena_state.deinit();
     defer app.deinit();
     defer tui_style.setActive(tui_style.default_theme);
 
-    app.cached_config_owned = true;
-    app.cached_config.theme = try gpa.dupe(u8, "default");
+    app.cached_config.theme = try arena_state.allocator().dupe(u8, "default");
 
     try applyTheme(&app, "cappuccino");
 
@@ -247,7 +254,7 @@ test "applyTheme updates live palette, cached_config_owned, and transcript" {
     try std.testing.expectEqual(.success, last_row.kind);
 }
 
-test "applyTheme with cached_config_owned=false does not alter cached_config.theme" {
+test "applyTheme without a config arena does not alter cached_config.theme" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -255,14 +262,13 @@ test "applyTheme with cached_config_owned=false does not alter cached_config.the
     defer app.deinit();
     defer tui_style.setActive(tui_style.default_theme);
 
-    app.cached_config_owned = false;
     app.cached_config.theme = null;
 
     try applyTheme(&app, "dracula");
 
     // Palette is updated
     try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
-    // Cached config remained null because cached_config_owned was false
+    // Cached config remained null because no config arena was installed
     try std.testing.expect(app.cached_config.theme == null);
 }
 

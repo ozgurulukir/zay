@@ -656,16 +656,21 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     // `.zay/config.json` so MCP servers, model selection, and project-scoped
     // settings match the session's own project. The env layer is constant
     // (process env vars don't change between projects), so we reuse the
-    // environ_map captured at startup.
+    // environ_map captured at startup. The reload merges directly into the
+    // App's long-lived config arena (loadInto), so no per-load arena exists
+    // to tear down and none can leak — the previous tree's slices simply
+    // stay valid in the arena until root releases it.
     var reloaded_config: ?config_mod.Config = null;
     var reloaded_diagnostics: []config_mod.Diagnostic = &.{};
     if (cross_project and app.environ_map != null) {
-        var result = config_mod.load(app.gpa, app.io, cwd, current.home_dir, app.environ_map.?) catch null;
-        if (result) |*lr| {
-            reloaded_diagnostics = lr.takeDiagnostics();
-            reloaded_config = lr.config;
-        } else {
-            log.warn("session.resume.config_reload_failed cwd={s}, using current config", .{cwd});
+        if (app.config_arena) |config_arena| {
+            var loaded = config_mod.loadInto(app.gpa, app.io, cwd, current.home_dir, app.environ_map.?, config_arena.allocator()) catch null;
+            if (loaded) |*lc| {
+                reloaded_diagnostics = lc.diagnostics;
+                reloaded_config = lc.config;
+            } else {
+                log.warn("session.resume.config_reload_failed cwd={s}, using current config", .{cwd});
+            }
         }
     }
     defer {
@@ -718,14 +723,12 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     runtime_initialized = true;
 
     // If config was reloaded, replace the app's cached config and re-sync MCP.
+    // Overwrite-in-arena: the old tree stays valid inside `config_arena` (no
+    // deinit, no free), but the picker's `.config` entries and any open form
+    // handle still reference the stale provider list — drop them here so the
+    // next picker build reads the NEW tree no matter which path touches it.
     if (reloaded_config) |rc| {
-        if (app.cached_config_owned) app.cached_config.deinit(app.gpa);
         app.cached_config = rc;
-        app.cached_config_owned = true;
-        // The provider picker's `.config` entries and any open form handle
-        // borrow the OLD config's storage, which the deinit above just freed.
-        // Dropping them here makes the dangle temporally impossible no matter
-        // which code path touches the picker next.
         provider_model.invalidateProviderEntries(app);
         app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch |err| {
             // One failure, one toast: the logger's warn→toast sink routes this

@@ -57,6 +57,7 @@ pub const PluginConfig = plugin_types.PluginConfig;
 // --- Parse / serialize / IO re-exports ---
 
 pub const load = parse_mod.load;
+pub const loadInto = parse_mod.loadInto;
 pub const syncModelSelectionFromLegacy = parse_mod.syncModelSelectionFromLegacy;
 pub const writeGlobal = parse_mod.writeGlobal;
 pub const readGlobal = parse_mod.readGlobal;
@@ -400,39 +401,6 @@ pub const Config = struct {
         self.* = undefined;
     }
 
-    pub fn clone(self: Config, gpa: std.mem.Allocator) !Config {
-        var out: Config = .{
-            .use_responses_endpoint = self.use_responses_endpoint,
-            .strict_outputs = self.strict_outputs,
-            .context = self.context,
-        };
-        errdefer out.deinit(gpa);
-        if (self.version) |s| out.version = try gpa.dupe(u8, s);
-        if (self.provider_name) |s| out.provider_name = try gpa.dupe(u8, s);
-        if (self.base_url) |s| out.base_url = try gpa.dupe(u8, s);
-        if (self.api_key) |s| out.api_key = try gpa.dupe(u8, s);
-        if (self.bash_classifier_url) |s| out.bash_classifier_url = try gpa.dupe(u8, s);
-        if (self.database_server_url) |s| out.database_server_url = try gpa.dupe(u8, s);
-        if (self.database_auth_token) |s| out.database_auth_token = try gpa.dupe(u8, s);
-        out.database = try self.database.clone(gpa);
-        if (self.model) |m| out.model = try m.clone(gpa);
-        out.providers = try gpa.alloc(ProviderConfig, self.providers.len);
-        for (self.providers, 0..) |provider, index| out.providers[index] = try provider.clone(gpa);
-        out.mcp_servers = try gpa.alloc(McpServerConfig, self.mcp_servers.len);
-        for (self.mcp_servers, 0..) |server, index| out.mcp_servers[index] = try server.clone(gpa);
-        out.plugins = try gpa.alloc(PluginConfig, self.plugins.len);
-        for (self.plugins, 0..) |plugin, index| out.plugins[index] = try plugin.clone(gpa);
-        if (self.system_prompt) |s| out.system_prompt = try gpa.dupe(u8, s);
-        if (self.theme) |s| out.theme = try gpa.dupe(u8, s);
-        if (self.dynamic_provider_name) |s| out.dynamic_provider_name = try gpa.dupe(u8, s);
-        if (self.dynamic_provider_id) |s| out.dynamic_provider_id = try gpa.dupe(u8, s);
-        if (self.toast.position) |s| out.toast.position = try gpa.dupe(u8, s);
-        out.tui = self.tui;
-        if (self.tui.custom_themes_dir) |s| out.tui.custom_themes_dir = try gpa.dupe(u8, s);
-        if (self.model_selection) |ms| out.model_selection = try ms.clone(gpa);
-        return out;
-    }
-
     /// Resolve the active database backend kind.
     pub fn effectiveDatabaseBackend(self: *const Config) DatabaseBackendKind {
         if (self.database.backend) |b| return b;
@@ -565,6 +533,14 @@ pub fn appendConfigError(
         .reason = reason,
     } });
 }
+
+/// A loaded config whose tree lives in a caller-supplied arena (see
+/// `loadInto`). The caller keeps owning the arena, so there is no deinit
+/// for the config itself — only the gpa-owned diagnostics need releasing.
+pub const LoadedConfig = struct {
+    config: Config,
+    diagnostics: []Diagnostic,
+};
 
 pub const LoadResult = struct {
     config: Config,

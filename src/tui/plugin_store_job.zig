@@ -193,14 +193,17 @@ pub fn isProjectPlugin(app: *App, name: []const u8) bool {
 pub fn setEnabled(app: *App, name: []const u8, enabled: bool) !void {
     const runtime = app.liveRuntime() orelse app.templateRuntime() orelse return error.NoActiveRuntime;
     if (runtime.cwd.len == 0) return error.ProjectPathUnavailable;
+    // The in-memory mirror allocates into the App config arena (overwrite-
+    // in-arena: the previous plugins slice stays valid until the arena is
+    // released — no deinit of the old entries). A bare test App without an
+    // arena has no App-owned config to mirror into.
+    const config_arena = app.config_arena orelse return error.ConfigArenaUnavailable;
 
-    const next_plugins = try clonePluginConfigsWithEnabled(app.gpa, app.cached_config.plugins, name, enabled);
-    errdefer deinitPluginConfigs(app.gpa, next_plugins);
+    const next_plugins = try clonePluginConfigsWithEnabled(config_arena.allocator(), app.cached_config.plugins, name, enabled);
     var update_plugins = [_]config_mod.PluginConfig{.{ .name = @constCast(name), .enabled = enabled }};
     const updates: config_mod.Config = .{ .plugins = &update_plugins };
     try config_mod.mergeAndWriteProject(app.gpa, app.io, runtime.cwd, updates);
 
-    if (app.cached_config.plugins.len > 0) deinitPluginConfigs(app.gpa, app.cached_config.plugins);
     app.cached_config.plugins = next_plugins;
 }
 
@@ -239,7 +242,15 @@ pub fn forgetMissingPlugin(app: *App, name: []const u8) void {
         setNotice(app, "Could not remove plugin preference: no active project.");
         return;
     };
-    forgetMissingPluginConfig(app.gpa, app.io, runtime.cwd, runtime.home_dir, &app.cached_config, name) catch |err| {
+    forgetMissingPluginConfig(
+        app.gpa,
+        app.io,
+        runtime.cwd,
+        runtime.home_dir,
+        if (app.config_arena) |arena| arena.allocator() else null,
+        &app.cached_config,
+        name,
+    ) catch |err| {
         if (err == error.GlobalPluginPreference) {
             setNotice(app, "Package is missing; remove its saved preference from global config.json.");
         } else {
@@ -250,28 +261,29 @@ pub fn forgetMissingPlugin(app: *App, name: []const u8) void {
     setNotice(app, "Removed saved plugin preference; package was already missing.");
 }
 
-fn forgetMissingPluginConfig(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, home_dir: []const u8, cached: *config_mod.Config, name: []const u8) !void {
+/// Remove a missing package's saved project preference from disk and mirror
+/// the removal into the cached config. `arena` receives the replacement
+/// plugins slice (overwrite-in-arena: the previous slice stays valid until
+/// the App config arena is released — no deinit of the old entries); null
+/// skips the in-memory mirror (a bare test App has no config arena).
+fn forgetMissingPluginConfig(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, home_dir: []const u8, arena: ?std.mem.Allocator, cached: *config_mod.Config, name: []const u8) !void {
     if (cwd.len == 0) return error.ProjectPathUnavailable;
     var global = try config_mod.readGlobal(gpa, io, home_dir);
     defer global.deinit(gpa);
     for (global.plugins) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return error.GlobalPluginPreference;
     }
+    const arena_alloc = arena orelse {
+        try config_mod.removeProjectPlugin(gpa, io, cwd, name);
+        return;
+    };
     var next: std.ArrayList(config_mod.PluginConfig) = .empty;
-    errdefer {
-        for (next.items) |*entry| entry.deinit(gpa);
-        next.deinit(gpa);
-    }
     for (cached.plugins) |entry| {
         if (std.mem.eql(u8, entry.name, name)) continue;
-        var copy = try entry.clone(gpa);
-        errdefer copy.deinit(gpa);
-        try next.append(gpa, copy);
+        try next.append(arena_alloc, try entry.clone(arena_alloc));
     }
-    const plugins = try next.toOwnedSlice(gpa);
-    errdefer deinitPluginConfigs(gpa, plugins);
+    const plugins = try next.toOwnedSlice(arena_alloc);
     try config_mod.removeProjectPlugin(gpa, io, cwd, name);
-    if (cached.plugins.len > 0) deinitPluginConfigs(gpa, cached.plugins);
     cached.plugins = plugins;
 }
 
@@ -292,25 +304,29 @@ test "missing plugin removal clears disk and cached preferences and preserves ot
     };
     const original: config_mod.Config = .{ .plugins = &entries };
     try config_mod.writeProject(gpa, io, project, original);
-    var cached = try original.clone(gpa);
-    defer cached.deinit(gpa);
+    // The cached config is arena-backed, mirroring the App hand-off: the
+    // mirror slices live in the arena and are released with it.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const cached_plugins = try arena_state.allocator().alloc(config_mod.PluginConfig, entries.len);
+    for (entries, 0..) |entry, index| cached_plugins[index] = try entry.clone(arena_state.allocator());
+    var cached: config_mod.Config = .{ .plugins = cached_plugins };
     try config_mod.writeGlobal(gpa, io, home, original);
-    try std.testing.expectError(error.GlobalPluginPreference, forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing"));
+    try std.testing.expectError(error.GlobalPluginPreference, forgetMissingPluginConfig(gpa, io, project, home, arena_state.allocator(), &cached, "missing"));
     try std.testing.expectEqual(@as(usize, 2), cached.plugins.len);
     try config_mod.writeGlobal(gpa, io, home, .{});
-    try forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing");
+    try forgetMissingPluginConfig(gpa, io, project, home, arena_state.allocator(), &cached, "missing");
     try std.testing.expectEqual(@as(usize, 1), cached.plugins.len);
     try std.testing.expectEqualStrings("keep", cached.plugins[0].name);
     var disk = try config_mod.readProject(gpa, io, project);
     defer disk.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), disk.plugins.len);
     try std.testing.expectEqualStrings("keep", disk.plugins[0].name);
-    try forgetMissingPluginConfig(gpa, io, project, home, &cached, "missing");
+    try forgetMissingPluginConfig(gpa, io, project, home, arena_state.allocator(), &cached, "missing");
     try std.testing.expectEqual(@as(usize, 1), cached.plugins.len);
 
     var empty_cached: config_mod.Config = .{};
-    try forgetMissingPluginConfig(gpa, io, project, home, &empty_cached, "nonexistent");
-    defer empty_cached.deinit(gpa);
+    try forgetMissingPluginConfig(gpa, io, project, home, arena_state.allocator(), &empty_cached, "nonexistent");
     try std.testing.expectEqual(@as(usize, 0), empty_cached.plugins.len);
 }
 
@@ -371,7 +387,7 @@ fn runUninstall(worker: *UninstallWorker) UninstallResult {
 }
 
 fn clonePluginConfigsWithEnabled(
-    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
     current: []const config_mod.PluginConfig,
     name: []const u8,
     enabled: bool,
@@ -381,27 +397,24 @@ fn clonePluginConfigsWithEnabled(
         found = true;
         break;
     };
-    const next = try gpa.alloc(config_mod.PluginConfig, current.len + @intFromBool(!found));
+    const next = try arena.alloc(config_mod.PluginConfig, current.len + @intFromBool(!found));
     var initialized: usize = 0;
     errdefer {
-        for (next[0..initialized]) |*entry| entry.deinit(gpa);
-        gpa.free(next);
+        // Arena-backed: entry.deinit/arena.free are no-ops on prior arena
+        // allocations, so this only stops the swap — nothing to reclaim.
+        for (next[0..initialized]) |*entry| entry.deinit(arena);
+        arena.free(next);
     }
     for (current, 0..) |entry, index| {
-        next[index] = try entry.clone(gpa);
+        next[index] = try entry.clone(arena);
         if (std.mem.eql(u8, entry.name, name)) next[index].enabled = enabled;
         initialized += 1;
     }
     if (!found) {
-        next[initialized] = .{ .name = try gpa.dupe(u8, name), .enabled = enabled };
+        next[initialized] = .{ .name = try arena.dupe(u8, name), .enabled = enabled };
         initialized += 1;
     }
     return next;
-}
-
-fn deinitPluginConfigs(gpa: std.mem.Allocator, plugins: []config_mod.PluginConfig) void {
-    for (plugins) |*entry| entry.deinit(gpa);
-    gpa.free(plugins);
 }
 
 const Worker = struct {

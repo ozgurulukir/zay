@@ -373,36 +373,37 @@ fn commitTextEdit(app: *App) !void {
 /// cached config: a null pending means "not touched", an empty pending
 /// clears the field, anything else replaces it. Inlined per field here
 /// because the cached config lives outside parse.zig's overlay path.
-fn applyPendingText(gpa: std.mem.Allocator, target: *?[]u8, pending: ?[]const u8) !void {
+fn applyPendingText(arena: std.mem.Allocator, target: *?[]u8, pending: ?[]const u8) !void {
     const s = pending orelse return;
-    const next: ?[]u8 = if (s.len > 0) try gpa.dupe(u8, s) else null;
-    if (target.*) |old| gpa.free(old);
-    target.* = next;
+    // Overwrite-in-arena: the previous value stays valid inside the App
+    // config arena until the arena is released — no free of the old slice.
+    target.* = if (s.len > 0) try arena.dupe(u8, s) else null;
 }
 
 fn applyToCachedConfig(app: *App, state: *const State) !void {
-    if (!app.cached_config_owned) return;
+    const config_arena = app.config_arena orelse return;
     if (app.cached_config.model_selection) |*ms| {
         // Model selection exists: update it directly
         switch (ms.*) {
             .builtin => |*b| {
                 if (state.pending_use_responses_endpoint) |v| b.use_responses_endpoint = v;
-                try applyPendingText(app.gpa, &b.system_prompt, state.pending_system_prompt);
-                try applyPendingText(app.gpa, &b.bash_classifier_url, state.pending_bash_classifier_url);
+                try applyPendingText(config_arena.allocator(), &b.system_prompt, state.pending_system_prompt);
+                try applyPendingText(config_arena.allocator(), &b.bash_classifier_url, state.pending_bash_classifier_url);
             },
             .custom => |*c| {
                 if (state.pending_use_responses_endpoint) |v| c.use_responses_endpoint = v;
-                try applyPendingText(app.gpa, &c.system_prompt, state.pending_system_prompt);
-                try applyPendingText(app.gpa, &c.bash_classifier_url, state.pending_bash_classifier_url);
+                try applyPendingText(config_arena.allocator(), &c.system_prompt, state.pending_system_prompt);
+                try applyPendingText(config_arena.allocator(), &c.bash_classifier_url, state.pending_bash_classifier_url);
             },
         }
     } else {
-        // Legacy config: update legacy fields directly
+        // Legacy config: update legacy fields directly. There is no
+        // model_selection to keep in sync — `syncModelSelectionFromLegacy`
+        // only acts when one already exists, so calling it here would be a
+        // guaranteed no-op.
         if (state.pending_use_responses_endpoint) |v| app.cached_config.use_responses_endpoint = v;
-        try applyPendingText(app.gpa, &app.cached_config.system_prompt, state.pending_system_prompt);
-        try applyPendingText(app.gpa, &app.cached_config.bash_classifier_url, state.pending_bash_classifier_url);
-        // Sync legacy field updates to model_selection for consistency
-        try config_mod.syncModelSelectionFromLegacy(app.gpa, &app.cached_config);
+        try applyPendingText(config_arena.allocator(), &app.cached_config.system_prompt, state.pending_system_prompt);
+        try applyPendingText(config_arena.allocator(), &app.cached_config.bash_classifier_url, state.pending_bash_classifier_url);
     }
     // Toast toggle applies regardless of model_selection shape.
     if (state.pending_toast_enabled) |v| app.cached_config.toast.enabled = v;
@@ -639,8 +640,7 @@ test "clearCurrentField marks a set field cleared and dirty" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    // Non-owned cached config with duplicated values the test frees itself.
-    app.cached_config_owned = false;
+    // Borrowed cached config (no App config arena) with values the test frees itself.
     app.cached_config.system_prompt = try gpa.dupe(u8, "custom prompt");
     app.cached_config.bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
     app.mode = .settings;
@@ -673,6 +673,84 @@ test "clearCurrentField marks a set field cleared and dirty" {
     gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
 }
 
+test "applyToCachedConfig overwrites in the App arena without foreign frees" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    // The App borrows a caller-owned config arena (root.zig hand-off); the
+    // arena is released only after `app.deinit` (LIFO defers).
+    const arena_state = try app.installConfigArena();
+    defer gpa.destroy(arena_state);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Custom-shape cached config (model_selection present), arena-backed
+    // like a real `config.load` result.
+    app.cached_config.model_selection = .{
+        .custom = .{
+            .provider_name = try arena.dupe(u8, "provider-a"),
+            .base_url = try arena.dupe(u8, "http://old.example/v1"),
+            .api_key = try arena.dupe(u8, "old-key"),
+            .model = .{ .id = try arena.dupe(u8, "old-model") },
+            .system_prompt = try arena.dupe(u8, "old prompt"),
+            .bash_classifier_url = try arena.dupe(u8, "http://old.example/classify"),
+        },
+    };
+    const state = &app.pickers.settings;
+    state.pending_system_prompt = try gpa.dupe(u8, "new prompt");
+    state.pending_bash_classifier_url = try gpa.dupe(u8, "http://new.example/classify");
+    state.pending_toast_enabled = true;
+    defer {
+        gpa.free(state.pending_system_prompt.?);
+        gpa.free(state.pending_bash_classifier_url.?);
+    }
+
+    // Free-of-arena-slice detector: applyPendingText must dupe the
+    // replacement into the arena and never free the old slice with `gpa` —
+    // a foreign free trips the testing allocator before the assertions run.
+    try applyToCachedConfig(&app, state);
+
+    const c = app.cached_config.model_selection.?.custom;
+    try std.testing.expectEqualStrings("new prompt", c.system_prompt.?);
+    try std.testing.expectEqualStrings("http://new.example/classify", c.bash_classifier_url.?);
+    try std.testing.expectEqual(true, app.cached_config.toast.enabled.?);
+
+    // Legacy shape: with model_selection null the flat fields are updated
+    // directly and the model_selection sync runs against the arena too.
+    app.cached_config.model_selection = null;
+    app.cached_config.system_prompt = try arena.dupe(u8, "legacy prompt");
+    app.cached_config.bash_classifier_url = try arena.dupe(u8, "http://legacy.example/classify");
+    app.cached_config.toast.enabled = false;
+    gpa.free(state.pending_system_prompt.?);
+    state.pending_system_prompt = try gpa.dupe(u8, "legacy new prompt");
+    state.pending_toast_enabled = false;
+
+    try applyToCachedConfig(&app, state);
+    try std.testing.expectEqualStrings("legacy new prompt", app.cached_config.system_prompt.?);
+    try std.testing.expectEqual(false, app.cached_config.toast.enabled.?);
+
+    // The sync helper behind the legacy save path also runs against the
+    // arena: the stale selection is replaced, its old slices stay valid
+    // inside the arena (deinit through the arena is a no-op, not a gpa free).
+    app.cached_config.model_selection = .{
+        .custom = .{
+            .provider_name = try arena.dupe(u8, "stale"),
+            .base_url = try arena.dupe(u8, "http://stale.example/v1"),
+            .api_key = try arena.dupe(u8, ""),
+            .model = .{ .id = try arena.dupe(u8, "stale-model") },
+        },
+    };
+    app.cached_config.provider_name = try arena.dupe(u8, "openai_compatible");
+    app.cached_config.model = .{ .id = try arena.dupe(u8, "legacy-model") };
+    app.cached_config.base_url = try arena.dupe(u8, "http://legacy.example/v1");
+    try config_mod.syncModelSelectionFromLegacy(arena, &app.cached_config);
+    const synced = app.cached_config.model_selection.?.custom;
+    try std.testing.expectEqualStrings("legacy-model", synced.model.id);
+    try std.testing.expectEqualStrings("http://legacy.example/v1", synced.base_url);
+}
+
 test "hasActualChanges includes the toast toggle" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -680,7 +758,6 @@ test "hasActualChanges includes the toast toggle" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.cached_config_owned = false;
     app.mode = .settings;
     const state = &app.pickers.settings;
 
@@ -727,7 +804,6 @@ test "syncClassifierUrls arms an idle lane's agent without a restart" {
 
     // Legacy-shape cached config (model_selection null): the sync resolves
     // the URL from the flat field.
-    app.cached_config_owned = false;
     const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
     app.cached_config.bash_classifier_url = url;
 
@@ -762,7 +838,6 @@ test "syncClassifierUrls parks for a mid-turn lane and the boundary applies it" 
     defer fixture.runtime.agent.deinit();
     attachLiveLane(&app, &fixture);
 
-    app.cached_config_owned = false;
     const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
     app.cached_config.bash_classifier_url = url;
 
@@ -801,7 +876,6 @@ test "syncClassifierUrls clears the agent URL when the field is cleared" {
 
     // Cleared on disk (null in the cached config); the "" pending is the
     // clear marker. The agent's existing URL must be freed, not leaked.
-    app.cached_config_owned = false;
     fixture.runtime.agent.bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
 
     const state = &app.pickers.settings;
@@ -842,7 +916,6 @@ test "a parked classifier URL survives a normal turn finish for the next spawn" 
     defer fixture.runtime.agent.deinit();
     attachLiveLane(&app, &fixture);
 
-    app.cached_config_owned = false;
     const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
     app.cached_config.bash_classifier_url = url;
 
@@ -891,7 +964,6 @@ test "syncClassifierUrls parks while a cancel teardown is still unwinding" {
     defer fixture.runtime.agent.deinit();
     attachLiveLane(&app, &fixture);
 
-    app.cached_config_owned = false;
     const url = try gpa.dupe(u8, "http://127.0.0.1:8765/classify");
     app.cached_config.bash_classifier_url = url;
 
