@@ -74,6 +74,13 @@ pub const AgentRuntime = struct {
     /// `compaction.contextWindowTokens` and the agent can use the
     /// compaction policy.
     context_settings: config_mod.ContextSettings = .{},
+    /// The App's config arena (non-owning), handed over by the resume
+    /// call sites (root.zig, session switcher). `restoreResumedModel`
+    /// plants the resumed model slices here — overwrite-in-arena, never
+    /// freed — instead of the gpa dupe→free dance. Null in bare test
+    /// runtimes, which fall back to the gpa and free after
+    /// `applyFromConfig` to stay leak-clean under the test allocator.
+    config_arena: ?std.mem.Allocator = null,
     /// Runtime models.dev registry (cache-only, no network). Loaded once
     /// at init for model capability lookups (reasoning, context window).
     /// The TUI's lazy `loadOrFetchRegistry` refreshes the cache for next time.
@@ -163,6 +170,9 @@ pub const AgentRuntime = struct {
         host_id: []const u8,
         session_id: ?[]const u8 = null,
         session_store: ?session_mod.SessionStore = null,
+        /// App config arena for `restoreResumedModel`'s overwrite-in-arena
+        /// planting (resume call sites only). Null keeps the gpa fallback.
+        config_arena: ?std.mem.Allocator = null,
         template: ?*const AgentRuntime = null,
     };
 
@@ -237,6 +247,7 @@ pub const AgentRuntime = struct {
             .codex_connection_expired = false,
             .strict_outputs = config.strict_outputs orelse false,
             .context_settings = config.context,
+            .config_arena = genesis.config_arena,
         };
         // The only other reader of diagnostics is the no-provider submit
         // error, so a dropped config field (oversized systemPrompt / plugin
@@ -448,20 +459,31 @@ pub const AgentRuntime = struct {
 
             var session_config = config;
             if (session_config.model_selection) |*ms| {
+                // Overwrite-in-arena: the model id planted into the session
+                // config copy is duped into the App config arena when one is
+                // installed and never freed — the arena is released wholesale
+                // by root after tui.run. Bare test runtimes without an arena
+                // keep the gpa dupe→free dance (applyFromConfig duplicates
+                // everything it keeps into the client).
+                const plant: std.mem.Allocator = self.config_arena orelse gpa;
+                const plant_free_on_gpa = self.config_arena == null;
+                var planted_mid: ?[]const u8 = null;
                 switch (ms.*) {
                     .builtin => |*b| {
                         b.provider = provider_enum;
                         b.provider_name = @constCast(mp);
                         if (summary.model_id) |mid| {
-                            // mid is borrowed from summary — dupe into owned memory.
-                            b.model.id = try gpa.dupe(u8, mid);
+                            // mid is borrowed from summary — dupe into the plant allocator.
+                            b.model.id = try plant.dupe(u8, mid);
+                            planted_mid = b.model.id;
                         }
                     },
                     .custom => |*c| {
                         c.provider_name = @constCast(mp);
                         if (summary.model_id) |mid| {
-                            // mid is borrowed from summary — dupe into owned memory.
-                            c.model.id = try gpa.dupe(u8, mid);
+                            // mid is borrowed from summary — dupe into the plant allocator.
+                            c.model.id = try plant.dupe(u8, mid);
+                            planted_mid = c.model.id;
                         }
                         if (c.base_url.len == 0 and resolved_base_url.len > 0) {
                             c.base_url = @constCast(resolved_base_url);
@@ -476,30 +498,31 @@ pub const AgentRuntime = struct {
                         .custom => |*c| c.model.reasoning = .{ .effort = effort },
                     }
                 }
+                // gpa plants must not leak if attach fails mid-restore
+                // (arena plants are reclaimed with the arena wholesale).
+                errdefer if (plant_free_on_gpa) if (planted_mid) |mid| gpa.free(mid);
                 try self.applyFromConfig(session_config);
-                // Free the dupe'd model_id — applyFromConfig dupe'd it again
-                // into the client, so the session_config copy is no longer needed.
-                if (summary.model_id) |_| {
-                    const mid_to_free = switch (ms.*) {
-                        .builtin => |b| b.model.id,
-                        .custom => |c| c.model.id,
-                    };
-                    gpa.free(mid_to_free);
-                }
+                // Fallback-only cleanup: the arena-backed plant stays valid
+                // for the arena's lifetime, the gpa plant dies with the copy.
+                if (plant_free_on_gpa) if (planted_mid) |mid| gpa.free(mid);
             } else {
                 const is_builtin = std.meta.stringToEnum(config_mod.Provider, mp) != null;
                 if (summary.model_id) |mid| {
-                    // mid is borrowed from summary's internal allocation.
-                    // Dupe it into owned memory so it survives summary.deinit.
-                    const owned_mid = try gpa.dupe(u8, mid);
-                    errdefer gpa.free(owned_mid);
+                    // Overwrite-in-arena (see the branch above): plant the
+                    // model id into the App config arena when available.
+                    const plant: std.mem.Allocator = self.config_arena orelse gpa;
+                    const plant_free_on_gpa = self.config_arena == null;
+                    // mid is borrowed from summary's internal allocation —
+                    // dupe it so the selection outlives summary.deinit.
+                    const planted_mid = try plant.dupe(u8, mid);
+                    errdefer if (plant_free_on_gpa) gpa.free(planted_mid);
                     if (is_builtin) {
                         session_config.model_selection = .{
                             .builtin = .{
                                 .provider = provider_enum,
                                 .provider_name = @constCast(mp),
                                 .model = .{
-                                    .id = owned_mid,
+                                    .id = planted_mid,
                                     .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
                                 },
                                 .use_responses_endpoint = false,
@@ -513,7 +536,7 @@ pub const AgentRuntime = struct {
                                 .base_url = @constCast(resolved_base_url),
                                 .api_key = "",
                                 .model = .{
-                                    .id = owned_mid,
+                                    .id = planted_mid,
                                     .reasoning = if (resume_effort) |effort| .{ .effort = effort } else .unset,
                                 },
                                 .use_responses_endpoint = false,
@@ -523,8 +546,8 @@ pub const AgentRuntime = struct {
                     }
                     try self.applyFromConfig(session_config);
                     // Free the dupe'd model_id — applyFromConfig dupe'd it
-                    // again into the client.
-                    gpa.free(owned_mid);
+                    // again into the client. (Arena plants are never freed.)
+                    if (plant_free_on_gpa) gpa.free(planted_mid);
                 } else {
                     // No model_id saved in session — fall back to config's
                     // default model rather than synthesizing an empty one.
@@ -1778,4 +1801,145 @@ test "initNew arms agent database_server_url from canonical database block" {
     try std.testing.expectEqualStrings("http://db-companion:8766", runtime.agent.database_server_url.?);
     try std.testing.expect(runtime.agent.database_auth_token != null);
     try std.testing.expectEqualStrings("test-auth-token", runtime.agent.database_auth_token.?);
+}
+
+test "initResume plants the restored model in the config arena (overwrite-in-arena)" {
+    // PR-2b regression: the resume path dupes the restored model id into the
+    // App config arena and never frees it — the arena is released wholesale
+    // by root after tui.run. A gpa plant without the matching free would trip
+    // the testing allocator, so the leak check here guards the hand-off; the
+    // client's restored model id proves the session's stored selection wins
+    // over the resume config's own model.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // Session 1: attach from the config, then switch the model mid-session —
+    // updateModel persists provider/id/effort for the resume below.
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
+        .config = .{
+            .model_selection = .{ .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("init-model") },
+            } },
+        },
+        .diagnostics = &.{},
+    });
+    const session_id = try gpa.dupe(u8, runtime.session_writer.session.id.slice());
+    defer gpa.free(session_id);
+    try runtime.session_writer.updateModel("ollama", "resumed-model", "high");
+    runtime.deinit();
+
+    // Resume with a DIFFERENT config model: the session's stored selection
+    // must win, and its planted slices land in the arena (never freed).
+    try runtime.initResume(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
+        .config = .{
+            .model_selection = .{ .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("config-model") },
+            } },
+        },
+        .config_arena = arena_state.allocator(),
+        .diagnostics = &.{},
+        .session_id = session_id,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.client != .none);
+    const client = switch (runtime.client) {
+        .openai_compatible => |c| c,
+        else => return error.UnexpectedAdapter,
+    };
+    try std.testing.expectEqualStrings("resumed-model", client.config.model);
+    try std.testing.expectEqual(ai.ReasoningEffort.high, client.config.reasoning.?.effort.?);
+}
+
+test "initResume gpa fallback frees the planted model id (no arena installed)" {
+    // Pins the fallback path: a bare runtime without `config_arena` keeps
+    // the gpa dupe→free dance, so the testing allocator's leak check is
+    // the guard — a missing free on either the success or the attach-failure
+    // path would surface here.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
+        .config = .{
+            .model_selection = .{ .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("init-model") },
+            } },
+        },
+        .diagnostics = &.{},
+    });
+    const session_id = try gpa.dupe(u8, runtime.session_writer.session.id.slice());
+    defer gpa.free(session_id);
+    try runtime.session_writer.updateModel("ollama", "resumed-model", null);
+    runtime.deinit();
+
+    try runtime.initResume(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = home_abs,
+        .session_dir = home_abs,
+        .home_dir = home_abs,
+        .base_system_prompt = "test system prompt",
+        .host_id = "test-host",
+        .config = .{
+            .model_selection = .{ .builtin = .{
+                .provider = .ollama,
+                .provider_name = @constCast("ollama"),
+                .model = .{ .id = @constCast("config-model") },
+            } },
+        },
+        .diagnostics = &.{},
+        .session_id = session_id,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.client != .none);
+    const client = switch (runtime.client) {
+        .openai_compatible => |c| c,
+        else => return error.UnexpectedAdapter,
+    };
+    try std.testing.expectEqualStrings("resumed-model", client.config.model);
 }
