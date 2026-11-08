@@ -928,12 +928,12 @@ pub const Agent = struct {
 
     /// Build the ExecutorService for a tool batch. Called only from the
     /// worker-thread batch path (`runToolBatch`): `effectiveCwd()` briefly
-    /// takes `workspace_mutex`, which is fine on the worker but would block
-    /// if this were constructed from the main thread. Every field is either
-    /// a direct Agent mirror or derived exactly as the batch path needs —
-    /// `toolExecutor bindings mirror the Agent fields they read` and the
-    /// runtime parity test guard that wiring.
-    pub fn toolExecutor(self: *Agent, turn_allocator: std.mem.Allocator) executor_mod.ExecutorService {
+    /// takes `workspace_mutex`, which is fine on the worker but would contend
+    /// with the UI-thread lock users if this were constructed from the main
+    /// thread. Every field is either a direct Agent mirror or derived exactly
+    /// as the batch path needs — `toolExecutor bindings mirror the Agent
+    /// fields they read` and the runtime parity test guard that wiring.
+    fn toolExecutor(self: *Agent, turn_allocator: std.mem.Allocator) executor_mod.ExecutorService {
         return executor_mod.ExecutorService.init(.{
             .gpa = self.gpa,
             .scratch_allocator = turn_allocator,
@@ -4049,9 +4049,11 @@ test "shared subsystems record mirrors the Agent fields it wires" {
 
 /// InitOptions field name → Agent field path for every `toolExecutor`
 /// binding taken straight from an Agent field. Derived bindings (cwd via
-/// `effectiveCwd`, scratch_allocator from the turn, the background and
-/// session_writer triples, lane_requester = the Agent itself, result_cache =
-/// an address-of) are covered by the runtime parity test below. The record
+/// `effectiveCwd`, scratch_allocator from the turn, the session_writer
+/// triple, the null background path, lane_requester = the Agent itself,
+/// result_cache = an address-of) are covered by the runtime parity test
+/// below — it exercises `background_manager == null` only, so a live
+/// manager's `owner_generation` wiring is not asserted there. The record
 /// splits along where ExecutorService stores the value: top-level fields
 /// versus `ctx` (tools.ToolContext).
 const tool_executor_service_bindings = .{
