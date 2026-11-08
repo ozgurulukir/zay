@@ -814,7 +814,7 @@ test "registerTool + countTools: sandboxed state" {
     // Create a sandboxed state with Io (so registerPluginApi is called).
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -847,7 +847,7 @@ test "registerTool rejects invalid tool names (T6)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -885,7 +885,7 @@ test "onEvent rejects unknown event names (T6)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -963,7 +963,7 @@ test "zay.write_file validates its arguments" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -982,7 +982,7 @@ test "zay.write_file rejects traversal and invalid paths without writing" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -1020,7 +1020,7 @@ test "zay.write_file writes content to a path under cwd" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L, chunk);
@@ -1085,7 +1085,7 @@ test "readFile exposes truncation on a file over 1 MB" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     const lua_target = try forwardSlashDup(gpa, target);
@@ -1120,7 +1120,7 @@ test "readFile clamps a negative max_size without panicking" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     const lua_target = try forwardSlashDup(gpa, target);
@@ -1177,7 +1177,7 @@ test "json_decode: object becomes Lua table" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1193,7 +1193,7 @@ test "json_decode: array becomes 1-indexed table" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1209,7 +1209,7 @@ test "json_decode: primitives (null/bool/number/string)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1227,7 +1227,7 @@ test "json_decode: malformed input returns nil + error" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1242,7 +1242,7 @@ test "json_encode: object table to JSON" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1259,7 +1259,7 @@ test "json_encode: array table to JSON bracket" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1276,7 +1276,7 @@ test "json_encode: pretty option indents output" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1293,7 +1293,7 @@ test "json_encode: escapes quotes and special chars in strings" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1311,7 +1311,7 @@ test "json_encode: nested table (object with array value)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1328,7 +1328,7 @@ test "json round-trip: decode then encode preserves structure" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1593,7 +1593,7 @@ test "searchFiles clamps a negative max_results without panicking" {
     defer bridge.plugin_cwd_slot = prev_cwd_slot;
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     // A negative max_results used to be `@intCast(v)` on the raw i64 — a cast
@@ -1617,7 +1617,7 @@ test "findFiles clamps a negative max_results without panicking" {
     defer bridge.plugin_cwd_slot = prev_cwd_slot;
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1632,7 +1632,7 @@ test "runBash clamps a negative timeout without panicking" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1648,7 +1648,7 @@ test "runBash pipes opts.stdin to the child (P4)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1672,7 +1672,7 @@ test "runBash blocks unsafe commands via the local matcher (P5)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     bridge.bash_classifier_url_slot = null;
@@ -1693,7 +1693,7 @@ test "runBash safety gate holds with a configured-but-unreachable classifier (P5
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     const prev = bridge.bash_classifier_url_slot;
@@ -1717,7 +1717,7 @@ test "runBash and run_shell reject an empty command before any spawn (P5)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1784,7 +1784,7 @@ test "zay.shell_quote dialects and error contract (P7)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1810,7 +1810,7 @@ test "zay.shell_quote native dispatches to pwsh rules on Windows (P7)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -1934,7 +1934,7 @@ test "git bridges return strings inside a repo (S4 success path)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -1968,7 +1968,7 @@ test "plugin_api: deletePath removes regular file, empty dir, and recursive tree
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -2098,7 +2098,7 @@ test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -2133,7 +2133,7 @@ test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -2178,7 +2178,7 @@ test "plugin_api: run_shell executes native shell on current OS" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -2231,7 +2231,7 @@ test "plugin_api: zay.require loads modules, caches results, and rejects breakou
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -2268,7 +2268,7 @@ test "plugin_api: zay.git_add and selective zay.git_commit validate arguments" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -2300,7 +2300,7 @@ test "plugin.get_config decodes object settings into a fresh table" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     seedSettingsSlot(&L, "{\"theme\":\"dark\",\"retries\":3}");
@@ -2322,7 +2322,7 @@ test "plugin.get_config returns nil when unconfigured" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     // No settings slot seeded — the unconfigured default.
@@ -2337,7 +2337,7 @@ test "plugin.get_config rejects malformed and non-object settings" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 

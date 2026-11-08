@@ -43,7 +43,7 @@ fn runTestSource(gpa: std.mem.Allocator, io: std.Io, content: []const u8) !bool 
     // The harness still bounds a hung run, just at a minute instead.
     var L = try sandbox.createSandboxedStateWithIo(.{ .full_access = true, .timeout_ms = 60_000 }, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 

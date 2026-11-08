@@ -356,7 +356,7 @@ const sandbox = @import("sandbox.zig");
 test "noteError_ignoresNonCanceledErrors_whenErrorIsNotCanceled" {
     var L = try sandbox.createSandboxedState(.{});
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -385,7 +385,7 @@ test "noteError_handlesNullBudget_whenExtraspaceIsNull" {
 test "noteError_setsStopReasonToCanceled_whenErrorIsCanceled" {
     var L = try sandbox.createSandboxedState(.{});
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -403,7 +403,7 @@ test "noteError_recancelsIo_whenIoIsPresentAndErrorIsCanceled" {
     const io = std.testing.io;
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -784,7 +784,7 @@ test "execution: stopped returns false when no budget attached" {
 test "execution: stopped returns false when stop_reason is none" {
     var state = try sandbox.createSandboxedState(.{});
     defer {
-        sandbox.freeHookData(state.handle);
+        sandbox.capFinalizerDeadline(state.handle);
         state.deinit();
     }
 
@@ -794,7 +794,7 @@ test "execution: stopped returns false when stop_reason is none" {
 test "execution: stopped returns true for non-none stop reasons" {
     var state = try sandbox.createSandboxedState(.{});
     defer {
-        sandbox.freeHookData(state.handle);
+        sandbox.capFinalizerDeadline(state.handle);
         state.deinit();
     }
 
@@ -816,7 +816,7 @@ test "execution: stopped returns true for non-none stop reasons" {
 test "execution: noteError sets stop_reason to canceled when error is Canceled" {
     var state = try sandbox.createSandboxedState(.{});
     defer {
-        sandbox.freeHookData(state.handle);
+        sandbox.capFinalizerDeadline(state.handle);
         state.deinit();
     }
 
