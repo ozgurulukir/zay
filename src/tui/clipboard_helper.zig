@@ -5,10 +5,16 @@
 const std = @import("std");
 const tui = @import("../tui.zig");
 const clipboard_mod = @import("../clipboard.zig");
+const mode_lifecycle = @import("mode_lifecycle.zig");
 
 const App = tui.App;
 
 /// Paste `text` into whichever text input currently has focus for `app.mode`.
+/// The target comes from `mode_lifecycle.modeTextInputSlot`, so paste
+/// routing follows the shared mode/sub-state classifier rather than a
+/// private switch. This arm carries no extra policy: paste drops text in
+/// every `.none` slot, including the provider list stage (typing filters
+/// there, paste does not).
 pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     if (text.len == 0) return;
     // The prompt is a multiline field: keep embedded newlines (that is the
@@ -31,52 +37,22 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     defer if (normalized) |buf| app.gpa.free(buf);
     if (clean_text.len == 0) return;
 
-    switch (app.getMode()) {
-        .normal => {
-            try app.inputs.input.insertSliceAtCursor(clean_text);
+    switch (mode_lifecycle.modeTextInputSlot(app)) {
+        .prompt => try app.inputs.input.insertSliceAtCursor(clean_text),
+        .palette => try app.inputs.palette.insertSliceAtCursor(clean_text),
+        .session_rename => try app.input_buffers.session_rename_text.appendSlice(app.gpa, clean_text),
+        .session_project_root => try app.input_buffers.project_root_text.appendSlice(app.gpa, clean_text),
+        .provider_key => {
+            try app.getProviderKeyInput().appendSlice(app.gpa, clean_text);
+            // Paste bypasses ProviderPicker.handle, so mark the key dirty
+            // here too — otherwise a pasted key over a pre-filled one stays
+            // masked and the user can't verify the paste.
+            app.pickers.provider.key_dirty = true;
         },
-        .command, .model_picker, .tree_picker, .search, .theme_picker => {
-            try app.inputs.palette.insertSliceAtCursor(clean_text);
-        },
-        .session_picker => {
-            if (app.nav.session_action == .renaming) {
-                try app.input_buffers.session_rename_text.appendSlice(app.gpa, clean_text);
-            } else if (app.nav.session_action == .locating_project) {
-                try app.input_buffers.project_root_text.appendSlice(app.gpa, clean_text);
-            } else {
-                try app.inputs.palette.insertSliceAtCursor(clean_text);
-            }
-        },
-        .provider_picker => {
-            if (app.pickers.provider.stage == .form) {
-                try app.getProviderKeyInput().appendSlice(app.gpa, clean_text);
-                // Paste bypasses ProviderPicker.handle, so mark the key dirty
-                // here too — otherwise a pasted key over a pre-filled one stays
-                // masked and the user can't verify the paste.
-                app.pickers.provider.key_dirty = true;
-            }
-        },
-        .settings => {
-            if (app.pickers.settings.edit_target != .none) {
-                try app.input_buffers.settings_text.appendSlice(app.gpa, clean_text);
-            }
-        },
-        .diff_viewer => {
-            if (app.diff.sub == .commenting) {
-                try app.inputs.comment.insertSliceAtCursor(clean_text);
-            } else if (app.diff.sub == .file_search) {
-                try app.inputs.palette.insertSliceAtCursor(clean_text);
-            }
-        },
-        .save_message => {
-            try app.inputs.palette.insertSliceAtCursor(clean_text);
-        },
-        .mcp => {
-            if (app.pickers.mcp.adding) {
-                try app.input_buffers.mcp_url.appendSlice(app.gpa, clean_text);
-            }
-        },
-        .lanes, .help, .plugins => {},
+        .settings_value => try app.input_buffers.settings_text.appendSlice(app.gpa, clean_text),
+        .diff_comment => try app.inputs.comment.insertSliceAtCursor(clean_text),
+        .mcp_url => try app.input_buffers.mcp_url.appendSlice(app.gpa, clean_text),
+        .none => {},
     }
 }
 

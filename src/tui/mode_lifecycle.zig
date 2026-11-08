@@ -15,6 +15,7 @@ const skill_mod = @import("../skill.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
+const diff_viewer_mod = @import("diff_viewer.zig");
 const tui_style = @import("style.zig");
 
 const App = tui.App;
@@ -147,6 +148,51 @@ pub fn isRuntimeBound(mode: App.Mode) bool {
     return switch (mode) {
         .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
         .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker => false,
+    };
+}
+
+/// Which text-entry surface, if any, currently receives typed characters
+/// under `app`'s mode and sub-state. This is the classifier home (#292) for
+/// the "is the mode's text-entry sub-state active, and where does it live"
+/// question: `pasteToFocusedInput` routes pasted text by this slot instead
+/// of re-deriving the per-mode/sub-state map in its own switch.
+/// `shouldOpenCommandMenuForSlash` answers a sibling question ("may '/'
+/// re-enter the command menu?") against the same sub-states; its policy
+/// deliberately differs from this map in places (see its doc comment), so a
+/// sub-state change here must be checked against both. The
+/// `modeTextInputSlot set is exhaustive and stable` test pins the map.
+pub const TextInputSlot = enum {
+    prompt,
+    palette,
+    session_rename,
+    session_project_root,
+    provider_key,
+    settings_value,
+    diff_comment,
+    mcp_url,
+    none,
+};
+
+pub fn modeTextInputSlot(app: *const App) TextInputSlot {
+    return switch (app.mode) {
+        .normal => .prompt,
+        .command, .model_picker, .tree_picker, .search, .theme_picker, .save_message => .palette,
+        .session_picker => switch (app.nav.session_action) {
+            .renaming => .session_rename,
+            .locating_project => .session_project_root,
+            // `.deleting`/`.blocked` swallow typing entirely; paste still
+            // lands in the (retained) palette filter.
+            .browsing, .deleting, .blocked => .palette,
+        },
+        .provider_picker => if (app.pickers.provider.stage == .form) .provider_key else .none,
+        .settings => if (app.pickers.settings.edit_target != .none) .settings_value else .none,
+        .diff_viewer => switch (app.diff.sub) {
+            .commenting => .diff_comment,
+            .file_search => .palette,
+            .browse => .none,
+        },
+        .mcp => if (app.pickers.mcp.adding) .mcp_url else .none,
+        .lanes, .help, .plugins => .none,
     };
 }
 
@@ -576,6 +622,14 @@ pub fn openCommandMenu(app: *App) !void {
     app.nav.command_selection = 0;
 }
 
+/// Whether '/' may re-enter the command menu for `app`'s mode/sub-state.
+/// Sibling of `modeTextInputSlot` (#292): same sub-states, but a narrower
+/// policy — the command menu never re-enters itself, the save-message title
+/// and the diff viewer (both file-search and commenting) treat '/' as
+/// literal text even where the slot map routes text into the palette
+/// filter, `.settings`/`.mcp` sub-states are never menu shortcuts, and in
+/// `.session_picker` only `.browsing` counts even though pasting also
+/// targets the filter in `.deleting`/`.blocked`.
 pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     if (!key.matches('/', .{})) return false;
     return switch (app.mode) {
@@ -1014,6 +1068,75 @@ test "runtime-bound mode set is exhaustive and stable" {
     }
     try std.testing.expectEqual(@as(u32, 5), bound);
     try std.testing.expectEqual(@as(u32, 10), free);
+}
+
+test "modeTextInputSlot set is exhaustive and stable" {
+    // Drives `modeTextInputSlot` over every Mode value at its default
+    // sub-state and pins the exact classification, mirroring the
+    // runtime-bound sweep: `pasteToFocusedInput` routes by this slot, so a
+    // new mode (or a default-sub-state change) can't silently fall into the
+    // wrong buffer. Add the new mode here when you change the map.
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    inline for (std.enums.values(App.Mode)) |m| {
+        app.mode = m;
+        const expected: TextInputSlot = switch (m) {
+            .normal => .prompt,
+            .command, .model_picker, .tree_picker, .search, .theme_picker, .save_message => .palette,
+            // Default `.browsing` routes to the palette filter.
+            .session_picker => .palette,
+            // Default `.list` stage and non-editing defaults are inert.
+            .provider_picker, .settings, .diff_viewer, .mcp => .none,
+            .lanes, .help, .plugins => .none,
+        };
+        try std.testing.expectEqual(expected, modeTextInputSlot(&app));
+    }
+
+    // Sub-state pins: every sub-state the slot map branches on, including
+    // the ones the defaults don't reach.
+    app.mode = .session_picker;
+    for ([_]@TypeOf(app.nav.session_action){ .browsing, .deleting, .blocked }) |action| {
+        app.nav.session_action = action;
+        try std.testing.expectEqual(TextInputSlot.palette, modeTextInputSlot(&app));
+    }
+    app.nav.session_action = .renaming;
+    try std.testing.expectEqual(TextInputSlot.session_rename, modeTextInputSlot(&app));
+    app.nav.session_action = .locating_project;
+    try std.testing.expectEqual(TextInputSlot.session_project_root, modeTextInputSlot(&app));
+
+    app.mode = .provider_picker;
+    app.pickers.provider.stage = .list;
+    try std.testing.expectEqual(TextInputSlot.none, modeTextInputSlot(&app));
+    app.pickers.provider.stage = .form;
+    try std.testing.expectEqual(TextInputSlot.provider_key, modeTextInputSlot(&app));
+
+    app.mode = .settings;
+    app.pickers.settings.edit_target = .system_prompt;
+    try std.testing.expectEqual(TextInputSlot.settings_value, modeTextInputSlot(&app));
+    app.pickers.settings.edit_target = .bash_classifier_url;
+    try std.testing.expectEqual(TextInputSlot.settings_value, modeTextInputSlot(&app));
+    app.pickers.settings.edit_target = .none;
+    try std.testing.expectEqual(TextInputSlot.none, modeTextInputSlot(&app));
+
+    app.mode = .diff_viewer;
+    for ([_]diff_viewer_mod.Sub{ .browse, .file_search, .commenting }) |sub| {
+        app.diff.sub = sub;
+        const expected: TextInputSlot = switch (sub) {
+            .browse => .none,
+            .file_search => .palette,
+            .commenting => .diff_comment,
+        };
+        try std.testing.expectEqual(expected, modeTextInputSlot(&app));
+    }
+
+    app.mode = .mcp;
+    try std.testing.expectEqual(TextInputSlot.none, modeTextInputSlot(&app));
+    app.pickers.mcp.adding = true;
+    try std.testing.expectEqual(TextInputSlot.mcp_url, modeTextInputSlot(&app));
 }
 
 test "closeRuntimeBoundOverlays closes exactly the runtime-bound set" {
