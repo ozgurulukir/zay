@@ -97,51 +97,102 @@ pub fn classify(
 fn localClassify(command: []const u8) Verdict {
     const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
     if (trimmed.len == 0) return .safe;
+    return if (localClassifyRule(trimmed) == null) .safe else .unsafe;
+}
 
+/// Identifies which local rule fired for `command` — the same disjunction
+/// `localClassify` folds into a verdict, exposed for diagnostics and tests.
+/// Module-private by design: the remote path has no rule id, and no caller
+/// may branch on attribution.
+fn localClassifyRule(command: []const u8) ?RuleId {
+    for (rules) |rule| {
+        if (rule.matches(command)) return rule.id;
+    }
+    return null;
+}
+
+const RuleId = enum {
+    fork_bomb_bash,
+    fork_bomb_pwsh,
+    rm_root,
+    dd_block_device,
+    mkfs_device,
+    pwsh_remove_system,
+    clear_recycle_bin,
+    redirect_system_bash,
+    redirect_system_pwsh,
+    privileged_pm_escalator,
+    privileged_pm_manager,
+    privileged_pm_phrase,
+};
+
+const Rule = struct {
+    id: RuleId,
+    matches: *const fn ([]const u8) bool,
+};
+
+/// The local matcher as an ordered rule table — a pure re-expression of the
+/// former OR-chain in `localClassify`. ORDER MATTERS ONLY FOR ATTRIBUTION:
+/// the first matching entry wins `localClassifyRule`, so rows keep the exact
+/// precedence the OR-chain evaluated in (escalators before managers before
+/// phrases, bash redirects before pwsh redirects, ...). Verdicts are
+/// order-INDEPENDENT — the table is a pure disjunction of `.matches`, so
+/// `.unsafe` results are identical under any row permutation. Adding a rule
+/// is adding a row.
+const rules = [_]Rule{
     // Fork bombs and infinite-recursion shell constructs (bash).
-    if (std.mem.indexOf(u8, trimmed, ":(){") != null) return .unsafe;
-    if (std.mem.indexOf(u8, trimmed, ":()") != null) return .unsafe;
+    .{ .id = .fork_bomb_bash, .matches = matchesBashForkBombDefinition },
+    .{ .id = .fork_bomb_bash, .matches = matchesBashForkBombCall },
     // PowerShell fork-bomb equivalents.
-    if (isPwshForkBomb(trimmed)) return .unsafe;
-
+    .{ .id = .fork_bomb_pwsh, .matches = isPwshForkBomb },
     // Destructive disk operations on system paths.
-    if (isDangerousRm(trimmed)) return .unsafe;
-    if (isDangerousDd(trimmed)) return .unsafe;
-    if (isDangerousMkfs(trimmed)) return .unsafe;
-    if (isDangerousPwshRemove(trimmed)) return .unsafe;
-    if (isDangerousClearRecycleBin(trimmed)) return .unsafe;
-
+    .{ .id = .rm_root, .matches = isDangerousRm },
+    .{ .id = .dd_block_device, .matches = isDangerousDd },
+    .{ .id = .mkfs_device, .matches = isDangerousMkfs },
+    .{ .id = .pwsh_remove_system, .matches = isDangerousPwshRemove },
+    .{ .id = .clear_recycle_bin, .matches = isDangerousClearRecycleBin },
     // Overwriting critical system files.
-    if (isDangerousRedirect(trimmed)) return .unsafe;
-
+    .{ .id = .redirect_system_bash, .matches = isDangerousBashRedirect },
+    .{ .id = .redirect_system_pwsh, .matches = isDangerousPwshRedirect },
     // Privileged package management (e.g. `sudo apt install`, `doas pacman -S`).
     // These mutate the system-wide install state and must surface for approval
     // rather than running unattended — a model should never be able to attempt
-    // `sudo apt install` without the interactive gate (TD-3).
-    if (isPrivilegedPackageManagement(trimmed)) return .unsafe;
+    // `sudo apt install` without the interactive gate (TD-3). The three
+    // sub-families keep the internal priority the single matcher had:
+    // escalators, then managers, then multi-word install phrases.
+    .{ .id = .privileged_pm_escalator, .matches = isPrivilegedPmEscalator },
+    .{ .id = .privileged_pm_manager, .matches = isPrivilegedPmManager },
+    .{ .id = .privileged_pm_phrase, .matches = isPrivilegedPmPhrase },
+};
 
-    return .safe;
+/// Fork-bomb definition construct `:(){` (the classic `:(){ :|:& };:`).
+fn matchesBashForkBombDefinition(command: []const u8) bool {
+    return std.mem.indexOf(u8, command, ":(){") != null;
 }
 
-/// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
-/// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, and
-/// the Windows installers `winget`/`choco`/`scoop`, ...).
-/// These mutate system-wide install state and must surface for approval rather
-/// than running unattended. The matcher splits on every shell metacharacter
-/// (not just spaces) so syntax tricks like `apt;install`, `/usr/bin/apt`,
-/// `./apt`, `apt\ninstall` and `pip  install` (double space) cannot bypass it.
-fn isPrivilegedPackageManagement(command: []const u8) bool {
-    // Privilege escalation prefixes.
+/// Fork-bomb call construct `:()` (a recursion seeding without the open
+/// brace, still an infinite-recursion shape).
+fn matchesBashForkBombCall(command: []const u8) bool {
+    return std.mem.indexOf(u8, command, ":()") != null;
+}
+
+/// True when `command` escalates privileges (`sudo`/`doas`/`runas`).
+fn isPrivilegedPmEscalator(command: []const u8) bool {
     const escalators = [_][]const u8{ "sudo", "doas", "runas" };
     for (escalators) |esc| {
         if (tokenContains(command, esc)) return true;
     }
-    // Single-token package managers (exact token match, case-insensitive).
-    // Self-installing managers matched as a bare token (case-insensitive, exact
-    // token). The tokenizer splits on shell metacharacters but NOT "-"/"." so
-    // "apt-cache" / "aptitude" stay single tokens and do not false-positive on
-    // "apt", while "/usr/bin/apt", "./apt" and "apt;install" still split to the
-    // bare "apt" token.
+    return false;
+}
+
+/// True when `command` invokes a system package manager (`apt`, `dnf`,
+/// `brew`, ...). Single-token package managers (exact token match,
+/// case-insensitive). Self-installing managers matched as a bare token
+/// (case-insensitive, exact token). The tokenizer splits on shell
+/// metacharacters but NOT "-"/"." so "apt-cache" / "aptitude" stay single
+/// tokens and do not false-positive on "apt", while "/usr/bin/apt", "./apt"
+/// and "apt;install" still split to the bare "apt" token.
+fn isPrivilegedPmManager(command: []const u8) bool {
     const managers = [_][]const u8{
         "apt",    "apt-get", "dpkg",     "dnf",     "yum",  "pacman", "apk", "brew",
         "zypper", "emerge",  "aptitude", "nix-env", "snap",
@@ -149,14 +200,17 @@ fn isPrivilegedPackageManagement(command: []const u8) bool {
     for (managers) |mgr| {
         if (tokenContains(command, mgr)) return true;
     }
-    // Multi-word install verbs, matched only at word boundaries so
-    // `apt-cache show` does not false-positive on `apt` while `apt;install`
-    // (no space) still trips the `apt` single-token rule above.
-    // Install verbs that require an explicit subcommand; matched only at word
-    // boundaries so "pip show" / "apt-cache show" stay safe reads. The
-    // Windows installers (`winget`, `choco`, `scoop`) are phrase-matched so
-    // read-only subcommands (`winget list`, `choco list`) stay safe; the
-    // Windows shell target is pwsh, where these are the standard managers.
+    return false;
+}
+
+/// True when `command` matches a multi-word install verb (`pip install`,
+/// `winget install`, ...), matched only at word boundaries so `pip show` /
+/// `apt-cache show` stay safe reads while `apt;install` (no space) still
+/// trips the `apt` single-token rule above. The Windows installers
+/// (`winget`, `choco`, `scoop`) are phrase-matched so read-only subcommands
+/// (`winget list`, `choco list`) stay safe; the Windows shell target is
+/// pwsh, where these are the standard managers.
+fn isPrivilegedPmPhrase(command: []const u8) bool {
     const phrases = [_][]const u8{
         "pip install",      "pip3 install",    "npm install -g",  "npm i -g",
         "cargo install",    "gem install",     "go install",      "conda install",
@@ -500,8 +554,8 @@ fn isDangerousMkfs(command: []const u8) bool {
     return false;
 }
 
-/// Check for redirecting into critical system files.
-fn isDangerousRedirect(command: []const u8) bool {
+/// Check for redirecting into critical POSIX system files.
+fn isDangerousBashRedirect(command: []const u8) bool {
     // Structural scan: every `>` (including `>>` and `2>`) with any run of
     // whitespace and one optional quote before the target, so `>/etc/x`,
     // `>> /etc/x`, and `> "/etc/x"` classify the same as `> /etc/x`. The
@@ -533,11 +587,6 @@ fn isDangerousRedirect(command: []const u8) bool {
         }
         idx = gt + 1;
     }
-    // PowerShell redirects into system roots: `> C:\Windows\`,
-    // `> 'C:\Program Files\'`, etc. Drive-letter roots and the well-known
-    // system dirs are the only Windows targets worth flagging from the local
-    // matcher (defense-in-depth; the remote classifier covers the full surface).
-    if (isDangerousPwshRedirect(command)) return true;
     return false;
 }
 
@@ -1248,6 +1297,32 @@ test "privileged pm: no false positives on safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
     try std.testing.expectEqual(Verdict.safe, localClassify("equip installation kit"));
+}
+
+test "rule table: every rule attributes its first-fire input" {
+    // One input per table row where that row is the FIRST to fire, so the
+    // table's ordering is pinned: attribution must match the row's id. The
+    // inputs are chosen so no earlier rule can claim them (e.g. `sudo apt
+    // install` attributes to the escalator entry, not the manager or the
+    // phrase; the pwsh Remove-Item spellings do not trip the bash rm rule).
+    const cases = [_]struct { input: []const u8, expected: RuleId }{
+        .{ .input = ":(){ :|:& };:", .expected = .fork_bomb_bash },
+        .{ .input = ":() recursion;:", .expected = .fork_bomb_bash },
+        .{ .input = "while($true){Start-Job {}}", .expected = .fork_bomb_pwsh },
+        .{ .input = "rm -rf /", .expected = .rm_root },
+        .{ .input = "dd if=/dev/zero of=/dev/sda", .expected = .dd_block_device },
+        .{ .input = "mkfs.ext4 /dev/sda1", .expected = .mkfs_device },
+        .{ .input = "Remove-Item -Recurse -Force C:\\", .expected = .pwsh_remove_system },
+        .{ .input = "Clear-RecycleBin -Force", .expected = .clear_recycle_bin },
+        .{ .input = "echo x > /etc/passwd", .expected = .redirect_system_bash },
+        .{ .input = "Write-Output 'x' > C:\\Windows\\x.txt", .expected = .redirect_system_pwsh },
+        .{ .input = "sudo apt install nginx", .expected = .privileged_pm_escalator },
+        .{ .input = "apt-get update", .expected = .privileged_pm_manager },
+        .{ .input = "pip install requests", .expected = .privileged_pm_phrase },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, localClassifyRule(case.input).?);
+    }
 }
 
 /// Accepts one connection, consumes the request head, then holds the
