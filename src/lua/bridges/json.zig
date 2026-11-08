@@ -338,7 +338,7 @@ test "bridges.json: object becomes Lua table" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -354,7 +354,7 @@ test "bridges.json: array becomes 1-indexed table" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -370,7 +370,7 @@ test "bridges.json: round-trip preserves structure" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -389,7 +389,7 @@ test "bridges.json: table with numeric and mixed keys does not corrupt lua_next"
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,
@@ -407,7 +407,7 @@ test "bridges.json: circular table bounds recursion without host crash" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try expectLuaOk(&L,

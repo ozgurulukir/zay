@@ -348,9 +348,10 @@ fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Alloc
     resetInstructionBudget(L);
 }
 
-/// Prepare bounded finalization. Retained SDK entry point; VM-owned userdata
-/// and hooks stay alive through lua_close, including main-thread finalizers.
-pub fn freeHookData(L: *c.lua_State) void {
+/// Cap the remaining execution deadline for the finalization phase so GC
+/// finalizers cannot run away during lua_close. VM-owned userdata and hooks
+/// stay alive through lua_close, including main-thread finalizers.
+pub fn capFinalizerDeadline(L: *c.lua_State) void {
     execution.capDeadline(L, 1000);
 }
 
@@ -359,7 +360,7 @@ pub fn freeHookData(L: *c.lua_State) void {
 test "sandbox: basic creation" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -371,7 +372,7 @@ test "sandbox: basic creation" {
 test "sandbox: blocks io" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -383,7 +384,7 @@ test "sandbox: blocks io" {
 test "sandbox: blocks debug" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -395,7 +396,7 @@ test "sandbox: blocks debug" {
 test "sandbox: blocks package" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -407,7 +408,7 @@ test "sandbox: blocks package" {
 test "sandbox: globals like type() still work" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -428,7 +429,7 @@ test "sandbox: full access exposes all libraries" {
 test "sandbox: blocks rawget and rawset" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -440,7 +441,7 @@ test "sandbox: blocks rawget and rawset" {
 test "sandbox: blocks os.exit" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -452,7 +453,7 @@ test "sandbox: blocks os.exit" {
 test "sandbox: blocks os.execute by default" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -464,7 +465,7 @@ test "sandbox: blocks os.execute by default" {
 test "sandbox: allows os.execute when permitted" {
     var L = try createSandboxedState(.{ .allow_os_execute = true });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -476,7 +477,7 @@ test "sandbox: allows os.execute when permitted" {
 test "sandbox: blocks dofile and loadfile" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -492,7 +493,7 @@ test "sandbox: blocks dofile and loadfile" {
 test "sandbox: _G points to restricted environment" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -510,7 +511,7 @@ test "sandbox: _G points to restricted environment" {
 test "sandbox: instruction limit triggers error" {
     var L = try createSandboxedState(.{ .instruction_limit = 100 });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -525,7 +526,7 @@ test "sandbox: instruction limit triggers error" {
 test "sandbox: memory limit triggers error" {
     var L = try createSandboxedState(.{ .memory_limit_mb = 1 });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -550,7 +551,7 @@ test "sandbox: instruction budget resets between dispatches (T1)" {
     // ~40 hook ticks — under a limit of 100, but two cumulative would exceed it.
     var L = try createSandboxedState(.{ .instruction_limit = 100 });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -567,7 +568,7 @@ test "sandbox: instruction budget resets between dispatches (T1)" {
 test "sandbox: without a reset the cumulative budget is exhausted (T1 pins mechanism)" {
     var L = try createSandboxedState(.{ .instruction_limit = 100 });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -588,7 +589,7 @@ test "sandbox: timeout_ms is enforced (T2)" {
     // High instruction limit so the timeout (not the count) is what fires.
     var L = try createSandboxedState(.{ .instruction_limit = 1_000_000, .timeout_ms = 1 });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -609,7 +610,7 @@ test "sandbox: timeout_ms is enforced (T2)" {
 test "sandbox: plugin table present with get_config in the restricted env" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -621,7 +622,7 @@ test "sandbox: plugin table present with get_config in the restricted env" {
 test "sandbox: plugin.get_config returns nil without a settings slot" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -635,7 +636,7 @@ test "sandbox: plugin table visible in full-access states" {
     // must still be reachable (embedded plugins, the Lua test runner).
     var L = try createSandboxedState(.{ .full_access = true });
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -647,7 +648,7 @@ test "sandbox: plugin table visible in full-access states" {
 test "sandbox: blocks os.remove and os.rename by default" {
     var L = try createSandboxedState(.{});
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -661,7 +662,7 @@ test "sandbox: allows path-sanitized os.remove and os.rename when permitted" {
     const gpa = std.testing.allocator;
     var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
@@ -707,7 +708,7 @@ test "sandbox: os.remove and os.rename prevent path traversal outside workspace 
     const io = std.testing.io;
     var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
     defer {
-        freeHookData(L.handle);
+        capFinalizerDeadline(L.handle);
         L.deinit();
     }
 
