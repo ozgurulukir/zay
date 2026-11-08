@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-11-08
+
+### Changed
+- Agent: centralize tool-batch executor wiring in Agent.toolExecutor (#348); extract the turn-finalization decision table from Agent.run (#345); retry once when inish_reason=tool_calls arrives with no tool call (#329).
+- Context: split ssembly.zig into rules and prune modules (#349).
+- Config: plant resumed model slices in the App config arena (#347); hand the loader arena to the App and stop cloning cached config (#346).
+- Tools: table-drive the local shell-safety rules (#350); make 	odo_prioritize.priority required to match the documented contract; correct plugin tool teaching descriptions and schemas (#338).
+- AI: re-home tool-call argument hygiene into a cross-dialect leaf (#342); harden the tool-call lifecycle across wire schemas, streaming, and recovery (#332); recover the <function=NAME> text tool-call variant (#330).
+- Lua: derive event-name validity from the Event tag set and delete the dead Plugin module (#343); harden the plugin bridge architecture against stack corruption and data races (#339).
+- Executor: check cancelation in atch runAll and unify tool display lookup (#331).
+
 ## [0.11.9] - 2026-11-05
 
 ### Fixed
@@ -131,7 +142,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.9...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.10...HEAD
+[0.11.10]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.10
 [0.11.9]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.9
 [0.11.8]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.8
 [0.11.7]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.7
