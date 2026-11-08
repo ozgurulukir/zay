@@ -99,7 +99,7 @@ pub const PluginInstance = struct {
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
         tool_snapshot.deinit(allocator, self.tool_snapshots);
         self.manifest.deinit(allocator);
-        sandbox.freeHookData(self.state.handle);
+        sandbox.capFinalizerDeadline(self.state.handle);
         self.state.deinit();
         allocator.free(self.dir_path);
     }
@@ -346,7 +346,7 @@ pub const PluginManager = struct {
         // (register_tool, read_file, etc.) are available in the sandbox.
         var L = try sandbox.createSandboxedStateWithIo(permissions, self.io);
         errdefer {
-            sandbox.freeHookData(L.handle);
+            sandbox.capFinalizerDeadline(L.handle);
             L.deinit();
         }
 

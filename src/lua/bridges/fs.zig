@@ -494,7 +494,7 @@ test "bridges.fs: file_info returns directory type for directories" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer {
-        sandbox.freeHookData(L.handle);
+        sandbox.capFinalizerDeadline(L.handle);
         L.deinit();
     }
     try std.testing.expect(L.doString("info = zay.file_info('.')"));
