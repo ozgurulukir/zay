@@ -47,15 +47,20 @@ pub const ToolRegistry = struct {
         return reg;
     }
 
+    /// Free one plugin record's owned fields. Plugin tool `name` and
+    /// `description` are always owned and heap-allocated (see
+    /// `buildPluginTool` in the registry bridge); `userdata_free` releases
+    /// the record's userdata. The registry is the single source of truth
+    /// for plugin tool lifetimes — all release paths go through here.
+    fn freePluginRecord(gpa: std.mem.Allocator, t: Tool) void {
+        gpa.free(t.name);
+        gpa.free(t.description);
+        if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
+    }
+
     pub fn deinit(self: *ToolRegistry, gpa: std.mem.Allocator) void {
         for (self.plugin.items) |*t| {
-            // Plugin tool's `name` and `description` are always owned and
-            // heap-allocated (see `buildPluginTool` in the registry
-            // bridge). Free them here so the registry is the single
-            // source of truth for plugin tool lifetimes.
-            gpa.free(t.name);
-            gpa.free(t.description);
-            if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
+            freePluginRecord(gpa, t.*);
         }
         self.plugin.deinit(gpa);
         self.scratch.deinit(gpa);
@@ -117,9 +122,7 @@ pub const ToolRegistry = struct {
         while (i < self.plugin.items.len) {
             const t = self.plugin.items[i];
             if (std.mem.startsWith(u8, t.name, prefix)) {
-                gpa.free(t.name);
-                gpa.free(t.description);
-                if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
+                freePluginRecord(gpa, t);
                 _ = self.plugin.orderedRemove(i);
                 removed = true;
             } else {
@@ -165,9 +168,7 @@ pub const ToolRegistry = struct {
                 self.addPluginTool(gpa, record) catch |err| {
                     // The record was fully built — free it before propagating
                     // or its name/description/key leak on the error path.
-                    gpa.free(record.name);
-                    gpa.free(record.description);
-                    if (record.userdata_free) |free_fn| free_fn(gpa, record.userdata);
+                    freePluginRecord(gpa, record);
                     return err;
                 };
             }
