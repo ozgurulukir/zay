@@ -895,6 +895,14 @@ pub const App = struct {
         return command_router.handleCommandKey(self, key);
     }
 
+    pub fn submitMcpOverlay(self: *App) !bool {
+        return command_router.submitMcp(self);
+    }
+
+    pub fn submitPluginsOverlay(self: *App) !bool {
+        return command_router.submitPlugins(self);
+    }
+
     pub fn handleModelPickerKey(self: *App, key: vaxis.Key) !bool {
         return command_router.ModelPicker.handle(self, key);
     }
