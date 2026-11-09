@@ -6,7 +6,14 @@
 const std = @import("std");
 const db = @import("../db.zig");
 const session_type = @import("types.zig");
+const database_backend = @import("../config/database_backend.zig");
 
+/// Store-side backend tags. The string vocabulary (env var, config.json,
+/// schema enum) lives in the config leaf; these tags stay distinct because
+/// the store speaks in concrete storage engines while config speaks in user
+/// selections. The remap switches below are compiler-exhaustive: a new leaf
+/// tag fails to compile here instead of silently falling through the
+/// config→store boundary.
 pub const BackendKind = enum {
     local_sqlite,
     remote_service,
@@ -14,25 +21,33 @@ pub const BackendKind = enum {
     d1_http,
     postgres_native,
 
-    pub const local = BackendKind.local_sqlite;
-    pub const zay_service = BackendKind.remote_service;
-
     pub fn fromString(str: []const u8) ?BackendKind {
-        if (std.mem.eql(u8, str, "local") or std.mem.eql(u8, str, "local_sqlite") or std.mem.eql(u8, str, "sqlite")) return .local_sqlite;
-        if (std.mem.eql(u8, str, "zay_service") or std.mem.eql(u8, str, "remote_service") or std.mem.eql(u8, str, "service")) return .remote_service;
-        if (std.mem.eql(u8, str, "turso_http") or std.mem.eql(u8, str, "turso") or std.mem.eql(u8, str, "libsql")) return .turso_http;
-        if (std.mem.eql(u8, str, "d1_http") or std.mem.eql(u8, str, "d1") or std.mem.eql(u8, str, "cloudflare_d1") or std.mem.eql(u8, str, "cloudflare")) return .d1_http;
-        if (std.mem.eql(u8, str, "postgres_native") or std.mem.eql(u8, str, "postgres") or std.mem.eql(u8, str, "postgresql")) return .postgres_native;
-        return null;
+        const leaf = database_backend.DatabaseBackendKind.fromString(str) orelse return null;
+        return fromLeaf(leaf);
     }
 
     pub fn asString(self: BackendKind) []const u8 {
+        return toLeaf(self).asString();
+    }
+
+    /// Map a config-leaf backend tag to this store-side vocabulary.
+    pub fn fromLeaf(kind: database_backend.DatabaseBackendKind) BackendKind {
+        return switch (kind) {
+            .local => .local_sqlite,
+            .zay_service => .remote_service,
+            .turso_http => .turso_http,
+            .d1_http => .d1_http,
+            .postgres_native => .postgres_native,
+        };
+    }
+
+    fn toLeaf(self: BackendKind) database_backend.DatabaseBackendKind {
         return switch (self) {
-            .local_sqlite => "local",
-            .remote_service => "zay_service",
-            .turso_http => "turso_http",
-            .d1_http => "d1_http",
-            .postgres_native => "postgres_native",
+            .local_sqlite => .local,
+            .remote_service => .zay_service,
+            .turso_http => .turso_http,
+            .d1_http => .d1_http,
+            .postgres_native => .postgres_native,
         };
     }
 };
@@ -351,4 +366,14 @@ test "SessionBackend openD1 initializes and deinits cleanly without leaks" {
     try std.testing.expectEqualStrings("secret-token", backend.remote_token.?);
     try std.testing.expectEqualStrings("test-host", backend.host_id);
     try std.testing.expect(backend.d1 != null);
+}
+
+test "BackendKind vocabulary stays byte-identical to the config leaf" {
+    inline for (std.meta.fields(database_backend.DatabaseBackendKind)) |field| {
+        const leaf_tag: database_backend.DatabaseBackendKind = @field(database_backend.DatabaseBackendKind, field.name);
+        const store_tag = BackendKind.fromLeaf(leaf_tag);
+        try std.testing.expectEqualStrings(leaf_tag.asString(), store_tag.asString());
+        try std.testing.expectEqual(leaf_tag, store_tag.toLeaf());
+    }
+    try std.testing.expectEqual(@as(?BackendKind, null), BackendKind.fromString("bogus_backend"));
 }
