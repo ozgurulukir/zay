@@ -115,33 +115,74 @@ pub fn isEnterKey(key: vaxis.Key) bool {
     return false;
 }
 
+/// Outcome of feeding one key to a `FormField`. `consumed` covers both a
+/// real edit (append/backspace) and a swallowed key (arrows, tab); the
+/// adapter decides what the visible-change answer is (always `true` today).
+pub const FormAction = enum { consumed, submit, cancel };
+
+/// Single-line form text input shared by every one-line editor form
+/// (provider key, session rename, project-root bind, MCP add, plugins add).
+///
+/// Semantics reproduced verbatim from the pre-refactor handlers: Enter
+/// reports `.submit`, Esc reports `.cancel`, backspace pops one UTF-8
+/// grapheme, `key.text` payloads append after CR/LF trimming, printable
+/// ASCII codepoints (32..126, no ctrl/alt/super) append as bytes, and
+/// everything else is swallowed as `.consumed`. The optional `dirty` flag
+/// (only the provider key form uses it) is set on every real edit and left
+/// untouched on Enter, Esc, and swallowed keys.
+pub const FormField = struct {
+    buf: *std.ArrayList(u8),
+    dirty: ?*bool = null,
+
+    pub fn feed(self: *FormField, gpa: std.mem.Allocator, key: vaxis.Key) !FormAction {
+        if (key.matches(vaxis.Key.escape, .{})) return .cancel;
+        if (isEnterKey(key)) return .submit;
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            popUtf8Tail(self.buf);
+            if (self.dirty) |dirty| dirty.* = true;
+            return .consumed;
+        }
+        if (key.text) |text| {
+            const trimmed = std.mem.trim(u8, text, "\r\n");
+            if (trimmed.len > 0) {
+                try self.buf.appendSlice(gpa, trimmed);
+                if (self.dirty) |dirty| dirty.* = true;
+                return .consumed;
+            }
+        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+            const byte: u8 = @intCast(key.codepoint);
+            try self.buf.append(gpa, byte);
+            if (self.dirty) |dirty| dirty.* = true;
+            return .consumed;
+        }
+        return .consumed;
+    }
+};
+
+/// Pop one UTF-8 tail off `buf`: remove the last codepoint by stepping back
+/// over continuation bytes (0b10xxxxxx), leaving an empty buffer intact.
+/// Combining-mark grapheme clusters split; that matches the old handlers.
+pub fn popUtf8Tail(buf: *std.ArrayList(u8)) void {
+    const items = buf.items;
+    if (items.len == 0) return;
+    var cut = items.len - 1;
+    while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
+    buf.shrinkRetainingCapacity(cut);
+}
+
 const ProviderPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (app.getProviderPicker().stage == .form) {
             app.getProviderPicker().form_error = null;
-            if (key.matches(vaxis.Key.escape, .{})) return false;
-            if (isEnterKey(key)) return false;
-
-            if (key.matches(vaxis.Key.backspace, .{})) {
-                app.popProviderKeyInput();
-                app.getProviderPicker().key_dirty = true;
-                return true;
-            }
-            if (key.text) |text| {
-                const trimmed = std.mem.trim(u8, text, "\r\n");
-                if (trimmed.len > 0) {
-                    try app.getProviderKeyInput().appendSlice(app.gpa, trimmed);
-                    app.getProviderPicker().key_dirty = true;
-                    return true;
-                }
-            } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-                const byte: u8 = @intCast(key.codepoint);
-                try app.getProviderKeyInput().append(app.gpa, byte);
-                app.getProviderPicker().key_dirty = true;
-                return true;
-            }
-            // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
-            return true;
+            var field = FormField{
+                .buf = app.getProviderKeyInput(),
+                .dirty = &app.getProviderPicker().key_dirty,
+            };
+            return switch (try field.feed(app.gpa, key)) {
+                .consumed => true,
+                // Esc and Enter are handled upstream (close menu / submit).
+                .submit, .cancel => false,
+            };
         }
         const filter = try app.peekPaletteInput();
         defer app.gpa.free(filter);
@@ -252,31 +293,14 @@ const SessionPicker = struct {
     /// Text input for the rename form. Enter submits, Esc cancels; printable
     /// keys append to the rename buffer and everything else is swallowed.
     fn handleRenameInput(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            app.cancelSessionAction();
-            return true;
+        var field = FormField{ .buf = &app.input_buffers.session_rename_text };
+        switch (try field.feed(app.gpa, key)) {
+            .cancel => app.cancelSessionAction(),
+            .submit => try app.confirmRenameSelectedSession(),
+            .consumed => {},
         }
-        if (isEnterKey(key)) {
-            try app.confirmRenameSelectedSession();
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            app.popSessionRenameInput();
-            return true;
-        }
-        if (key.text) |text| {
-            const trimmed = std.mem.trim(u8, text, "\r\n");
-            if (trimmed.len > 0) {
-                try app.input_buffers.session_rename_text.appendSlice(app.gpa, trimmed);
-                return true;
-            }
-        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-            const byte: u8 = @intCast(key.codepoint);
-            try app.input_buffers.session_rename_text.append(app.gpa, byte);
-            return true;
-        }
-        // Swallow everything else (arrows, tab) — the rename buffer is the
-        // sole input target while this sub-state is active.
+        // The rename buffer is the sole input target while this sub-state is
+        // active: every key changes visible state (or closes the sub-state).
         return true;
     }
 
@@ -298,30 +322,16 @@ const SessionPicker = struct {
     /// submitMode), Esc cancels without any mutation; printable keys append
     /// to the buffer and everything else is swallowed.
     fn handleProjectRootInput(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            app.cancelProjectRootBinding();
-            return true;
+        var field = FormField{ .buf = &app.input_buffers.project_root_text };
+        switch (try field.feed(app.gpa, key)) {
+            .cancel => app.cancelProjectRootBinding(),
+            // Enter is handled by the submitMode session_picker dispatch;
+            // swallow it here so the raw key doesn't re-submit.
+            .submit => {},
+            .consumed => {},
         }
-        // Enter is handled by the submitMode session_picker dispatch; swallow
-        // it here so the raw key doesn't append to the buffer.
-        if (isEnterKey(key)) return true;
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            app.popSessionProjectRootInput();
-            return true;
-        }
-        if (key.text) |text| {
-            const trimmed = std.mem.trim(u8, text, "\r\n");
-            if (trimmed.len > 0) {
-                try app.input_buffers.project_root_text.appendSlice(app.gpa, trimmed);
-                return true;
-            }
-        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-            const byte: u8 = @intCast(key.codepoint);
-            try app.input_buffers.project_root_text.append(app.gpa, byte);
-            return true;
-        }
-        // Swallow everything else (arrows, tab) — the bind form is the sole
-        // input target while this sub-state is active.
+        // The bind form is the sole input target while this sub-state is
+        // active: every key changes visible state (or leaves the sub-state).
         return true;
     }
 };
@@ -687,32 +697,19 @@ const McpMode = struct {
     /// Text input for the "add server by URL" form. Enter submits, Esc cancels;
     /// printable keys append to the URL buffer and everything else is swallowed.
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            app.pickers.mcp.adding = false;
-            app.input_buffers.mcp_url.clearRetainingCapacity();
-            return true;
-        }
-        if (isEnterKey(key)) {
-            const url = std.mem.trim(u8, app.input_buffers.mcp_url.items, " \t\r\n");
-            if (url.len > 0) provider_model.addMcpServerByUrl(app, url) catch {};
-            app.pickers.mcp.adding = false;
-            app.input_buffers.mcp_url.clearRetainingCapacity();
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            app.popMcpUrlInput();
-            return true;
-        }
-        if (key.text) |text| {
-            const trimmed = std.mem.trim(u8, text, "\r\n");
-            if (trimmed.len > 0) {
-                try app.input_buffers.mcp_url.appendSlice(app.gpa, trimmed);
-                return true;
-            }
-        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-            const byte: u8 = @intCast(key.codepoint);
-            try app.input_buffers.mcp_url.append(app.gpa, byte);
-            return true;
+        var field = FormField{ .buf = &app.input_buffers.mcp_url };
+        switch (try field.feed(app.gpa, key)) {
+            .submit => {
+                const url = std.mem.trim(u8, app.input_buffers.mcp_url.items, " \t\r\n");
+                if (url.len > 0) provider_model.addMcpServerByUrl(app, url) catch {};
+                app.pickers.mcp.adding = false;
+                app.input_buffers.mcp_url.clearRetainingCapacity();
+            },
+            .cancel => {
+                app.pickers.mcp.adding = false;
+                app.input_buffers.mcp_url.clearRetainingCapacity();
+            },
+            .consumed => {},
         }
         return true;
     }
@@ -872,32 +869,20 @@ const PluginsMode = struct {
     }
 
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            app.pickers.plugins.adding = false;
-            app.input_buffers.plugin_store_url.clearRetainingCapacity();
-            return true;
-        }
-        if (isEnterKey(key)) {
-            const url = std.mem.trim(u8, app.input_buffers.plugin_store_url.items, " \t\r\n");
-            // addStore owns validation and projects failures into the notice.
-            app.addPluginStore(url) catch {};
-            app.pickers.plugins.adding = false;
-            app.input_buffers.plugin_store_url.clearRetainingCapacity();
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            app.popPluginStoreUrlInput();
-            return true;
-        }
-        if (key.text) |text| {
-            const trimmed = std.mem.trim(u8, text, "\r\n");
-            if (trimmed.len > 0) {
-                try app.input_buffers.plugin_store_url.appendSlice(app.gpa, trimmed);
-                return true;
-            }
-        } else if (key.codepoint >= 32 and key.codepoint <= 126 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-            try app.input_buffers.plugin_store_url.append(app.gpa, @intCast(key.codepoint));
-            return true;
+        var field = FormField{ .buf = &app.input_buffers.plugin_store_url };
+        switch (try field.feed(app.gpa, key)) {
+            .submit => {
+                const url = std.mem.trim(u8, app.input_buffers.plugin_store_url.items, " \t\r\n");
+                // addStore owns validation and projects failures into the notice.
+                app.addPluginStore(url) catch {};
+                app.pickers.plugins.adding = false;
+                app.input_buffers.plugin_store_url.clearRetainingCapacity();
+            },
+            .cancel => {
+                app.pickers.plugins.adding = false;
+                app.input_buffers.plugin_store_url.clearRetainingCapacity();
+            },
+            .consumed => {},
         }
         return true;
     }
@@ -977,4 +962,147 @@ test "provider picker setup form submit with empty key sets form_error" {
 
     _ = try ProviderPicker.handle(&app, .{ .codepoint = 'a' });
     try std.testing.expect(app.pickers.provider.form_error == null);
+}
+
+/// A `vaxis.Key` carrying a two-byte UTF-8 text payload ('ğ'), as terminals
+/// send it for pasted or IME-entered multibyte input.
+fn multibyteKey() vaxis.Key {
+    var key: vaxis.Key = .{ .codepoint = 0 };
+    key.text = "ğ";
+    return key;
+}
+
+test "session rename form appends printable and multibyte text, pops UTF-8 tails, submits and cancels" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.nav.session_action = .renaming;
+
+    // Printable ASCII appends.
+    try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = 'a' }));
+    try std.testing.expectEqualStrings("a", app.input_buffers.session_rename_text.items);
+
+    // Multibyte text appends whole graphemes.
+    try std.testing.expect(try SessionPicker.handleRenameInput(&app, multibyteKey()));
+    try std.testing.expectEqualStrings("ağ", app.input_buffers.session_rename_text.items);
+
+    // Backspace pops the whole multibyte tail, not a partial byte.
+    try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.backspace }));
+    try std.testing.expectEqualStrings("a", app.input_buffers.session_rename_text.items);
+
+    // Enter routes to the confirm routine; an empty rename is a no-op confirm
+    // (the sub-state stays open and the buffer is untouched).
+    _ = try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.backspace });
+    try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expectEqual(.renaming, app.nav.session_action);
+    try std.testing.expectEqualStrings("", app.input_buffers.session_rename_text.items);
+
+    // Esc also exits the sub-state and clears the buffer.
+    app.nav.session_action = .renaming;
+    _ = try SessionPicker.handleRenameInput(&app, .{ .codepoint = 'x' });
+    try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expectEqual(.browsing, app.nav.session_action);
+    try std.testing.expectEqualStrings("", app.input_buffers.session_rename_text.items);
+
+    // Non-editing keys (arrows, tab) are swallowed and report a change so the
+    // overlay redraws.
+    app.nav.session_action = .renaming;
+    try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.down }));
+}
+
+test "project-root bind form appends printable and multibyte text, pops UTF-8 tails, swallows Enter and cancels" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.nav.session_action = .locating_project;
+
+    try std.testing.expect(try SessionPicker.handleProjectRootInput(&app, .{ .codepoint = 'C' }));
+    try std.testing.expectEqualStrings("C", app.input_buffers.project_root_text.items);
+
+    try std.testing.expect(try SessionPicker.handleProjectRootInput(&app, multibyteKey()));
+    try std.testing.expectEqualStrings("Cğ", app.input_buffers.project_root_text.items);
+
+    try std.testing.expect(try SessionPicker.handleProjectRootInput(&app, .{ .codepoint = vaxis.Key.backspace }));
+    try std.testing.expectEqualStrings("C", app.input_buffers.project_root_text.items);
+
+    // Enter is swallowed here — the submitMode dispatch owns submission —
+    // and the raw key must not append to the buffer.
+    try std.testing.expect(try SessionPicker.handleProjectRootInput(&app, .{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expectEqualStrings("C", app.input_buffers.project_root_text.items);
+    try std.testing.expectEqual(.locating_project, app.nav.session_action);
+
+    // Esc cancels: buffer cleared and sub-state left.
+    try std.testing.expect(try SessionPicker.handleProjectRootInput(&app, .{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expectEqual(.browsing, app.nav.session_action);
+    try std.testing.expectEqualStrings("", app.input_buffers.project_root_text.items);
+}
+
+test "plugins add form appends printable and multibyte text, pops UTF-8 tails, confirms and cancels" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.pickers.plugins.adding = true;
+
+    try std.testing.expect(try PluginsMode.handleAddInput(&app, .{ .codepoint = 'h' }));
+    try std.testing.expectEqualStrings("h", app.input_buffers.plugin_store_url.items);
+
+    try std.testing.expect(try PluginsMode.handleAddInput(&app, multibyteKey()));
+    try std.testing.expectEqualStrings("hğ", app.input_buffers.plugin_store_url.items);
+
+    try std.testing.expect(try PluginsMode.handleAddInput(&app, .{ .codepoint = vaxis.Key.backspace }));
+    try std.testing.expectEqualStrings("h", app.input_buffers.plugin_store_url.items);
+
+    // Enter confirms (empty store URL fails validation internally and is
+    // swallowed) and closes the form.
+    try std.testing.expect(try PluginsMode.handleAddInput(&app, .{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(!app.pickers.plugins.adding);
+    try std.testing.expectEqualStrings("", app.input_buffers.plugin_store_url.items);
+
+    // Esc cancels the form too.
+    app.pickers.plugins.adding = true;
+    _ = try PluginsMode.handleAddInput(&app, .{ .codepoint = 'x' });
+    try std.testing.expect(try PluginsMode.handleAddInput(&app, .{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expect(!app.pickers.plugins.adding);
+    try std.testing.expectEqualStrings("", app.input_buffers.plugin_store_url.items);
+}
+
+test "mcp add form appends printable and multibyte text, pops UTF-8 tails, confirms and cancels" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.pickers.mcp.adding = true;
+
+    try std.testing.expect(try McpMode.handleAddInput(&app, .{ .codepoint = 'h' }));
+    try std.testing.expectEqualStrings("h", app.input_buffers.mcp_url.items);
+
+    try std.testing.expect(try McpMode.handleAddInput(&app, multibyteKey()));
+    try std.testing.expectEqualStrings("hğ", app.input_buffers.mcp_url.items);
+
+    try std.testing.expect(try McpMode.handleAddInput(&app, .{ .codepoint = vaxis.Key.backspace }));
+    try std.testing.expectEqualStrings("h", app.input_buffers.mcp_url.items);
+
+    // Enter confirms (empty server URL fails validation internally and is
+    // swallowed) and closes the form.
+    try std.testing.expect(try McpMode.handleAddInput(&app, .{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(!app.pickers.mcp.adding);
+    try std.testing.expectEqualStrings("", app.input_buffers.mcp_url.items);
+
+    // Esc cancels the form too.
+    app.pickers.mcp.adding = true;
+    _ = try McpMode.handleAddInput(&app, .{ .codepoint = 'x' });
+    try std.testing.expect(try McpMode.handleAddInput(&app, .{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expect(!app.pickers.mcp.adding);
+    try std.testing.expectEqualStrings("", app.input_buffers.mcp_url.items);
 }
