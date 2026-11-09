@@ -44,6 +44,13 @@ pub const Permissions = struct {
 /// Data stored in lua_getextraspace for the instruction hook.
 const HookData = execution.Budget;
 
+/// Registry key under which the per-state budget userdata is stored. It
+/// doubles as the boundary marker for `isSandboxedState`: only states built
+/// by this module's constructors carry it, so differently-shaped extraspace
+/// payloads (a manifest evaluation state stores a differently typed budget
+/// pointer there) can never be mistaken for one of ours.
+pub const execution_budget_registry_key = "zay_execution_budget";
+
 /// Monotonic clock reading in nanoseconds, used for the per-dispatch timeout.
 /// The instruction hook has no `Io` handle, so it reads the OS clock directly.
 /// Falls back to 0 (no timeout) if the clock is unavailable.
@@ -69,13 +76,26 @@ fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
     execution.raiseIfStopped(L_ptr);
 }
 
+/// Whether `L` was created by this module's constructors and therefore owns
+/// a `*Budget` in its extraspace plus the registry marker key. Manifest
+/// evaluation states and raw states store differently typed (or absent)
+/// payloads in the same slot; the budget API below must treat them as no-ops
+/// instead of reinterpreting their bytes.
+pub fn isSandboxedState(L: *c.lua_State) bool {
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, execution_budget_registry_key);
+    const sandboxed = !c.lua_isnil(L, -1);
+    c.lua_pop(L, 1);
+    return sandboxed;
+}
+
 /// Reset the per-dispatch instruction budget and timeout deadline on `L`.
 /// The instruction count is a per-session accumulator that nothing else
 /// resets; without this, a busy plugin eventually fails every call with
 /// "instruction limit exceeded" for the rest of the session. Resetting here
 /// makes the limit mean "per tool call / per event", which matches intuition.
-/// No-op only for a Lua state not created by this sandbox builder.
+/// No-op for a Lua state not created by this sandbox builder.
 pub fn resetInstructionBudget(L: *c.lua_State) void {
+    if (!isSandboxedState(L)) return;
     const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
     const data = slot.* orelse return;
     data.instruction_count = 0;
@@ -91,9 +111,10 @@ pub fn resetInstructionBudget(L: *c.lua_State) void {
 /// instruction limit makes the wall clock the only init bound), so callers
 /// that need a tight *dispatch* deadline must tighten it only after init
 /// succeeded and release it again for coarse follow-up calls. No-op for
-/// states without hook data (states not created by this module's
-/// constructors), like `resetInstructionBudget`.
+/// states not created by this module's constructors, like
+/// `resetInstructionBudget`.
 pub fn setWallClockTimeoutMs(L: *c.lua_State, timeout_ms: u32) void {
+    if (!isSandboxedState(L)) return;
     const slot = @as(*?*HookData, @ptrCast(@alignCast(c.lua_getextraspace(L))));
     const data = slot.* orelse return;
     data.timeout_ms = timeout_ms;
@@ -112,6 +133,8 @@ pub fn createSandboxedState(permissions: Permissions) !State {
 /// Returns `error.LuaInitFailed` if the Lua runtime cannot allocate the state.
 pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ LuaInitFailed, OutOfMemory }!State {
     const L = c.luaL_newstate() orelse return error.LuaInitFailed;
+    // Bare close is correct here: no user code has run, so no finalizer can
+    // be pending and the 1000 ms cap would have nothing to bound.
     errdefer c.lua_close(L);
 
     // Initialize extraspace to null (no hook data yet)
@@ -336,7 +359,7 @@ fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Alloc
     // Coroutines copy the extraspace pointer. Keep the budget VM-owned and
     // strongly referenced until lua_close finishes every Lua finalizer.
     const data = @as(*HookData, @ptrCast(@alignCast(c.lua_newuserdata(L, @sizeOf(HookData)))));
-    c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_execution_budget");
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, execution_budget_registry_key);
     data.* = HookData{
         .instruction_limit = if (permissions.instruction_limit > 0) permissions.instruction_limit else std.math.maxInt(u32),
         .instruction_count = 0,
@@ -350,9 +373,22 @@ fn setupInstructionHook(L: *c.lua_State, permissions: Permissions) std.mem.Alloc
 
 /// Cap the remaining execution deadline for the finalization phase so GC
 /// finalizers cannot run away during lua_close. VM-owned userdata and hooks
-/// stay alive through lua_close, including main-thread finalizers.
+/// stay alive through lua_close, including main-thread finalizers. No-op for
+/// states not created by this module's constructors, like the other budget
+/// entry points.
 pub fn capFinalizerDeadline(L: *c.lua_State) void {
+    if (!isSandboxedState(L)) return;
     execution.capDeadline(L, 1000);
+}
+
+/// Tear down a state created by `createSandboxedState` or
+/// `createSandboxedStateWithIo`: cap the finalizer deadline first so GC
+/// finalizers cannot run away during close, then close. Production call
+/// sites must never `deinit` such a state directly — the cap is what makes
+/// teardown safe, and owning it here keeps that ordering in one place.
+pub fn destroySandboxedState(state: *State) void {
+    capFinalizerDeadline(state.handle);
+    state.deinit();
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -723,4 +759,73 @@ test "sandbox: os.remove and os.rename prevent path traversal outside workspace 
     try std.testing.expect(L.doString("local res, err = os.remove('../../../etc/passwd'); return res == nil and err ~= nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
+}
+
+test "sandbox: destroySandboxedState bounds runaway finalizers without an explicit cap" {
+    const FinalizerProbe = struct {
+        callbacks: std.atomic.Value(u32) = .init(0),
+        fn observe(L: ?*c.lua_State) callconv(.c) c_int {
+            const probe: *@This() = @ptrCast(@alignCast(c.lua_touserdata(L.?, c.lua_upvalueindex(1)).?));
+            _ = probe.callbacks.fetchAdd(1, .acq_rel);
+            return 0;
+        }
+    };
+    var probe = FinalizerProbe{};
+    var L = try createSandboxedState(.{});
+    c.lua_pushlightuserdata(L.handle, &probe);
+    c.lua_pushcclosure(L.handle, FinalizerProbe.observe, 1);
+    c.lua_setglobal(L.handle, "host_observe");
+    const loaded = L.doString(
+        \\held=setmetatable({}, {__gc=function()
+        \\  host_observe()
+        \\  while true do pcall(function() while true do end end) end
+        \\end})
+    );
+    try std.testing.expect(loaded);
+
+    // Teardown through the owner must land inside the 1000 ms finalizer cap
+    // (same 3 s outer bound as the cap+deinit equivalent in
+    // concurrency_tests.zig) and the finalizer must have run exactly once.
+    const start = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
+    destroySandboxedState(&L);
+    try std.testing.expect(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - start < 3 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u32, 1), probe.callbacks.load(.acquire));
+}
+
+test "sandbox: budget API no-ops on a manifest-shaped extraspace" {
+    // Manifest evaluation states store a differently typed budget pointer in
+    // the same extraspace slot (manifest.zig). The budget entry points must
+    // treat such states as absent, not reinterpret their bytes.
+    const ManifestShapedBudget = struct {
+        used_bytes: usize = 0,
+        hook_count: u32 = 0,
+        exhausted: bool = false,
+        deadline_ns: i128 = 0,
+    };
+    const L = c.luaL_newstate() orelse return error.LuaInitFailed;
+    defer c.lua_close(L);
+    var manifest_budget = ManifestShapedBudget{};
+    @as(*?*ManifestShapedBudget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).* = &manifest_budget;
+    const before = std.mem.toBytes(manifest_budget);
+
+    resetInstructionBudget(L);
+    setWallClockTimeoutMs(L, 1);
+    capFinalizerDeadline(L);
+    try std.testing.expect(!isSandboxedState(L));
+    try std.testing.expectEqualSlices(u8, &before, &std.mem.toBytes(manifest_budget));
+
+    // Positive space: the same calls on a sandboxed state do act — the guard
+    // must not swallow the real path. resetInstructionBudget arms the
+    // deadline; capFinalizerDeadline clamps it to now+1000 ms.
+    var sandboxed = try createSandboxedState(.{});
+    defer destroySandboxedState(&sandboxed);
+    try std.testing.expect(isSandboxedState(sandboxed.handle));
+    resetInstructionBudget(sandboxed.handle);
+    const armed = execution.budget(sandboxed.handle).?.deadline_ns;
+    capFinalizerDeadline(sandboxed.handle);
+    const capped = execution.budget(sandboxed.handle).?.deadline_ns;
+    const t0 = platform.monotonicNowNs();
+    try std.testing.expect(armed != 0);
+    try std.testing.expect(capped >= t0);
+    try std.testing.expect(capped <= t0 + 2 * std.time.ns_per_s);
 }

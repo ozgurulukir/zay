@@ -99,8 +99,7 @@ pub const PluginInstance = struct {
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
         tool_snapshot.deinit(allocator, self.tool_snapshots);
         self.manifest.deinit(allocator);
-        sandbox.capFinalizerDeadline(self.state.handle);
-        self.state.deinit();
+        sandbox.destroySandboxedState(&self.state);
         allocator.free(self.dir_path);
     }
 };
@@ -345,10 +344,7 @@ pub const PluginManager = struct {
         // Create the plugin instance with Io so zay.* bridge functions
         // (register_tool, read_file, etc.) are available in the sandbox.
         var L = try sandbox.createSandboxedStateWithIo(permissions, self.io);
-        errdefer {
-            sandbox.capFinalizerDeadline(L.handle);
-            L.deinit();
-        }
+        errdefer sandbox.destroySandboxedState(&L);
 
         // Store the plugin root directory in the registry so zay.require knows its base path
         _ = c.lua_pushlstring(L.handle, dir_path.ptr, dir_path.len);
