@@ -101,6 +101,13 @@ pub fn closeSettings(app: *App) void {
 
 pub fn submitSettings(app: *App) !void {
     const state = &app.pickers.settings;
+    // Enter during an active text edit belongs to the editor: falling
+    // through to the row switch would re-enter the row's editor and re-seed
+    // the buffer from the live config, silently wiping the unsaved draft.
+    if (state.edit_target != .none) {
+        try submitTextEdit(app);
+        return;
+    }
     switch (state.tab) {
         .general => try submitGeneralItem(app, state),
         .prompt => submitPromptItem(app, state),
@@ -369,6 +376,22 @@ fn commitTextEdit(app: *App) !void {
     app.input_buffers.settings_text.clearRetainingCapacity();
 }
 
+/// Enter inside an active text edit: a newline in the multiline prompt,
+/// commit-without-save for single-line fields. Single owner of edit-mode
+/// Enter semantics, shared by `handleTextEditKey` and `submitSettings`
+/// (which receives Enter first through `submitMode`).
+fn submitTextEdit(app: *App) !void {
+    const state = &app.pickers.settings;
+    if (state.edit_target == .system_prompt) {
+        try app.input_buffers.settings_text.append(app.gpa, '\n');
+        return;
+    }
+    // Enter commits the text edit without saving to disk (user must press
+    // Ctrl+S to persist). This gives a chance to edit multiple fields
+    // before saving.
+    try commitTextEdit(app);
+}
+
 /// Mirror of `applyTextOverlay`'s contract (parse.zig) for the in-memory
 /// cached config: a null pending means "not touched", an empty pending
 /// clears the field, anything else replaces it. Inlined per field here
@@ -532,14 +555,7 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
         return true;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
-        if (state.edit_target == .system_prompt) {
-            try app.input_buffers.settings_text.append(app.gpa, '\n');
-            return true;
-        }
-        // Enter commits the text edit without saving to disk (user must
-        // press Ctrl+S to persist). This gives a chance to edit multiple
-        // fields before saving.
-        try commitTextEdit(app);
+        try submitTextEdit(app);
         return true;
     }
     if (key.matches(vaxis.Key.backspace, .{})) {
@@ -617,6 +633,53 @@ test "handleTextEditKey Enter commits for bash_classifier_url" {
     try std.testing.expect(handled);
     try std.testing.expect(app.pickers.settings.edit_target == .none);
     try std.testing.expectEqualStrings("https://example.com", app.pickers.settings.pending_bash_classifier_url.?);
+
+    // Free the committed allocated memory since we don't save to disk in this test
+    gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
+}
+
+test "submitSettings during a prompt edit appends a newline instead of re-seeding the buffer" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Editing the multiline system prompt with an unsaved draft. Before the
+    // edit-aware guard, Enter fell through to submitPromptItem, which
+    // re-entered the editor and re-seeded the buffer from the live config,
+    // silently wiping the draft.
+    app.mode = .settings;
+    app.pickers.settings.tab = .prompt;
+    app.pickers.settings.edit_target = .system_prompt;
+    try app.input_buffers.settings_text.appendSlice(gpa, "draft");
+
+    try submitSettings(&app);
+
+    try std.testing.expectEqualStrings("draft\n", app.input_buffers.settings_text.items);
+    try std.testing.expect(app.pickers.settings.edit_target == .system_prompt);
+    try std.testing.expect(app.pickers.settings.pending_system_prompt == null);
+}
+
+test "submitSettings during a URL edit commits the draft instead of re-seeding the buffer" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .settings;
+    app.pickers.settings.tab = .advanced;
+    app.pickers.settings.edit_target = .bash_classifier_url;
+    try app.input_buffers.settings_text.appendSlice(gpa, "https://example.com/a");
+
+    try submitSettings(&app);
+
+    // Single-line fields commit on Enter without saving, exactly like the
+    // handleTextEditKey Enter branch documents.
+    try std.testing.expectEqualStrings("https://example.com/a", app.pickers.settings.pending_bash_classifier_url.?);
+    try std.testing.expect(app.pickers.settings.edit_target == .none);
+    try std.testing.expectEqual(@as(usize, 0), app.input_buffers.settings_text.items.len);
 
     // Free the committed allocated memory since we don't save to disk in this test
     gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
