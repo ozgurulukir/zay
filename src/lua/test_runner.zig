@@ -42,10 +42,7 @@ fn runTestSource(gpa: std.mem.Allocator, io: std.Io, content: []const u8) !bool 
     // pwsh→rg chain, #321) legitimately need longer on a loaded Windows box.
     // The harness still bounds a hung run, just at a minute instead.
     var L = try sandbox.createSandboxedStateWithIo(.{ .full_access = true, .timeout_ms = 60_000 }, io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
 
     // Pre-load the test_runner module
     const runner_src = @embedFile("test_runner.lua");
