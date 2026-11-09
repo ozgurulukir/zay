@@ -125,13 +125,7 @@ pub const SessionStore = struct {
         path: ?[]const u8,
     ) SessionStore {
         return .{
-            .kind = switch (backend_kind) {
-                .local => .local_sqlite,
-                .zay_service => .remote_service,
-                .turso_http => .turso_http,
-                .d1_http => .d1_http,
-                .postgres_native => .postgres_native,
-            },
+            .kind = backend_mod.BackendKind.fromLeaf(backend_kind),
             .url = url,
             .token = token,
             .path = path,

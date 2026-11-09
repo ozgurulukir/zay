@@ -654,6 +654,7 @@ test {
     _ = @import("agent/compactor.zig");
     _ = @import("agent/queue.zig");
     _ = @import("auth/keyring.zig");
+    _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");
     _ = @import("config/provider.zig");
     _ = @import("db.zig");
