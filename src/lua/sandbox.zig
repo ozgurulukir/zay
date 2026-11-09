@@ -80,7 +80,9 @@ fn instructionHook(L: ?*c.lua_State, ar: [*c]c.lua_Debug) callconv(.c) void {
 /// a `*Budget` in its extraspace plus the registry marker key. Manifest
 /// evaluation states and raw states store differently typed (or absent)
 /// payloads in the same slot; the budget API below must treat them as no-ops
-/// instead of reinterpreting their bytes.
+/// instead of reinterpreting their bytes. The registry probe can raise on
+/// stack-growth OOM (a longjmp), but every caller already sits inside a
+/// protected dispatch or teardown frame, so the error unwinds safely.
 pub fn isSandboxedState(L: *c.lua_State) bool {
     _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, execution_budget_registry_key);
     const sandboxed = !c.lua_isnil(L, -1);
