@@ -571,38 +571,6 @@ pub const App = struct {
         self.nav.command_selection = v;
     }
 
-    pub fn popProviderKeyInput(self: *App) void {
-        const items = self.input_buffers.provider_key.items;
-        if (items.len == 0) return;
-        var cut = items.len - 1;
-        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.input_buffers.provider_key.shrinkRetainingCapacity(cut);
-    }
-
-    pub fn popMcpUrlInput(self: *App) void {
-        const items = self.input_buffers.mcp_url.items;
-        if (items.len == 0) return;
-        var cut = items.len - 1;
-        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.input_buffers.mcp_url.shrinkRetainingCapacity(cut);
-    }
-
-    pub fn popPluginStoreUrlInput(self: *App) void {
-        const items = self.input_buffers.plugin_store_url.items;
-        if (items.len == 0) return;
-        var cut = items.len - 1;
-        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.input_buffers.plugin_store_url.shrinkRetainingCapacity(cut);
-    }
-
-    pub fn popSessionRenameInput(self: *App) void {
-        const items = self.input_buffers.session_rename_text.items;
-        if (items.len == 0) return;
-        var cut = items.len - 1;
-        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.input_buffers.session_rename_text.shrinkRetainingCapacity(cut);
-    }
-
     pub fn isCodexSignedIn(self: *const App) bool {
         return self.codex_signed_in;
     }
@@ -1056,14 +1024,6 @@ pub const App = struct {
 
     pub fn cancelSessionAction(self: *App) void {
         session_switcher.cancelSessionAction(self);
-    }
-
-    pub fn popSessionProjectRootInput(self: *App) void {
-        const items = self.input_buffers.project_root_text.items;
-        if (items.len == 0) return;
-        var cut = items.len - 1;
-        while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-        self.input_buffers.project_root_text.shrinkRetainingCapacity(cut);
     }
 
     /// Resolve the selected resume entry onto this host and either switch
