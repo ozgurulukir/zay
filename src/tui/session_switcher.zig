@@ -390,7 +390,8 @@ pub fn beginRenameSelectedSession(app: *App) !void {
 }
 
 /// Confirm the rename: write the new title to the DB and reload the list.
-/// The caller has already validated that the text is non-empty.
+/// Reached through submitMode's session_picker dispatch; an empty (or
+/// whitespace-only) buffer is a no-op that keeps the sub-state open.
 pub fn confirmRenameSelectedSession(app: *App) !void {
     const text = std.mem.trim(u8, app.input_buffers.session_rename_text.items, " \t\r\n");
     if (text.len == 0) return;

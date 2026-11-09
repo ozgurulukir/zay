@@ -103,7 +103,6 @@ const TreePicker = struct {
     }
 };
 
-/// Provider picker mode (provider list + API-key setup form).
 /// Check if a key event corresponds to Enter/Return across terminal protocols and encodings.
 pub fn isEnterKey(key: vaxis.Key) bool {
     if (key.matches(vaxis.Key.enter, .{})) return true;
@@ -199,6 +198,7 @@ pub fn submitPlugins(app: *App) !bool {
     return true;
 }
 
+/// Provider picker mode (provider list + API-key setup form).
 const ProviderPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (app.getProviderPicker().stage == .form) {
