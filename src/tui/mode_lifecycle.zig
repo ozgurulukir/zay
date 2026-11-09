@@ -611,9 +611,21 @@ pub fn submitMode(app: *App) !bool {
         .save_message => return submitSaveMessage(app),
         .lanes => return submitLanes(app),
         .command => return submitCommandMode(app),
+        // Overlay Enter: delegate to the same per-mode actions the old
+        // routeKey exception reached, keeping this switch the single Enter
+        // wiring site. Always true — Enter is consumed in these overlays
+        // even when the action is a no-op.
+        .mcp => {
+            _ = try app.submitMcpOverlay();
+            return true;
+        },
+        .plugins => {
+            _ = try app.submitPluginsOverlay();
+            return true;
+        },
         // Modes with no Enter action: the switch is exhaustive, so these must
         // be listed to compile. (This is the old fall-through `return false`.)
-        .normal, .diff_viewer, .help, .mcp, .plugins => return false,
+        .normal, .diff_viewer, .help => return false,
     }
 }
 

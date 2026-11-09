@@ -116,8 +116,9 @@ pub fn isEnterKey(key: vaxis.Key) bool {
 }
 
 /// Outcome of feeding one key to a `FormField`. `consumed` covers both a
-/// real edit (append/backspace) and a swallowed key (arrows, tab); the
-/// adapter decides what the visible-change answer is (always `true` today).
+/// real edit (append/backspace) and a swallowed key (routeKey owns Enter
+/// upstream: submitMode is the single wiring site for Enter submit, so the
+/// per-mode `.submit` arms below are defensive parity for direct callers).
 pub const FormAction = enum { consumed, submit, cancel };
 
 /// Single-line form text input shared by every one-line editor form
@@ -168,6 +169,34 @@ pub fn popUtf8Tail(buf: *std.ArrayList(u8)) void {
     var cut = items.len - 1;
     while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
     buf.shrinkRetainingCapacity(cut);
+}
+
+/// Enter submit for the MCP overlay, owned by `submitMode`. The add form
+/// while `adding`, the selected client's connect toggle otherwise. Always
+/// true: Enter is consumed in these overlays even when the action is a
+/// no-op (the old routeKey exception consumed it the same way).
+pub fn submitMcp(app: *App) !bool {
+    if (app.pickers.mcp.adding) {
+        try McpMode.addMcpFromForm(app);
+        return true;
+    }
+    _ = try McpMode.toggleSelectedMcpClient(app);
+    return true;
+}
+
+/// Enter submit for the plugins overlay, owned by `submitMode`: no-op
+/// during uninstall confirm ('y'/'n' own it), the add form while `adding`,
+/// install in the store view, no-op in the sources and installed views
+/// (space owns their toggle). Always true — Enter is consumed in these
+/// overlays even when the action is a no-op.
+pub fn submitPlugins(app: *App) !bool {
+    if (app.pickers.plugins.confirming_uninstall) return true;
+    if (app.pickers.plugins.adding) {
+        try PluginsMode.addPluginFromForm(app);
+        return true;
+    }
+    if (app.pickers.plugins.view == .store) PluginsMode.startStoreInstall(app);
+    return true;
 }
 
 const ProviderPicker = struct {
@@ -290,13 +319,17 @@ const SessionPicker = struct {
         return false;
     }
 
-    /// Text input for the rename form. Enter submits, Esc cancels; printable
-    /// keys append to the rename buffer and everything else is swallowed.
+    /// Text input for the rename form. Esc cancels; printable keys append
+    /// to the rename buffer and everything else is swallowed.
     fn handleRenameInput(app: *App, key: vaxis.Key) !bool {
         var field = FormField{ .buf = &app.input_buffers.session_rename_text };
         switch (try field.feed(app.gpa, key)) {
             .cancel => app.cancelSessionAction(),
-            .submit => try app.confirmRenameSelectedSession(),
+            // Enter delivery is owned by submitMode's session_picker dispatch
+            // (confirmRenameSelectedSession lives there); swallow it here so
+            // the raw key doesn't re-submit. Same convention as the
+            // project-root and provider forms.
+            .submit => {},
             .consumed => {},
         }
         // The rename buffer is the sole input target while this sub-state is
@@ -653,24 +686,7 @@ const McpMode = struct {
             return true;
         }
         if (key.matches(' ', .{}) or key.matches(vaxis.Key.enter, .{})) {
-            if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
-                const client = &app.mcp_manager.clients.items[app.pickers.mcp.selection];
-                switch (client.status()) {
-                    .connected => {
-                        client.stop(app.io);
-                        client.lifecycle = .disabled;
-                    },
-                    .failed => {
-                        // Reconnect on toggle when failed
-                        app.mcp_manager.reconnectClient(app.io, app.pickers.mcp.selection);
-                    },
-                    else => {
-                        client.markConnecting();
-                    },
-                }
-                provider_model.injectMcpTools(app);
-                return true;
-            }
+            if (try toggleSelectedMcpClient(app)) return true;
         }
         if (key.matches('r', .{ .ctrl = true }) or key.matches('r', .{})) {
             if (app.pickers.mcp.selection < app.mcp_manager.clients.items.len) {
@@ -694,17 +710,50 @@ const McpMode = struct {
         return false;
     }
 
+    /// Toggle (connect/disconnect/reconnect) the selected MCP client.
+    /// False with an out-of-range selection: the caller may fall through to
+    /// the next binding.
+    fn toggleSelectedMcpClient(app: *App) !bool {
+        if (app.pickers.mcp.selection >= app.mcp_manager.clients.items.len) return false;
+        const client = &app.mcp_manager.clients.items[app.pickers.mcp.selection];
+        switch (client.status()) {
+            .connected => {
+                client.stop(app.io);
+                client.lifecycle = .disabled;
+            },
+            .failed => {
+                // Reconnect on toggle when failed
+                app.mcp_manager.reconnectClient(app.io, app.pickers.mcp.selection);
+            },
+            else => {
+                client.markConnecting();
+            },
+        }
+        provider_model.injectMcpTools(app);
+        return true;
+    }
+
+    /// The add form's submit action: trim the URL, hand it to
+    /// `addMcpServerByUrl` (which owns validation and failure projection),
+    /// and close the form. Reached through `submitMcp` (submitMode) in
+    /// production; the `handleAddInput` `.submit` arm keeps the same action
+    /// for direct callers as defensive parity.
+    fn addMcpFromForm(app: *App) !void {
+        const url = std.mem.trim(u8, app.input_buffers.mcp_url.items, " \t\r\n");
+        if (url.len > 0) provider_model.addMcpServerByUrl(app, url) catch {};
+        app.pickers.mcp.adding = false;
+        app.input_buffers.mcp_url.clearRetainingCapacity();
+    }
+
     /// Text input for the "add server by URL" form. Enter submits, Esc cancels;
     /// printable keys append to the URL buffer and everything else is swallowed.
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
         var field = FormField{ .buf = &app.input_buffers.mcp_url };
         switch (try field.feed(app.gpa, key)) {
-            .submit => {
-                const url = std.mem.trim(u8, app.input_buffers.mcp_url.items, " \t\r\n");
-                if (url.len > 0) provider_model.addMcpServerByUrl(app, url) catch {};
-                app.pickers.mcp.adding = false;
-                app.input_buffers.mcp_url.clearRetainingCapacity();
-            },
+            // Enter delivery is owned by submitMode → submitMcp; this arm
+            // stays for direct callers so the form cannot drift from the
+            // owning path.
+            .submit => try addMcpFromForm(app),
             .cancel => {
                 app.pickers.mcp.adding = false;
                 app.input_buffers.mcp_url.clearRetainingCapacity();
@@ -829,11 +878,7 @@ const PluginsMode = struct {
             return true;
         }
         if (app.pickers.plugins.view == .store and isEnterKey(key)) {
-            // startInstall projects setup failures into the overlay notice;
-            // worker failures are adopted and reported by the lifecycle.
-            app.installSelectedPlugin() catch |err| {
-                log.warn("plugin_store.install.start_failed err={s}", .{@errorName(err)});
-            };
+            startStoreInstall(app);
             return true;
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches(' ', .{})) {
@@ -868,16 +913,34 @@ const PluginsMode = struct {
         return rows[app.pickers.plugins.selection];
     }
 
+    /// Start installing the selected store plugin. Projects setup failures
+    /// into the overlay notice; worker failures are adopted and reported by
+    /// the lifecycle.
+    fn startStoreInstall(app: *App) void {
+        app.installSelectedPlugin() catch |err| {
+            log.warn("plugin_store.install.start_failed err={s}", .{@errorName(err)});
+        };
+    }
+
+    /// The add form's submit action: trim the URL, hand it to `addStore`
+    /// (which owns validation and projects failures into the notice), and
+    /// close the form. Reached through `submitPlugins` (submitMode) in
+    /// production; the `handleAddInput` `.submit` arm keeps the same action
+    /// for direct callers as defensive parity.
+    fn addPluginFromForm(app: *App) !void {
+        const url = std.mem.trim(u8, app.input_buffers.plugin_store_url.items, " \t\r\n");
+        app.addPluginStore(url) catch {};
+        app.pickers.plugins.adding = false;
+        app.input_buffers.plugin_store_url.clearRetainingCapacity();
+    }
+
     fn handleAddInput(app: *App, key: vaxis.Key) !bool {
         var field = FormField{ .buf = &app.input_buffers.plugin_store_url };
         switch (try field.feed(app.gpa, key)) {
-            .submit => {
-                const url = std.mem.trim(u8, app.input_buffers.plugin_store_url.items, " \t\r\n");
-                // addStore owns validation and projects failures into the notice.
-                app.addPluginStore(url) catch {};
-                app.pickers.plugins.adding = false;
-                app.input_buffers.plugin_store_url.clearRetainingCapacity();
-            },
+            // Enter delivery is owned by submitMode → submitPlugins; this
+            // arm stays for direct callers so the form cannot drift from
+            // the owning path.
+            .submit => try addPluginFromForm(app),
             .cancel => {
                 app.pickers.plugins.adding = false;
                 app.input_buffers.plugin_store_url.clearRetainingCapacity();
@@ -993,8 +1056,9 @@ test "session rename form appends printable and multibyte text, pops UTF-8 tails
     try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.backspace }));
     try std.testing.expectEqualStrings("a", app.input_buffers.session_rename_text.items);
 
-    // Enter routes to the confirm routine; an empty rename is a no-op confirm
-    // (the sub-state stays open and the buffer is untouched).
+    // Enter is swallowed (submitMode's session_picker dispatch owns the
+    // rename confirm — handleRenameInput must not re-submit it), so the
+    // sub-state stays open and the buffer is untouched.
     _ = try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.backspace });
     try std.testing.expect(try SessionPicker.handleRenameInput(&app, .{ .codepoint = vaxis.Key.enter }));
     try std.testing.expectEqual(.renaming, app.nav.session_action);

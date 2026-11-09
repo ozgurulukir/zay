@@ -327,19 +327,9 @@ fn routeKey(
             ctx.consumeAndRedraw();
             return;
         }
-        // The MCP and plugin overlays own Enter: it is the add form's submit
-        // while `adding`, or the selected-item action otherwise. `submitMode`
-        // has no `.mcp`/`.plugins` arm (both are in the "no Enter action"
-        // list), so routing Enter through the generic chat `submit` would
-        // bypass their handlers and leave these forms/actions inert.
-        if (app.getMode() == .mcp or app.getMode() == .plugins) {
-            if (try handlePerModeKey(app, root, ctx, key)) {
-                ctx.consumeAndRedraw();
-            } else {
-                ctx.consumeEvent();
-            }
-            return;
-        }
+        // Every mode's Enter disposition is owned by submitMode (the single
+        // wiring site — overlay forms included); the generic chat submit
+        // only fires when no mode arm claimed the key.
         try root.submit(ctx);
         return;
     }
@@ -582,6 +572,124 @@ test "plugin overlay reports an install request before the catalog is ready" {
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
 
     try std.testing.expectEqualStrings("Plugin catalog is not ready yet. Press r to refresh.", app.plugin_store.notice.?);
+}
+
+test "captureEvent delivers settings edit Enter to the editor, not the row re-entry" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // The routing-level proof of the settings Enter fix: routeKey consumes
+    // every Enter before per-mode handlers, so the disposition is decided by
+    // submitSettings' edit-aware guard, not by handleTextEditKey (whose
+    // direct-call tests cannot see the routing).
+    tui.openSettings(&app);
+    try std.testing.expectEqual(App.Mode.settings, app.getMode());
+    app.pickers.settings.tab = .prompt;
+    app.pickers.settings.edit_target = .system_prompt;
+    try app.input_buffers.settings_text.appendSlice(gpa, "draft");
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+    try std.testing.expectEqualStrings("draft\n", app.input_buffers.settings_text.items);
+    try std.testing.expect(app.pickers.settings.edit_target == .system_prompt);
+
+    // Single-line URL field: Enter commits without saving, exactly like the
+    // editor's own documented semantics.
+    app.pickers.settings.tab = .advanced;
+    app.pickers.settings.edit_target = .bash_classifier_url;
+    app.input_buffers.settings_text.clearRetainingCapacity();
+    try app.input_buffers.settings_text.appendSlice(gpa, "https://example.com/a");
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+    try std.testing.expectEqualStrings("https://example.com/a", app.pickers.settings.pending_bash_classifier_url.?);
+    try std.testing.expect(app.pickers.settings.edit_target == .none);
+    gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
+}
+
+test "Enter disposition sweep: every overlay consumes Enter per its submitMode arm" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // Every mode's Enter goes through submitMode (routeKey → root.submit);
+    // the sweep pins each documented disposition plus the global invariant
+    // that nothing leaks into the chat submit buffer. Per-mode setup via a
+    // plain switch — the repo avoids fn-pointer tables.
+    for (std.enums.values(App.Mode)) |m| {
+        app.mode = m;
+        switch (m) {
+            .search => {}, // empty matches: acceptSearchSelection no-ops
+            .command => {}, // empty palette: consumed, nothing executes
+            .settings => {}, // no edit, browsing: row toggles on the current tab
+            .provider_picker => {}, // idle-lane refusal: consumed
+            .model_picker, .tree_picker, .theme_picker => {}, // idle-lane refusal: consumed
+            .session_picker => {}, // browsing, empty list: consumed
+            .save_message => {}, // empty title: consumed by the mode arm
+            .lanes, .help, .diff_viewer, .normal => {}, // no-op or normal submit on empty input
+            .mcp => {}, // list view, no selection change: consumed no-op
+            .plugins => {}, // installed view: consumed no-op (space owns toggle)
+        }
+        try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+        // Nothing may leak into the chat submit on any of these paths.
+        try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
+
+        // Sub-state dispositions that the bare mode sweep cannot see:
+        switch (m) {
+            .settings => {
+                // Active edit: Enter belongs to the editor, not the rows.
+                app.pickers.settings.tab = .prompt;
+                app.pickers.settings.edit_target = .system_prompt;
+                try app.input_buffers.settings_text.appendSlice(gpa, "d");
+                try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+                try std.testing.expectEqualStrings("d\n", app.input_buffers.settings_text.items);
+                app.pickers.settings.edit_target = .none;
+                app.input_buffers.settings_text.clearRetainingCapacity();
+            },
+            .mcp => {
+                // Add form: Enter submits the form, overlay stays open.
+                app.pickers.mcp.adding = true;
+                try app.input_buffers.mcp_url.appendSlice(gpa, "https://example.com/mcp.json");
+                try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+                try std.testing.expect(!app.pickers.mcp.adding);
+                try std.testing.expectEqual(@as(usize, 0), app.input_buffers.mcp_url.items.len);
+                try std.testing.expectEqual(App.Mode.mcp, app.getMode());
+            },
+            .plugins => {
+                // Add form: Enter submits the form, overlay stays open.
+                app.pickers.plugins.adding = true;
+                try app.input_buffers.plugin_store_url.appendSlice(gpa, "https://example.com/store.json");
+                try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+                try std.testing.expect(!app.pickers.plugins.adding);
+                try std.testing.expectEqual(@as(usize, 0), app.input_buffers.plugin_store_url.items.len);
+                try std.testing.expectEqual(App.Mode.plugins, app.getMode());
+            },
+            .session_picker => {
+                // Rename sub-state: Enter confirms via submitMode (empty
+                // rename is a no-op confirm), not through the form handler.
+                app.nav.session_action = .renaming;
+                try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '\r' } });
+                try std.testing.expectEqual(.renaming, app.nav.session_action);
+                app.nav.session_action = .browsing;
+            },
+            else => {},
+        }
+        app.mode = .normal;
+    }
 }
 
 test "single Ctrl-C with empty input arms pending quit" {
