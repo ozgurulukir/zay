@@ -1528,21 +1528,30 @@ pub const Agent = struct {
                     }
                 }
             }
+            const failed = r.failed;
+            // Drops name / expanded label / body / stderr and hands us the
+            // history trio; the result becomes a deinit-safe shell, so the
+            // errdefer loop above would free nothing twice if persistence
+            // fails after this point.
+            const channels = r.takeHistoryChannels(self.gpa);
+            errdefer {
+                // The moved channels are ours until persistence succeeds
+                // (appendPersisted failure leaves ownership with the caller).
+                self.gpa.free(channels.call_id.value);
+                self.gpa.free(channels.content);
+                self.gpa.free(channels.display_label);
+            }
             const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
             errdefer self.gpa.free(blocks);
-            blocks[0] = .{ .text = .{ .text = r.content } };
+            blocks[0] = .{ .text = .{ .text = channels.content } };
             try self.context_manager.appendPersisted(.{
                 .tool = .{
                     .content = blocks,
-                    .call_id = r.call_id,
-                    .display_label = r.display_label,
-                    .failed = r.failed,
+                    .call_id = channels.call_id,
+                    .display_label = channels.display_label,
+                    .failed = failed,
                 },
             });
-            self.gpa.free(r.name);
-            if (r.display_expanded_label) |label| self.gpa.free(label);
-            self.gpa.free(r.display_body);
-            if (r.stderr) |s| self.gpa.free(s);
             r.* = undefined;
             moved += 1;
             if (self.skill_context.entries.items.len != skill_count) {
