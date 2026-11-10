@@ -1535,7 +1535,9 @@ pub const Agent = struct {
             // fails after this point.
             const channels = r.takeHistoryChannels(self.gpa);
             errdefer {
-                // The moved channels are ours until persistence succeeds.
+                // The moved channels are ours until persistence succeeds
+                // (appendPersisted failure leaves ownership with the caller).
+                self.gpa.free(channels.call_id.value);
                 self.gpa.free(channels.content);
                 self.gpa.free(channels.display_label);
             }
