@@ -442,7 +442,7 @@ test "sandbox: globals like type() still work" {
 
 test "sandbox: full access exposes all libraries" {
     var L = try createSandboxedState(.{ .full_access = true });
-    defer L.deinit();
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type(io) == 'table'"));
     try std.testing.expect(L.toBoolean(-1));
