@@ -332,8 +332,7 @@ fn snapshotAllocations(gpa: std.mem.Allocator, L: *c.lua_State) !void {
 
 test "Lua concurrency: snapshot and schema clones unwind every allocation failure" {
     var L = try sandbox.createSandboxedStateWithIo(.{}, testing.io);
-    defer L.deinit();
-    defer sandbox.capFinalizerDeadline(L.handle);
+    defer sandbox.destroySandboxedState(&L);
     try testing.expect(L.doString(
         \\zay.register_tool({name='t',description='description',parameters={p={type='string',description='parameter',enum={'a','b'},default='a"b'}},handler=function() return 'ok' end})
     ));
@@ -439,8 +438,7 @@ test "lock architecture: protected calls and coroutines cannot swallow instructi
     };
     for (cases) |script| {
         var L = try sandbox.createSandboxedState(.{ .instruction_limit = 10, .timeout_ms = 1000 });
-        defer L.deinit();
-        defer sandbox.capFinalizerDeadline(L.handle);
+        defer sandbox.destroySandboxedState(&L);
         try testing.expect(!L.doString(script));
         const err = L.getErrorMessage() orelse return error.MissingLimitError;
         try testing.expect(std.mem.indexOf(u8, err, "instruction limit exceeded") != null);
@@ -455,8 +453,7 @@ test "lock architecture: protected calls and coroutines cannot swallow instructi
 
 test "lock architecture: ordinary protected errors, multiple results and coroutine yields remain usable" {
     var L = try sandbox.createSandboxedState(.{});
-    defer L.deinit();
-    defer sandbox.capFinalizerDeadline(L.handle);
+    defer sandbox.destroySandboxedState(&L);
     try testing.expect(L.doString(
         \\local ok,err=pcall(function() error('ordinary') end)
         \\assert(not ok and string.find(err,'ordinary'))
@@ -477,8 +474,7 @@ test "lock architecture: ordinary protected errors, multiple results and corouti
 test "lock architecture: timeout-only and full-access states retain host execution limits" {
     for ([_]bool{ false, true }) |full_access| {
         var L = try sandbox.createSandboxedState(.{ .instruction_limit = 0, .memory_limit_mb = 0, .timeout_ms = 1, .full_access = full_access });
-        defer L.deinit();
-        defer sandbox.capFinalizerDeadline(L.handle);
+        defer sandbox.destroySandboxedState(&L);
         try testing.expect(!L.doString("while true do pcall(function() while true do end end) end"));
         try testing.expect(std.mem.indexOf(u8, L.getErrorMessage().?, "timeout exceeded") != null);
         L.pop(1);
@@ -681,8 +677,7 @@ test "lock architecture: coroutine budget survives finalizers during Lua close" 
         \\  if ok and res=='ok' then host_observe() end
         \\end})
     );
-    sandbox.capFinalizerDeadline(L.handle);
-    L.deinit();
+    sandbox.destroySandboxedState(&L);
     try testing.expect(loaded);
     try testing.expectEqual(@as(u32, 1), gate.callbacks.load(.acquire));
 }
@@ -701,8 +696,7 @@ test "lock architecture: main-thread finalizer cannot swallow execution limits" 
             \\end})
         );
         const start = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
+        sandbox.destroySandboxedState(&L);
         try testing.expect(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start < 3 * std.time.ns_per_s);
         try testing.expect(loaded);
         try testing.expectEqual(@as(u32, 1), gate.callbacks.load(.acquire));

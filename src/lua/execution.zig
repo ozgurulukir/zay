@@ -355,10 +355,7 @@ const sandbox = @import("sandbox.zig");
 
 test "noteError_ignoresNonCanceledErrors_whenErrorIsNotCanceled" {
     var L = try sandbox.createSandboxedState(.{});
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
 
     const data = budget(L.handle).?;
     try std.testing.expectEqual(StopReason.none, data.stop_reason);
@@ -384,10 +381,7 @@ test "noteError_handlesNullBudget_whenExtraspaceIsNull" {
 
 test "noteError_setsStopReasonToCanceled_whenErrorIsCanceled" {
     var L = try sandbox.createSandboxedState(.{});
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
 
     const data = budget(L.handle).?;
     try std.testing.expectEqual(StopReason.none, data.stop_reason);
@@ -402,10 +396,7 @@ test "noteError_setsStopReasonToCanceled_whenErrorIsCanceled" {
 test "noteError_recancelsIo_whenIoIsPresentAndErrorIsCanceled" {
     const io = std.testing.io;
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
 
     const data = budget(L.handle).?;
     try std.testing.expect(data.io != null);
@@ -783,20 +774,14 @@ test "execution: stopped returns false when no budget attached" {
 
 test "execution: stopped returns false when stop_reason is none" {
     var state = try sandbox.createSandboxedState(.{});
-    defer {
-        sandbox.capFinalizerDeadline(state.handle);
-        state.deinit();
-    }
+    defer sandbox.destroySandboxedState(&state);
 
     try std.testing.expect(!stopped(state.handle));
 }
 
 test "execution: stopped returns true for non-none stop reasons" {
     var state = try sandbox.createSandboxedState(.{});
-    defer {
-        sandbox.capFinalizerDeadline(state.handle);
-        state.deinit();
-    }
+    defer sandbox.destroySandboxedState(&state);
 
     const data = budget(state.handle).?;
 
@@ -815,10 +800,7 @@ test "execution: stopped returns true for non-none stop reasons" {
 
 test "execution: noteError sets stop_reason to canceled when error is Canceled" {
     var state = try sandbox.createSandboxedState(.{});
-    defer {
-        sandbox.capFinalizerDeadline(state.handle);
-        state.deinit();
-    }
+    defer sandbox.destroySandboxedState(&state);
 
     const data = budget(state.handle).?;
     try std.testing.expect(!stopped(state.handle));
