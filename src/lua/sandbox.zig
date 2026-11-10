@@ -397,10 +397,7 @@ pub fn destroySandboxedState(state: *State) void {
 
 test "sandbox: basic creation" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return 2 + 2"));
     try std.testing.expectEqual(@as(i64, 4), L.toInteger(-1));
@@ -409,10 +406,7 @@ test "sandbox: basic creation" {
 
 test "sandbox: blocks io" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return io == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -421,10 +415,7 @@ test "sandbox: blocks io" {
 
 test "sandbox: blocks debug" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return debug == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -433,10 +424,7 @@ test "sandbox: blocks debug" {
 
 test "sandbox: blocks package" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return package == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -445,10 +433,7 @@ test "sandbox: blocks package" {
 
 test "sandbox: globals like type() still work" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type('hello')"));
     try std.testing.expectEqualStrings("string", L.toString(-1).?);
@@ -457,7 +442,7 @@ test "sandbox: globals like type() still work" {
 
 test "sandbox: full access exposes all libraries" {
     var L = try createSandboxedState(.{ .full_access = true });
-    defer L.deinit();
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type(io) == 'table'"));
     try std.testing.expect(L.toBoolean(-1));
@@ -466,10 +451,7 @@ test "sandbox: full access exposes all libraries" {
 
 test "sandbox: blocks rawget and rawset" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return rawget == nil and rawset == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -478,10 +460,7 @@ test "sandbox: blocks rawget and rawset" {
 
 test "sandbox: blocks os.exit" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return os.exit == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -490,10 +469,7 @@ test "sandbox: blocks os.exit" {
 
 test "sandbox: blocks os.execute by default" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return os.execute == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -502,10 +478,7 @@ test "sandbox: blocks os.execute by default" {
 
 test "sandbox: allows os.execute when permitted" {
     var L = try createSandboxedState(.{ .allow_os_execute = true });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type(os.execute) == 'function'"));
     try std.testing.expect(L.toBoolean(-1));
@@ -514,10 +487,7 @@ test "sandbox: allows os.execute when permitted" {
 
 test "sandbox: blocks dofile and loadfile" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return dofile == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -530,10 +500,7 @@ test "sandbox: blocks dofile and loadfile" {
 
 test "sandbox: _G points to restricted environment" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     // _G should not have io
     try std.testing.expect(L.doString("return _G.io == nil"));
@@ -548,10 +515,7 @@ test "sandbox: _G points to restricted environment" {
 
 test "sandbox: instruction limit triggers error" {
     var L = try createSandboxedState(.{ .instruction_limit = 100 });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     // Infinite loop should hit the instruction limit
     try std.testing.expect(!L.doString("while true do end"));
@@ -563,10 +527,7 @@ test "sandbox: instruction limit triggers error" {
 
 test "sandbox: memory limit triggers error" {
     var L = try createSandboxedState(.{ .memory_limit_mb = 1 });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     // Allocate a large table to exceed 1MB
     try std.testing.expect(!L.doString(
@@ -588,10 +549,7 @@ test "sandbox: instruction budget resets between dispatches (T1)" {
     // The hook fires every 1000 instructions, so a 30k-iteration table loop is
     // ~40 hook ticks — under a limit of 100, but two cumulative would exceed it.
     var L = try createSandboxedState(.{ .instruction_limit = 100 });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     // First dispatch consumes most of the budget but stays under it.
     // A successful doString with no return values leaves nothing on the stack.
@@ -605,10 +563,7 @@ test "sandbox: instruction budget resets between dispatches (T1)" {
 
 test "sandbox: without a reset the cumulative budget is exhausted (T1 pins mechanism)" {
     var L = try createSandboxedState(.{ .instruction_limit = 100 });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     // Consume most of the budget. A table-accumulating loop can't be optimized
     // away and produces enough instructions to cross the 100-tick limit across
@@ -626,10 +581,7 @@ test "sandbox: without a reset the cumulative budget is exhausted (T1 pins mecha
 test "sandbox: timeout_ms is enforced (T2)" {
     // High instruction limit so the timeout (not the count) is what fires.
     var L = try createSandboxedState(.{ .instruction_limit = 1_000_000, .timeout_ms = 1 });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     // Arm the per-dispatch deadline, mirroring production (callToolHandler /
     // drainEventCallbacks call resetInstructionBudget before each dispatch).
@@ -647,10 +599,7 @@ test "sandbox: timeout_ms is enforced (T2)" {
 
 test "sandbox: plugin table present with get_config in the restricted env" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type(plugin) == 'table' and type(plugin.get_config) == 'function'"));
     try std.testing.expect(L.toBoolean(-1));
@@ -659,10 +608,7 @@ test "sandbox: plugin table present with get_config in the restricted env" {
 
 test "sandbox: plugin.get_config returns nil without a settings slot" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return plugin.get_config() == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -673,10 +619,7 @@ test "sandbox: plugin table visible in full-access states" {
     // Full-access states skip createRestrictedEnvironment entirely; the table
     // must still be reachable (embedded plugins, the Lua test runner).
     var L = try createSandboxedState(.{ .full_access = true });
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type(plugin.get_config) == 'function'"));
     try std.testing.expect(L.toBoolean(-1));
@@ -685,10 +628,7 @@ test "sandbox: plugin table visible in full-access states" {
 
 test "sandbox: blocks os.remove and os.rename by default" {
     var L = try createSandboxedState(.{});
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return os.remove == nil and os.rename == nil"));
     try std.testing.expect(L.toBoolean(-1));
@@ -699,10 +639,7 @@ test "sandbox: allows path-sanitized os.remove and os.rename when permitted" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("return type(os.remove) == 'function' and type(os.rename) == 'function'"));
     try std.testing.expect(L.toBoolean(-1));
@@ -745,10 +682,7 @@ test "sandbox: allows path-sanitized os.remove and os.rename when permitted" {
 test "sandbox: os.remove and os.rename prevent path traversal outside workspace when permitted" {
     const io = std.testing.io;
     var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
-    defer {
-        capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer destroySandboxedState(&L);
 
     try std.testing.expect(L.doString("local res, err = os.remove('/etc/passwd'); return res == nil and err ~= nil"));
     try std.testing.expect(L.toBoolean(-1));

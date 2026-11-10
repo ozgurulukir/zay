@@ -493,10 +493,7 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
 test "bridges.fs: file_info returns directory type for directories" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
     try std.testing.expect(L.doString("info = zay.file_info('.')"));
     try std.testing.expect(L.doString("assert(info ~= nil, 'info should not be nil')"));
     try std.testing.expect(L.doString("assert(info.type == 'directory', 'type should be directory')"));

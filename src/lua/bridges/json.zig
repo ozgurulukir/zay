@@ -337,10 +337,7 @@ fn expectLuaOk(L: *State, chunk: [:0]const u8) !void {
 test "bridges.json: object becomes Lua table" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local t = zay.json_decode('{"a": 1, "b": "hi"}')
         \\assert(type(t) == "table", "expected table")
@@ -353,10 +350,7 @@ test "bridges.json: object becomes Lua table" {
 test "bridges.json: array becomes 1-indexed table" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local arr = zay.json_decode('[10, 20, 30]')
         \\assert(arr[1] == 10, "arr[1] should be 10")
@@ -369,10 +363,7 @@ test "bridges.json: array becomes 1-indexed table" {
 test "bridges.json: round-trip preserves structure" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local original = '{"id": 7, "steps": [{"text": "a", "done": true}]}'
         \\local decoded = zay.json_decode(original)
@@ -388,10 +379,7 @@ test "bridges.json: round-trip preserves structure" {
 test "bridges.json: table with numeric and mixed keys does not corrupt lua_next" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local t = { [10] = "ten", [20] = "twenty", foo = "bar" }
         \\local encoded = zay.json_encode(t)
@@ -406,10 +394,7 @@ test "bridges.json: table with numeric and mixed keys does not corrupt lua_next"
 test "bridges.json: circular table bounds recursion without host crash" {
     const sandbox = @import("../sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
-    defer {
-        sandbox.capFinalizerDeadline(L.handle);
-        L.deinit();
-    }
+    defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local t = { name = "node" }
         \\t.self = t
