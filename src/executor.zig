@@ -88,6 +88,45 @@ pub const ToolResult = struct {
         self.* = undefined;
     }
 
+    /// The channels that persist into assistant history: the LLM-facing
+    /// observation plus the pieces the TUI needs to render the collapsed
+    /// tool call. Ownership of all three moves to the caller.
+    pub const HistoryChannels = struct {
+        content: []u8,
+        call_id: ai.CallId,
+        display_label: []u8,
+    };
+
+    /// Free the channels history persistence drops (identity and expanded
+    /// display strings) and return the three that move into the history
+    /// block. Split-owner next to `deinit`: adding a ToolResult field means
+    /// deciding here whether it moves into history or is dropped, so the
+    /// persistence path and teardown cannot drift apart.
+    ///
+    /// Afterwards the result is a deinit-safe shell (every field an empty
+    /// slice or null) whose moved fields belong to the caller: store them on
+    /// success, or free them and run `deinit` on the shell — both are exactly
+    /// once per allocation on either path.
+    pub fn takeHistoryChannels(self: *ToolResult, gpa: std.mem.Allocator) HistoryChannels {
+        const moved = HistoryChannels{
+            .content = self.content,
+            .call_id = self.call_id,
+            .display_label = self.display_label,
+        };
+        gpa.free(self.name);
+        if (self.display_expanded_label) |label| gpa.free(label);
+        gpa.free(self.display_body);
+        if (self.stderr) |s| gpa.free(s);
+        self.call_id = .{ .value = "" };
+        self.content = "";
+        self.name = "";
+        self.display_label = "";
+        self.display_expanded_label = null;
+        self.display_body = "";
+        self.stderr = null;
+        return moved;
+    }
+
     /// Build inputs for `ToolResult.init`. Split into "moved" (ownership
     /// transferred into the result on success; the caller keeps an `errdefer`
     /// for each until the call returns) and "borrowed" (`init` dupes these),
@@ -2196,6 +2235,45 @@ test "freesAllAllocatedFields_whenDeinitedWithOptionalFields" {
     });
 
     res.deinit(gpa);
+}
+
+test "takeHistoryChannels moves the history trio and leaves a deinit-safe shell" {
+    const gpa = std.testing.allocator;
+
+    const content = try gpa.dupe(u8, "observation");
+    errdefer gpa.free(content);
+    const label = try gpa.dupe(u8, "label");
+    errdefer gpa.free(label);
+    const expanded_label = try gpa.dupe(u8, "expanded");
+    errdefer gpa.free(expanded_label);
+    const display_body = try gpa.dupe(u8, "body");
+    errdefer gpa.free(display_body);
+
+    var res = try ToolResult.init(gpa, .{
+        .call_id = "call_123",
+        .name = "bash",
+        .stderr = "boom",
+        .content = content,
+        .display = .{ .label = label, .expanded_label = expanded_label },
+        .display_body = display_body,
+    });
+
+    const channels = res.takeHistoryChannels(gpa);
+    // The moved channels are ours now; the shell must survive a deinit
+    // (freeing nothing) so a persistence failure after the take stays
+    // exactly once per allocation.
+    defer {
+        gpa.free(channels.call_id.value);
+        gpa.free(channels.content);
+        gpa.free(channels.display_label);
+        res.deinit(gpa);
+    }
+    try std.testing.expectEqualStrings("observation", channels.content);
+    try std.testing.expectEqualStrings("call_123", channels.call_id.value);
+    try std.testing.expectEqualStrings("label", channels.display_label);
+    try std.testing.expectEqualStrings("", res.name);
+    try std.testing.expectEqual(@as(?[]u8, null), res.display_expanded_label);
+    try std.testing.expectEqual(@as(?[]u8, null), res.stderr);
 }
 
 test "freesAllAllocatedFields_whenDeinitedWithoutOptionalFields" {
