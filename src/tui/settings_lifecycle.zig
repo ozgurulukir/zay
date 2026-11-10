@@ -13,6 +13,8 @@ const runtime_mod = @import("../runtime.zig");
 const settings_widget = @import("widgets/settings.zig");
 const toast = @import("toast.zig");
 
+const command_router = @import("command_router.zig");
+
 const App = tui.App;
 const State = settings_widget.State;
 const Tab = settings_widget.Tab;
@@ -22,22 +24,40 @@ const EditTarget = settings_widget.EditTarget;
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// The use_responses_endpoint a config currently resolves to — the
+/// model_selection shape when present, the legacy flat field otherwise.
+fn currentResponsesEndpoint(config: *const config_mod.Config) bool {
+    if (config.model_selection) |ms| return ms.useResponsesEndpoint();
+    return config.use_responses_endpoint orelse false;
+}
+
+/// The system prompt a config currently resolves to ("" when unset), in the
+/// same model_selection-aware way as `currentResponsesEndpoint`.
+fn currentSystemPrompt(config: *const config_mod.Config) []const u8 {
+    if (config.model_selection) |ms| return ms.systemPrompt() orelse "";
+    return config.system_prompt orelse "";
+}
+
+/// Toggle a bool pending field against its config value. Returns the new
+/// dirty flag: only an outcome that differs from the config marks the panel.
+fn togglePending(pending: *?bool, config_value: bool) bool {
+    const new_value = !(pending.* orelse config_value);
+    pending.* = new_value;
+    return new_value != config_value;
+}
+
 /// Check if pending values differ from current config values. A null
 /// pending means "not touched"; an empty-string pending means "cleared"
 /// and compares as a change against any non-empty current value.
 fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool {
     if (state.pending_use_responses_endpoint) |v| {
-        const current_value = if (config.model_selection) |ms| ms.useResponsesEndpoint() else config.use_responses_endpoint orelse false;
-        if (v != current_value) return true;
+        if (v != currentResponsesEndpoint(config)) return true;
     }
     if (state.pending_system_prompt) |s| {
-        const current_value = if (config.model_selection) |ms| ms.systemPrompt() else config.system_prompt;
-        const current_prompt = current_value orelse "";
-        if (!std.mem.eql(u8, s, current_prompt)) return true;
+        if (!std.mem.eql(u8, s, currentSystemPrompt(config))) return true;
     }
     if (state.pending_bash_classifier_url) |s| {
-        const current_value = if (config.model_selection) |ms| ms.bashClassifierUrl() else config.bash_classifier_url;
-        const current_url = current_value orelse "";
+        const current_url = cachedClassifierUrl(config) orelse "";
         if (!std.mem.eql(u8, s, current_url)) return true;
     }
     if (state.pending_toast_enabled) |v| {
@@ -120,55 +140,34 @@ fn submitGeneralItem(app: *App, state: *State) !void {
     switch (state.selection[@intFromEnum(Tab.general)]) {
         0 => {
             // Toggle use_responses_endpoint.
-            const current = state.pending_use_responses_endpoint orelse
-                (if (app.cached_config.model_selection) |ms| ms.useResponsesEndpoint() else app.cached_config.use_responses_endpoint orelse false);
-            const new_value = !current;
-            state.pending_use_responses_endpoint = new_value;
-            // Only mark dirty if the new value differs from the config
-            const config_value = if (app.cached_config.model_selection) |ms| ms.useResponsesEndpoint() else app.cached_config.use_responses_endpoint orelse false;
-            state.dirty = (new_value != config_value);
+            state.dirty = togglePending(&state.pending_use_responses_endpoint, currentResponsesEndpoint(&app.cached_config));
         },
         1 => {
             // Toggle toast notifications.
-            const current = state.pending_toast_enabled orelse
-                (app.cached_config.toast.enabled orelse true);
-            const new_value = !current;
-            state.pending_toast_enabled = new_value;
-            const config_value = app.cached_config.toast.enabled orelse true;
-            state.dirty = (new_value != config_value);
+            state.dirty = togglePending(&state.pending_toast_enabled, app.cached_config.toast.enabled orelse true);
         },
         else => {},
     }
 }
 
+/// Enter the text editor for a settings row: point `target` at the field and
+/// seed the shared buffer from `current` (the live config value).
+fn beginTextEdit(app: *App, state: *State, target: EditTarget, current: []const u8) void {
+    state.edit_target = target;
+    app.input_buffers.settings_text.clearRetainingCapacity();
+    app.input_buffers.settings_text.appendSlice(app.gpa, current) catch {};
+}
+
 fn submitPromptItem(app: *App, state: *State) void {
     switch (state.selection[@intFromEnum(Tab.prompt)]) {
-        0 => {
-            // Enter edit mode for system prompt.
-            state.edit_target = .system_prompt;
-            const current = if (app.cached_config.model_selection) |ms|
-                (ms.systemPrompt() orelse "")
-            else
-                "";
-            app.input_buffers.settings_text.clearRetainingCapacity();
-            app.input_buffers.settings_text.appendSlice(app.gpa, current) catch {};
-        },
+        0 => beginTextEdit(app, state, .system_prompt, currentSystemPrompt(&app.cached_config)),
         else => {},
     }
 }
 
 fn submitAdvancedItem(app: *App, state: *State) void {
     switch (state.selection[@intFromEnum(Tab.advanced)]) {
-        0 => {
-            // Enter edit mode for bash_classifier_url.
-            state.edit_target = .bash_classifier_url;
-            const current = if (app.cached_config.model_selection) |ms|
-                (ms.bashClassifierUrl() orelse "")
-            else
-                "";
-            app.input_buffers.settings_text.clearRetainingCapacity();
-            app.input_buffers.settings_text.appendSlice(app.gpa, current) catch {};
-        },
+        0 => beginTextEdit(app, state, .bash_classifier_url, cachedClassifierUrl(&app.cached_config) orelse ""),
         else => {},
     }
 }
@@ -177,23 +176,21 @@ fn submitAdvancedItem(app: *App, state: *State) void {
 // Delete key — clear a text field
 // ---------------------------------------------------------------------------
 
+/// Stage "" as the pending value for a text field: "cleared" is the empty
+/// string, NOT null — a null pending means "not touched" and never reaches
+/// the save path.
+fn clearPendingText(app: *App, state: *State, pending: *?[]const u8) void {
+    const cleared = app.gpa.dupe(u8, "") catch return;
+    if (pending.*) |old| app.gpa.free(old);
+    pending.* = cleared;
+    state.dirty = hasActualChanges(state, &app.cached_config);
+}
+
 pub fn clearCurrentField(app: *App) void {
     const state = &app.pickers.settings;
     switch (state.tab) {
-        .prompt => {
-            // "Cleared" is the empty string, NOT null: a null pending means
-            // "not touched" and never reaches the save path.
-            const cleared = app.gpa.dupe(u8, "") catch return;
-            if (state.pending_system_prompt) |old| app.gpa.free(old);
-            state.pending_system_prompt = cleared;
-            state.dirty = hasActualChanges(state, &app.cached_config);
-        },
-        .advanced => {
-            const cleared = app.gpa.dupe(u8, "") catch return;
-            if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
-            state.pending_bash_classifier_url = cleared;
-            state.dirty = hasActualChanges(state, &app.cached_config);
-        },
+        .prompt => clearPendingText(app, state, &state.pending_system_prompt),
+        .advanced => clearPendingText(app, state, &state.pending_bash_classifier_url),
         .general, .about => {},
     }
 }
@@ -403,20 +400,27 @@ fn applyPendingText(arena: std.mem.Allocator, target: *?[]u8, pending: ?[]const 
     target.* = if (s.len > 0) try arena.dupe(u8, s) else null;
 }
 
+/// Apply the two pending text fields to a config payload's owned fields.
+/// Shared by every model_selection variant and the legacy flat fields: all
+/// three payloads carry the same system_prompt / bash_classifier_url pair.
+fn applyPendingTextFields(arena: std.mem.Allocator, system_prompt: *?[]u8, classifier_url: *?[]u8, state: *const State) !void {
+    try applyPendingText(arena, system_prompt, state.pending_system_prompt);
+    try applyPendingText(arena, classifier_url, state.pending_bash_classifier_url);
+}
+
 fn applyToCachedConfig(app: *App, state: *const State) !void {
     const config_arena = app.config_arena orelse return;
+    const arena = config_arena.allocator();
     if (app.cached_config.model_selection) |*ms| {
         // Model selection exists: update it directly
         switch (ms.*) {
             .builtin => |*b| {
                 if (state.pending_use_responses_endpoint) |v| b.use_responses_endpoint = v;
-                try applyPendingText(config_arena.allocator(), &b.system_prompt, state.pending_system_prompt);
-                try applyPendingText(config_arena.allocator(), &b.bash_classifier_url, state.pending_bash_classifier_url);
+                try applyPendingTextFields(arena, &b.system_prompt, &b.bash_classifier_url, state);
             },
             .custom => |*c| {
                 if (state.pending_use_responses_endpoint) |v| c.use_responses_endpoint = v;
-                try applyPendingText(config_arena.allocator(), &c.system_prompt, state.pending_system_prompt);
-                try applyPendingText(config_arena.allocator(), &c.bash_classifier_url, state.pending_bash_classifier_url);
+                try applyPendingTextFields(arena, &c.system_prompt, &c.bash_classifier_url, state);
             },
         }
     } else {
@@ -425,8 +429,7 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
         // only acts when one already exists, so calling it here would be a
         // guaranteed no-op.
         if (state.pending_use_responses_endpoint) |v| app.cached_config.use_responses_endpoint = v;
-        try applyPendingText(config_arena.allocator(), &app.cached_config.system_prompt, state.pending_system_prompt);
-        try applyPendingText(config_arena.allocator(), &app.cached_config.bash_classifier_url, state.pending_bash_classifier_url);
+        try applyPendingTextFields(arena, &app.cached_config.system_prompt, &app.cached_config.bash_classifier_url, state);
     }
     // Toast toggle applies regardless of model_selection shape.
     if (state.pending_toast_enabled) |v| app.cached_config.toast.enabled = v;
@@ -580,12 +583,7 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
 }
 
 fn popSettingsTextInput(app: *App) void {
-    const items = app.input_buffers.settings_text.items;
-    if (items.len == 0) return;
-    // Walk back over continuation bytes to preserve UTF-8 codepoint boundary.
-    var cut = items.len - 1;
-    while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
-    app.input_buffers.settings_text.shrinkRetainingCapacity(cut);
+    command_router.popUtf8Tail(&app.input_buffers.settings_text);
 }
 
 // ---------------------------------------------------------------------------
