@@ -540,3 +540,74 @@ pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !
     }
     return visible_change;
 }
+
+test "setLaneTitleIfUnset derives the title from the first prompt line" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_helpers = @import("test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try test_helpers.addIdleFocusedLane(gpa, &app, "tl-title1");
+    const lane = app.thread;
+    try setLaneTitleIfUnset(&app, lane, "  fix the parser bug  \nsecond line");
+    try std.testing.expectEqualStrings("fix the parser bug", lane.title.?);
+
+    // An already-titled lane keeps its title.
+    try setLaneTitleIfUnset(&app, lane, "a different prompt");
+    try std.testing.expectEqualStrings("fix the parser bug", lane.title.?);
+
+    // Blank prompts never set a title.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "tl-title2");
+    try setLaneTitleIfUnset(&app, app.thread, "   \r\n ");
+    try std.testing.expectEqual(@as(?[]u8, null), app.thread.title);
+
+    // A long prompt truncates to the 40-char cap plus an ellipsis.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "tl-title3");
+    try setLaneTitleIfUnset(&app, app.thread, "x" ** 60);
+    const long_title = app.thread.title.?;
+    try std.testing.expectEqual(@as(usize, 43), long_title.len); // 40 chars + "…" (3 bytes)
+    try std.testing.expect(std.mem.endsWith(u8, long_title, "…"));
+    // Titles are owned by the lane and freed with it (app.deinit above).
+}
+
+test "resetTurnState clears the failure record and turn counters" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_helpers = @import("test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+    try test_helpers.addIdleFocusedLane(gpa, &app, "tl-reset");
+
+    const lane = app.thread;
+    lane.turn_failed = try gpa.dupe(u8, "boom");
+    lane.turn_tool_calls = 7;
+    lane.stall_warned = true;
+    lane.last_activity_ms = 0;
+
+    resetTurnState(&app, lane);
+    try std.testing.expectEqual(@as(?[]u8, null), lane.turn_failed);
+    try std.testing.expectEqual(@as(u32, 0), lane.turn_tool_calls);
+    try std.testing.expect(!lane.stall_warned);
+    // The activity clock re-anchored to now, not to the stale 0.
+    const now_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+    try std.testing.expect(lane.last_activity_ms <= now_ms);
+}
+
+test "formatNoProviderMessage falls back to the connect hint without a runtime" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // No live runtime and no model selection: the generic connect hint.
+    const message = try formatNoProviderMessage(&app);
+    defer gpa.free(message);
+    try std.testing.expect(std.mem.indexOf(u8, message, "/connect") != null);
+}

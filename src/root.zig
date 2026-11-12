@@ -816,4 +816,12 @@ test {
     _ = @import("db/http_transport.zig");
     _ = @import("models/registry.zig");
     _ = @import("tools/database.zig");
+    // Session type leaves (id/project-key validation) and the entry payload
+    // serializer; only transitively imported through session.zig before, so
+    // their inline tests were never analyzed (silent-drop guard).
+    _ = @import("session/types.zig");
+    _ = @import("session/serialize.zig");
+    // Plugin tool-metadata capture leaf; same transitive-only situation
+    // through the lua subtree.
+    _ = @import("lua/tool_snapshot.zig");
 }

@@ -328,3 +328,87 @@ pub fn deleteSelectedParked(app: *App) !void {
     }
     try reloadParkedLanes(app);
 }
+
+test "activeIndex reports the focused lane's position" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../../agent.zig");
+    const test_helpers = @import("../test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A fresh app carries its primary lane; each fixture lane is appended
+    // after it and focused, so its index equals the list length before it.
+    const base = app.threads.len();
+    try test_helpers.addIdleFocusedLane(gpa, &app, "mf-a");
+    try std.testing.expectEqual(base, @as(usize, activeIndex(&app)));
+    // The second fixture lane is focused, so its index is one further.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "mf-b");
+    try std.testing.expectEqual(base + 1, @as(usize, activeIndex(&app)));
+}
+
+test "laneIdOf returns the worktree path's last segment" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../../agent.zig");
+    const test_helpers = @import("../test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try test_helpers.addIdleFocusedLane(gpa, &app, "lane-abc123");
+    const id = laneIdOf(app.thread).?;
+    try std.testing.expectEqualStrings("lane-abc123", id);
+}
+
+test "laneMergeDir prefers the lane worktree path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../../agent.zig");
+    const test_helpers = @import("../test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try test_helpers.addIdleFocusedLane(gpa, &app, "mf-dir");
+    // A working lane merges from its own worktree, not the repo root.
+    try std.testing.expectEqualStrings("/tmp/zay-lanes/mf-dir", laneMergeDir(&app, app.thread).?);
+}
+
+test "laneOpenAtPath matches open worktrees exactly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../../agent.zig");
+    const test_helpers = @import("../test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try test_helpers.addIdleFocusedLane(gpa, &app, "mf-open");
+    try std.testing.expect(laneOpenAtPath(&app, "/tmp/zay-lanes/mf-open"));
+    try std.testing.expect(!laneOpenAtPath(&app, "/tmp/zay-lanes/other"));
+    try std.testing.expect(!laneOpenAtPath(&app, "/tmp/zay-lanes/mf-open/extra"));
+}
+
+test "discardUndeliveredCompletion is a no-op for a primary lane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../../agent.zig");
+    const test_helpers = @import("../test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A primary lane has no spawner generation: the discard path must
+    // return without touching engine state.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "mf-primary");
+    discardUndeliveredCompletion(&app, app.thread);
+    try std.testing.expect(app.thread.engine == .idle);
+    try std.testing.expect(!app.thread.completion_delivered);
+}

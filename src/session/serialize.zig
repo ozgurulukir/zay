@@ -227,3 +227,107 @@ pub fn utf8PrefixLen(text: []const u8, limit: u32) u32 {
     }
     return limit;
 }
+
+test "titleFromUserMessage takes the first line and trims whitespace" {
+    const gpa = std.testing.allocator;
+    {
+        const title = (try titleFromUserMessage(gpa, "  fix the parser bug  \n\nsecond line")).?;
+        defer gpa.free(title);
+        try std.testing.expectEqualStrings("fix the parser bug", title);
+    }
+    // Whitespace-only content has no title (the trim set includes newlines,
+    // so even "\nhello" yields a title, not null).
+    try std.testing.expectEqual(@as(?[]u8, null), try titleFromUserMessage(gpa, "   \r\n\t "));
+    {
+        const title = (try titleFromUserMessage(gpa, "\nhello")).?;
+        defer gpa.free(title);
+        try std.testing.expectEqualStrings("hello", title);
+    }
+    {
+        const title = (try titleFromUserMessage(gpa, "short")).?;
+        defer gpa.free(title);
+        try std.testing.expectEqualStrings("short", title);
+    }
+}
+
+test "titleFromUserMessage truncates long titles on a UTF-8 boundary" {
+    const gpa = std.testing.allocator;
+    // 81 ASCII characters: longer than the 80-char title cap.
+    const long = "x" ** 81;
+    const title = (try titleFromUserMessage(gpa, long)).?;
+    defer gpa.free(title);
+    try std.testing.expect(title.len < 84); // cut + "..."
+    try std.testing.expect(std.mem.endsWith(u8, title, "..."));
+
+    // A multi-byte sequence straddling the cut must not be split mid-codepoint:
+    // build a 79-char prefix of 'a' then a 3-byte codepoint so the naive
+    // 80-byte cut would land inside it.
+    const straddle = "a" ** 78 ++ "\xe2\x9c\x93\xe2\x9c\x93"; // two check marks
+    const cut_title = (try titleFromUserMessage(gpa, straddle)).?;
+    defer gpa.free(cut_title);
+    const body = cut_title[0 .. cut_title.len - 3];
+    // Every prefix must end on a codepoint boundary (no stray continuation bytes).
+    try std.testing.expect((body[body.len - 1] & 0xc0) != 0x80);
+}
+
+test "utf8PrefixLen never splits a multi-byte codepoint" {
+    const text = "ab" ++ "\xe2\x9c\x93" ++ "cd"; // a, b, ✓(3 bytes), c, d
+    // Limit inside the ✓ sequence backs up to its start (after "ab").
+    try std.testing.expectEqual(@as(u32, 2), utf8PrefixLen(text, 3));
+    try std.testing.expectEqual(@as(u32, 2), utf8PrefixLen(text, 4));
+    // Limit after the full codepoint keeps it whole.
+    try std.testing.expectEqual(@as(u32, 5), utf8PrefixLen(text, 5));
+}
+
+test "compaction payload round-trips through toJson and its parsers" {
+    const gpa = std.testing.allocator;
+    const first_kept = "0123abcd";
+    const payload = try compactionToJson(gpa, first_kept, "kept the summary of everything before");
+    defer gpa.free(payload);
+
+    {
+        const parsed_id = try compactionFirstKeptId(gpa, payload);
+        try std.testing.expectEqualSlices(u8, first_kept, &parsed_id);
+    }
+    {
+        const summary = try compactionSummaryText(gpa, payload);
+        defer gpa.free(summary);
+        try std.testing.expectEqualStrings("kept the summary of everything before", summary);
+    }
+    // Corrupt payloads are reported, not silently accepted.
+    try std.testing.expectError(error.CorruptPayload, compactionFirstKeptId(gpa, "not json"));
+    try std.testing.expectError(error.BadEntryId, compactionFirstKeptId(gpa, "{\"first_kept_id\":\"short\"}"));
+}
+
+test "optionalString and optionalBool distinguish absent from corrupt" {
+    const gpa = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"name":"zay","flag":true,"count":3}
+    , .{});
+    defer parsed.deinit();
+    const value = parsed.value;
+
+    {
+        const name = (try optionalString(gpa, value, "name")).?;
+        defer gpa.free(name);
+        try std.testing.expectEqualStrings("zay", name);
+    }
+    // Absent field → null; present but non-string → error.
+    try std.testing.expectEqual(@as(?[]u8, null), try optionalString(gpa, value, "missing"));
+    try std.testing.expectError(error.CorruptPayload, optionalString(gpa, value, "count"));
+
+    try std.testing.expect(try optionalBool(value, "flag"));
+    // Absent field defaults to false; present but non-bool → error.
+    try std.testing.expect(!try optionalBool(value, "missing"));
+    try std.testing.expectError(error.CorruptPayload, optionalBool(value, "name"));
+}
+
+test "titleToJson escapes quotes for embedding in stored payloads" {
+    const gpa = std.testing.allocator;
+    const encoded = try titleToJson(gpa, "say \"hi\" \\ back");
+    defer gpa.free(encoded);
+    // The escaping must produce valid JSON that parses back to the title.
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("say \"hi\" \\ back", parsed.value.object.get("title").?.string);
+}

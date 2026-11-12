@@ -538,3 +538,46 @@ pub fn handleDiffCommentKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vax
     }
     // Typed text / backspace handled by the focused comment input.
 }
+
+test "installDiffCounts installs changed counts and reports no-op repeats" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../agent.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // First install differs from the zero default → reported as changed.
+    try std.testing.expect(installDiffCounts(&app, .{ .additions = 12, .deletions = 3 }));
+    try std.testing.expectEqual(@as(u32, 12), app.metrics.diff_counts.additions);
+    try std.testing.expectEqual(@as(u32, 3), app.metrics.diff_counts.deletions);
+    // The same counts install as a no-op.
+    try std.testing.expect(!installDiffCounts(&app, .{ .additions = 12, .deletions = 3 }));
+    // Only one half changing still reports a change.
+    try std.testing.expect(installDiffCounts(&app, .{ .additions = 12, .deletions = 4 }));
+}
+
+test "runDiffRefresh fails cleanly outside a repository and owns the job lifetime" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    // A directory outside any git repo: `git diff HEAD` exits non-zero, so
+    // the refresh reports .failed — the drain path keeps the prior cache in
+    // that case rather than crashing the pipeline.
+    const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "nogit" });
+    defer gpa.free(dir_path);
+
+    const job = try gpa.create(DiffRefreshJob);
+    job.* = .{ .gpa = gpa, .io = io, .cwd = try gpa.dupe(u8, dir_path) };
+    // runDiffRefresh takes ownership: it deinits and destroys the job itself.
+    // The testing allocator's leak check proves the handoff is complete.
+    const cancel_requested: std.atomic.Value(bool) = .init(false);
+    var outcome = runDiffRefresh(job, &cancel_requested);
+    defer outcome.deinit(gpa);
+
+    try std.testing.expect(outcome == .failed);
+}

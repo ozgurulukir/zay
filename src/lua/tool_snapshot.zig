@@ -205,3 +205,47 @@ fn luaValueToJson(gpa: std.mem.Allocator, L: *c.lua_State) ![]const u8 {
     const ptr = c.lua_tolstring(L, -1, &len) orelse return gpa.dupe(u8, "null");
     return std.json.Stringify.valueAlloc(gpa, ptr[0..len], .{});
 }
+
+test "parseToolParamType maps the documented Lua type names" {
+    // Every name the plugin tool-teaching docs allow.
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, parseToolParamType("string"));
+    try std.testing.expectEqual(tools_common.Schema.Kind.integer, parseToolParamType("integer"));
+    try std.testing.expectEqual(tools_common.Schema.Kind.number, parseToolParamType("number"));
+    try std.testing.expectEqual(tools_common.Schema.Kind.boolean, parseToolParamType("boolean"));
+    try std.testing.expectEqual(tools_common.Schema.Kind.object, parseToolParamType("object"));
+    try std.testing.expectEqual(tools_common.Schema.Kind.array, parseToolParamType("array"));
+    // An unknown or misspelled type falls back to string rather than
+    // producing a schema the wire layer cannot express.
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, parseToolParamType("float"));
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, parseToolParamType(""));
+}
+
+test "ToolSnapshot.deinit frees the owned metadata" {
+    const gpa = std.testing.allocator;
+    // deinit must release the name, description, and schema allocations —
+    // the testing allocator fails the suite on any leak here.
+    var snapshot = ToolSnapshot{
+        .name = try gpa.dupe(u8, "todo_add"),
+        .description = try gpa.dupe(u8, "Add a todo item"),
+        .schema = try testSchemaWithOwnedProperty(),
+        .index = 3,
+    };
+    snapshot.deinit(gpa);
+}
+
+/// Build a schema owning one property so deinit's schema free is exercised
+/// on non-empty memory.
+fn testSchemaWithOwnedProperty() !tools_common.Schema {
+    const gpa = std.testing.allocator;
+    var schema: tools_common.Schema = .{ .properties = &.{} };
+    errdefer schema.deinit(gpa);
+    const properties = try gpa.alloc(tools_common.Schema.Property, 1);
+    properties[0] = .{
+        .name = try gpa.dupe(u8, "title"),
+        .kind = .string,
+        .description = try gpa.dupe(u8, "Todo title"),
+        .required = true,
+    };
+    schema.properties = properties;
+    return schema;
+}

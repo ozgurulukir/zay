@@ -40,6 +40,13 @@ const turn_lifecycle = @import("turn_lifecycle.zig");
 const tools_mod = @import("../tools.zig");
 const draw_root_layout = @import("root_layout.zig");
 const background_delivery = @import("background_delivery.zig");
+// Files that were previously only transitively imported (through tui.zig):
+// their inline test blocks are analyzed only when the file itself is
+// referenced here directly (silent-test-discovery rule).
+const app_state_mod = @import("app_state.zig");
+const diff_lifecycle_mod = @import("diff_lifecycle.zig");
+const merge_flow_mod = @import("lanes/merge_flow.zig");
+const overlay_widget_mod = @import("widgets/overlay.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 
 const App = tui.App;
