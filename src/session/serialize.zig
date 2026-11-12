@@ -259,14 +259,17 @@ test "titleFromUserMessage truncates long titles on a UTF-8 boundary" {
     try std.testing.expect(title.len < 84); // cut + "..."
     try std.testing.expect(std.mem.endsWith(u8, title, "..."));
 
-    // A multi-byte sequence straddling the cut must not be split mid-codepoint:
-    // build a 79-char prefix of 'a' then a 3-byte codepoint so the naive
-    // 80-byte cut would land inside it.
-    const straddle = "a" ** 78 ++ "\xe2\x9c\x93\xe2\x9c\x93"; // two check marks
+    // A multi-byte sequence straddling the cut must not be split mid-codepoint.
+    // With 76 ASCII bytes the byte at index 77 (the cut limit) is the middle
+    // continuation byte of the first check mark, so utf8PrefixLen's backup
+    // loop actually walks 77 -> 76 before landing on the lead byte.
+    const straddle = "a" ** 76 ++ "\xe2\x9c\x93\xe2\x9c\x93"; // two check marks
     const cut_title = (try titleFromUserMessage(gpa, straddle)).?;
     defer gpa.free(cut_title);
     const body = cut_title[0 .. cut_title.len - 3];
-    // Every prefix must end on a codepoint boundary (no stray continuation bytes).
+    // The cut lands on the lead byte of the check mark: exactly 76 bytes.
+    try std.testing.expectEqual(@as(usize, 76), body.len);
+    // The prefix must end on a codepoint boundary (no stray continuation bytes).
     try std.testing.expect((body[body.len - 1] & 0xc0) != 0x80);
 }
 

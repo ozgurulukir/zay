@@ -558,17 +558,18 @@ test "installDiffCounts installs changed counts and reports no-op repeats" {
     try std.testing.expect(installDiffCounts(&app, .{ .additions = 12, .deletions = 4 }));
 }
 
-test "runDiffRefresh fails cleanly outside a repository and owns the job lifetime" {
+test "runDiffRefresh reports .failed when the working directory is missing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd_abs = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd_abs);
-    // A directory outside any git repo: `git diff HEAD` exits non-zero, so
-    // the refresh reports .failed — the drain path keeps the prior cache in
-    // that case rather than crashing the pipeline.
-    const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "nogit" });
+    // The directory does not exist, so process spawn itself fails before any
+    // git runs — the catch maps every launch failure to .failed, and the
+    // drain path keeps the prior cache in that case rather than crashing
+    // the pipeline.
+    const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "missing" });
     defer gpa.free(dir_path);
 
     const job = try gpa.create(DiffRefreshJob);
@@ -580,4 +581,44 @@ test "runDiffRefresh fails cleanly outside a repository and owns the job lifetim
     defer outcome.deinit(gpa);
 
     try std.testing.expect(outcome == .failed);
+}
+
+test "runDiffRefresh outside a git repository reports an empty ready diff" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    // A real non-repository directory: runDiffRefresh does not inspect the
+    // exit code, so a non-zero git exit (an empty repo's `git diff HEAD` is
+    // fatal: unknown revision) arrives as .ready with whatever stdout came
+    // back — empty here. That is the empty-diff path the viewer renders as
+    // "No changes to review."
+    const dir_path = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "emptyrepo" });
+    defer gpa.free(dir_path);
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_path);
+
+    // An initialized-but-commitless repo keeps the fixture hermetic: an
+    // uninitialized directory under .zig-cache/tmp would still resolve
+    // rev-parse up to the enclosing zay repo.
+    var init_result = try bash_mod.runWithOptions(gpa, io, .{
+        .cwd = dir_path,
+        .command = "git init",
+        .timeout = bash_mod.timeoutFromSeconds(10),
+    });
+    defer init_result.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 0), init_result.code);
+
+    const job = try gpa.create(DiffRefreshJob);
+    job.* = .{ .gpa = gpa, .io = io, .cwd = try gpa.dupe(u8, dir_path) };
+    const cancel_requested: std.atomic.Value(bool) = .init(false);
+    var outcome = runDiffRefresh(job, &cancel_requested);
+    defer outcome.deinit(gpa);
+
+    const raw = switch (outcome) {
+        .ready => |payload| payload,
+        .failed => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("", raw);
 }
