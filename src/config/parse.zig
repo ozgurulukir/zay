@@ -1659,7 +1659,9 @@ var write_serial: std.atomic.Value(u64) = .init(0);
 /// The file is synced before the rename so a crash cannot leave the rename
 /// durable while its data blocks are not; std.Io exposes no directory sync,
 /// so the rename's own durability stays filesystem-dependent. A failed write
-/// unlinks its temp file, so no `.tmp` litter outlives an error return.
+/// unlinks its temp file; a failed unlink (an antivirus hold on Windows) is
+/// swallowed so it cannot mask the write error, and may leave a stale
+/// `.tmp` behind.
 fn writeConfigFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, config: Config) !void {
     const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);

@@ -141,10 +141,12 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         }
         if (pruned > 0) {
             // Report which keys went, not just how many: a destructive prune
-            // must be distinguishable from an allowlist accident.
-            const joined = std.mem.join(runtime_gpa, ",", pruned_names.items) catch "<join-failed>";
-            defer runtime_gpa.free(joined);
-            log.warn("auth.integrity.pruned count={d} keys={s}", .{ pruned, joined });
+            // must be distinguishable from an allowlist accident. A join
+            // failure (OOM) still reports the count, and only the owned
+            // buffer is freed — never the literal fallback.
+            const joined: ?[]u8 = std.mem.join(runtime_gpa, ",", pruned_names.items) catch null;
+            defer if (joined) |text| runtime_gpa.free(text);
+            log.warn("auth.integrity.pruned count={d} keys={s}", .{ pruned, joined orelse "<join-failed>" });
         }
     }
 

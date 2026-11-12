@@ -45,8 +45,11 @@ fn localAppliedVersion(connection: *db.Connection) !u32 {
     var statement = try connection.prepare("select max(version) from schema_migrations");
     defer statement.finalize();
     if (try statement.step()) |row| {
-        const version = row.int(0);
-        if (version > 0) return @intCast(version);
+        // A corrupted row (negative or beyond u32) reads as unversioned so
+        // the DDL re-runs under the column guards instead of mis-casting.
+        if (std.math.cast(u32, row.int(0))) |version| {
+            if (version > 0) return version;
+        }
     }
     return 0;
 }
@@ -759,9 +762,11 @@ test "local migrate propagates a DDL failure instead of stamping the version" {
     defer conn.close();
 
     try migrate(&conn, io);
-    // Inject a failure: `lanes` becomes a view, so the lanes.host_id ALTER
-    // has no table to run against (pragma_table_info sees no columns, the
-    // guard fires, and the ALTER itself errors).
+    // Inject a failure: `lanes` becomes a view, so the `create index if not
+    // exists lanes_repo_state` errors first ("views may not be indexed") —
+    // sqlite treats `create table if not exists` on an existing view as a
+    // no-op, so the index DDL is the first loud failure, before any ALTER
+    // (and its pragma_table_info guard) even runs.
     try conn.exec("drop table lanes");
     try conn.exec("create view lanes as select 1 as worktree_path");
     // Erase the version history so the DDL block re-runs.
