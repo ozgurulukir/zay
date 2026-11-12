@@ -597,6 +597,128 @@ fn handleStrictScanFlag(init: std.process.Init, gpa: std.mem.Allocator, home_dir
     return true;
 }
 
+// Guards the test-root listing below: a file whose `test` blocks are not
+// reachable from a test binary is compiled (or not) with its tests silently
+// never running — the suite reports success for work it did not do. This
+// test walks `src/`, computes the transitive `@import` closure of both test
+// roots (`src/root.zig` here, `src/main.zig` for the executable's own test
+// binary in build.zig), and fails — naming the file — when a test-bearing
+// file is outside it. Adding a file with tests then FORCES the registration
+// that the listing alone left to memory. Named-module imports (`@import("zay")`)
+// and std imports do not resolve under `src/` and are skipped.
+test "every file with test blocks under src/ is reachable from a test root" {
+    const io = std.testing.io;
+
+    // Scratch memory for the walk, closure, and file texts: freed in one
+    // shot, no per-container bookkeeping. (An arena over the page allocator
+    // keeps the testing allocator's leak check free of transient noise.)
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The module's root directory is `src/` (build.zig roots the module at
+    // src/root.zig), so this file's compiler path carries no directory
+    // component. Walking "src" relative to the process cwd matches the same
+    // build-root assumption src/tui/test_fixture.zig already makes when it
+    // parks fixtures under .zig-cache/tmp.
+    const src_dir_path = "src";
+
+    var test_bearing: std.ArrayList([]const u8) = .empty;
+    var files: std.ArrayList([]const u8) = .empty;
+    var imports_of: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+    var reachable: std.StringHashMapUnmanaged(void) = .empty;
+    var queue: std.ArrayList([]const u8) = .empty;
+    var missing: std.ArrayList([]const u8) = .empty;
+    var stack: std.ArrayList([]const u8) = .empty;
+
+    try stack.append(arena, src_dir_path);
+    while (stack.pop()) |dir_path| {
+        var dir = try std.Io.Dir.openDir(.cwd(), io, dir_path, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            switch (entry.kind) {
+                .directory => try stack.append(arena, try std.fs.path.join(arena, &.{ dir_path, entry.name })),
+                .file => if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                    try files.append(arena, try std.fs.path.join(arena, &.{ dir_path, entry.name }));
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Read every file once, remember which bear `test` blocks, and collect
+    // their literal imports (all @import calls in src/ are string literals).
+    for (files.items) |path| {
+        const text = try std.Io.Dir.readFileAlloc(.cwd(), io, path, arena, .limited(4 << 20));
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw_line| {
+            const trimmed = std.mem.trim(u8, raw_line, " \t\r");
+            if (std.mem.startsWith(u8, trimmed, "test ") or std.mem.eql(u8, trimmed, "test {")) {
+                try test_bearing.append(arena, path);
+                break;
+            }
+        }
+        var list: std.ArrayList([]const u8) = .empty;
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, text, cursor, "@import(\"")) |at| {
+            const name_start = at + "@import(\"".len;
+            const name_end = std.mem.indexOfScalarPos(u8, text, name_start, '"') orelse break;
+            try list.append(arena, text[name_start..name_end]);
+            cursor = name_end + 1;
+        }
+        try imports_of.put(arena, path, list);
+    }
+
+    // Transitive closure over the two test-binary roots in build.zig. The
+    // seeds go through the same `join` as the walked keys: map keys compare
+    // bytes, so the literal "src/root.zig" would miss the Windows key
+    // "src\root.zig" and the closure would silently be empty.
+    const seed_stems = [_][]const u8{ "root.zig", "main.zig" };
+    for (seed_stems) |stem| {
+        const seed = try std.fs.path.join(arena, &.{ src_dir_path, stem });
+        if (!imports_of.contains(seed)) {
+            std.debug.print("test root not walked under src/: {s} (build.zig and this guard disagree)\n", .{seed});
+            return error.TestUnexpectedResult;
+        }
+        try queue.append(arena, seed);
+    }
+    while (queue.pop()) |path| {
+        if (reachable.contains(path)) continue;
+        try reachable.put(arena, path, {});
+        const file_imports = imports_of.get(path) orelse continue;
+        // A file import always resolves against the importing file's own
+        // directory (Zig's import rule); `dirname` of a file at the src/
+        // root is `src` itself, so root-file imports like
+        // "mcp/mock_server.zig" land identically. `resolve` normalizes `..`
+        // so imports like "../test_util.zig" (src/context/rules.zig) or
+        // "../mcp/registry_bridge.zig" (src/tools/registry.zig) map onto the
+        // walked file keys. Resolving against `src` first instead would
+        // mis-credit a same-named root file over the real sibling (e.g.
+        // tools/registry.zig's "skill.zig").
+        const dir_of_file = std.fs.path.dirname(path) orelse src_dir_path;
+        for (file_imports.items) |import_name| {
+            const target = try std.fs.path.resolve(arena, &.{ dir_of_file, import_name });
+            if (imports_of.contains(target) and !reachable.contains(target)) {
+                try queue.append(arena, target);
+            }
+        }
+    }
+
+    // Every test-bearing file must be in the closure.
+    for (test_bearing.items) |path| {
+        if (!reachable.contains(path)) {
+            try missing.append(arena, path);
+        }
+    }
+    if (missing.items.len > 0) {
+        for (missing.items) |path| {
+            std.debug.print("unreachable test file: {s} (add it to src/root.zig's test root or a module in its import closure)\n", .{path});
+        }
+        return error.TestUnexpectedResult;
+    }
+}
+
 test {
     _ = @import("mcp/mock_server.zig");
     _ = @import("plugin_package.zig");

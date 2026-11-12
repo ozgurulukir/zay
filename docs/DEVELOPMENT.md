@@ -83,7 +83,7 @@ const output = try writer.toOwnedSlice();
 - prefer `const foo: Type = .{ .field = value };` over `const foo = Type{ .field = value };`
 - preferred file order: `//!` module doc comment, `const Self = @This();`, imports, `const log = std.log.scoped(...)`
 - pass allocators explicitly; use `errdefer` for cleanup on error
-- keep tests inline with the code they cover; a new file's tests only run once the file is reachable from the `src/root.zig` test root (its `refAllDecls`) — see [Test runner quirks](BUILDING.md#test-runner-quirks-read-before-debugging-a-failure)
+- keep tests inline with the code they cover; a new file's tests only run once the file is reachable from the `src/root.zig` test root (its `refAllDecls`) — a guard test in `src/root.zig` fails the suite when a file with `test` blocks is unreachable from either test root (`src/root.zig`, `src/main.zig`), so the registration cannot be forgotten — see [Test runner quirks](BUILDING.md#test-runner-quirks-read-before-debugging-a-failure)
 
 ## Ownership and API safety
 
