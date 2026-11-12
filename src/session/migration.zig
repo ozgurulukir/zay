@@ -39,28 +39,80 @@ test "defaultPath: resolves to sessions.sqlite under the platform config dir" {
     try std.testing.expect(paths.pathsEqual(path, expected));
 }
 
+/// The highest recorded schema version on a local connection, or 0 when the
+/// table is empty (a fresh or pre-versioning database).
+fn localAppliedVersion(connection: *db.Connection) !u32 {
+    var statement = try connection.prepare("select max(version) from schema_migrations");
+    defer statement.finalize();
+    if (try statement.step()) |row| {
+        const version = row.int(0);
+        if (version > 0) return @intCast(version);
+    }
+    return 0;
+}
+
+/// True when `table` carries `column` — the local counterpart of the remote
+/// engine's `column_guards`.
+fn localColumnExists(connection: *db.Connection, table: []const u8, column: []const u8) !bool {
+    var statement = try connection.prepare("select count(*) from pragma_table_info(?) where name = ?");
+    defer statement.finalize();
+    try statement.bindValue(1, .{ .text = table });
+    try statement.bindValue(2, .{ .text = column });
+    if (try statement.step()) |row| {
+        return row.int(0) > 0;
+    }
+    return false;
+}
+
+/// Apply one `alter table ... add column` only when the column is missing.
+/// Replaces the old unconditional `catch {}`: the guard makes the common
+/// idempotent case explicit and lets every other failure — locked database,
+/// read-only filesystem, missing table — propagate instead of presenting as
+/// success.
+fn addColumnIfMissing(connection: *db.Connection, table: []const u8, column: []const u8, ddl: []const u8) !void {
+    if (try localColumnExists(connection, table, column)) return;
+    try connection.exec(ddl);
+}
+
 /// Migrate the database to the latest schema version.
 pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     // Lanes share one repo-level DB; each lane's background writer holds its own
-    // connection, so a busy timeout makes concurrent writes wait (WAL serializes
+    // connection, so a busy timeout makes concurrent writers wait (WAL serializes
     // writers) instead of failing with SQLITE_BUSY and dropping a session entry.
     try connection.exec("pragma busy_timeout = 5000");
     try connection.exec("pragma foreign_keys = on");
     try connection.exec("pragma journal_mode = wal");
     try connection.exec("create table if not exists schema_migrations(version integer primary key, applied_at_ms integer not null)");
+
+    // Steady state: history never re-runs; no further roundtrips. This is the
+    // fast path — the version read below needs no lock, so an open on an
+    // already-migrated database performs no DDL and takes no write lock.
+    if (try localAppliedVersion(connection) >= schema_version) return;
+
+    // Serialize concurrent migrators (lanes hold their own connections on the
+    // shared repo DB): two processes that both read a stale version would
+    // otherwise race the ALTERs and one would die on a duplicate-column error
+    // the column guards just checked. The version is re-read under the lock,
+    // and the version row is recorded only after the DDL it covers succeeds.
+    try connection.exec("begin exclusive");
+    errdefer connection.exec("rollback") catch {};
+    if (try localAppliedVersion(connection) >= schema_version) {
+        try connection.exec("commit");
+        return;
+    }
+
     try connection.exec("create table if not exists sessions(id text primary key, title text, cwd text not null, project_key text, created_at_ms integer not null, updated_at_ms integer not null, leaf_entry_id text, model_provider text, model_id text, reasoning_effort text, foreign key(id, leaf_entry_id) references session_entries(session_id, id))");
     try connection.exec("create table if not exists session_entries(id text not null, session_id text not null, parent_id text, kind text not null, role text, payload_json text not null, created_at_ms integer not null, snapshot text, primary key(session_id, id), foreign key(session_id) references sessions(id) on delete cascade, foreign key(session_id, parent_id) references session_entries(session_id, id))");
     // Upgrade DBs created before the git-shadow model: add the `snapshot` column
     // (a git commit id binding the entry to its code state). On a fresh DB the
-    // column already exists, so the ALTER fails with "duplicate column" — ignore.
-    connection.exec("alter table session_entries add column snapshot text") catch {};
+    // column already exists in the CREATE TABLE, so the guard skips the ALTER.
+    try addColumnIfMissing(connection, "session_entries", "snapshot", "alter table session_entries add column snapshot text");
     // Upgrade DBs from schema v3 to v4: add model_provider and model_id columns
-    connection.exec("alter table sessions add column model_provider text") catch {};
-    connection.exec("alter table sessions add column model_id text") catch {};
+    try addColumnIfMissing(connection, "sessions", "model_provider", "alter table sessions add column model_provider text");
+    try addColumnIfMissing(connection, "sessions", "model_id", "alter table sessions add column model_id text");
     // Upgrade DBs from schema v4 to v5: add the session-scoped reasoning effort
-    // label. Nullable (NULL = "use config/default"). On a fresh DB the column
-    // already exists in the CREATE TABLE, so the ALTER fails — ignore.
-    connection.exec("alter table sessions add column reasoning_effort text") catch {};
+    // label. Nullable (NULL = "use config/default").
+    try addColumnIfMissing(connection, "sessions", "reasoning_effort", "alter table sessions add column reasoning_effort text");
     try connection.exec("create index if not exists session_entries_parent on session_entries(session_id, parent_id)");
     try connection.exec("create index if not exists session_entries_kind on session_entries(session_id, kind)");
     try connection.exec("create index if not exists session_entries_role on session_entries(session_id, role)");
@@ -85,8 +137,8 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     try connection.exec("create index if not exists lane_reviews_lane_created on lane_reviews(repo_key, lane_id, created_at_ms)");
 
     // Upgrade DBs from schema v7 to v8: add host_id for roaming users
-    connection.exec("alter table sessions add column host_id text") catch {};
-    connection.exec("alter table lanes add column host_id text") catch {};
+    try addColumnIfMissing(connection, "sessions", "host_id", "alter table sessions add column host_id text");
+    try addColumnIfMissing(connection, "lanes", "host_id", "alter table lanes add column host_id text");
 
     // Upgrade DBs from schema v8 to v9: logical project identity
     // (`sessions.project_key`, nullable — legacy rows stay unbound until a
@@ -96,7 +148,7 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     // project identity from old cwd values — old remote rows commonly carry
     // `default-host` from several machines, and a SQL-only backfill could
     // silently merge unrelated projects.
-    connection.exec("alter table sessions add column project_key text") catch {};
+    try addColumnIfMissing(connection, "sessions", "project_key", "alter table sessions add column project_key text");
     try connection.exec("create table if not exists project_locations(project_key text not null, host_id text not null, cwd text not null, cwd_key text not null, updated_at_ms integer not null, primary key(project_key, host_id, cwd_key))");
     try connection.exec("create index if not exists sessions_project_updated on sessions(project_key, updated_at_ms)");
     try connection.exec("create index if not exists project_locations_lookup on project_locations(project_key, host_id, updated_at_ms)");
@@ -116,6 +168,8 @@ pub fn migrate(connection: *db.Connection, io: std.Io) !void {
     while (true) {
         if (try statement.step()) |_| {} else break;
     }
+
+    try connection.exec("commit");
 }
 
 pub fn migrateBackend(backend: *backend_mod.SessionBackend, io: std.Io) !void {
@@ -672,9 +726,54 @@ test "local migrate builds the v9 schema and re-runs idempotently" {
         try std.testing.expectEqual(@as(i64, 1), res.rows[0][0].int);
     }
 
-    // Second open: the duplicate-column ALTERs are ignored and every
+    // Second open: the version gate short-circuits and every
     // create-if-not-exists is a no-op — migrate must not fail.
     try migrate(&conn, io);
+}
+
+test "local migrate does no DDL on an already-migrated database" {
+    const io = std.testing.io;
+    var conn = try db.Connection.open(":memory:", .{});
+    defer conn.close();
+
+    try migrate(&conn, io);
+
+    // Make the DDL observable: drop two create-if-not-exists targets. A
+    // re-run that executed any DDL would recreate them.
+    try conn.exec("drop table prompt_history");
+    try conn.exec("drop table tool_results");
+
+    // The version gate short-circuits: migrate must not recreate the dropped
+    // tables and must not fail — an open on a migrated database performs no
+    // DDL.
+    try migrate(&conn, io);
+    var probe = SqliteTarget{ .conn = &conn };
+    var res = try probe.query(io, "select count(*) from sqlite_master where type = 'table' and name in ('prompt_history', 'tool_results')", &.{});
+    defer res.deinit();
+    try std.testing.expectEqual(@as(i64, 0), res.rows[0][0].int);
+}
+
+test "local migrate propagates a DDL failure instead of stamping the version" {
+    const io = std.testing.io;
+    var conn = try db.Connection.open(":memory:", .{});
+    defer conn.close();
+
+    try migrate(&conn, io);
+    // Inject a failure: `lanes` becomes a view, so the lanes.host_id ALTER
+    // has no table to run against (pragma_table_info sees no columns, the
+    // guard fires, and the ALTER itself errors).
+    try conn.exec("drop table lanes");
+    try conn.exec("create view lanes as select 1 as worktree_path");
+    // Erase the version history so the DDL block re-runs.
+    try conn.exec("delete from schema_migrations");
+
+    // The failure must propagate — the old `catch {}` presented a broken
+    // schema as success and stamped a healthy-looking version row over it.
+    try std.testing.expectError(error.Sqlite, migrate(&conn, io));
+    var probe = SqliteTarget{ .conn = &conn };
+    var res = try probe.query(io, "select count(*) from schema_migrations", &.{});
+    defer res.deinit();
+    try std.testing.expectEqual(@as(i64, 0), res.rows[0][0].int);
 }
 
 test "local migrate upgrades a v8 database (sessions without project_key)" {
