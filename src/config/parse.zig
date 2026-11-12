@@ -8,6 +8,20 @@
 //!
 //! Types (Config, Diagnostic, LoadResult, ContextSettings, CompactionSettings)
 //! live in config.zig; provider/model types in provider.zig; MCP types in mcp.zig.
+//!
+//! Layout map (tests stay inline with the code they cover, so production and
+//! test regions alternate; `// ---` banners mark every boundary):
+//!
+//!    ~30–669  production — parse/merge/file-IO helpers
+//!   ~670–707  tests — layer merge and env-expansion notices
+//!   ~709–1248 production — layered load and merge algebra
+//!  ~1249–1290 tests — response-policy overlays
+//!  ~1291–2408 production — parse layer (parseResponsePolicy, config paths)
+//!  ~2423–end  tests — the bulk of the suite
+//!
+//! The banners carry the region role so a scroll lands visibly in either
+//! production or tests. This map is the contract the banners annotate; keep
+//! both in sync when moving code.
 
 const std = @import("std");
 /// Leaf vocabulary imports: config reaches into ai leaves directly, never
@@ -667,6 +681,10 @@ fn warnProjectLayerEnvExpansion(project: *const Config) usize {
     return risks;
 }
 
+// ---------------------------------------------------------------------------
+// Tests: layer merge and env-expansion notices (production continues below)
+// ---------------------------------------------------------------------------
+
 test "project-layer env-expansion notice counts provider, MCP header, and URL risks" {
     const gpa = std.testing.allocator;
 
@@ -705,6 +723,10 @@ test "project-layer env-expansion notice counts provider, MCP header, and URL ri
     defer clean.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), warnProjectLayerEnvExpansion(&clean));
 }
+
+// ---------------------------------------------------------------------------
+// Production: layered load and merge algebra
+// ---------------------------------------------------------------------------
 
 fn loadFile(
     gpa: std.mem.Allocator,
@@ -1246,6 +1268,10 @@ fn parsePlugins(
     return try plugins.toOwnedSlice(gpa);
 }
 
+// ---------------------------------------------------------------------------
+// Tests: response-policy overlays
+// ---------------------------------------------------------------------------
+
 test "response policy configuration survives overlays cloning and serialization" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
@@ -1287,6 +1313,10 @@ test "response policy configuration rejects misspelled kinds and fields" {
         try std.testing.expectError(error.InvalidResponsePolicy, parseResponsePolicy(parsed.value));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Production: parse layer
+// ---------------------------------------------------------------------------
 
 fn parseResponsePolicy(value: std.json.Value) !response_policy.Overrides {
     if (value != .object) return error.InvalidResponsePolicy;
@@ -2419,6 +2449,12 @@ fn projectConfigPath(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ cwd, ".zay", "config.json" });
 }
 
+// ---------------------------------------------------------------------------
+// Tests: the bulk of the suite
+// ---------------------------------------------------------------------------
+
+// Test-only fixture: an environment-map stand-in for parse tests. Declared in
+// the test region, not among production functions.
 const TestEnv = struct {
     entries: []const Entry,
 
