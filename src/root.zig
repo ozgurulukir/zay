@@ -124,30 +124,29 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     // known provider. Builtin labels are always valid; config provider
     // names, current provider_name/dynamic_provider_id, and dynamic providers
     // from the models.dev registry are collected as the valid set.
-    // Idempotent — running again after a prune removes nothing.
+    // Idempotent — running again after a prune removes nothing. The prune is
+    // skipped rather than run against a partially-built allowlist: a short
+    // list would make a live provider's stored key look like an orphan.
     {
-        var valid_names: std.ArrayList([]const u8) = .empty;
-        defer valid_names.deinit(runtime_gpa);
-        for (config.allBuiltinLabels()) |label| {
-            valid_names.append(runtime_gpa, label) catch continue;
+        var pruned_names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (pruned_names.items) |name| runtime_gpa.free(name);
+            pruned_names.deinit(runtime_gpa);
         }
-        for (load_result.config.providers) |p| {
-            valid_names.append(runtime_gpa, p.name) catch continue;
+        var pruned: u32 = 0;
+        if (pruneOrphanKeysAtStartup(runtime_gpa, init.io, home_dir, load_result.config, &pruned_names)) |count| {
+            pruned = count;
+        } else |err| {
+            log.warn("auth.integrity.prune_skipped err={s}", .{@errorName(err)});
         }
-        if (load_result.config.provider_name) |name| {
-            valid_names.append(runtime_gpa, name) catch {};
-        }
-        if (load_result.config.dynamic_provider_id) |id| {
-            valid_names.append(runtime_gpa, id) catch {};
-        }
-        var reg = models.loadRegistryCached(runtime_gpa, init.io, home_dir);
-        defer reg.deinit(runtime_gpa);
-        for (reg.providers) |p| {
-            valid_names.append(runtime_gpa, p.id) catch continue;
-        }
-        const pruned = auth.pruneOrphanKeys(runtime_gpa, init.io, home_dir, valid_names.items) catch 0;
         if (pruned > 0) {
-            log.warn("auth.integrity.pruned count={d}", .{pruned});
+            // Report which keys went, not just how many: a destructive prune
+            // must be distinguishable from an allowlist accident. A join
+            // failure (OOM) still reports the count, and only the owned
+            // buffer is freed — never the literal fallback.
+            const joined: ?[]u8 = std.mem.join(runtime_gpa, ",", pruned_names.items) catch null;
+            defer if (joined) |text| runtime_gpa.free(text);
+            log.warn("auth.integrity.pruned count={d} keys={s}", .{ pruned, joined orelse "<join-failed>" });
         }
     }
 
@@ -359,6 +358,40 @@ fn runWorktreeHygiene(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, 
             log.warn("vcs.startup_prune.failed err={s}", .{@errorName(err)});
         };
     }
+}
+
+/// Run the startup orphan-key prune against a fully-built deletion allowlist.
+/// Every allowlist append is a `try`: the list is the fail-closed side of the
+/// prune — one swallowed allocation failure would shorten it, and a provider
+/// missing from the list has its stored key treated as an orphan and deleted.
+/// Returns the removed key names (gpa-owned, appended to `removed_names`).
+fn pruneOrphanKeysAtStartup(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    loaded: config.Config,
+    removed_names: *std.ArrayList([]const u8),
+) !u32 {
+    var valid_names: std.ArrayList([]const u8) = .empty;
+    defer valid_names.deinit(gpa);
+    for (config.allBuiltinLabels()) |label| {
+        try valid_names.append(gpa, label);
+    }
+    for (loaded.providers) |p| {
+        try valid_names.append(gpa, p.name);
+    }
+    if (loaded.provider_name) |name| {
+        try valid_names.append(gpa, name);
+    }
+    if (loaded.dynamic_provider_id) |id| {
+        try valid_names.append(gpa, id);
+    }
+    var reg = models.loadRegistryCached(gpa, io, home_dir);
+    defer reg.deinit(gpa);
+    for (reg.providers) |p| {
+        try valid_names.append(gpa, p.id);
+    }
+    return auth.pruneOrphanKeys(gpa, io, home_dir, valid_names.items, removed_names);
 }
 
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {

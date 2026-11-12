@@ -1645,24 +1645,42 @@ fn fieldCompat(object: std.json.ObjectMap, camel: []const u8, snake: []const u8)
     return object.get(camel) orelse object.get(snake);
 }
 
-pub fn writeGlobal(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    home_dir: []const u8,
-    config: Config,
-) !void {
-    const path = try globalConfigPath(gpa, io, home_dir);
-    defer gpa.free(path);
+/// Process-wide counter giving every config write a distinct temp name,
+/// even two writes in the same clock tick or two threads racing on one file.
+var write_serial: std.atomic.Value(u64) = .init(0);
 
+/// Serialize `config` and atomically replace `path` with it.
+///
+/// The payload goes to a per-writer unique temporary sibling, is synced, and
+/// is then renamed over the destination. The temp name embeds the wall clock
+/// and a process-wide counter because the old fixed `<path>.tmp` was a
+/// collision point: two concurrent writers both truncated the same temp file,
+/// and the second rename failed with FileNotFound once the first consumed it.
+/// The file is synced before the rename so a crash cannot leave the rename
+/// durable while its data blocks are not; std.Io exposes no directory sync,
+/// so the rename's own durability stays filesystem-dependent. A failed write
+/// unlinks its temp file; a failed unlink (an antivirus hold on Windows) is
+/// swallowed so it cannot mask the write error, and may leave a stale
+/// `.tmp` behind.
+fn writeConfigFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, config: Config) !void {
     const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
-
-    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
-    defer gpa.free(tmp_path);
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
     try serialize(gpa, &payload.writer, config);
+
+    const tmp_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}.{d}.{d}.tmp",
+        .{
+            path,
+            std.Io.Clock.now(.real, io).toNanoseconds(),
+            write_serial.fetchAdd(1, .monotonic),
+        },
+    );
+    defer gpa.free(tmp_path);
+    errdefer std.Io.Dir.deleteFile(.cwd(), io, tmp_path) catch {};
 
     {
         var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{ .truncate = true });
@@ -1671,9 +1689,23 @@ pub fn writeGlobal(
         var writer = file.writer(io, &buffer);
         try writer.interface.writeAll(payload.written());
         try writer.interface.flush();
+        // Data before name: make the payload durable before the rename can
+        // publish it.
+        try file.sync(io);
     }
 
     try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
+}
+
+pub fn writeGlobal(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home_dir: []const u8,
+    config: Config,
+) !void {
+    const path = try globalConfigPath(gpa, io, home_dir);
+    defer gpa.free(path);
+    return writeConfigFile(gpa, io, path, config);
 }
 
 pub fn readGlobal(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Config {
@@ -1725,27 +1757,7 @@ pub fn writeProject(
 ) !void {
     const path = try projectConfigPath(gpa, cwd);
     defer gpa.free(path);
-
-    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    try std.Io.Dir.createDirPath(.cwd(), io, dirname);
-
-    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
-    defer gpa.free(tmp_path);
-
-    var payload: std.Io.Writer.Allocating = .init(gpa);
-    defer payload.deinit();
-    try serialize(gpa, &payload.writer, config);
-
-    {
-        var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{ .truncate = true });
-        defer file.close(io);
-        var buffer: [4096]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        try writer.interface.writeAll(payload.written());
-        try writer.interface.flush();
-    }
-
-    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
+    return writeConfigFile(gpa, io, path, config);
 }
 
 pub fn mergeAndWriteProject(
@@ -4371,21 +4383,37 @@ test "removeProjectPlugin removes only the named override and is idempotent" {
     defer project_config.deinit(gpa);
     try writeProject(gpa, io, project_dir, project_config);
 
-    // Occupy the atomic writer's temporary path to force a save failure.
+    // Force a save failure by occupying the destination: the atomic writer's
+    // temp name is unique per write, so the rename over a directory is the
+    // injectable failure point. The original bytes are kept so the config can
+    // be restored and proven unchanged.
     const config_path = try projectConfigPath(gpa, project_dir);
     defer gpa.free(config_path);
-    const blocked_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{config_path});
-    defer gpa.free(blocked_path);
-    try std.Io.Dir.createDirPath(.cwd(), io, blocked_path);
+    const original = try std.Io.Dir.readFileAlloc(.cwd(), io, config_path, gpa, .limited(1 << 20));
+    defer gpa.free(original);
+    try std.Io.Dir.deleteFile(.cwd(), io, config_path);
+    try std.Io.Dir.createDirPath(.cwd(), io, config_path);
     if (removeProjectPlugin(gpa, io, project_dir, "remove-me")) |_| {
         return error.TestUnexpectedResult;
     } else |_| {}
+
+    // A failed write leaves no temp litter behind.
+    var dir = try std.Io.Dir.openDir(.cwd(), io, project_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".tmp")) return error.TestUnexpectedResult;
+    }
+    try std.Io.Dir.deleteDir(.cwd(), io, config_path);
+    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = config_path, .data = original });
+
+    // The config survived the failed save byte-for-byte, and the save retries
+    // cleanly now that the destination is a file again.
     var unchanged = try readProject(gpa, io, project_dir);
     defer unchanged.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 2), unchanged.plugins.len);
     try std.testing.expectEqualStrings("remove-me", unchanged.plugins[0].name);
     try std.testing.expectEqualStrings("keep-me", unchanged.plugins[1].name);
-    try std.Io.Dir.deleteDir(.cwd(), io, blocked_path);
 
     try removeProjectPlugin(gpa, io, project_dir, "remove-me");
     var after_remove = try readProject(gpa, io, project_dir);
@@ -4399,6 +4427,35 @@ test "removeProjectPlugin removes only the named override and is idempotent" {
     defer after_retry.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), after_retry.plugins.len);
     try std.testing.expectEqualStrings("keep-me", after_retry.plugins[0].name);
+}
+
+test "config write ignores a stale fixed-name tmp directory" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const project_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    defer gpa.free(project_dir);
+
+    // A crash under the old fixed-`<path>.tmp` writer could litter a tmp path
+    // (here: as a directory, the worst case — createFile fails NotDir on it).
+    // The unique-per-write temp name must not care.
+    const config_path = try projectConfigPath(gpa, project_dir);
+    defer gpa.free(config_path);
+    const stale_tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{config_path});
+    defer gpa.free(stale_tmp);
+    try std.Io.Dir.createDirPath(.cwd(), io, stale_tmp);
+
+    var config: Config = .{};
+    defer config.deinit(gpa);
+    config.theme = try gpa.dupe(u8, "stale-tmp");
+    try writeProject(gpa, io, project_dir, config);
+
+    var written = try readProject(gpa, io, project_dir);
+    defer written.deinit(gpa);
+    try std.testing.expectEqualStrings("stale-tmp", written.theme.?);
 }
 
 test "parseObject drops oversized systemPrompt with a diagnostic" {
