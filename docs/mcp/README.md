@@ -63,7 +63,7 @@ rewrites the config as `"mcpServers"`.
 
 ### Server Configuration Options
 
-The `mcpServers` entry fields (`command`, `args`, `url`, `headers`, `enabled`, `requestTimeoutMs`) are part of the config schema — the authoritative field table lives in the [Configuration Guide](../config/README.md#mcp-server-configuration). A `"type"` key may be present for compatibility with other MCP clients but is **ignored**: Zay infers the transport solely from `command` (stdio) vs `url` (Streamable HTTP). The two auth shapes and the `{env:VAR}` expansion behavior are specific to MCP and covered below.
+The `mcpServers` entry fields (`command`, `args`, `url`, `headers`, `enabled`, `requestTimeoutMs`) are part of the config schema — the authoritative field table lives in the [Configuration Guide](../config/providers-mcp-and-plugins.md#mcp-server-configuration). A `"type"` key may be present for compatibility with other MCP clients but is **ignored**: Zay infers the transport solely from `command` (stdio) vs `url` (Streamable HTTP). The two auth shapes and the `{env:VAR}` expansion behavior are specific to MCP and covered below.
 
 ### Environment variable expansion (`{env:VAR}`)
 
@@ -83,7 +83,7 @@ than silently producing a broken command or URL.
 The same `{env:VAR}` mechanism (raw placeholders on disk, expansion at use time,
 secrets never written back) also covers AI provider headers
 (`providers.<name>.headers`), expanded once per client attach — see
-[Configuration Guide — Provider Configuration](../config/README.md#provider-configuration).
+[Configuration Guide — Provider Configuration](../config/providers-mcp-and-plugins.md#provider-configuration).
 
 **Project-layer trust parity.** When an `mcpServers` entry (or a provider
 header) comes from the *project* config (`<cwd>/.zay/config.json`) and its

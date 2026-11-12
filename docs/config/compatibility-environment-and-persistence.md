@@ -35,7 +35,7 @@ When both camelCase and snake_case keys are present, **camelCase wins**.
 | `ZAY_BASH_CLASSIFIER_URL`    | Sets external safety classifier URL   | `http://localhost:8765/classify`         |
 | `ZAY_DATABASE_SERVER_URL`    | Sets external database service URL    | `http://localhost:8766`                  |
 | `ZAY_DATABASE_AUTH_TOKEN`    | Sets external database auth token     | `secret-key`                             |
-| `ZAY_DATABASE_BACKEND`    | Selects the session-database backend (see [Supported Backends](#external-database--roaming-session-configuration)); invalid values fail env loading | `turso_http` |
+| `ZAY_DATABASE_BACKEND`    | Selects the session-database backend (see [Supported Backends](database-and-roaming.md#external-database--roaming-session-configuration)); invalid values fail env loading | `turso_http` |
 | `ZAY_DATABASE_URL`        | Sets the backend endpoint URL (equivalent to `database.url`) | `libsql://my-db.turso.io` |
 | `ZAY_DATABASE_PATH`       | Overrides the local SQLite file path (equivalent to `database.path`) | `/srv/zay/sessions.sqlite` |
 | `ZAY_HOST_ID`             | Pins the roaming `host_id` instead of deriving it from `COMPUTERNAME` / `HOSTNAME` | `laptop-01` |
