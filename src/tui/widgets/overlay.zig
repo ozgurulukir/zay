@@ -502,3 +502,35 @@ const OverlayInner = struct {
         return std.fmt.allocPrint(arena, "  Scope: {s}  │  Ctrl+S to change      →  {s}:\"{s}\" ({s}){s}", .{ scope_text, wire_param, effort_label, provider, refresh });
     }
 };
+
+test "overlaySize gives every mode a panel and zeroes the chromeless ones" {
+    // Exhaustive over the Mode enum: a mode added without an overlay size
+    // must fail here, not show up as a zero-sized popup at runtime.
+    inline for (std.meta.fields(App.Mode)) |field| {
+        const mode: App.Mode = @enumFromInt(field.value);
+        const size = overlaySize(mode);
+        switch (mode) {
+            // Rendered inline, no overlay panel.
+            .normal, .diff_viewer => {
+                try std.testing.expectEqual(@as(u16, 0), size.width);
+                try std.testing.expectEqual(@as(u16, 0), size.height);
+            },
+            // Every other mode gets a visible panel.
+            else => {
+                try std.testing.expect(size.width > 0);
+                try std.testing.expect(size.height > 0);
+            },
+        }
+    }
+}
+
+test "overlaySize pins known panel dimensions" {
+    // The exact grid the root layout clamps against — these are load-bearing
+    // numbers (a screen smaller than a panel must still fit).
+    try std.testing.expectEqual(@as(u16, 64), overlaySize(.command).width);
+    try std.testing.expectEqual(@as(u16, 90), overlaySize(.settings).width);
+    try std.testing.expectEqual(@as(u16, 22), overlaySize(.settings).height);
+    try std.testing.expectEqual(@as(u16, 20), overlaySize(.tree_picker).height);
+    // The commit-message box is a one-line input, deliberately tiny.
+    try std.testing.expectEqual(@as(u16, 3), overlaySize(.save_message).height);
+}
