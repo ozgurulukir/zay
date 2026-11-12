@@ -469,3 +469,76 @@ pub const DiffCounts = struct {
     additions: u32 = 0,
     deletions: u32 = 0,
 };
+
+test "ChipRect.contains hit-tests the exact chip extent" {
+    const chip = ChipRect{ .row = 3, .col = 10, .width = 4 };
+    // Inside: first and last column of the chip row.
+    try std.testing.expect(chip.contains(3, 10));
+    try std.testing.expect(chip.contains(3, 13));
+    // Outside: one past, one before, wrong row.
+    try std.testing.expect(!chip.contains(3, 14));
+    try std.testing.expect(!chip.contains(3, 9));
+    try std.testing.expect(!chip.contains(2, 10));
+    // Negative coordinates come from mouse events outside the widget and
+    // must never hit (the u16 cast below would otherwise trap).
+    try std.testing.expect(!chip.contains(-1, 10));
+    try std.testing.expect(!chip.contains(3, -1));
+}
+
+test "AtSearchState defaults to file kind and empty results when closed" {
+    const gpa = std.testing.allocator;
+    var state: AtSearchState = .closed;
+    try std.testing.expectEqual(MentionSearchKind.file, state.kind());
+    try std.testing.expectEqual(@as(usize, 0), state.results().len);
+    try std.testing.expect(state.resultsPtr() == null);
+    // close on a closed state is a no-op, safe to call repeatedly.
+    state.close(gpa);
+    state.close(gpa);
+    try std.testing.expect(state == .closed);
+}
+
+test "AtSearchState.close frees every owned buffer in the payload" {
+    const gpa = std.testing.allocator;
+    var state: AtSearchState = .{ .open = .{ .kind = .file, .query = try gpa.dupe(u8, "@src/") } };
+    state.open.notice = try gpa.dupe(u8, "scanning");
+    try state.open.results.append(gpa, try gpa.dupe(u8, "src/main.zig"));
+    try state.open.results.append(gpa, try gpa.dupe(u8, "src/root.zig"));
+    try state.open.results.append(gpa, try gpa.dupe(u8, "src/root.zig.bak"));
+    state.open.selection = 2;
+
+    state.close(gpa);
+    try std.testing.expect(state == .closed);
+    // The transition also resets the accessor surface.
+    try std.testing.expectEqual(@as(usize, 0), state.results().len);
+    try std.testing.expect(state.resultsPtr() == null);
+    // The testing allocator proves the free on deinit of the suite run.
+}
+
+test "AtSearchState indexing payload exposes results and their pointer" {
+    const gpa = std.testing.allocator;
+    var state: AtSearchState = .{ .indexing = .{ .kind = .skill } };
+    try std.testing.expectEqual(MentionSearchKind.skill, state.kind());
+    const list = state.resultsPtr().?;
+    try list.append(gpa, try gpa.dupe(u8, "todo"));
+    // close frees the payload strings too — no manual free here.
+    defer state.close(gpa);
+    try std.testing.expectEqual(@as(usize, 1), state.results().len);
+    try std.testing.expectEqualStrings("todo", state.results()[0]);
+}
+
+test "AtSearchState debounce gates the refresh cycle" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    // No deadline anywhere (closed) means expired — nothing to wait for.
+    var state: AtSearchState = .closed;
+    try std.testing.expect(state.debounceExpired(io));
+    // refreshDebounce is a no-op while closed.
+    state.refreshDebounce(io, 5_000);
+    try std.testing.expect(state == .closed);
+
+    state = .{ .open = .{ .kind = .file } };
+    defer state.close(gpa);
+    try std.testing.expect(state.debounceExpired(io));
+    state.refreshDebounce(io, 5_000);
+    try std.testing.expect(!state.debounceExpired(io));
+}

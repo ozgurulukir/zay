@@ -315,3 +315,41 @@ pub const EntrySummary = union(enum) {
         };
     }
 };
+
+test "EntryId.fromSlice round-trips exactly entry_id_len bytes" {
+    var raw: [entry_id_len]u8 = undefined;
+    for (&raw, 0..) |*b, i| b.* = @intCast(i);
+    const id = try EntryId.fromSlice(&raw);
+    try std.testing.expectEqualSlices(u8, &raw, id.slice());
+    // Wrong lengths are rejected — ids arrive from untrusted storage.
+    try std.testing.expectError(error.BadEntryId, EntryId.fromSlice(raw[0 .. entry_id_len - 1]));
+    // One byte too long (a separate buffer, since raw has no spare byte).
+    const too_long: [entry_id_len + 1]u8 = @splat('0');
+    try std.testing.expectError(error.BadEntryId, EntryId.fromSlice(&too_long));
+}
+
+test "SessionId.fromSlice round-trips exactly session_id_len bytes" {
+    var raw: [session_id_len]u8 = undefined;
+    @memset(&raw, 'a');
+    const id = try SessionId.fromSlice(&raw);
+    try std.testing.expectEqualSlices(u8, &raw, id.slice());
+    try std.testing.expectError(error.BadSessionId, SessionId.fromSlice(raw[0 .. session_id_len - 1]));
+    try std.testing.expectError(error.BadSessionId, SessionId.fromSlice(""));
+}
+
+test "ProjectKey.validate accepts only the minted pk-<32 hex> shape" {
+    // A minted key: prefix + 32 lowercase hex characters.
+    const minted = "pk-" ++ ("0123456789abcdef" ** 2);
+    try std.testing.expectEqual(@as(usize, project_key_len), minted.len);
+    const key = try ProjectKey.validate(minted);
+    try std.testing.expectEqualStrings(minted, key.value);
+
+    // Wrong length.
+    try std.testing.expectError(error.BadProjectKey, ProjectKey.validate("pk-abc"));
+    // Missing prefix.
+    try std.testing.expectError(error.BadProjectKey, ProjectKey.validate(minted[3..]));
+    // Uppercase hex is rejected.
+    try std.testing.expectError(error.BadProjectKey, ProjectKey.validate("pk-" ++ ("0123456789ABCDEF" ** 2)));
+    // Path-looking values are rejected.
+    try std.testing.expectError(error.BadProjectKey, ProjectKey.validate("/home/user/project"));
+}

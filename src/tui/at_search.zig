@@ -344,3 +344,121 @@ pub fn onSearchBackendReady(app: *App) !void {
     app.at_search.refreshDebounce(app.io, 40);
     try refreshAtResults(app);
 }
+
+test "isSearchFooter recognizes the search backend's footer lines" {
+    try std.testing.expect(isSearchFooter("+anything-after-plus"));
+    try std.testing.expect(isSearchFooter("0 results."));
+    // Real paths never look like footers.
+    try std.testing.expect(!isSearchFooter("src/main.zig"));
+    try std.testing.expect(!isSearchFooter("0 results later."));
+}
+
+test "parseAtResults filters footers and directories and clamps selection" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../agent.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.at_search = .{ .open = .{ .kind = .file, .query = try gpa.dupe(u8, "@src") } };
+    app.at_search.open.selection = 9; // beyond any result count
+
+    // One blank line, one footer, one directory (dropped), two files (kept).
+    try parseAtResults(&app,
+        \\src/main.zig
+        \\
+        \\src/dir/
+        \\+ committed 5 files
+        \\0 results.
+        \\src/root.zig
+    );
+    defer app.at_search.close(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), app.at_search.open.results.items.len);
+    try std.testing.expectEqualStrings("src/main.zig", app.at_search.open.results.items[0]);
+    try std.testing.expectEqualStrings("src/root.zig", app.at_search.open.results.items[1]);
+    // The out-of-range selection clamped to the first result.
+    try std.testing.expectEqual(@as(u32, 0), app.at_search.open.selection);
+}
+
+test "parseAtResults keeps the selection when it still points at a result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../agent.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.at_search = .{ .open = .{ .kind = .file } };
+    app.at_search.open.selection = 1;
+    try parseAtResults(&app, "one\n two\nthree");
+    defer app.at_search.close(gpa);
+    try std.testing.expectEqual(@as(usize, 3), app.at_search.open.results.items.len);
+    try std.testing.expectEqual(@as(u32, 1), app.at_search.open.selection);
+}
+
+test "parseAtResults ignores everything while the popup is closed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../agent.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try parseAtResults(&app, "src/main.zig\nsrc/root.zig");
+    try std.testing.expect(app.at_search == .closed);
+}
+
+test "setMentionSearch opens a skill query and closeAtSearch frees it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../agent.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // Skill mentions run offline: the refresh path returns without a
+    // runtime, so no search backend thread is started here.
+    try setMentionSearch(&app, .skill, "todo");
+    try std.testing.expect(app.at_search == .open);
+    try std.testing.expectEqual(MentionSearchKind.skill, app.at_search.open.kind);
+    try std.testing.expectEqualStrings("todo", app.at_search.open.query);
+
+    // Re-setting the same query is a no-op, not a re-dupe.
+    try setMentionSearch(&app, .skill, "todo");
+    try std.testing.expectEqualStrings("todo", app.at_search.open.query);
+
+    closeAtSearch(&app);
+    try std.testing.expect(app.at_search == .closed);
+    // Closing again is safe.
+    closeAtSearch(&app);
+}
+
+test "setSearchNotice sets, replaces, and clears the popup notice" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const agent_mod = @import("../agent.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // No popup open: the notice is dropped silently.
+    setSearchNotice(&app, "ignored");
+    try std.testing.expect(app.at_search == .closed);
+
+    app.at_search = .{ .open = .{ .kind = .skill } };
+    defer app.at_search.close(gpa);
+    setSearchNotice(&app, "search failed");
+    try std.testing.expectEqualStrings("search failed", app.at_search.open.notice.?);
+    setSearchNotice(&app, "still failing");
+    try std.testing.expectEqualStrings("still failing", app.at_search.open.notice.?);
+    // An empty string clears the notice rather than storing it.
+    setSearchNotice(&app, "");
+    try std.testing.expect(app.at_search.open.notice == null);
+}

@@ -797,3 +797,49 @@ fn drainGitLabelJob(app: *App) bool {
     app.git_label_refresh_deadline = null;
     return changed;
 }
+
+test "atSearchActive tracks the popup lifecycle states" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // Closed popup: nothing to tick for.
+    try std.testing.expect(!atSearchActive(&app));
+
+    // An indexing scan always wants ticks.
+    app.at_search = .{ .indexing = .{ .kind = .file } };
+    try std.testing.expect(atSearchActive(&app));
+    app.at_search.close(gpa);
+
+    // An in-flight async search wants ticks regardless of debounce.
+    app.at_search = .{ .open = .{ .kind = .skill, .searching = true } };
+    try std.testing.expect(atSearchActive(&app));
+    app.at_search.close(gpa);
+
+    // A settled skill popup (no search in flight, debounce expired) does not.
+    app.at_search = .{ .open = .{ .kind = .skill } };
+    try std.testing.expect(!atSearchActive(&app));
+    app.at_search.close(gpa);
+    try std.testing.expect(app.at_search == .closed);
+}
+
+test "anyJobActive clears once the git label is no longer dirty" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A fresh app is git_label_dirty by default — the label has never been
+    // fetched — so exactly one job family is pending until the first
+    // refresh consumes the flag.
+    try std.testing.expect(anyJobActive(&app));
+    app.git_label_dirty = false;
+    // With the label clean and no other families armed (diff idle, no
+    // registry/model/login/plugin jobs), nothing is left to poll.
+    try std.testing.expect(!anyJobActive(&app));
+}
