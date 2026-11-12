@@ -806,7 +806,6 @@ test "Credentials.deinit frees all credential slices" {
     // where that scribble is compiled out and `deinit` is the only scrub.
 }
 
-
 test "authPath returns HomeNotSet error when home_dir is empty" {
     // Arrange
     const gpa = std.testing.allocator;

@@ -1,0 +1,96 @@
+name: ci
+
+# The documented verification gate (docs/BUILDING.md "Verifying") is the test
+# suite; before this workflow existed, release.yml only built and every
+# "the suite passes" claim was about someone's local machine. This workflow
+# enforces the gate on every push and pull request.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: zig fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          printf '%s\n' "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      # vendor/ is excluded on purpose: it mirrors upstream sources and must
+      # stay byte-identical to them, so the formatter does not own those files.
+      - name: zig fmt --check
+        shell: bash
+        run: zig fmt --check src/ build.zig build.zig.zon
+
+  test:
+    name: zig build test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          printf '%s\n' "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      - name: Fetch dependencies
+        shell: bash
+        run: zig build --fetch
+
+      # The exit code is authoritative (see docs/BUILDING.md "Test runner
+      # quirks"): output may contain a misleading `failed command` line on
+      # build-server hosts, and known load flakes are documented there too.
+      - name: zig build test
+        shell: bash
+        run: zig build test
+
+      - name: zig build test-plugin
+        shell: bash
+        run: zig build test-plugin
+
+  docs:
+    name: docs hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Reject raw control bytes in tracked text files (everything except
+      # newline and tab). Control bytes survive review invisibly and once
+      # corrupted four words in CHANGELOG.md inside a tagged release; binary
+      # assets are excluded by directory.
+      - name: No control bytes in tracked text files
+        shell: bash
+        run: |
+          bad=0
+          while IFS= read -r -d '' file; do
+            case "$file" in assets/*) continue ;; esac
+            if LC_ALL=C grep -qP '[\x00-\x08\x0b\x0c\x0e-\x1f]' "$file"; then
+              echo "::error file=$file::tracked file contains a raw control byte (allowed: \\n, \\t)"
+              LC_ALL=C grep -nP '[\x00-\x08\x0b\x0c\x0e-\x1f]' "$file" | cat -v | head -5
+              bad=1
+            fi
+          done < <(git ls-files -z)
+          exit $bad
+
+      # AGENTS.md's routing table has silently rotted before (links pointing
+      # at a pre-split compatibility stub); fail the build when any doc link
+      # or heading anchor no longer resolves.
+      - name: Doc links resolve
+        shell: bash
+        run: python3 scripts/check_doc_links.py

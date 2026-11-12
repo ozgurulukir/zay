@@ -159,7 +159,7 @@ how a plugin reads its configuration and applies defaults at runtime.
 
 The manifest can be minimal — permissions are advisory metadata (only the
 `allow_*` keys gate runtime behavior; see the
-[development guide](README.md#permissions)), and this pattern needs none.
+[development guide](permissions-and-runtime.md)), and this pattern needs none.
 
 ### init.lua
 
