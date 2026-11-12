@@ -6,16 +6,26 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Lua: route sandboxed-state teardown through `destroySandboxedState` (#360) and own the teardown path plus the budget API boundary (#356); rename `freeHookData` to `capFinalizerDeadline` to say what it does (#351).
+- Executor: own the ToolResult history move/free split (#359).
+- TUI: dedupe settings pending-state helpers into `settings_lifecycle` (#358); centralize the mode text-input activation predicate (#354); dedupe single-line form editors into `FormField` (#353).
+- Config: extract database backend vocabulary into a leaf module (#355).
+- Tools: funnel plugin record release through `freePluginRecord` (#352).
+
+### Fixed
+- TUI: commit the settings text edit on Enter; `submitMode` now owns every Enter press (#357).
+
 ## [0.11.10] - 2026-11-08
 
 ### Changed
-- Agent: centralize tool-batch executor wiring in Agent.toolExecutor (#348); extract the turn-finalization decision table from Agent.run (#345); retry once when inish_reason=tool_calls arrives with no tool call (#329).
-- Context: split ssembly.zig into rules and prune modules (#349).
+- Agent: centralize tool-batch executor wiring in Agent.toolExecutor (#348); extract the turn-finalization decision table from Agent.run (#345); retry once when finish_reason=tool_calls arrives with no tool call (#329).
+- Context: split assembly.zig into rules and prune modules (#349).
 - Config: plant resumed model slices in the App config arena (#347); hand the loader arena to the App and stop cloning cached config (#346).
-- Tools: table-drive the local shell-safety rules (#350); make 	odo_prioritize.priority required to match the documented contract; correct plugin tool teaching descriptions and schemas (#338).
+- Tools: table-drive the local shell-safety rules (#350); make todo_prioritize.priority required to match the documented contract; correct plugin tool teaching descriptions and schemas (#338).
 - AI: re-home tool-call argument hygiene into a cross-dialect leaf (#342); harden the tool-call lifecycle across wire schemas, streaming, and recovery (#332); recover the <function=NAME> text tool-call variant (#330).
 - Lua: derive event-name validity from the Event tag set and delete the dead Plugin module (#343); harden the plugin bridge architecture against stack corruption and data races (#339).
-- Executor: check cancelation in atch runAll and unify tool display lookup (#331).
+- Executor: check cancelation in batch runAll and unify tool display lookup (#331).
 
 ## [0.11.9] - 2026-11-05
 

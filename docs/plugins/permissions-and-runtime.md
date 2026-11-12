@@ -238,7 +238,7 @@ a file sidecar (`.zay/<plugin>/state.json` via `zay.write_file` +
 (or `nil` when unconfigured). `plugin` is a reserved global name. Settings are
 read once at App start — set `"enabled": false` in config.json to skip loading
 a plugin entirely; either way, restart Zay to apply config changes. See the
-API reference for the full contract and `docs/CONFIG.md` for both settings
+API reference for the full contract and `docs/config/README.md` for both settings
 forms (escaped JSON string or inline object).
 
 ## Permissions

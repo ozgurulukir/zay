@@ -19,7 +19,10 @@ panel's About tab.
 
 ## Cutting a release
 
-1. Make sure `main` is green (`zig build test`).
+1. Make sure `main` is green — the `ci` workflow (`.github/workflows/ci.yml`)
+   runs `zig build test`, `zig build test-plugin`, `zig fmt --check`, and the
+   docs checks on every push and pull request, so a green `main` badge is the
+   same gate as the manual procedure below.
 2. Update `CHANGELOG.md` and bump `build.zig.zon`'s `.version` **in the same
    commit**. The changelog entry rides the bump commit so every tag carries
    its own `## [X.Y.Z] - YYYY-MM-DD` section: add the section under
@@ -31,7 +34,10 @@ panel's About tab.
    A pre-release tag with a suffix such as `vX.Y.Z-beta.1` needs the matching
    suffix in `.version` and its own changelog heading. (0.11.6 shipped the
    entry on main only, after the tag was published — this convention is what
-   prevents a repeat.)
+   prevents a repeat.) Changelog entries are plain text: control characters
+   other than newline and tab are rejected by the `ci` workflow's docs job —
+   raw control bytes once corrupted four words in the `0.11.10` entry and the
+   damage is invisible in terminals and most viewers.
 3. Tag the commit you want to ship and push that tag. Remove the leading `v`
    from the tag when setting `.version`:
 

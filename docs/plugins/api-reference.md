@@ -108,7 +108,7 @@ or `nil` when the plugin has no config entry or no settings.
 
 - Settings come from the plugin's `config.json` entry and are read once at
   App start (restart Zay to apply config changes). Both settings forms work
-  (see `docs/CONFIG.md`): an escaped JSON string, or an inline JSON object.
+  (see `docs/config/README.md`): an escaped JSON string, or an inline JSON object.
 - `plugins.<name>.enabled: false` means the plugin is never loaded at all —
   `get_config()` is moot for it.
 - Malformed or non-object settings (e.g. a JSON array) return

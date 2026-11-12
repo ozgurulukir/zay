@@ -1,6 +1,6 @@
 # Zay Development Guide
 
-Read this guide before writing Zig code. Use the repository’s `tigerstyle` skill for the full coding discipline and [Building](BUILDING.md#verifying) for verification and test-runner behavior. Subsystem contracts live in [Engineering patterns](PATTERNS.md).
+Read this guide before writing Zig code. Use the repository’s `tigerstyle` skill for the full coding discipline and [Building](BUILDING.md#verifying) for verification and test-runner behavior. Subsystem contracts live in [Engineering patterns](patterns/README.md).
 
 ## Zig Development
 
