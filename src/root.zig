@@ -670,30 +670,37 @@ test "every file with test blocks under src/ is reachable from a test root" {
         try imports_of.put(arena, path, list);
     }
 
-    // Transitive closure over the two test-binary roots in build.zig.
-    for ([_][]const u8{ "src/root.zig", "src/main.zig" }) |seed| {
-        if (imports_of.get(seed) != null) try queue.append(arena, seed);
+    // Transitive closure over the two test-binary roots in build.zig. The
+    // seeds go through the same `join` as the walked keys: map keys compare
+    // bytes, so the literal "src/root.zig" would miss the Windows key
+    // "src\root.zig" and the closure would silently be empty.
+    const seed_stems = [_][]const u8{ "root.zig", "main.zig" };
+    for (seed_stems) |stem| {
+        const seed = try std.fs.path.join(arena, &.{ src_dir_path, stem });
+        if (!imports_of.contains(seed)) {
+            std.debug.print("test root not walked under src/: {s} (build.zig and this guard disagree)\n", .{seed});
+            return error.TestUnexpectedResult;
+        }
+        try queue.append(arena, seed);
     }
     while (queue.pop()) |path| {
         if (reachable.contains(path)) continue;
         try reachable.put(arena, path, {});
         const file_imports = imports_of.get(path) orelse continue;
-        // Imports resolve against src/ (module-relative, e.g.
-        // "mcp/mock_server.zig") or against the importing file's own
-        // directory (sibling imports like tui/tests.zig's "test_helpers.zig").
+        // A file import always resolves against the importing file's own
+        // directory (Zig's import rule); `dirname` of a file at the src/
+        // root is `src` itself, so root-file imports like
+        // "mcp/mock_server.zig" land identically. `resolve` normalizes `..`
+        // so imports like "../test_util.zig" (src/context/rules.zig) or
+        // "../mcp/registry_bridge.zig" (src/tools/registry.zig) map onto the
+        // walked file keys. Resolving against `src` first instead would
+        // mis-credit a same-named root file over the real sibling (e.g.
+        // tools/registry.zig's "skill.zig").
         const dir_of_file = std.fs.path.dirname(path) orelse src_dir_path;
         for (file_imports.items) |import_name| {
-            // `resolve` normalizes `..` so imports like "../test_util.zig"
-            // (src-context/rules.zig) or "../mcp/registry_bridge.zig"
-            // (src/tools/registry.zig) map onto the walked file keys.
-            const candidate = try std.fs.path.resolve(arena, &.{ src_dir_path, import_name });
-            if (imports_of.contains(candidate) and !reachable.contains(candidate)) {
-                try queue.append(arena, candidate);
-                continue;
-            }
-            const sibling = try std.fs.path.resolve(arena, &.{ dir_of_file, import_name });
-            if (imports_of.contains(sibling) and !reachable.contains(sibling)) {
-                try queue.append(arena, sibling);
+            const target = try std.fs.path.resolve(arena, &.{ dir_of_file, import_name });
+            if (imports_of.contains(target) and !reachable.contains(target)) {
+                try queue.append(arena, target);
             }
         }
     }
