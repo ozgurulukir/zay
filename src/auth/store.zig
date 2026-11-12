@@ -150,12 +150,16 @@ pub fn removeProviderApiKey(gpa: std.mem.Allocator, io: std.Io, home_dir: []cons
 /// Keys matching `valid_names` (builtin labels + config provider names)
 /// are kept; everything else is an orphan and gets removed.
 /// Idempotent: running again after a prune removes nothing.
-/// Returns the number of keys removed.
+/// Returns the number of keys removed. When `removed_names` is non-null,
+/// each removed key's name is appended there as a gpa-owned duplicate the
+/// caller must free — a destructive prune is only diagnosable after the
+/// fact by name, never by count alone.
 pub fn pruneOrphanKeys(
     gpa: std.mem.Allocator,
     io: std.Io,
     home_dir: []const u8,
     valid_names: []const []const u8,
+    removed_names: ?*std.ArrayList([]const u8),
 ) !u32 {
     var keys = try loadAllProviderApiKeys(gpa, io, home_dir);
     defer freeApiKeyMap(gpa, &keys);
@@ -179,6 +183,10 @@ pub fn pruneOrphanKeys(
     if (orphans.items.len == 0) return 0;
 
     for (orphans.items) |name| {
+        // Report the name before the removal frees the map key it points into.
+        if (removed_names) |list| {
+            try list.append(gpa, try gpa.dupe(u8, name));
+        }
         if (keys.fetchOrderedRemove(name)) |old| {
             gpa.free(old.key);
             gpa.free(old.value);
@@ -393,8 +401,23 @@ fn writeBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes
     defer gpa.free(path);
     const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
-    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+    // The blob is plaintext provider API keys, and on keyring-less platforms
+    // (Linux/BSD) this file is the only credential store. Create it
+    // owner-only — 0600 survives any umask, unlike the 0o666 default — and
+    // narrow an existing wider mode on every save, since a truncating
+    // rewrite keeps the old mode from when an older build created the file.
+    // Fails closed: a file that cannot be narrowed is not written. Windows
+    // keeps its attribute-based default (the keyring is native there).
+    const file_permissions: std.Io.File.Permissions = if (os.is_windows)
+        .default_file
+    else
+        .fromMode(0o600);
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{
+        .truncate = true,
+        .permissions = file_permissions,
+    });
     defer file.close(io);
+    if (!os.is_windows) try file.setPermissions(io, file_permissions);
     var buffer: [4096]u8 = undefined;
     var writer = file.writer(io, &buffer);
     try writer.interface.writeAll(bytes);
@@ -637,6 +660,40 @@ test "writeBlob handles large payload triggering keyring error and falls back to
     try std.testing.expectEqualSlices(u8, large_payload, loaded);
 }
 
+test "writeBlob keeps auth.json owner-only regardless of umask" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/zay-writeblob-perms-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+    // Force the plaintext fallback: on keyring-less platforms this file is
+    // the only credential store, so its mode is the whole point of the test.
+    keyring.forced_error = error.Unsupported;
+    defer keyring.forced_error = null;
+
+    // Act
+    try writeBlob(gpa, io, home_dir, "{\"apiKeys\":{\"openrouter\":\"or-key\"}}");
+
+    // Assert: freshly written auth.json is owner-only (survives any umask).
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    const stat = try std.Io.Dir.statFile(.cwd(), io, path, .{});
+    if (os.tag != .windows) {
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    }
+
+    // A file created wide by an older build (umask-derived 0644) is narrowed
+    // on the next save instead of staying readable by group and other.
+    if (os.tag != .windows) {
+        var wide = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+        defer wide.close(io);
+        try wide.setPermissions(io, .fromMode(0o666));
+        try writeBlob(gpa, io, home_dir, "{\"apiKeys\":{}}");
+        const narrowed = try std.Io.Dir.statFile(.cwd(), io, path, .{});
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(narrowed.permissions.toMode() & 0o777)));
+    }
+}
+
 test "deleteBlob handles keyring delete failure and removes auth.json file" {
     // Arrange
     const gpa = std.testing.allocator;
@@ -684,10 +741,22 @@ test "pruneOrphanKeys removes unknown provider keys while keeping valid ones and
     const valid_names = [_][]const u8{ "cerebras", "openai", "anthropic" };
 
     // Act
-    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+    var removed_names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (removed_names.items) |name| gpa.free(name);
+        removed_names.deinit(gpa);
+    }
+    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names, &removed_names);
 
     // Assert
     try std.testing.expectEqual(@as(u32, 2), removed_count);
+    try std.testing.expectEqual(@as(usize, 2), removed_names.items.len);
+    // A destructive prune reports which keys went, by name, order-free.
+    try std.testing.expect(std.mem.eql(u8, removed_names.items[0], "deprecated_provider") or
+        std.mem.eql(u8, removed_names.items[0], "old_custom"));
+    try std.testing.expect(std.mem.eql(u8, removed_names.items[1], "deprecated_provider") or
+        std.mem.eql(u8, removed_names.items[1], "old_custom"));
+    try std.testing.expect(!std.mem.eql(u8, removed_names.items[0], removed_names.items[1]));
 
     const cerebras_key = try loadProviderApiKey(gpa, io, home_dir, "cerebras");
     defer if (cerebras_key) |k| gpa.free(k);
@@ -724,7 +793,7 @@ test "pruneOrphanKeys returns zero when no orphan keys exist" {
     const valid_names = [_][]const u8{ "cerebras", "openai", "anthropic" };
 
     // Act
-    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names, null);
 
     // Assert
     try std.testing.expectEqual(@as(u32, 0), removed_count);
@@ -748,7 +817,7 @@ test "pruneOrphanKeys returns zero when no provider keys are stored" {
     const valid_names = [_][]const u8{"cerebras"};
 
     // Act
-    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names, null);
 
     // Assert
     try std.testing.expectEqual(@as(u32, 0), removed_count);
@@ -767,8 +836,8 @@ test "pruneOrphanKeys is idempotent" {
     const valid_names = [_][]const u8{"cerebras"};
 
     // Act
-    const first_run = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
-    const second_run = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+    const first_run = try pruneOrphanKeys(gpa, io, home_dir, &valid_names, null);
+    const second_run = try pruneOrphanKeys(gpa, io, home_dir, &valid_names, null);
 
     // Assert
     try std.testing.expectEqual(@as(u32, 1), first_run);
