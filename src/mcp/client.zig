@@ -8,8 +8,8 @@ const os = @import("../os.zig");
 const http = @import("../http.zig");
 const tools_common = @import("../tools/common.zig");
 const transport = @import("transport.zig");
-const naming = @import("naming.zig");
 const schema_mod = @import("schema.zig");
+const discovery_mod = @import("discovery.zig");
 
 const assert = std.debug.assert;
 
@@ -133,28 +133,7 @@ pub const ServerStatus = enum {
     }
 };
 
-pub const McpTool = struct {
-    server_name: []u8,
-    name: []u8,
-    full_name: []u8,
-    description: []u8,
-    schema: tools_common.Schema,
-    /// The server's original `inputSchema` as raw JSON (lossless) — the
-    /// source of truth for provider serialization on pass-through-capable
-    /// dialects, while `schema` stays the best-effort local projection.
-    /// Owned; null when the server sent no object-typed `inputSchema`.
-    raw_input_schema: ?[]u8 = null,
-
-    pub fn deinit(self: *McpTool, gpa: std.mem.Allocator) void {
-        gpa.free(self.server_name);
-        gpa.free(self.name);
-        gpa.free(self.full_name);
-        gpa.free(self.description);
-        if (self.raw_input_schema) |raw| gpa.free(raw);
-        self.schema.deinit(gpa);
-        self.* = undefined;
-    }
-};
+pub const McpTool = discovery_mod.McpTool;
 
 /// Server identity reported in the `initialize` response. Owned; freed in
 /// `McpClient.deinit`. Used for diagnostics and TUI display.
@@ -206,7 +185,14 @@ pub const McpClient = struct {
         },
     },
     latency_ms: u32 = 0,
-    tools: std.ArrayList(McpTool) = .empty,
+    /// The discovery cache: discovered tool records, the
+    /// `notifications/tools/list_changed` pending flag, and the
+    /// `capabilities.tools.listChanged` capability bit. Owned by the
+    /// `discovery.zig` spoke (no back-reference); the client orchestrates —
+    /// it fills the cache via `listTools`, routes notifications into it, and
+    /// drops it through `clearTools` on every transition off a live
+    /// transport (#384 invariants live in the spoke).
+    discovery: discovery_mod.Discovery,
     next_request_id: i64 = 1,
     /// Serializes JSON-RPC requests — stdin/stdout pipes can't handle
     /// concurrent requests. Defensive for future parallel tool execution.
@@ -222,20 +208,6 @@ pub const McpClient = struct {
     /// Protocol version the server echoed back in `initialize`. May differ
     /// from what we sent — the server may downgrade. Owned; freed in deinit.
     negotiated_protocol: ?[]u8 = null,
-    /// True when the server advertised `capabilities.tools.listChanged`. When
-    /// set, the server may send `notifications/tools/list_changed` and the
-    /// App should re-discover tools. False otherwise (including when the
-    /// server advertises tools but not the listChanged flag).
-    server_supports_tools_list_changed: bool = false,
-    /// Set by `handleNotification` when a `notifications/tools/list_changed`
-    /// arrives mid-request — written on the transport's worker thread (stdio
-    /// read loop, SSE accumulation, both under `request_mutex`), read and
-    /// cleared on the UI thread via `pollToolsRefresh`. Atomic so the worker's
-    /// store and the UI's load-and-clear can never race (a plain bool was a
-    /// formal data race; #384). This avoids re-entering `listTools`
-    /// synchronously from inside a JSON-RPC read loop (which would deadlock
-    /// the request mutex).
-    pending_tools_refresh: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8, command: ?[]const u8, args: []const []const u8, url: ?[]const u8) !McpClient {
         // Legacy init: if url is set, build an sse client; otherwise stdio.
@@ -280,6 +252,7 @@ pub const McpClient = struct {
                 },
             },
             .lifecycle = .disabled,
+            .discovery = discovery_mod.Discovery.init(gpa),
         };
     }
 
@@ -293,6 +266,7 @@ pub const McpClient = struct {
             .name = name_owned,
             .transport = .{ .sse = .{ .url = url_owned } },
             .lifecycle = .disabled,
+            .discovery = discovery_mod.Discovery.init(gpa),
         };
     }
 
@@ -303,11 +277,11 @@ pub const McpClient = struct {
     /// thread, so the live client is never mutated off-thread.
     ///
     /// The clone starts from the `initStdio`/`initSse` defaults, so it never
-    /// inherits the live client's discovery cache: `tools` is empty and
-    /// `pending_tools_refresh` is reset to false. A fresh connect has nothing
-    /// to refresh yet — its own handshake runs `listTools` — and inheriting a
-    /// stale pending flag would trigger a redundant re-discovery on the first
-    /// tick after the clone is installed.
+    /// inherits the live client's discovery cache: `discovery` is a fresh
+    /// `Discovery` — empty tools, pending flag reset. A fresh connect has
+    /// nothing to refresh yet — its own handshake runs `listTools` — and
+    /// inheriting a stale pending flag would trigger a redundant re-discovery
+    /// on the first tick after the clone is installed.
     pub fn cloneForConnect(self: *const McpClient, io: std.Io) !McpClient {
         var clone: McpClient = switch (self.transport) {
             .stdio => |t| try initStdio(self.gpa, self.name, t.command, t.args),
@@ -318,8 +292,8 @@ pub const McpClient = struct {
             clone.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, self.transport.sse.headers);
         }
         clone.markConnecting();
-        assert(clone.tools.items.len == 0);
-        assert(!clone.pending_tools_refresh.load(.acquire));
+        assert(clone.discovery.tools.items.len == 0);
+        assert(!clone.discovery.pending_refresh.load(.acquire));
         return clone;
     }
 
@@ -389,8 +363,7 @@ pub const McpClient = struct {
             .failed => |f| self.gpa.free(f.reason),
             else => {},
         }
-        self.clearTools();
-        self.tools.deinit(self.gpa);
+        self.discovery.deinit();
         if (self.session_id) |sid| self.gpa.free(sid);
         if (self.server_info) |*si| si.deinit(self.gpa);
         if (self.negotiated_protocol) |pv| self.gpa.free(pv);
@@ -426,43 +399,35 @@ pub const McpClient = struct {
     }
 
     /// Free every discovered tool record and empty the list, clearing the
-    /// pending-refresh flag with it. Owns the discovery-cache invariant the
-    /// disable/reconnect transitions rely on: the cache belongs to a live
-    /// transport, so stopping the transport without dropping the cache would
-    /// leave stale tools that wedge the next reconcile in CONNECTING (#384).
+    /// pending-refresh flag with it. Unchanged-signature delegate to the
+    /// discovery spoke, which owns the invariant: the cache belongs to a
+    /// live transport, so stopping the transport without dropping the cache
+    /// would leave stale tools that wedge the next reconcile in CONNECTING
+    /// (#384). Every transition off a live transport calls this.
     pub fn clearTools(self: *McpClient) void {
-        for (self.tools.items) |*tool| tool.deinit(self.gpa);
-        self.tools.clearRetainingCapacity();
-        self.pending_tools_refresh.store(false, .release);
+        self.discovery.clear();
     }
 
     /// Route a server-initiated notification captured during a request read.
-    /// Only `notifications/tools/list_changed` is consumed (sets
-    /// `pending_tools_refresh`); other notifications (progress, logging,
+    /// Only `notifications/tools/list_changed` is consumed (marks the
+    /// discovery cache stale — the bookkeeping lives on the
+    /// `discovery.zig` spoke); other notifications (progress, logging,
     /// resources/list_changed, prompts/list_changed) are accepted but ignored
     /// — Zay doesn't expose those primitives yet. `payload` is unused for
     /// the list_changed path (the spec carries no params), but kept on the
     /// signature for future notifications that do carry params.
     fn handleNotification(self: *McpClient, method: []const u8, payload: []const u8) void {
         _ = payload;
-        if (std.mem.eql(u8, method, "notifications/tools/list_changed")) {
-            // Honor the capability flag — a server that didn't advertise
-            // listChanged shouldn't be sending these, but we still set the
-            // flag: re-discovery is idempotent and harmless. Release-store:
-            // pairs with the UI thread's swap below.
-            self.pending_tools_refresh.store(true, .release);
-            return;
-        }
-        // Silently accept other notifications — they're informational.
+        self.discovery.onNotification(method);
     }
 
     /// True when a `notifications/tools/list_changed` arrived since the last
     /// check. The App calls this on each tick and, when true, calls
     /// `refreshMcpTools` (which re-runs `tools/list` and reinjects schemas).
-    /// Read-and-clear is one atomic swap: a notification landing between the
-    /// read and the clear survives to the next poll instead of being lost.
+    /// Unchanged-signature delegate to the discovery spoke's atomic
+    /// read-and-clear swap.
     pub fn pollToolsRefresh(self: *McpClient) bool {
-        return self.pending_tools_refresh.swap(false, .acq_rel);
+        return self.discovery.takeRefreshPending();
     }
 
     /// Spawn the MCP server subprocess (stdio transport).
@@ -923,8 +888,8 @@ pub const McpClient = struct {
                 notifications.deinit(self.gpa);
             }
             const response_body = try transport.readSseResponse(self.gpa, reader, id, &notifications);
-            // Route accumulated server notifications — they may set
-            // pending_tools_refresh, which the App polls on the next tick.
+            // Route accumulated server notifications — they may mark the
+            // discovery cache stale, which the App polls on the next tick.
             for (notifications.items) |n| self.handleNotification(n.method, n.payload);
             return response_body;
         }
@@ -1072,15 +1037,16 @@ pub const McpClient = struct {
             }
         }
 
-        // Parse server capabilities — record `tools.listChanged` so the App
-        // can subscribe to `notifications/tools/list_changed` and re-discover.
-        self.server_supports_tools_list_changed = false;
+        // Parse server capabilities — record `tools.listChanged` on the
+        // discovery spoke so the App can subscribe to
+        // `notifications/tools/list_changed` and re-discover.
+        self.discovery.server_supports_tools_list_changed = false;
         if (result_obj.get("capabilities")) |caps| {
             if (caps == .object) {
                 if (caps.object.get("tools")) |tools_cap| {
                     if (tools_cap == .object) {
                         if (tools_cap.object.get("listChanged")) |lc| {
-                            if (lc == .bool) self.server_supports_tools_list_changed = lc.bool;
+                            if (lc == .bool) self.discovery.server_supports_tools_list_changed = lc.bool;
                         }
                     }
                 }
@@ -1127,7 +1093,7 @@ pub const McpClient = struct {
             fresh.deinit(self.gpa);
         }
         for (tools_val.array.items) |tool_val| {
-            var record = try toolRecordFromListEntry(self.gpa, self.name, tool_val) orelse continue;
+            var record = try discovery_mod.toolRecordFromListEntry(self.gpa, self.name, tool_val) orelse continue;
             fresh.append(self.gpa, record) catch |err| {
                 record.deinit(self.gpa);
                 return err;
@@ -1135,9 +1101,9 @@ pub const McpClient = struct {
         }
 
         // Full success: swap the replacement in and release the stale cache.
-        for (self.tools.items) |*tool| tool.deinit(self.gpa);
-        self.tools.deinit(self.gpa);
-        self.tools = fresh;
+        // The spoke's replaceAll owns the swap; reaching it at all means the
+        // failure-keeps-old half of the invariant already held.
+        self.discovery.replaceAll(fresh);
     }
 
     /// Call a tool via `tools/call` JSON-RPC.
@@ -1201,10 +1167,12 @@ pub const McpClient = struct {
     }
 
     /// Register a mock or discovered tool for testing / dynamic loading.
-    /// `raw_input_schema` is the server's original `inputSchema` JSON
-    /// (borrowed; duped into the record) — pass null for mock tools that
-    /// have no source schema. The record takes ownership of `schema` on
-    /// success; on error `schema` stays caller-owned.
+    /// Unchanged-signature delegate to the discovery spoke's `addTool`, which
+    /// owns the record construction and its failure contract (the record
+    /// takes ownership of `schema` on success; on error `schema` stays
+    /// caller-owned). `raw_input_schema` is the server's original
+    /// `inputSchema` JSON (borrowed; duped into the record) — pass null for
+    /// mock tools that have no source schema.
     pub fn addTool(
         self: *McpClient,
         tool_name: []const u8,
@@ -1212,83 +1180,7 @@ pub const McpClient = struct {
         schema: tools_common.Schema,
         raw_input_schema: ?[]const u8,
     ) !void {
-        const record = try buildToolRecord(self.gpa, self.name, tool_name, description, schema, raw_input_schema);
-        // Append may fail; on failure the schema stays caller-owned (the
-        // discovery loop's errdefer frees it), so release every field the
-        // record owns EXCEPT the schema.
-        self.tools.append(self.gpa, record) catch |err| {
-            self.gpa.free(record.server_name);
-            self.gpa.free(record.name);
-            self.gpa.free(record.full_name);
-            self.gpa.free(record.description);
-            if (record.raw_input_schema) |raw| self.gpa.free(raw);
-            return err;
-        };
-    }
-
-    /// Build one owned tool record from borrowed discovery fields — the
-    /// shared construction behind `addTool` and `listTools`. On success the
-    /// record owns `schema`; on error nothing is allocated and `schema`
-    /// stays caller-owned.
-    fn buildToolRecord(
-        gpa: std.mem.Allocator,
-        server_name: []const u8,
-        tool_name: []const u8,
-        description: []const u8,
-        schema: tools_common.Schema,
-        raw_input_schema: ?[]const u8,
-    ) !McpTool {
-        const full_name = try naming.toolFullName(gpa, server_name, tool_name);
-        errdefer gpa.free(full_name);
-
-        // Hoist the record's owned fields into locals so every errdefer below
-        // frees an initialized slice — `try` dupes inside the return's struct
-        // literal would leave the earlier copies stranded when a later one
-        // failed (same hazard `buildMcpTool` fixed in the registry bridge).
-        const server_name_owned = try gpa.dupe(u8, server_name);
-        errdefer gpa.free(server_name_owned);
-        const tool_name_owned = try gpa.dupe(u8, tool_name);
-        errdefer gpa.free(tool_name_owned);
-        const description_owned = try gpa.dupe(u8, description);
-        errdefer gpa.free(description_owned);
-        const raw_owned = if (raw_input_schema) |raw| try gpa.dupe(u8, raw) else null;
-        errdefer if (raw_owned) |raw| gpa.free(raw);
-
-        return .{
-            .server_name = server_name_owned,
-            .name = tool_name_owned,
-            .full_name = full_name,
-            .description = description_owned,
-            .schema = schema,
-            .raw_input_schema = raw_owned,
-        };
-    }
-
-    /// Extract one `tools/list` entry into an owned record. Null when the
-    /// entry is malformed (skipped silently, matching the discovery
-    /// contract); an error only for allocation failure. On success the
-    /// record owns the schema projection and raw capture, so the caller's
-    /// errdefer scope can end at the return without ownership overlap.
-    fn toolRecordFromListEntry(
-        gpa: std.mem.Allocator,
-        server_name: []const u8,
-        tool_val: std.json.Value,
-    ) !?McpTool {
-        if (tool_val != .object) return null;
-        const obj = tool_val.object;
-
-        const tool_name = if (obj.get("name")) |n| (if (n == .string) n.string else return null) else return null;
-        const description = if (obj.get("description")) |d| (if (d == .string) d.string else "") else "";
-        const input_schema = obj.get("inputSchema");
-        var schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(gpa, s)) else tools_common.Schema{ .properties = &.{} };
-        // Covers the OOM window before the record takes ownership (raw
-        // capture or record construction); after that, deinit-ing here would
-        // double-free — the record now owns the projection.
-        errdefer schema.deinit(gpa);
-        const raw_input_schema = try schema_mod.rawInputSchemaJson(gpa, input_schema);
-        defer if (raw_input_schema) |raw| gpa.free(raw);
-
-        return try buildToolRecord(gpa, server_name, tool_name, description, schema, raw_input_schema);
+        try self.discovery.addTool(self.name, tool_name, description, schema, raw_input_schema);
     }
 };
 
@@ -1399,8 +1291,8 @@ test "McpClient initializes and formats namespaced tool names" {
 
     try std.testing.expectEqualStrings("memory", client.name);
     try std.testing.expectEqual(ServerStatus.connected, client.status());
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    try std.testing.expectEqualStrings("mcp__memory__create_entities", client.tools.items[0].full_name);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__memory__create_entities", client.discovery.tools.items[0].full_name);
 }
 
 test "McpClient startStdio + stop lifecycle" {
@@ -1458,36 +1350,18 @@ test "McpClient full handshake + tools/list" {
     try std.testing.expectEqualStrings("1.0", client.server_info.?.version);
     try std.testing.expect(client.negotiated_protocol != null);
     try std.testing.expectEqualStrings("2024-11-05", client.negotiated_protocol.?);
-    try std.testing.expectEqual(false, client.server_supports_tools_list_changed);
+    try std.testing.expectEqual(false, client.discovery.server_supports_tools_list_changed);
 
     // Tool discovery
     try client.listTools(io);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    try std.testing.expectEqualStrings("mcp__mock-server__greet", client.tools.items[0].full_name);
-    try std.testing.expectEqualStrings("greet", client.tools.items[0].name);
-    try std.testing.expectEqualStrings("Say hello", client.tools.items[0].description);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items[0].schema.properties.len);
-    try std.testing.expectEqualStrings("name", client.tools.items[0].schema.properties[0].name);
-    try std.testing.expectEqual(tools_common.Schema.Kind.string, client.tools.items[0].schema.properties[0].kind);
-    try std.testing.expect(client.tools.items[0].schema.properties[0].required);
-}
-
-test "McpTool deinit frees extended schema fields" {
-    const gpa = std.testing.allocator;
-    var client = try McpClient.init(gpa, "schema-server", "echo", &.{}, null);
-    defer client.deinit(std.testing.io);
-
-    const schema_json =
-        \\{"type":"object","properties":{
-        \\  "time_range":{"anyOf":[{"type":"string","enum":["day","week"]},{"type":"null"}],"default":null},
-        \\  "value":{"anyOf":[{"type":"object"},{"type":"array"}]}
-        \\}}
-    ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
-    defer parsed.deinit();
-    const schema = try schema_mod.schemaFromJsonSchema(gpa, parsed.value);
-
-    try client.addTool("search", "Search", schema, null);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__mock-server__greet", client.discovery.tools.items[0].full_name);
+    try std.testing.expectEqualStrings("greet", client.discovery.tools.items[0].name);
+    try std.testing.expectEqualStrings("Say hello", client.discovery.tools.items[0].description);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items[0].schema.properties.len);
+    try std.testing.expectEqualStrings("name", client.discovery.tools.items[0].schema.properties[0].name);
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, client.discovery.tools.items[0].schema.properties[0].kind);
+    try std.testing.expect(client.discovery.tools.items[0].schema.properties[0].required);
 }
 
 test "McpClient listTools preserves the raw inputSchema of a rich schema" {
@@ -1503,8 +1377,8 @@ test "McpClient listTools preserves the raw inputSchema of a rich schema" {
     try client.initialize(io);
     try client.listTools(io);
 
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    const tool = client.tools.items[0];
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    const tool = client.discovery.tools.items[0];
     const raw = tool.raw_input_schema orelse return error.RawSchemaMissing;
 
     // Every construct the projection drops survives the raw capture.
@@ -1526,17 +1400,6 @@ test "McpClient listTools preserves the raw inputSchema of a rich schema" {
     try std.testing.expect(filter_property.kind_unconstrained);
 }
 
-test "McpClient addTool leaves raw_input_schema null without a source schema" {
-    const gpa = std.testing.allocator;
-    var client = try McpClient.init(gpa, "bare", "echo", &.{}, null);
-    defer client.deinit(std.testing.io);
-
-    // addTool's null raw path is the mock registration contract; discovery
-    // only produces a non-null raw for object-typed inputSchemas.
-    try client.addTool("noop", "No schema", .{ .properties = &.{} }, null);
-    try std.testing.expect(client.tools.items[0].raw_input_schema == null);
-}
-
 test "McpClient init and addTool leak no partial copies on a mid-call OOM" {
     // Regression for the hoisted errdefer chains: a `try` dupe failing inside
     // a struct literal (initStdio's name/command, addTool's server/name/
@@ -1556,8 +1419,8 @@ test "McpClient init and addTool leak no partial copies on a mid-call OOM" {
             defer client.deinit(io);
 
             if (client.addTool("search", "Search the index", .{ .properties = &.{} }, "{\"type\":\"object\"}")) {
-                try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-                try std.testing.expectEqualStrings("{\"type\":\"object\"}", client.tools.items[0].raw_input_schema.?);
+                try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+                try std.testing.expectEqualStrings("{\"type\":\"object\"}", client.discovery.tools.items[0].raw_input_schema.?);
                 succeeded = true;
                 break;
             } else |err| {
@@ -1582,7 +1445,7 @@ test "McpClient initialize captures tools.listChanged capability" {
 
     try client.initialize(io);
     try std.testing.expectEqual(ServerStatus.connected, client.status());
-    try std.testing.expect(client.server_supports_tools_list_changed);
+    try std.testing.expect(client.discovery.server_supports_tools_list_changed);
     try std.testing.expectEqualStrings("changeful", client.server_info.?.name);
     try std.testing.expectEqualStrings("2.0", client.server_info.?.version);
 }
@@ -1600,7 +1463,7 @@ test "McpClient callTool round-trip" {
     // Handshake + discovery
     try client.initialize(io);
     try client.listTools(io);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
 
     // Call the tool
     const result = try client.callTool(io, "greet", "{\"name\":\"World\"}");
@@ -1672,27 +1535,6 @@ test "captureSessionId + isEventStream read the response head" {
 // Notification handling tests
 // ---------------------------------------------------------------------------
 
-test "handleNotification sets pending_tools_refresh for tools/list_changed" {
-    const gpa = std.testing.allocator;
-    var client = try McpClient.init(gpa, "x", "echo", &.{}, null);
-    defer client.deinit(std.testing.io);
-
-    // Initially no pending refresh.
-    try std.testing.expectEqual(false, client.pollToolsRefresh());
-
-    // Simulate a server-initiated tools/list_changed notification.
-    client.handleNotification("notifications/tools/list_changed", "");
-    try std.testing.expect(client.pollToolsRefresh());
-
-    // The flag clears on read — a second poll returns false.
-    try std.testing.expectEqual(false, client.pollToolsRefresh());
-
-    // Other notifications do NOT set the flag.
-    client.handleNotification("notifications/progress", "{}");
-    client.handleNotification("notifications/resources/list_changed", "");
-    try std.testing.expectEqual(false, client.pollToolsRefresh());
-}
-
 test "sendRequestStdio routes interleaved notifications to handleNotification" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1705,13 +1547,13 @@ test "sendRequestStdio routes interleaved notifications to handleNotification" {
 
     // Handshake records the listChanged capability.
     try client.initialize(io);
-    try std.testing.expect(client.server_supports_tools_list_changed);
+    try std.testing.expect(client.discovery.server_supports_tools_list_changed);
 
     // tools/list arrives after a notification — the loop routes the
     // notification and keeps reading until the response.
     try client.listTools(io);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    try std.testing.expectEqualStrings("mcp__notif-server__greet", client.tools.items[0].full_name);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__notif-server__greet", client.discovery.tools.items[0].full_name);
 
     // The interleaved notification was buffered — poll drains it.
     try std.testing.expect(client.pollToolsRefresh());
@@ -1786,19 +1628,19 @@ test "McpClient listTools replaces the cache instead of appending" {
     // must be exactly the server's catalog, never the union of both lists
     // (the old append path grew the list on every `tools/list_changed`).
     try client.addTool("stale", "Removed server-side", .{ .properties = &.{} }, null);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
 
     try client.listTools(io);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    try std.testing.expectEqualStrings("greet", client.tools.items[0].name);
-    try std.testing.expectEqualStrings("mcp__rediscover__greet", client.tools.items[0].full_name);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("greet", client.discovery.tools.items[0].name);
+    try std.testing.expectEqualStrings("mcp__rediscover__greet", client.discovery.tools.items[0].full_name);
 
     // The list_changed path re-runs listTools on the same client — a second
     // discovery must keep the count at the server's catalog size, with
     // unique names (no duplicates).
     try client.listTools(io);
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    try std.testing.expectEqualStrings("greet", client.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("greet", client.discovery.tools.items[0].name);
 }
 
 test "McpClient keeps the previous tool list when re-discovery fails" {
@@ -1825,9 +1667,9 @@ test "McpClient keeps the previous tool list when re-discovery fails" {
         // success. Both outcomes must leave the cache untouched.
     } else |_| {}
 
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
-    try std.testing.expectEqualStrings("kept", client.tools.items[0].name);
-    try std.testing.expectEqualStrings("mcp__broken-list__kept", client.tools.items[0].full_name);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("kept", client.discovery.tools.items[0].name);
+    try std.testing.expectEqualStrings("mcp__broken-list__kept", client.discovery.tools.items[0].full_name);
     try std.testing.expectEqual(ServerStatus.connected, client.status());
 }
 
@@ -1868,44 +1710,9 @@ test "McpClient setError stops a live stdio transport before failing" {
     }
     // The transport's discovery cache went down with it — a failed lifecycle
     // never carries tools.
-    try std.testing.expectEqual(@as(usize, 0), client.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.discovery.tools.items.len);
 
     // The orphan half of the bug: the process must actually be gone, not
     // merely dropped from the lifecycle union.
     if (watch) |*w| try std.testing.expect(w.awaitExit(io, 2_000));
-}
-
-test "pending_tools_refresh survives concurrent worker stores" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var client = try McpClient.init(gpa, "hammer", "echo", &.{}, null);
-    defer client.deinit(io);
-
-    // Only the atomic flag is shared with the worker — no allocator use, so
-    // the plain testing allocator is safe on the UI side.
-    const Worker = struct {
-        fn run(flag: *std.atomic.Value(bool), stop_flag: *std.atomic.Value(bool)) void {
-            while (!stop_flag.load(.acquire)) flag.store(true, .release);
-        }
-    };
-    var stop_flag = std.atomic.Value(bool).init(false);
-    const worker = try std.Thread.spawn(.{}, Worker.run, .{ &client.pending_tools_refresh, &stop_flag });
-
-    // The UI's swap must observe a store under concurrent writes — a lost
-    // notification deadlocks the UI's re-discovery into this deadline. (The
-    // clear-exactly-once half is pinned single-threaded by the
-    // handleNotification test above: after a worker store there is no
-    // deterministic flag value to assert once the hammer stops.)
-    var observed = false;
-    var spins: usize = 0;
-    while (!observed and spins < 5_000) : (spins += 1) {
-        observed = client.pollToolsRefresh();
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    }
-
-    stop_flag.store(true, .release);
-    worker.join();
-
-    try std.testing.expect(observed);
 }
