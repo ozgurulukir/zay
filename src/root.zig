@@ -811,6 +811,9 @@ test {
     // Agent workspace scoping leaf (S5 lane-worktree borrow + its mutex),
     // extracted from agent.zig; referenced explicitly so its inline tests run.
     _ = @import("agent/workspace.zig");
+    // Agent per-turn continuation policy (tool-call budget + stop knobs),
+    // extracted from agent.zig; referenced explicitly so its inline tests run.
+    _ = @import("agent/turn_budget.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");
