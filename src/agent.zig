@@ -32,6 +32,8 @@ const MessageQueue = agent_queue.MessageQueue;
 
 const agent_workspace = @import("agent/workspace.zig");
 const WorkspaceScope = agent_workspace.WorkspaceScope;
+const agent_turn_budget = @import("agent/turn_budget.zig");
+const TurnBudget = agent_turn_budget.TurnBudget;
 
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
@@ -42,24 +44,6 @@ const Compactor = agent_compactor.Compactor;
 /// path backs off (emitting one notice); the manual `/compact` command is
 /// never gated (TD-6). Alias of the AutoCompactor's own limit — one SSOT.
 pub const compaction_failure_limit: u32 = auto_compactor_mod.failure_limit;
-/// Trailing machine-authored continuation hint left in history after a soft
-/// budget stop. Role `.user` (not `.system`) because `SessionWriter.append`
-/// skips system messages — `.user` survives `/resume`, branch switches, and
-/// compaction reprojection, and Qwen's single-leading-system normalization
-/// never touches it. Static text: the event carries the limit for the human;
-/// the model does not need the number.
-const tool_budget_continuation_hint =
-    "[zay] This turn stopped early because the per-turn tool-call budget was reached. " ++
-    "Work done so far is intact. When the user asks to continue, briefly summarize " ++
-    "completed steps, then pick up exactly where the work left off.";
-/// Trailing machine-authored continuation hint appended when a response was
-/// severed by the provider's output token cap (`finish_reason=length`) with
-/// no tool calls: the prose landed, the tool_call section did not. Same
-/// `.user`-role reasoning as `tool_budget_continuation_hint` (survives
-/// resume/compaction; Qwen normalization never touches it).
-const length_cut_continuation_hint =
-    "[zay] Your previous response was cut off by the output token limit before it finished. " ++
-    "Continue from exactly where it stopped; if you were about to call a tool, emit that tool call now.";
 /// Injected when the provider severed the tool_call section (name+id arrived,
 /// arguments never streamed — intern-ai/internlm gateway truncation). The
 /// model's request is NOT executed, so the model must re-emit the call with
@@ -157,24 +141,12 @@ pub const Agent = struct {
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
     compaction_settings: config_mod.CompactionSettings = .{},
-    /// Per-turn hard cap on individual tool calls. Model-response iterations
-    /// are also capped by this value so queued continuations remain bounded.
-    /// Set by the runtime from `config.context.tool_call_limit_per_turn`;
-    /// the default matches `config_mod.default_tool_call_limit_per_turn`.
-    tool_call_limit_per_turn: u32 = config_mod.default_tool_call_limit_per_turn,
-    /// When true, exhausting `tool_call_limit_per_turn` ends the turn
-    /// gracefully (drain + hint + typed event) instead of failing with
-    /// `error.ToolCallLimit`. Default true; `false` restores the historical
-    /// hard-failure contract byte-for-byte.
-    soft_stop_on_tool_call_limit: bool = true,
-    /// When true (default), a response severed by the provider's output
-    /// token cap (`finish_reason=length`, no tool calls) gets ONE automatic
-    /// continuation inside the same turn: a hint is appended and the model
-    /// re-requested. Guards against providers whose default completion
-    /// budget cuts the tool_call section off after the prose — the turn
-    /// otherwise ends as a text-only message that looks complete. Set from
-    /// `config.context.auto_continue_on_length_cut`.
-    auto_continue_on_length_cut: bool = true,
+    /// Per-turn continuation policy (tool-call budget, soft stop on budget
+    /// exhaustion, one-shot length-cut auto-continue) — state, budget math,
+    /// and continuation hints live in `agent/turn_budget.zig`; the turn loop
+    /// and its stop handlers below are the only consumers. Set by the
+    /// runtime from `config.context`.
+    turn_budget: TurnBudget = .{},
     /// Process-wide cap on concurrent LLM requests to the provider, shared by
     /// every lane's agent. Borrowed from the App (never freed here); null in
     /// headless/tests = no gate. Acquired around each `client.prompt` so at
@@ -674,7 +646,7 @@ pub const Agent = struct {
         var turn_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer turn_arena.deinit();
 
-        while (iterations < self.tool_call_limit_per_turn and tool_calls_executed < self.tool_call_limit_per_turn) {
+        while (self.turn_budget.hasCapacity(iterations, tool_calls_executed)) {
             iterations += 1;
             _ = turn_arena.reset(.retain_capacity);
             const turn_allocator = turn_arena.allocator();
@@ -857,7 +829,7 @@ pub const Agent = struct {
                 .end_turn => return,
             }
             if (self.tool_access == .none) return error.ToolAccessDenied;
-            const calls_remaining: usize = @intCast(self.tool_call_limit_per_turn - tool_calls_executed);
+            const calls_remaining: usize = self.turn_budget.callsRemaining(tool_calls_executed);
             const calls_to_dispatch = @min(tool_calls.len, calls_remaining);
             const batch_exceeds_budget = calls_to_dispatch < tool_calls.len;
             const end_turn = try Agent.runToolBatch(L, self, tool_calls[0..calls_to_dispatch], &stream_context, l, turn_allocator);
@@ -865,7 +837,7 @@ pub const Agent = struct {
             tool_calls_executed += @intCast(calls_to_dispatch);
             if (batch_exceeds_budget) {
                 try self.reconcileUnresolvedToolCalls(budget_skipped_tool_result, "budget");
-                if (self.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, tool_calls_executed, iterations);
+                if (self.turn_budget.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, tool_calls_executed, iterations);
                 return error.ToolCallLimit;
             }
             if (end_turn) return;
@@ -878,7 +850,7 @@ pub const Agent = struct {
         }
         // Budget exhausted: soft stop ends the turn gracefully (drain + hint +
         // event); hard stop keeps the historical error contract byte-for-byte.
-        if (self.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, tool_calls_executed, iterations);
+        if (self.turn_budget.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, tool_calls_executed, iterations);
         return error.ToolCallLimit;
     }
 
@@ -889,11 +861,11 @@ pub const Agent = struct {
     /// auto-resume, so the budget stays a per-run bound (TD-6: continuation
     /// is the user's next submit).
     fn softStopOnBudget(self: *Agent, listener: anytype, tool_calls_executed: u32, iterations: u32) !void {
-        log.warn("turn budget reached after {d} tool calls in {d} model iterations (limit {d}); soft-stopping", .{ tool_calls_executed, iterations, self.tool_call_limit_per_turn });
+        log.warn("turn budget reached after {d} tool calls in {d} model iterations (limit {d}); soft-stopping", .{ tool_calls_executed, iterations, self.turn_budget.tool_call_limit_per_turn });
         const drained = try self.drainAllQueuedToHistory();
         if (drained > 0) try listener.emit(.{ .queued_messages_flushed = drained });
-        try self.addUser(tool_budget_continuation_hint);
-        try listener.emit(.{ .tool_budget_exhausted = self.tool_call_limit_per_turn });
+        try self.addUser(agent_turn_budget.tool_budget_continuation_hint);
+        try listener.emit(.{ .tool_budget_exhausted = self.turn_budget.tool_call_limit_per_turn });
     }
 
     /// React to a response severed by the provider's output token cap
@@ -904,14 +876,14 @@ pub const Agent = struct {
     /// still fires so the TUI renders a resumable notice instead of the cut
     /// passing as a complete answer.
     fn handleLengthCut(self: *Agent, listener: anytype, already_continued: bool) !bool {
-        if (!self.auto_continue_on_length_cut or already_continued) {
+        if (!self.turn_budget.auto_continue_on_length_cut or already_continued) {
             log.warn("turn ended on finish_reason=length with no tool calls — output token cap severed the response; not auto-continuing", .{});
             try listener.emit(.{ .length_cut = .stopped });
             return false;
         }
         log.warn("response cut by the output token cap (finish_reason=length, no tool calls) — auto-continuing once", .{});
         try listener.emit(.{ .length_cut = .auto_continued });
-        try self.addUser(length_cut_continuation_hint);
+        try self.addUser(agent_turn_budget.length_cut_continuation_hint);
         return true;
     }
 
@@ -2578,7 +2550,7 @@ test "softStopOnBudget drains queue, appends hint, emits events" {
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    agent.tool_call_limit_per_turn = 7;
+    agent.turn_budget.tool_call_limit_per_turn = 7;
 
     try agent.enqueueUser("first");
     try agent.enqueueUser("second");
@@ -2615,7 +2587,7 @@ test "softStopOnBudget with empty queue emits only the budget event" {
     defer seen.deinit(gpa);
     const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
 
-    try agent.softStopOnBudget(listener, 0, agent.tool_call_limit_per_turn);
+    try agent.softStopOnBudget(listener, 0, agent.turn_budget.tool_call_limit_per_turn);
 
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[zay] This turn stopped"));
@@ -2654,7 +2626,7 @@ test "handleLengthCut with the knob off only emits the stopped event" {
     const gpa = std.testing.allocator;
     var agent = Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
-    agent.auto_continue_on_length_cut = false;
+    agent.turn_budget.auto_continue_on_length_cut = false;
 
     var seen: BudgetSeen = .{};
     defer seen.deinit(gpa);
@@ -3017,7 +2989,7 @@ test "tool-call budget caps parallel batches by individual calls" {
 
     var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
     defer agent.deinit();
-    agent.tool_call_limit_per_turn = 1;
+    agent.turn_budget.tool_call_limit_per_turn = 1;
     try agent.addUser("run exactly one tool call");
 
     var seen: BudgetSeen = .{};
