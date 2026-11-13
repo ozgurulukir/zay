@@ -197,6 +197,29 @@ pub const McpClient = struct {
     /// Serializes JSON-RPC requests — stdin/stdout pipes can't handle
     /// concurrent requests. Defensive for future parallel tool execution.
     request_mutex: std.Io.Mutex = .init,
+    /// Transport LIFETIME guard (#385) — not request serialization. Guards the
+    /// `lifecycle` union variant, the stdio pipe handles, and `session_id`
+    /// against `stop`/`setError` racing an in-flight request's captured
+    /// handles. Short critical sections only, NEVER held across request I/O.
+    /// Lock order is strictly `request_mutex → transport_mutex`;
+    /// `stop`/`setError`/`terminateHttpSession` take this mutex alone and never
+    /// `request_mutex`, so the UI thread can never block on an in-flight
+    /// request.
+    transport_mutex: std.Io.Mutex = .init,
+    /// Requests currently inside a stdio capture bracket (I/O on the live
+    /// pipes). `stop` parks the pipes instead of closing while this is > 0;
+    /// the LAST exiting request performs the deferred close on its own thread.
+    /// Atomic so a worker's release never needs `transport_mutex` — a canceled
+    /// lock there must not strand the counter (it would strand the deferred
+    /// close with it). Writes to the parked-pipes decision itself remain
+    /// mutex-guarded.
+    in_flight_requests: std.atomic.Value(u32) = .init(0),
+    /// Pipes parked by `stop` while requests were in flight (#385). Non-null
+    /// means someone must close them; the release bracket consumes it. Windows:
+    /// a closed HANDLE value may be reused by another object, POSIX: fd reuse —
+    /// closing under an in-flight read is a crossfire, not an error.
+    /// Guarded by `transport_mutex`.
+    pending_close: ?struct { stdin: ?std.Io.File = null, stdout: ?std.Io.File = null } = null,
     /// Timeout for one stdio poll or complete HTTP request, in milliseconds.
     read_timeout_ms: u32 = 30_000,
     /// Server-assigned `Mcp-Session-Id` for the Streamable HTTP transport.
@@ -291,7 +314,7 @@ pub const McpClient = struct {
         if (self.transport == .sse) {
             clone.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, self.transport.sse.headers);
         }
-        clone.markConnecting();
+        clone.markConnecting(io);
         assert(clone.discovery.tools.items.len == 0);
         assert(!clone.discovery.pending_refresh.load(.acquire));
         return clone;
@@ -319,7 +342,14 @@ pub const McpClient = struct {
     /// stdio process handle or sse url). Used by the manager after
     /// syncFromConfig to mark a previously-disabled client as
     /// about-to-connect.
-    pub fn markConnecting(self: *McpClient) void {
+    ///
+    /// The `.disabled`/`.failed` overwrites run under `transport_mutex`
+    /// (#385): a background refresh worker can still be inside this client
+    /// (its capture bracket reads the union tag under the same mutex), so the
+    /// write must not race that read even though it is UI-thread-only.
+    pub fn markConnecting(self: *McpClient, io: std.Io) void {
+        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
+        defer if (locked) self.transport_mutex.unlock(io);
         switch (self.lifecycle) {
             .stdio => |*s| s.status = .connecting,
             .sse => |*s| s.status = .connecting,
@@ -343,6 +373,19 @@ pub const McpClient = struct {
                 };
             },
         }
+    }
+
+    /// Install a pre-built `.failed` reason under the `transport_mutex`
+    /// discipline (#385) — the manager's connect-failure arm has already
+    /// stopped the transport and cleared tools; this only swaps the variant,
+    /// serialized against any worker's capture bracket like `setError`'s
+    /// write. Takes ownership of `reason`; frees any prior one (possible only
+    /// if the caller skipped `stop`, which always frees it).
+    pub fn adoptFailure(self: *McpClient, io: std.Io, reason: []u8) void {
+        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
+        defer if (locked) self.transport_mutex.unlock(io);
+        if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
+        self.lifecycle = .{ .failed = .{ .reason = reason } };
     }
 
     pub fn deinit(self: *McpClient, io: std.Io) void {
@@ -394,6 +437,11 @@ pub const McpClient = struct {
             log.warn("MCP '{s}': OOM formatting failure reason; left disabled instead of failed", .{self.name});
             return;
         };
+        // Serialize the lifecycle overwrite with any worker's capture bracket
+        // (#385) — a capture that took the `.stdio` tag branch must never
+        // dereference a union mid-overwrite.
+        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
+        defer if (locked) self.transport_mutex.unlock(io);
         if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
         self.lifecycle = .{ .failed = .{ .reason = reason } };
     }
@@ -484,21 +532,26 @@ pub const McpClient = struct {
     /// wait so an external MCP server cannot wedge TUI teardown. For the
     /// Streamable HTTP transport, terminates the remote session (best-effort)
     /// and drops the session id.
+    ///
+    /// Pipe close is deferred while requests are in flight (#385): a worker
+    /// holding captured handles must never observe them closed (HANDLE/fd
+    /// reuse crossfire), so `parkStdioPipes` moves them to `pending_close` and
+    /// the last exiting request closes them on its own thread. Process
+    /// kill/reap stays immediate — it never touches the pipe handles — so an
+    /// in-flight read fails loudly via the existing crash/EOF paths. The
+    /// lifecycle flips to `.disabled` synchronously; status() never waits on
+    /// the deferred close.
     pub fn stop(self: *McpClient, io: std.Io) void {
         log.info("shutdown.mcp.client.begin name={s}", .{self.name});
         defer log.info("shutdown.mcp.client.done name={s}", .{self.name});
         if (self.lifecycle == .stdio) {
             var child = self.lifecycle.stdio.process;
             const job_obj = if (os.is_windows) self.lifecycle.stdio.win32_job_obj else null;
-            // Close stdin so the child sees EOF and can exit gracefully.
-            if (child.stdin) |*stdin_file| {
-                stdin_file.close(io);
-                child.stdin = null;
-            }
-            if (child.stdout) |*stdout_file| {
-                stdout_file.close(io);
-                child.stdout = null;
-            }
+            // Close stdin so the child sees EOF and can exit gracefully —
+            // parked instead of closed while a request is in flight.
+            self.parkStdioPipes(io);
+            child.stdin = null;
+            child.stdout = null;
             // SIGTERM first — gives well-behaved servers a chance to clean up.
             // kill() below sends SIGKILL and reaps the zombie regardless.
             if (child.id) |pid| {
@@ -522,40 +575,125 @@ pub const McpClient = struct {
         // before the lifecycle is clobbered, or deinit's failed-arm can never
         // see it and the reason leaks.
         if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
+        // Serialize the lifecycle overwrite with any worker's capture bracket
+        // (#385). Parked pipes are closed here ONLY when no request is in
+        // flight — an in-flight request owns its captured handles and closes
+        // them in its release bracket; closing under it would be exactly the
+        // HANDLE/fd-reuse crossfire #385 fixes. A worker wedged past its join
+        // point (no path reaches this; manager deinit joins jobs first)
+        // leaks the parked handles to process exit instead of racing it.
+        // If the lock is canceled we proceed unsynchronized, matching
+        // pre-#385 teardown semantics, rather than blocking shutdown.
+        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
+        defer if (locked) self.transport_mutex.unlock(io);
+        if (self.in_flight_requests.load(.acquire) == 0) self.closePendingPipesLocked(io);
         self.lifecycle = .disabled;
+    }
+
+    /// Move the stdio pipe handles out of the child under `transport_mutex`:
+    /// closed immediately when no request is in flight (previous behavior),
+    /// parked in `pending_close` for the last exiting request to close
+    /// otherwise (#385). On lock failure (canceled teardown) the pipes are
+    /// left open — stop clobbers the lifecycle union either way; the handles
+    /// are closed by the release bracket, stop's tail, or process exit,
+    /// rather than blocking on a canceled mutex.
+    fn parkStdioPipes(self: *McpClient, io: std.Io) void {
+        self.transport_mutex.lock(io) catch return;
+        defer self.transport_mutex.unlock(io);
+        if (self.lifecycle != .stdio) return;
+        const child = &self.lifecycle.stdio.process;
+        if (self.in_flight_requests.load(.acquire) > 0) {
+            self.pending_close = .{ .stdin = child.stdin, .stdout = child.stdout };
+        } else {
+            if (child.stdin) |*f| f.close(io);
+            if (child.stdout) |*f| f.close(io);
+        }
+        child.stdin = null;
+        child.stdout = null;
+    }
+
+    /// Register as an in-flight stdio request and snapshot the live pipe
+    /// handles under `transport_mutex` (#385). The lifecycle variant IS the
+    /// generation check: anything but `.stdio` with both pipes present fails
+    /// loudly here instead of I/O on closed handles. Every caller must run the
+    /// paired `releaseStdioTransport` (use `defer`) — it owns the deferred
+    /// close when `stop` parked the pipes mid-flight.
+    fn captureStdioTransport(self: *McpClient, io: std.Io) !struct { stdin: std.Io.File, stdout: std.Io.File } {
+        try self.transport_mutex.lock(io);
+        defer self.transport_mutex.unlock(io);
+        if (self.lifecycle != .stdio) return error.NotConnected;
+        const child = &self.lifecycle.stdio.process;
+        const stdin_file = child.stdin orelse return error.NotConnected;
+        const stdout_file = child.stdout orelse return error.NotConnected;
+        _ = self.in_flight_requests.fetchAdd(1, .monotonic);
+        return .{ .stdin = stdin_file, .stdout = stdout_file };
+    }
+
+    /// Exit a `captureStdioTransport` bracket. The counter is atomic, so the
+    /// decrement NEVER needs `transport_mutex` — a canceled lock (request
+    /// canceled during manager deinit) cannot strand the bracket open. The
+    /// last exiting request performs the deferred close; if its lock attempt
+    /// is also canceled, stop's tail (which re-checks the counter) or process
+    /// exit closes the parked pipes instead.
+    fn releaseStdioTransport(self: *McpClient, io: std.Io) void {
+        if (self.in_flight_requests.fetchSub(1, .acq_rel) != 1) return;
+        self.transport_mutex.lock(io) catch return;
+        defer self.transport_mutex.unlock(io);
+        self.closePendingPipesLocked(io);
+    }
+
+    /// Close pipes parked by `parkStdioPipes`, if any, for a caller already
+    /// holding `transport_mutex` (the release bracket and stop's locked tail).
+    fn closePendingPipesLocked(self: *McpClient, io: std.Io) void {
+        if (self.pending_close) |parked| {
+            if (parked.stdin) |*f| f.close(io);
+            if (parked.stdout) |*f| f.close(io);
+            self.pending_close = null;
+        }
     }
 
     /// Terminate the remote session via HTTP DELETE (best-effort) and free the
     /// stored session id. Servers may refuse DELETE; failures are ignored since
     /// the connection is being torn down regardless. Idempotent.
+    ///
+    /// Guarded by `transport_mutex` (#385): the DELETE's header bytes borrow
+    /// Terminate the remote session via HTTP DELETE (best-effort) and free the
+    /// stored session id. Servers may refuse DELETE; failures are ignored since
+    /// the connection is being torn down regardless. Idempotent.
+    ///
+    /// The session id is DETACHED under `transport_mutex` — a short section —
+    /// and the DELETE runs outside the mutex (#385 review): the request is
+    /// network I/O (unbounded connect on POSIX), and holding the mutex across
+    /// it would stall a worker's `snapshotSessionId` for the whole span while
+    /// the worker holds `request_mutex`. The detached ownership closes the
+    /// free-while-borrowed race: concurrent request paths read the field under
+    /// the mutex (or hold their own snapshot) and never touch the detached id.
     fn terminateHttpSession(self: *McpClient, io: std.Io) void {
-        defer {
-            if (self.session_id) |sid| {
-                self.gpa.free(sid);
-                self.session_id = null;
-            }
-        }
-        if (self.session_id == null) return;
+        self.transport_mutex.lock(io) catch return;
+        const session_id = self.session_id;
+        self.session_id = null;
+        self.transport_mutex.unlock(io);
+        defer if (session_id) |sid| self.gpa.free(sid);
 
+        const sid = session_id orelse return;
         if (os.is_windows) {
-            self.runHttpVoidWithTimeout(io, .termination, httpTerminationTask, .{ self, io }) catch |err| {
+            self.runHttpVoidWithTimeout(io, .termination, httpTerminationTask, .{ self, io, sid }) catch |err| {
                 log.warn("MCP HTTP session termination failed err={s}", .{@errorName(err)});
             };
             return;
         }
 
-        self.terminateHttpSessionUnbounded(io);
+        self.terminateHttpSessionUnbounded(io, sid);
     }
 
-    fn terminateHttpSessionUnbounded(self: *McpClient, io: std.Io) void {
-        if (self.session_id == null) return;
+    fn terminateHttpSessionUnbounded(self: *McpClient, io: std.Io, session_id: []const u8) void {
         const url = switch (self.transport) {
             .sse => |t| t.url,
             .stdio => return,
         };
         var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
         defer client.deinit();
-        const extra_headers = self.buildExtraHeaders(self.gpa) catch return;
+        const extra_headers = buildExtraHeadersWith(self.gpa, self.customHttpHeaders(), session_id) catch return;
         defer self.gpa.free(extra_headers);
         var req = client.request(.DELETE, std.Uri.parse(url) catch return, .{
             .extra_headers = extra_headers,
@@ -585,14 +723,26 @@ pub const McpClient = struct {
     /// between the request and its response — those are routed to
     /// `handleNotification` and the read continues until the matching
     /// response (id present) arrives.
+    ///
+    /// The pipe handles are captured AFTER `request_mutex` and under the
+    /// `transport_mutex` bracket (#385): capturing before the lock raced a
+    /// UI-thread `stop` closing the handles while this thread waited at the
+    /// mutex. `stop` never takes `request_mutex`, so it parks the pipes
+    /// instead of closing them under this request; the release bracket
+    /// performs the deferred close.
     fn sendRequestStdio(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
-        const stdin_file = child.stdin orelse return error.NotConnected;
-        const stdout_file = child.stdout orelse return error.NotConnected;
-
-        // Serialize requests: stdin/stdout pipes can't handle concurrent I/O.
+        // Serialize requests first: stdin/stdout pipes can't handle
+        // concurrent I/O.
         try self.request_mutex.lock(io);
         defer self.request_mutex.unlock(io);
+
+        // Bracket the captured handles: `stop` parks instead of closing while
+        // this is in flight, so the handles stay open until release. (Defers
+        // run LIFO: the release bracket exits before the request mutex.)
+        const pipes = try self.captureStdioTransport(io);
+        defer self.releaseStdioTransport(io);
+        const stdin_file = pipes.stdin;
+        const stdout_file = pipes.stdout;
 
         const id = self.next_request_id;
         self.next_request_id += 1;
@@ -692,14 +842,22 @@ pub const McpClient = struct {
         };
     }
 
+    /// stdio transport: write a notification line to the child's stdin. Serialized
+    /// via `request_mutex` like requests (#385 — previously this path captured and
+    /// wrote `stdin` with NO synchronization, racing both `stop`'s close and an
+    /// in-flight request's interleaved stdin bytes), with the same
+    /// `transport_mutex` capture bracket as `sendRequestStdio`.
     fn sendNotificationStdio(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
-        const child = if (self.lifecycle == .stdio) &self.lifecycle.stdio.process else return error.NotConnected;
-        const stdin_file = child.stdin orelse return error.NotConnected;
+        try self.request_mutex.lock(io);
+        defer self.request_mutex.unlock(io);
+
+        const pipes = try self.captureStdioTransport(io);
+        defer self.releaseStdioTransport(io);
 
         const request = try transport.formatNotification(self.gpa, method, params_json);
         defer self.gpa.free(request);
 
-        try stdin_file.writeStreamingAll(io, request);
+        try pipes.stdin.writeStreamingAll(io, request);
     }
 
     // ── Streamable HTTP transport ──
@@ -856,7 +1014,12 @@ pub const McpClient = struct {
         var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
         defer client.deinit();
 
-        const extra_headers = try self.buildExtraHeaders(self.gpa);
+        // Owned session-id snapshot (#385): immune to a concurrent
+        // stop→terminateHttpSession freeing the stored id while this request's
+        // header bytes still borrow it.
+        const session_snapshot = self.snapshotSessionId(io, self.gpa);
+        defer if (session_snapshot) |sid| self.gpa.free(sid);
+        const extra_headers = try buildExtraHeadersWith(self.gpa, self.customHttpHeaders(), session_snapshot);
         defer self.gpa.free(extra_headers);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
             .headers = .{ .content_type = .{ .override = http.content_type_json } },
@@ -876,7 +1039,7 @@ pub const McpClient = struct {
 
         // Capture session id + content type BEFORE the body reader invalidates
         // the head's borrowed pointers.
-        try self.captureSessionId(response.head);
+        try self.captureSessionId(io, response.head);
         const is_sse = isEventStream(response.head);
 
         if (is_sse) {
@@ -920,7 +1083,11 @@ pub const McpClient = struct {
         var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
         defer client.deinit();
 
-        const extra_headers = try self.buildExtraHeaders(self.gpa);
+        // Owned session-id snapshot (#385) — same rationale as
+        // sendRequestHttpUnbounded.
+        const session_snapshot = self.snapshotSessionId(io, self.gpa);
+        defer if (session_snapshot) |sid| self.gpa.free(sid);
+        const extra_headers = try buildExtraHeadersWith(self.gpa, self.customHttpHeaders(), session_snapshot);
         defer self.gpa.free(extra_headers);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
             .headers = .{ .content_type = .{ .override = http.content_type_json } },
@@ -933,7 +1100,7 @@ pub const McpClient = struct {
 
         var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
         const response = try req.receiveHead(&redirect_buffer);
-        try self.captureSessionId(response.head);
+        try self.captureSessionId(io, response.head);
         const status_code: u16 = @intFromEnum(response.head.status);
         if (status_code == 404) return error.McpSessionExpired;
         if (status_code >= 400) return error.McpHttpRequestFailed;
@@ -943,17 +1110,32 @@ pub const McpClient = struct {
     /// `Mcp-Session-Id` once a session is established, and any custom headers
     /// configured for the server (e.g. API keys). Returned slice is owned; free
     /// with `gpa.free`.
-    fn buildExtraHeaders(self: *const McpClient, gpa: std.mem.Allocator) ![]std.http.Header {
-        const custom: []const config_mod.McpHeader = switch (self.transport) {
+    ///
+    /// Reads `session_id`, so callers must hold `transport_mutex` — or use the
+    /// `snapshotSessionId` + `buildExtraHeadersWith` pair (#385), which hands
+    /// the request an owned dupe immune to a concurrent `terminateHttpSession`
+    /// freeing the stored id.
+    fn customHttpHeaders(self: *const McpClient) []const config_mod.McpHeader {
+        return switch (self.transport) {
             .sse => |t| t.headers,
             .stdio => &.{},
         };
-        const count = 1 + custom.len + (if (self.session_id != null) @as(usize, 1) else 0);
+    }
+
+    fn buildExtraHeaders(self: *const McpClient, gpa: std.mem.Allocator) ![]std.http.Header {
+        return buildExtraHeadersWith(gpa, self.customHttpHeaders(), self.session_id);
+    }
+
+    /// Pure header builder behind `buildExtraHeaders`; `session_id` is passed
+    /// in so a request can build headers from an owned snapshot instead of
+    /// borrowing the live field (#385).
+    fn buildExtraHeadersWith(gpa: std.mem.Allocator, custom: []const config_mod.McpHeader, session_id: ?[]const u8) ![]std.http.Header {
+        const count = 1 + custom.len + (if (session_id != null) @as(usize, 1) else 0);
         const headers = try gpa.alloc(std.http.Header, count);
         var i: usize = 0;
         headers[i] = .{ .name = "Accept", .value = accept_streamable_http };
         i += 1;
-        if (self.session_id) |sid| {
+        if (session_id) |sid| {
             headers[i] = .{ .name = "Mcp-Session-Id", .value = sid };
             i += 1;
         }
@@ -964,14 +1146,37 @@ pub const McpClient = struct {
         return headers;
     }
 
+    /// Owned copy of the live `session_id` under `transport_mutex` (#385), for
+    /// request paths that hold `request_mutex` and must not borrow the field a
+    /// concurrent `stop`→`terminateHttpSession` may free. null when there is
+    /// no session or the lock is canceled (the request then fails loudly
+    /// server-side rather than racing the free). Caller frees the result.
+    fn snapshotSessionId(self: *McpClient, io: std.Io, gpa: std.mem.Allocator) ?[]u8 {
+        self.transport_mutex.lock(io) catch return null;
+        defer self.transport_mutex.unlock(io);
+        const sid = self.session_id orelse return null;
+        return gpa.dupe(u8, sid) catch {
+            log.warn("MCP '{s}': OOM snapshotting session id; request goes out session-less", .{self.name});
+            return null;
+        };
+    }
+
     /// Update `session_id` from the response's `Mcp-Session-Id` header (if
     /// present). Header values borrow the response head, so the value is duped.
-    fn captureSessionId(self: *McpClient, head: std.http.Client.Response.Head) !void {
+    /// The free/dupe swap is guarded by `transport_mutex` (#385) — callers hold
+    /// `request_mutex`, so the lock order stays `request_mutex →
+    /// transport_mutex`.
+    fn captureSessionId(self: *McpClient, io: std.Io, head: std.http.Client.Response.Head) !void {
         var it = head.iterateHeaders();
         while (it.next()) |header| {
             if (!std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) continue;
+            try self.transport_mutex.lock(io);
+            defer self.transport_mutex.unlock(io);
+            // Dupe BEFORE freeing the old value: on OOM the field keeps the
+            // coherent old id instead of dangling at freed memory.
+            const fresh = try self.gpa.dupe(u8, header.value);
             if (self.session_id) |old| self.gpa.free(old);
-            self.session_id = try self.gpa.dupe(u8, header.value);
+            self.session_id = fresh;
             return;
         }
     }
@@ -1075,17 +1280,31 @@ pub const McpClient = struct {
     /// fully intact: the replacement is built first and swapped in only once
     /// every record is owned.
     pub fn listTools(self: *McpClient, io: std.Io) !void {
+        const fresh = try self.listToolsFresh(io);
+        self.discovery.replaceAll(fresh);
+    }
+
+    /// tools/list WITHOUT touching the discovery cache: returns freshly-built
+    /// owned records for the caller to install via `Discovery.replaceAll` (the
+    /// background re-discovery path, #385). A malformed response (no result
+    /// object, `tools` not an array) errors instead of returning an empty list
+    /// — installing empty would wipe the cache, so failure-keeps-old holds by
+    /// construction. Thread-safety: runs on refresh worker threads,
+    /// concurrent with in-flight tool calls (`request_mutex`) and with `stop`
+    /// (`transport_mutex` capture bracket); never mutates shared state except
+    /// the request-serialized fields and the atomic refresh flag.
+    pub fn listToolsFresh(self: *McpClient, io: std.Io) !std.ArrayList(discovery_mod.McpTool) {
         const response = try self.sendRequest(io, "tools/list", null);
         defer self.gpa.free(response);
 
-        const parsed = try schema_mod.parseResponse(self.gpa, response) orelse return;
+        const parsed = try schema_mod.parseResponse(self.gpa, response) orelse return error.McpInvalidToolsResponse;
         defer parsed.deinit();
 
-        const result = parsed.value.object.get("result") orelse return;
-        if (result != .object) return;
+        const result = parsed.value.object.get("result") orelse return error.McpInvalidToolsResponse;
+        if (result != .object) return error.McpInvalidToolsResponse;
 
-        const tools_val = result.object.get("tools") orelse return;
-        if (tools_val != .array) return;
+        const tools_val = result.object.get("tools") orelse return error.McpInvalidToolsResponse;
+        if (tools_val != .array) return error.McpInvalidToolsResponse;
 
         var fresh: std.ArrayList(McpTool) = .empty;
         errdefer {
@@ -1099,11 +1318,7 @@ pub const McpClient = struct {
                 return err;
             };
         }
-
-        // Full success: swap the replacement in and release the stale cache.
-        // The spoke's replaceAll owns the swap; reaching it at all means the
-        // failure-keeps-old half of the invariant already held.
-        self.discovery.replaceAll(fresh);
+        return fresh;
     }
 
     /// Call a tool via `tools/call` JSON-RPC.
@@ -1212,8 +1427,8 @@ fn httpNotificationTask(
     return .success;
 }
 
-fn httpTerminationTask(self: *McpClient, io: std.Io) HttpVoidOutcome {
-    self.terminateHttpSessionUnbounded(io);
+fn httpTerminationTask(self: *McpClient, io: std.Io, session_id: []const u8) HttpVoidOutcome {
+    self.terminateHttpSessionUnbounded(io, session_id);
     return .success;
 }
 
@@ -1521,7 +1736,7 @@ test "captureSessionId + isEventStream read the response head" {
     const json_head = try std.http.Client.Response.Head.parse(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-42\r\n\r\n",
     );
-    try client.captureSessionId(json_head);
+    try client.captureSessionId(std.testing.io, json_head);
     try std.testing.expectEqualStrings("sess-42", client.session_id.?);
     try std.testing.expect(!isEventStream(json_head));
 
@@ -1715,4 +1930,221 @@ test "McpClient setError stops a live stdio transport before failing" {
     // The orphan half of the bug: the process must actually be gone, not
     // merely dropped from the lifecycle union.
     if (watch) |*w| try std.testing.expect(w.awaitExit(io, 2_000));
+}
+
+// ---------------------------------------------------------------------------
+// Transport-lifetime races + background re-discovery (#385)
+// ---------------------------------------------------------------------------
+
+test "McpClient listToolsFresh returns owned records and never touches the cache" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // default mode: the discovery response round-trips normally.
+    var client = try initMockClient(gpa, "fresh", "default");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    // Prime the cache as a completed discovery would have; listToolsFresh
+    // must leave it untouched — the caller owns installation.
+    try client.addTool("cached", "Primed before the fetch", .{ .properties = &.{} }, null);
+
+    var fresh = try client.listToolsFresh(io);
+    defer {
+        for (fresh.items) |*tool| tool.deinit(gpa);
+        fresh.deinit(gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fresh.items.len);
+    try std.testing.expectEqualStrings("greet", fresh.items[0].name);
+    // The cache still holds exactly the primed record.
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("cached", client.discovery.tools.items[0].name);
+}
+
+test "McpClient listToolsFresh errors on a malformed response and keeps the cache" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "broken-fresh", "malformed_tools");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+    try client.addTool("kept", "Survives the failed fetch", .{ .properties = &.{} }, null);
+
+    // A malformed tools/list response must error — never return an empty
+    // list, which the installer would swap in and wipe the cache. The error
+    // identity depends on where parsing rejects the line (SyntaxError from
+    // the JSON scanner, McpInvalidToolsResponse from the shape checks) —
+    // either keeps the cache intact.
+    if (client.listToolsFresh(io)) |_| return error.ExpectedError else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("kept", client.discovery.tools.items[0].name);
+}
+
+test "snapshotSessionId dupes under transport_mutex and buildExtraHeadersWith keeps the header set" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
+    defer client.deinit(io);
+
+    // No session yet.
+    try std.testing.expect(client.snapshotSessionId(io, gpa) == null);
+
+    client.session_id = try gpa.dupe(u8, "sess-42");
+    const snapshot = client.snapshotSessionId(io, gpa) orelse return error.SnapshotFailed;
+    defer gpa.free(snapshot);
+    try std.testing.expectEqualStrings("sess-42", snapshot);
+    // The snapshot is owned — freeing the original leaves it readable.
+    gpa.free(client.session_id.?);
+    client.session_id = null;
+    try std.testing.expectEqualStrings("sess-42", snapshot);
+
+    // The pure builder produces the identical header set for the same input.
+    const headers = try McpClient.buildExtraHeadersWith(gpa, &.{}, snapshot);
+    defer gpa.free(headers);
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings("Accept", headers[0].name);
+    try std.testing.expectEqualStrings("Mcp-Session-Id", headers[1].name);
+    try std.testing.expectEqualStrings("sess-42", headers[1].value);
+}
+
+test "stop during an in-flight request defers the pipe close and fails the request loudly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // slow mode: the response takes 500ms, so the request is genuinely
+    // in flight when stop lands on the main thread.
+    var client = try initMockClient(gpa, "mid-stop", "slow");
+    defer client.deinit(io);
+    client.read_timeout_ms = 60_000;
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    var worker = try io.concurrent(McpClient.sendRequest, .{ &client, io, "tools/list", @as(?[]const u8, null) });
+    // Land stop while the worker sits in its read.
+    try io.sleep(.fromMilliseconds(50), .awake);
+    const stop_started = std.Io.Timestamp.now(io, .awake);
+    client.stop(io);
+    const stop_elapsed = stop_started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+
+    // stop must stay bounded — the pipe close was deferred to the release
+    // bracket, and the process kill path was already bounded.
+    try std.testing.expect(stop_elapsed < 5 * std.time.ns_per_s);
+    // The lifecycle flips synchronously, not at the deferred close.
+    try std.testing.expectEqual(ServerStatus.disabled, client.status());
+
+    // The in-flight request fails loudly — any error beats I/O on closed
+    // handles — and the release bracket consumed the parked pipes.
+    if (worker.await(io)) |r| gpa.free(r) else |err| {
+        try std.testing.expect(err == error.McpServerCrashed or
+            err == error.ReadFailed or
+            err == error.NotConnected);
+    }
+    try std.testing.expect(client.pending_close == null);
+}
+
+test "a request queued behind another request fails loudly after stop" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "queued-stop", "slow");
+    defer client.deinit(io);
+    client.read_timeout_ms = 60_000;
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    // Two concurrent requests: the second queues on request_mutex behind
+    // the first; stop lands while both are pending (one inside the read,
+    // one at the lock — the exact capture-before-lock window from #385).
+    var first = try io.concurrent(McpClient.sendRequest, .{ &client, io, "tools/list", @as(?[]const u8, null) });
+    try io.sleep(.fromMilliseconds(50), .awake);
+    var second = try io.concurrent(McpClient.sendRequest, .{ &client, io, "ping", @as(?[]const u8, null) });
+    try io.sleep(.fromMilliseconds(50), .awake);
+    client.stop(io);
+
+    // No use-after-free, no crash: each future resolves (error or value).
+    if (first.await(io)) |r| gpa.free(r) else |_| {}
+    if (second.await(io)) |r| gpa.free(r) else |_| {}
+    try std.testing.expectEqual(ServerStatus.disabled, client.status());
+    try std.testing.expect(client.pending_close == null);
+}
+
+test "sendNotificationStdio during stop is safe and serialized" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "notify-stop", "slow");
+    defer client.deinit(io);
+    client.read_timeout_ms = 60_000;
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    // A notification concurrent with stop must not write through a handle
+    // stop is closing (pre-#385 this path had NO synchronization at all).
+    var notify = try io.concurrent(McpClient.sendNotification, .{ &client, io, "notifications/initialized", @as(?[]const u8, null) });
+    try io.sleep(.fromMilliseconds(50), .awake);
+    client.stop(io);
+    if (notify.await(io)) |_| {} else |err| {
+        try std.testing.expectEqual(error.NotConnected, err);
+    }
+    try std.testing.expectEqual(ServerStatus.disabled, client.status());
+}
+
+test "a notification concurrent with an in-flight request does not corrupt stdin" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "interleave", "default");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    // Both paths serialize on request_mutex: the mock must still answer
+    // the request correctly, not a spliced notification/request line.
+    var request = try io.concurrent(McpClient.callTool, .{ &client, io, "greet", "{\"name\":\"World\"}" });
+    client.sendNotification(io, "notifications/initialized", null) catch {};
+    const result = try request.await(io);
+    defer gpa.free(result);
+    try std.testing.expectEqualStrings("Hello, World!", result);
+}
+
+test "stop parks the pipes while a capture bracket is open and the bracket's release closes them" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "bracket-park", "default");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    // Hold a capture bracket across stop — deterministic stand-in for a
+    // lane worker mid-request (the concurrent variant of this test covers
+    // the real thread; this pins the mechanism without a race window).
+    _ = try client.captureStdioTransport(io);
+    client.stop(io);
+
+    // The transport went down synchronously, but the pipes the bracket
+    // holds are PARKED, not closed — closing them here would be the #385
+    // HANDLE/fd-reuse crossfire.
+    try std.testing.expectEqual(ServerStatus.disabled, client.status());
+    try std.testing.expect(client.pending_close != null);
+
+    // The bracket's exit owns the deferred close.
+    client.releaseStdioTransport(io);
+    try std.testing.expect(client.pending_close == null);
 }

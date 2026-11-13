@@ -429,6 +429,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     const background_active = root.app.backgroundActive();
     const naming_active = root.app.namingActive();
     const mcp_connect_pending = root.app.mcp_manager.hasPendingConnects();
+    const mcp_refresh_pending = root.app.mcp_manager.hasPendingRefreshes();
     const manual_compact_active = compaction_lifecycle.manualCompactActive(root.app);
     const toasts_visible = toast.global.hasToasts();
     const worktree_async_active = lane_lifecycle.anyAsyncWorktreeActive(root.app);
@@ -443,6 +444,7 @@ fn decideShouldTick(root: *RootWidget) bool {
         background_active or
         naming_active or
         mcp_connect_pending or
+        mcp_refresh_pending or
         manual_compact_active or
         toasts_visible or
         worktree_async_active or
@@ -666,7 +668,7 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects() or compaction_lifecycle.manualCompactActive(root.app) or gitLabelRefreshActive(root.app)) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects() or root.app.mcp_manager.hasPendingRefreshes() or compaction_lifecycle.manualCompactActive(root.app) or gitLabelRefreshActive(root.app)) try ensureTick(root, ctx);
         ctx.consumeAndRedraw();
         return;
     }
