@@ -832,7 +832,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         const path = working.path;
         const branch = working.branch;
 
-        const framed = workerPrompt(app.gpa, id, branch, path, repo, task, target.liveRuntime().?.agent.tool_call_limit_per_turn) catch {
+        const framed = workerPrompt(app.gpa, id, branch, path, repo, task, target.liveRuntime().?.agent.turn_budget.tool_call_limit_per_turn) catch {
             // Rollback: re-park the lane to idle (frees the runtime we just
             // attached). `context` is owned by `lane.parent_context` now;
             // `parkFinishedWorker` leaves the lane idle and does not touch
@@ -976,7 +976,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     // so a task that mentions the main tree's absolute path — e.g. the driver's
     // own cwd — doesn't steer the worker into `cd`-ing there. The bash
     // containment guard is the mechanical backstop (L2).
-    const framed = workerPrompt(app.gpa, id, wt_branch, wt_dest, repo, task, runtime.agent.tool_call_limit_per_turn) catch {
+    const framed = workerPrompt(app.gpa, id, wt_branch, wt_dest, repo, task, runtime.agent.turn_budget.tool_call_limit_per_turn) catch {
         removeFailedSpawn(app, lane);
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
@@ -1137,7 +1137,7 @@ fn resumeLaneOp(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Th
     };
     target.spawned_by_generation = spawner.generation;
     const working = lanes_util.workingLaneOf(target).?;
-    const framed = workerPrompt(app.gpa, id, working.branch, working.path, repo, task, target.liveRuntime().?.agent.tool_call_limit_per_turn) catch {
+    const framed = workerPrompt(app.gpa, id, working.branch, working.path, repo, task, target.liveRuntime().?.agent.turn_budget.tool_call_limit_per_turn) catch {
         target.spawned_by_generation = null;
         parkFinishedWorker(app, target);
         return failResp(app.gpa, "lane: out of memory\n", .{});
