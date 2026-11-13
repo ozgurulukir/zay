@@ -82,7 +82,7 @@ pub const Content = struct {
             if (is_selected) panel.fillRow(&surface, row, p.selected);
 
             const badge = client.status().label();
-            const tool_count = client.tools.items.len;
+            const tool_count = client.discovery.tools.items.len;
             const transport_tag: []const u8 = switch (client.transport) {
                 .stdio => "stdio",
                 .sse => "remote",
