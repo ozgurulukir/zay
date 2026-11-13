@@ -9,18 +9,16 @@
 //! Types (Config, Diagnostic, LoadResult, ContextSettings, CompactionSettings)
 //! live in config.zig; provider/model types in provider.zig; MCP types in mcp.zig.
 //!
-//! Layout map (tests stay inline with the code they cover, so production and
-//! test regions alternate; `// ---` banners mark every boundary):
+//! Layout map (strictly production → tests, per #365; a single `// ---`
+//! banner marks the one boundary):
 //!
-//!    ~30–669  production — parse/merge/file-IO helpers
-//!   ~670–707  tests — layer merge and env-expansion notices
-//!   ~709–1248 production — layered load and merge algebra
-//!  ~1249–1290 tests — response-policy overlays
-//!  ~1291–2408 production — parse layer (parseResponsePolicy, config paths)
-//!  ~2423–end  tests — the bulk of the suite
+//!     ~26–2351  production — parse/merge/file-IO helpers, layered load and
+//!               merge algebra, parse layer (parseResponsePolicy, config paths)
+//!    ~2353–end  tests — the bulk of the suite plus the layer-merge
+//!               env-expansion notices and response-policy overlay tests
 //!
-//! The banners carry the region role so a scroll lands visibly in either
-//! production or tests. This map is the contract the banners annotate; keep
+//! The banner carries the region role so a scroll lands visibly in either
+//! production or tests. This map is the contract the banner annotates; keep
 //! both in sync when moving code.
 
 const std = @import("std");
@@ -681,53 +679,6 @@ fn warnProjectLayerEnvExpansion(project: *const Config) usize {
     return risks;
 }
 
-// ---------------------------------------------------------------------------
-// Tests: layer merge and env-expansion notices (production continues below)
-// ---------------------------------------------------------------------------
-
-test "project-layer env-expansion notice counts provider, MCP header, and URL risks" {
-    const gpa = std.testing.allocator;
-
-    const provider_headers = try cloneHeaders(gpa, &[_]McpHeader{
-        .{ .name = @constCast("x-safe"), .value = @constCast("plain") },
-        .{ .name = @constCast("x-secret"), .value = @constCast("{env:GITHUB_TOKEN}") },
-    });
-    var providers = try gpa.alloc(ProviderConfig, 1);
-    providers[0] = .{
-        .name = try gpa.dupe(u8, "gateway"),
-        .provider = .openai_compatible,
-        .base_url = .{ .custom = try gpa.dupe(u8, "https://gateway.example.com/v1") },
-        .headers = provider_headers,
-    };
-
-    var servers = try gpa.alloc(McpServerConfig, 1);
-    servers[0] = .{
-        .name = try gpa.dupe(u8, "search"),
-        .transport = .{ .sse = .{
-            .url = try gpa.dupe(u8, "https://mcp.example.com/mcp?key={env:MCP_KEY}"),
-            .headers = try cloneHeaders(gpa, &[_]McpHeader{
-                .{ .name = @constCast("Authorization"), .value = @constCast("Bearer {env:MCP_TOKEN}") },
-            }),
-        } },
-    };
-
-    var project: Config = .{ .providers = providers, .mcp_servers = servers };
-    defer project.deinit(gpa);
-
-    // One provider header + one MCP header + one MCP URL embed = 3 risks
-    // (the plain provider header counts for nothing).
-    try std.testing.expectEqual(@as(usize, 3), warnProjectLayerEnvExpansion(&project));
-
-    // A project layer without placeholders reports nothing.
-    var clean: Config = .{};
-    defer clean.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 0), warnProjectLayerEnvExpansion(&clean));
-}
-
-// ---------------------------------------------------------------------------
-// Production: layered load and merge algebra
-// ---------------------------------------------------------------------------
-
 fn loadFile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1267,56 +1218,6 @@ fn parsePlugins(
     }
     return try plugins.toOwnedSlice(gpa);
 }
-
-// ---------------------------------------------------------------------------
-// Tests: response-policy overlays
-// ---------------------------------------------------------------------------
-
-test "response policy configuration survives overlays cloning and serialization" {
-    const gpa = std.testing.allocator;
-    var sink: std.ArrayList(Diagnostic) = .empty;
-    defer {
-        for (sink.items) |*diagnostic| diagnostic.deinit(gpa);
-        sink.deinit(gpa);
-    }
-    var lower = try parseFile(gpa, "<lower>",
-        \\{"providers":{"proxy":{"responsePolicy":{"thinking":"reasoning","reasoning":"ignore"},"models":{"m":{"reasoningEffort":"high","responsePolicy":{"reasoning_content":"text"}}}}}}
-    , &sink);
-    defer lower.deinit(gpa);
-    var upper = try parseFile(gpa, "<upper>",
-        \\{"providers":{"proxy":{"responsePolicy":{"thinking":"text"},"models":{"m":{"responsePolicy":{"reasoning":"reasoning"}}}}}}
-    , &sink);
-    defer upper.deinit(gpa);
-    var merged = try mergeLayers(gpa, &.{ lower, upper });
-    defer merged.deinit(gpa);
-    const policy = merged.responsePolicyForModel("proxy", "m", "https://example.invalid/v1");
-    try std.testing.expectEqual(response_policy.TextKind.text, policy.thinking);
-    try std.testing.expectEqual(response_policy.TextKind.text, policy.reasoning_content);
-    try std.testing.expectEqual(response_policy.TextKind.reasoning, policy.reasoning);
-    try std.testing.expectEqual(response_policy.TextKind.ignore, merged.responsePolicyForModel("proxy", "other", "https://example.invalid/v1").reasoning);
-
-    var buffer: std.Io.Writer.Allocating = .init(gpa);
-    defer buffer.deinit();
-    try serialize(gpa, &buffer.writer, merged);
-    var roundtrip = try parseFile(gpa, "<roundtrip>", buffer.written(), &sink);
-    defer roundtrip.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
-    try std.testing.expectEqualDeep(policy, roundtrip.responsePolicyForModel("proxy", "m", "https://example.invalid/v1"));
-}
-
-test "response policy configuration rejects misspelled kinds and fields" {
-    const gpa = std.testing.allocator;
-    const cases = [_][]const u8{ "{\"thinking\":\"thought\"}", "{\"thought\":\"reasoning\"}", "{\"thinking\":true}", "null" };
-    for (cases) |input| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, input, .{});
-        defer parsed.deinit();
-        try std.testing.expectError(error.InvalidResponsePolicy, parseResponsePolicy(parsed.value));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Production: parse layer
-// ---------------------------------------------------------------------------
 
 fn parseResponsePolicy(value: std.json.Value) !response_policy.Overrides {
     if (value != .object) return error.InvalidResponsePolicy;
@@ -2450,7 +2351,7 @@ fn projectConfigPath(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: the bulk of the suite
+// Tests
 // ---------------------------------------------------------------------------
 
 // Test-only fixture: an environment-map stand-in for parse tests. Declared in
@@ -2467,6 +2368,95 @@ const TestEnv = struct {
         return null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests: layer merge and env-expansion notices
+// ---------------------------------------------------------------------------
+
+test "project-layer env-expansion notice counts provider, MCP header, and URL risks" {
+    const gpa = std.testing.allocator;
+
+    const provider_headers = try cloneHeaders(gpa, &[_]McpHeader{
+        .{ .name = @constCast("x-safe"), .value = @constCast("plain") },
+        .{ .name = @constCast("x-secret"), .value = @constCast("{env:GITHUB_TOKEN}") },
+    });
+    var providers = try gpa.alloc(ProviderConfig, 1);
+    providers[0] = .{
+        .name = try gpa.dupe(u8, "gateway"),
+        .provider = .openai_compatible,
+        .base_url = .{ .custom = try gpa.dupe(u8, "https://gateway.example.com/v1") },
+        .headers = provider_headers,
+    };
+
+    var servers = try gpa.alloc(McpServerConfig, 1);
+    servers[0] = .{
+        .name = try gpa.dupe(u8, "search"),
+        .transport = .{ .sse = .{
+            .url = try gpa.dupe(u8, "https://mcp.example.com/mcp?key={env:MCP_KEY}"),
+            .headers = try cloneHeaders(gpa, &[_]McpHeader{
+                .{ .name = @constCast("Authorization"), .value = @constCast("Bearer {env:MCP_TOKEN}") },
+            }),
+        } },
+    };
+
+    var project: Config = .{ .providers = providers, .mcp_servers = servers };
+    defer project.deinit(gpa);
+
+    // One provider header + one MCP header + one MCP URL embed = 3 risks
+    // (the plain provider header counts for nothing).
+    try std.testing.expectEqual(@as(usize, 3), warnProjectLayerEnvExpansion(&project));
+
+    // A project layer without placeholders reports nothing.
+    var clean: Config = .{};
+    defer clean.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), warnProjectLayerEnvExpansion(&clean));
+}
+
+// ---------------------------------------------------------------------------
+// Tests: response-policy overlays
+// ---------------------------------------------------------------------------
+
+test "response policy configuration survives overlays cloning and serialization" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*diagnostic| diagnostic.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var lower = try parseFile(gpa, "<lower>",
+        \\{"providers":{"proxy":{"responsePolicy":{"thinking":"reasoning","reasoning":"ignore"},"models":{"m":{"reasoningEffort":"high","responsePolicy":{"reasoning_content":"text"}}}}}}
+    , &sink);
+    defer lower.deinit(gpa);
+    var upper = try parseFile(gpa, "<upper>",
+        \\{"providers":{"proxy":{"responsePolicy":{"thinking":"text"},"models":{"m":{"responsePolicy":{"reasoning":"reasoning"}}}}}}
+    , &sink);
+    defer upper.deinit(gpa);
+    var merged = try mergeLayers(gpa, &.{ lower, upper });
+    defer merged.deinit(gpa);
+    const policy = merged.responsePolicyForModel("proxy", "m", "https://example.invalid/v1");
+    try std.testing.expectEqual(response_policy.TextKind.text, policy.thinking);
+    try std.testing.expectEqual(response_policy.TextKind.text, policy.reasoning_content);
+    try std.testing.expectEqual(response_policy.TextKind.reasoning, policy.reasoning);
+    try std.testing.expectEqual(response_policy.TextKind.ignore, merged.responsePolicyForModel("proxy", "other", "https://example.invalid/v1").reasoning);
+
+    var buffer: std.Io.Writer.Allocating = .init(gpa);
+    defer buffer.deinit();
+    try serialize(gpa, &buffer.writer, merged);
+    var roundtrip = try parseFile(gpa, "<roundtrip>", buffer.written(), &sink);
+    defer roundtrip.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    try std.testing.expectEqualDeep(policy, roundtrip.responsePolicyForModel("proxy", "m", "https://example.invalid/v1"));
+}
+
+test "response policy configuration rejects misspelled kinds and fields" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const u8{ "{\"thinking\":\"thought\"}", "{\"thought\":\"reasoning\"}", "{\"thinking\":true}", "null" };
+    for (cases) |input| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidResponsePolicy, parseResponsePolicy(parsed.value));
+    }
+}
 
 test "providers_by_name recognizes known vendor names" {
     try std.testing.expectEqual(Provider.openai, providers_by_name.get("openai").?);
