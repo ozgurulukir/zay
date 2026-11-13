@@ -53,6 +53,14 @@ the current process. URL-only; headers are not supported.
 
 - **`McpClient.stop()` must free a `.failed` reason.** `stop` clobbers `lifecycle` to `.disabled`; if the client carries an owned failure reason (set via `setError`), free `lifecycle.failed.reason` **before** overwriting the lifecycle, or the reason leaks silently (`deinit` calls `stop` before its `failed`-arm switch, so the switch can never see it). Caught by the async-connect tests.
 
+- **Lifecycle transitions stop the live transport before overwriting the union (2026-11-13).** `lifecycle.stdio` owns the child process and the Windows Job Object handle; every transition to `.failed`/`.disabled` (`setError`, the config-disable arm of `syncFromConfig`, `installConnectResult`) must `stop()` first — dropping the variant raw orphans the child and leaks the handle beyond the reach of any later `stop`/`deinit` (#384 bug 3).
+
+- **A non-connected lifecycle never carries tools (2026-11-13).** Disable and failure transitions clear the discovery cache (`McpClient.clearTools`). `syncFromConfigEx` only launches a connect for a `.connecting` client whose `tools` list is empty, so a disable that keeps the cache wedges the server in CONNECTING with stale tool counts until a manual reconnect (#384 bug 1).
+
+- **Re-discovery REPLACES the cache; a failed re-discovery keeps the old list (2026-11-13).** `listTools` builds a fresh record list and swaps it in only on full success — the old append path duplicated every record on `tools/list_changed`, inflated every tool count, and made server-side removals invisible (#384 bug 2).
+
+- **`pending_tools_refresh` is `std.atomic.Value(bool)` (2026-11-13).** Worker threads (stdio read loop, SSE accumulation) store `.release`; the UI tick consumes it with an `.acq_rel` swap in `pollToolsRefresh`. A plain bool was a formal cross-thread data race even though lost updates were logically benign (#384).
+
 - **MCP registry records own a DEEP-COPIED schema (2026-09-14).** `buildMcpTool` (`src/mcp/registry_bridge.zig`) clones the client's `McpTool.schema` into the record's `*McpToolKey` (`Schema.clone` in `tools/common.zig`), and `freeMcpToolKey` frees it. `disconnectClient`/`reconnectClient` free the client-side schema while the client STAYS in `clients.items`, and the registry cleanup (`syncMcpTools`) is gated off by `anyLaneTurnActive` while `injectToolsInto` still runs — a record borrowing the client schema would dangle through every `tools_json` rebuild and schema-validation read mid-turn. Never store a borrowed `Schema` in a registry record; the record's lifetime must be independent of the client's. MCP transports/protocol/injection: [[MCP]].
 
 ### Lua Plugin System pattern

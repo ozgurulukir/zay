@@ -718,8 +718,11 @@ const McpMode = struct {
         const client = &app.mcp_manager.clients.items[app.pickers.mcp.selection];
         switch (client.status()) {
             .connected => {
-                client.stop(app.io);
-                client.lifecycle = .disabled;
+                // Disconnect through the manager, never with an inline stop:
+                // the discovery cache must be cleared WITH the transport, or
+                // the next reconcile wedges the server in CONNECTING with
+                // stale tools (#384 bug 1).
+                app.mcp_manager.disconnectClient(app.io, app.pickers.mcp.selection);
             },
             .failed => {
                 // Reconnect on toggle when failed

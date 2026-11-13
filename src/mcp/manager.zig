@@ -86,7 +86,15 @@ pub const McpManager = struct {
                 if (server_cfg.enabled) {
                     if (c.status() != .connected) c.markConnecting();
                 } else {
-                    c.lifecycle = .disabled;
+                    // Mirrors `disconnectClient` (#384 bug 4): the raw
+                    // `.disabled` write this replaced dropped the lifecycle
+                    // union on a possibly-connected client — orphaning the
+                    // stdio child and leaving the discovery cache populated,
+                    // which then wedged the next re-enable in CONNECTING.
+                    // `stop` sets the `.disabled` lifecycle itself.
+                    c.stop(io);
+                    c.clearTools();
+                    c.latency_ms = 0;
                 }
             } else {
                 var c = try client_mod.McpClient.init(
@@ -221,8 +229,7 @@ pub const McpManager = struct {
         if (index >= self.clients.items.len) return;
         const client = &self.clients.items[index];
         client.stop(io);
-        for (client.tools.items) |*tool| tool.deinit(self.gpa);
-        client.tools.clearRetainingCapacity();
+        client.clearTools();
         client.latency_ms = 0;
         client.markConnecting();
         self.launchConnect(io, client.name);
@@ -236,8 +243,7 @@ pub const McpManager = struct {
         if (index >= self.clients.items.len) return;
         const client = &self.clients.items[index];
         client.stop(io);
-        for (client.tools.items) |*tool| tool.deinit(self.gpa);
-        client.tools.clearRetainingCapacity();
+        client.clearTools();
         client.latency_ms = 0;
         // An in-flight connect is NOT canceled here — cancel blocks the main
         // thread on a hung handshake. `drainConnects` observes the target is
@@ -360,6 +366,11 @@ pub const McpManager = struct {
                     return;
                 }
                 target.stop(io);
+                // Defense-in-depth for the #384 invariant — a non-connected
+                // lifecycle never carries tools — so no future path that
+                // leaves tools on a connecting client can re-create the
+                // stale-cache CONNECTING wedge through this arm.
+                target.clearTools();
                 target.lifecycle = .{ .failed = .{ .reason = msg } };
                 job.clone.deinit(io);
             },
@@ -977,4 +988,141 @@ test "McpManager deinit cancels a partial stdio response" {
     manager.deinit(io);
     const elapsed_ns = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
     try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+// ---------------------------------------------------------------------------
+// Discovery-cache/lifecycle invariants (#384): a non-connected lifecycle
+// never carries tools, and a live transport is stopped before it is dropped.
+// ---------------------------------------------------------------------------
+
+test "McpManager toggle-off clears the cache so a re-enabled server reconnects" {
+    const gpa = std.testing.allocator;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(std.testing.io);
+
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "toggle", "default");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try drainUntilConnected(&manager, std.testing.io);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+
+    // Toggle-off (command_router's connected arm goes through
+    // `disconnectClient`): the transport goes down and the discovery cache
+    // goes down WITH it — a disabled lifecycle never carries tools.
+    manager.disconnectClient(std.testing.io, 0);
+    try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+
+    // The server is still enabled in config: the reconcile marks it
+    // connecting again and — because the cache is cleared — launches a
+    // fresh connect. With stale tools this used to be skipped and the
+    // server wedged in CONNECTING forever (#384 bug 1).
+    try manager.syncFromConfig(std.testing.io, &cfg);
+    try std.testing.expectEqual(client_mod.ServerStatus.connecting, manager.clients.items[0].status());
+
+    manager.syncFromConfigEx(std.testing.io, &cfg);
+    try std.testing.expect(manager.hasPendingConnects());
+    try drainUntilConnected(&manager, std.testing.io);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+    try std.testing.expect(!manager.hasPendingConnects());
+}
+
+test "McpManager config-disable stops the child and clears the cache" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // After discovery the mock sits blocked in its stdin read loop and only
+    // `stop()` ends it (closing stdin / terminating), so the process-death
+    // probe below can only pass if the disable actually tore the child down
+    // — the raw `.disabled` write this replaced orphaned it, keeping the
+    // child alive forever with its stdin still open (#384 bug 4).
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "orphan", "default");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+
+    // Watch the child while the client still owns it — the watch survives
+    // the client closing its own process handle.
+    var watch: ?os.ChildExitWatch = os.ChildExitWatch.init(&manager.clients.items[0].lifecycle.stdio.process);
+    defer if (watch) |*w| w.deinit();
+    if (os.ChildExitWatch.supported) try std.testing.expect(watch != null);
+
+    // The server flips to disabled in config on the next reconcile.
+    servers[0].enabled = false;
+    try manager.syncFromConfig(io, &cfg);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+    // No orphan: bounded wait on the process itself.
+    if (watch) |*w| try std.testing.expect(w.awaitExit(io, 2_000));
+}
+
+test "McpManager relaunches a connect for a failed server with a cleared cache" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    // Arena-backed config fixture (PR-2b): mirrors the App hand-off —
+    // the config tree lives in this arena and is released in one shot;
+    // no per-field Config.deinit, no gpa frees for fixture slices.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "recover", "default");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+
+    // A re-discovery failure on a connected client lands via `setError`
+    // (the list_changed path in provider_model): the transport stops, the
+    // lifecycle fails — and the discovery cache must go down with it, or
+    // the reconcile wedges the server in CONNECTING with stale tools (bug
+    // 1's shape through the failed arm).
+    const client = &manager.clients.items[0];
+    try client.addTool("stale", "Cached before the failure", .{ .properties = &.{} }, null);
+    client.setError(io, "list_changed re-discovery failed", .{});
+    try std.testing.expectEqual(client_mod.ServerStatus.failed, client.status());
+    try std.testing.expectEqual(@as(usize, 0), client.tools.items.len);
+
+    // Still enabled in config: the reconcile marks it connecting (freeing
+    // the failure reason) and launches a fresh connect.
+    try manager.syncFromConfig(io, &cfg);
+    try std.testing.expectEqual(client_mod.ServerStatus.connecting, client.status());
+
+    manager.syncFromConfigEx(io, &cfg);
+    try std.testing.expect(manager.hasPendingConnects());
+    try drainUntilConnected(&manager, io);
+
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, client.status());
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
 }

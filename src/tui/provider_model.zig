@@ -1807,8 +1807,9 @@ pub fn drainMcpNotifications(self: *App) bool {
         if (c.status() != .connected) continue;
         if (c.pollToolsRefresh()) {
             any_pending = true;
-            c.listTools(self.io) catch {
-                c.setError("list_changed re-discovery failed", .{});
+            c.listTools(self.io) catch |err| {
+                log.warn("MCP '{s}': list_changed re-discovery failed err={s}", .{ c.name, @errorName(err) });
+                c.setError(self.io, "list_changed re-discovery failed: {s}", .{@errorName(err)});
             };
         }
     }

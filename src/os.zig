@@ -214,6 +214,86 @@ pub fn terminateChildTree(io: std.Io, child: *const std.process.Child, job_handl
         _ = windows.TerminateJobObject(h, 1);
     }
 }
+
+/// Watch a child process for exit from OUTSIDE its owner: the owner keeps the
+/// `std.process.Child` (and its handles); the watch answers, with a bound,
+/// whether the process is gone. Test support for "no orphaned child"
+/// assertions (#384): a regression that merely DROPS a child from a lifecycle
+/// union — leaving the process itself running — must fail such a test, which
+/// requires observing the process, not the struct that used to own it.
+///
+/// Platform support:
+/// - Windows: duplicates the child's process handle; the duplicate stays
+///   valid after the owner closes the original, and the kernel signals it
+///   exactly when the process terminates.
+/// - Linux: probes `processExited` (`waitid(NOHANG | NOWAIT)`), which
+///   reports an already-reaped child (ECHILD) as exited.
+/// - Other POSIX: no portable zombie-aware probe (see `awaitExit` above);
+///   `init` returns null there so callers can skip just the death assertion.
+pub const ChildExitWatch = struct {
+    /// Whether this platform can observe a child's exit. Callers gate the
+    /// death assertion on this instead of skipping whole tests.
+    pub const supported = is_windows or tag == .linux;
+
+    /// Windows: a duplicated process handle owned by the watch. Others: unused.
+    process_handle: if (is_windows) std.os.windows.HANDLE else void,
+    /// Linux: the child's pid. Others: unused.
+    pid: if (is_windows) void else std.posix.pid_t,
+
+    /// Snapshot `child`'s process identity. Null when there is nothing to
+    /// watch — the child was never spawned (`id == null`) — or when the
+    /// platform has no probe (`supported == false`).
+    pub fn init(child: *const std.process.Child) ?ChildExitWatch {
+        if (!supported) return null;
+        const id = child.id orelse return null;
+        if (is_windows) {
+            var duplicate: std.os.windows.HANDLE = undefined;
+            if (windows.DuplicateHandle(
+                windows.GetCurrentProcess(),
+                id,
+                windows.GetCurrentProcess(),
+                &duplicate,
+                0,
+                0, // FALSE — not inheritable
+                windows.DUPLICATE_SAME_ACCESS,
+            ) == 0) return null;
+            return .{ .process_handle = duplicate, .pid = {} };
+        } else {
+            return .{ .process_handle = {}, .pid = id };
+        }
+    }
+
+    /// True once the watched process has exited, waiting at most `timeout_ms`.
+    /// Observing only — never signals or reaps the child. Call on supported
+    /// platforms only (`init` returned a watch).
+    pub fn awaitExit(self: *const ChildExitWatch, io: std.Io, timeout_ms: u32) bool {
+        if (is_windows) {
+            const timeout_100ns: std.os.windows.LARGE_INTEGER =
+                -@divTrunc(@as(std.os.windows.LARGE_INTEGER, timeout_ms) * std.time.ns_per_ms, 100);
+            switch (std.os.windows.ntdll.NtWaitForSingleObject(self.process_handle, .FALSE, &timeout_100ns)) {
+                .WAIT_0 => return true,
+                else => return false,
+            }
+        } else if (tag == .linux) {
+            var waited_ms: u32 = 0;
+            while (true) {
+                if (processExited(self.pid)) return true;
+                if (waited_ms >= timeout_ms) return false;
+                const step_ms = @min(child_term_poll_ms, timeout_ms - waited_ms);
+                io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch {};
+                waited_ms += step_ms;
+            }
+        } else {
+            unreachable; // no probe on this platform — `init` returned null
+        }
+    }
+
+    /// Release the duplicated handle (Windows). No-op elsewhere.
+    pub fn deinit(self: *const ChildExitWatch) void {
+        if (is_windows) _ = closeWin32Handle(self.process_handle);
+    }
+};
+
 /// Spawn `bash -c <command>` in its own process group — the shape the shell
 /// capture paths use — so the group-signal teardown in
 /// `terminateChildBounded` reaches grandchildren. Caller reaps via
@@ -403,6 +483,65 @@ test "terminateChildBounded returns quickly when TERM kills instantly" {
     try std.testing.expect(child.id == null);
 }
 
+/// A long-lived child for the watch tests: alive well past any test window.
+fn spawnLongLived(io: std.Io) !std.process.Child {
+    if (is_windows) {
+        return std.process.spawn(io, .{
+            .argv = &.{ "cmd.exe", "/c", "ping", "127.0.0.1", "-n", "30" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+    }
+    return spawnGrouped("sleep 30");
+}
+
+test "ChildExitWatch distinguishes a live child from an exited one" {
+    // No probe on this platform — the death assertion is skipped, not vacuous.
+    if (!ChildExitWatch.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try spawnLongLived(io);
+    defer child.kill(io);
+
+    var watch = ChildExitWatch.init(&child) orelse return error.NoChildToWatch;
+    defer watch.deinit();
+
+    // Negative space: a live child must NOT be reported as exited — otherwise
+    // every orphan assertion would pass vacuously.
+    try std.testing.expect(!watch.awaitExit(io, 150));
+
+    // The owner tears the child down and closes its own handle.
+    child.kill(io);
+    try std.testing.expect(child.id == null);
+
+    // The watch survives that teardown (duplicated handle / remembered pid)
+    // and answers the death.
+    try std.testing.expect(watch.awaitExit(io, 2_000));
+}
+
+test "ChildExitWatch.init returns null once the child is reaped" {
+    const io = std.testing.io;
+
+    var child = if (is_windows)
+        try std.process.spawn(io, .{
+            .argv = &.{ "cmd.exe", "/c", "echo", "done" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        })
+    else
+        try spawnGrouped("true");
+    defer child.kill(io);
+
+    child.kill(io);
+    try std.testing.expect(child.id == null);
+
+    // Nothing left to watch — and on probe-less platforms (no `supported`)
+    // this is the null every init returns.
+    try std.testing.expect(ChildExitWatch.init(&child) == null);
+}
+
 const windows = if (is_windows) struct {
     const BOOL = i32;
     const UINT = u32;
@@ -465,6 +604,20 @@ const windows = if (is_windows) struct {
     extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) callconv(.winapi) BOOL;
     extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    extern "kernel32" fn DuplicateHandle(
+        hSourceProcessHandle: HANDLE,
+        hSourceHandle: HANDLE,
+        hTargetProcessHandle: HANDLE,
+        lpTargetHandle: *HANDLE,
+        dwDesiredAccess: DWORD,
+        bInheritHandle: BOOL,
+        dwOptions: DWORD,
+    ) callconv(.winapi) BOOL;
+
+    /// DuplicateHandle option: the new handle receives the same access rights
+    /// as the source (a spawn's process handle already carries SYNCHRONIZE).
+    const DUPLICATE_SAME_ACCESS: DWORD = 0x00000002;
 } else struct {
     pub const HANDLE = std.os.windows.HANDLE;
     pub const DWORD = std.os.windows.DWORD;
