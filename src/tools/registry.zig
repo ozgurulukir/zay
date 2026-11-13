@@ -160,7 +160,7 @@ pub const ToolRegistry = struct {
         self.removePluginToolsWithPrefix(gpa, "mcp__");
         for (manager.clients.items) |*client| {
             if (client.status() != .connected) continue;
-            for (client.tools.items) |*tool| {
+            for (client.discovery.tools.items) |*tool| {
                 const record = mcp_bridge.buildMcpTool(gpa, client.name, tool.name, tool.description, tool.schema, tool.raw_input_schema) catch |err| {
                     log.warn("syncMcpTools: buildMcpTool '{s}' failed: {s}", .{ tool.full_name, @errorName(err) });
                     continue;
@@ -576,7 +576,7 @@ test "ToolRegistry: MCP records outlive a server disconnect with their raw schem
     // is freed. The registry record's deep copy must remain valid until the
     // next (turn-gated) sync removes it.
     manager.disconnectClient(io, 0);
-    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].discovery.tools.items.len);
 
     const stale = reg.lookup("mcp__rich__query") orelse return error.McpToolMissing;
     try std.testing.expectEqualStrings(raw_before, stale.raw_input_schema.?);

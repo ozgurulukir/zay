@@ -134,7 +134,7 @@ pub const McpManager = struct {
         };
         for (self.clients.items) |c| {
             if (c.status() != .connecting) continue;
-            if (c.tools.items.len > 0) continue;
+            if (c.discovery.tools.items.len > 0) continue;
             if (self.hasPendingConnect(c.name)) continue;
             self.launchConnect(io, c.name);
         }
@@ -145,7 +145,7 @@ pub const McpManager = struct {
         var count: usize = 0;
         for (self.clients.items) |c| {
             if (c.status() == .connected) {
-                count += c.tools.items.len;
+                count += c.discovery.tools.items.len;
             }
         }
         return count;
@@ -169,13 +169,13 @@ pub const McpManager = struct {
     pub fn buildMcpToolSchemas(self: *const McpManager, gpa: std.mem.Allocator) ![]ai.McpToolSchema {
         var total: usize = 0;
         for (self.clients.items) |c| {
-            if (c.status() == .connected) total += c.tools.items.len;
+            if (c.status() == .connected) total += c.discovery.tools.items.len;
         }
         var schemas = try gpa.alloc(ai.McpToolSchema, total);
         var idx: usize = 0;
         next_tool: for (self.clients.items) |c| {
             if (c.status() != .connected) continue;
-            for (c.tools.items) |tool| {
+            for (c.discovery.tools.items) |tool| {
                 // Defensive only: server names are deduped at config parse time,
                 // so a `full_name` collision means one server advertised two
                 // tools with the same name — skip the malformed duplicate (first
@@ -214,7 +214,7 @@ pub const McpManager = struct {
             if (c.status() != .connected) continue;
             if (!first) try out.writer.writeAll(", ");
             first = false;
-            try out.writer.print("{s} ({d} tools)", .{ c.name, c.tools.items.len });
+            try out.writer.print("{s} ({d} tools)", .{ c.name, c.discovery.tools.items.len });
         }
         return out.toOwnedSlice();
     }
@@ -294,7 +294,7 @@ pub const McpManager = struct {
         if (self.hasPendingConnect(name)) return;
         const client = self.findClient(name) orelse return;
         if (client.status() != .connecting) return;
-        if (client.tools.items.len > 0) return;
+        if (client.discovery.tools.items.len > 0) return;
 
         const job = self.gpa.create(ConnectJob) catch return;
         // Full-struct init: `create` hands back undefined memory, and the
@@ -716,8 +716,8 @@ test "McpManager async connect spawns, handshakes, discovers, and installs" {
     try drainUntilConnected(&manager, std.testing.io);
 
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
-    try std.testing.expectEqualStrings("mcp__mock__greet", manager.clients.items[0].tools.items[0].full_name);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__mock__greet", manager.clients.items[0].discovery.tools.items[0].full_name);
     try std.testing.expectEqual(@as(usize, 1), manager.activeServerCount());
     try std.testing.expect(!manager.hasPendingConnects());
 }
@@ -748,7 +748,7 @@ test "McpManager buildMcpToolSchemas carries the raw inputSchema" {
     try std.testing.expectEqualStrings("mcp__rich__query", schemas[0].name);
     // The borrowed raw form is the client's verbatim capture — the
     // serialization path can pass it through without another copy.
-    try std.testing.expectEqualStrings(manager.clients.items[0].tools.items[0].raw_input_schema.?, raw);
+    try std.testing.expectEqualStrings(manager.clients.items[0].discovery.tools.items[0].raw_input_schema.?, raw);
 }
 
 test "McpManager reconnect frees and re-captures raw inputSchemas" {
@@ -772,7 +772,7 @@ test "McpManager reconnect frees and re-captures raw inputSchemas" {
 
     const client = &manager.clients.items[0];
     try std.testing.expectEqual(client_mod.ServerStatus.connected, client.status());
-    const raw_before = try gpa.dupe(u8, client.tools.items[0].raw_input_schema.?);
+    const raw_before = try gpa.dupe(u8, client.discovery.tools.items[0].raw_input_schema.?);
     defer gpa.free(raw_before);
     try std.testing.expect(std.mem.indexOf(u8, raw_before, "$defs") != null);
 
@@ -784,8 +784,8 @@ test "McpManager reconnect frees and re-captures raw inputSchemas" {
 
     const refreshed = &manager.clients.items[0];
     try std.testing.expectEqual(client_mod.ServerStatus.connected, refreshed.status());
-    try std.testing.expectEqual(@as(usize, 1), refreshed.tools.items.len);
-    const raw_after = refreshed.tools.items[0].raw_input_schema orelse return error.RawSchemaMissing;
+    try std.testing.expectEqual(@as(usize, 1), refreshed.discovery.tools.items.len);
+    const raw_after = refreshed.discovery.tools.items[0].raw_input_schema orelse return error.RawSchemaMissing;
     try std.testing.expectEqualStrings(raw_before, raw_after);
 }
 
@@ -871,7 +871,7 @@ test "McpManager discards a connect outcome when the client is disconnected mid-
     try drainUntilConnected(&manager, std.testing.io);
 
     try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].discovery.tools.items.len);
     try std.testing.expect(!manager.hasPendingConnects());
 }
 
@@ -1014,14 +1014,14 @@ test "McpManager toggle-off clears the cache so a re-enabled server reconnects" 
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try drainUntilConnected(&manager, std.testing.io);
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
 
     // Toggle-off (command_router's connected arm goes through
     // `disconnectClient`): the transport goes down and the discovery cache
     // goes down WITH it — a disabled lifecycle never carries tools.
     manager.disconnectClient(std.testing.io, 0);
     try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].discovery.tools.items.len);
 
     // The server is still enabled in config: the reconcile marks it
     // connecting again and — because the cache is cleared — launches a
@@ -1035,7 +1035,7 @@ test "McpManager toggle-off clears the cache so a re-enabled server reconnects" 
     try drainUntilConnected(&manager, std.testing.io);
 
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
     try std.testing.expect(!manager.hasPendingConnects());
 }
 
@@ -1064,7 +1064,7 @@ test "McpManager config-disable stops the child and clears the cache" {
     manager.syncFromConfigEx(io, &cfg);
     try drainUntilConnected(&manager, io);
     try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
 
     // Watch the child while the client still owns it — the watch survives
     // the client closing its own process handle.
@@ -1077,7 +1077,7 @@ test "McpManager config-disable stops the child and clears the cache" {
     try manager.syncFromConfig(io, &cfg);
 
     try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
-    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].discovery.tools.items.len);
     // No orphan: bounded wait on the process itself.
     if (watch) |*w| try std.testing.expect(w.awaitExit(io, 2_000));
 }
@@ -1112,7 +1112,7 @@ test "McpManager relaunches a connect for a failed server with a cleared cache" 
     try client.addTool("stale", "Cached before the failure", .{ .properties = &.{} }, null);
     client.setError(io, "list_changed re-discovery failed", .{});
     try std.testing.expectEqual(client_mod.ServerStatus.failed, client.status());
-    try std.testing.expectEqual(@as(usize, 0), client.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.discovery.tools.items.len);
 
     // Still enabled in config: the reconcile marks it connecting (freeing
     // the failure reason) and launches a fresh connect.
@@ -1124,5 +1124,5 @@ test "McpManager relaunches a connect for a failed server with a cleared cache" 
     try drainUntilConnected(&manager, io);
 
     try std.testing.expectEqual(client_mod.ServerStatus.connected, client.status());
-    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
 }
