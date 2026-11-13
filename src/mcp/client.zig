@@ -228,11 +228,14 @@ pub const McpClient = struct {
     /// server advertises tools but not the listChanged flag).
     server_supports_tools_list_changed: bool = false,
     /// Set by `handleNotification` when a `notifications/tools/list_changed`
-    /// arrives mid-request. The App polls `pollToolsRefresh` on each tick and,
-    /// if true, calls `refreshMcpTools` to re-discover the tool list. This
-    /// avoids re-entering `listTools` synchronously from inside a JSON-RPC
-    /// read loop (which would deadlock the request mutex).
-    pending_tools_refresh: bool = false,
+    /// arrives mid-request — written on the transport's worker thread (stdio
+    /// read loop, SSE accumulation, both under `request_mutex`), read and
+    /// cleared on the UI thread via `pollToolsRefresh`. Atomic so the worker's
+    /// store and the UI's load-and-clear can never race (a plain bool was a
+    /// formal data race; #384). This avoids re-entering `listTools`
+    /// synchronously from inside a JSON-RPC read loop (which would deadlock
+    /// the request mutex).
+    pending_tools_refresh: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8, command: ?[]const u8, args: []const []const u8, url: ?[]const u8) !McpClient {
         // Legacy init: if url is set, build an sse client; otherwise stdio.
@@ -298,6 +301,13 @@ pub const McpClient = struct {
     /// connect worker. The worker spawns and handshakes on the clone; the
     /// manager moves the completed client into the live list slot on the main
     /// thread, so the live client is never mutated off-thread.
+    ///
+    /// The clone starts from the `initStdio`/`initSse` defaults, so it never
+    /// inherits the live client's discovery cache: `tools` is empty and
+    /// `pending_tools_refresh` is reset to false. A fresh connect has nothing
+    /// to refresh yet — its own handshake runs `listTools` — and inheriting a
+    /// stale pending flag would trigger a redundant re-discovery on the first
+    /// tick after the clone is installed.
     pub fn cloneForConnect(self: *const McpClient, io: std.Io) !McpClient {
         var clone: McpClient = switch (self.transport) {
             .stdio => |t| try initStdio(self.gpa, self.name, t.command, t.args),
@@ -308,6 +318,8 @@ pub const McpClient = struct {
             clone.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, self.transport.sse.headers);
         }
         clone.markConnecting();
+        assert(clone.tools.items.len == 0);
+        assert(!clone.pending_tools_refresh.load(.acquire));
         return clone;
     }
 
@@ -377,7 +389,7 @@ pub const McpClient = struct {
             .failed => |f| self.gpa.free(f.reason),
             else => {},
         }
-        for (self.tools.items) |*tool| tool.deinit(self.gpa);
+        self.clearTools();
         self.tools.deinit(self.gpa);
         if (self.session_id) |sid| self.gpa.free(sid);
         if (self.server_info) |*si| si.deinit(self.gpa);
@@ -385,11 +397,43 @@ pub const McpClient = struct {
         self.* = undefined;
     }
 
-    /// Set the lifecycle to failed (or replace the existing reason).
-    pub fn setError(self: *McpClient, comptime fmt: []const u8, args: anytype) void {
+    /// Set the lifecycle to failed (or replace the existing reason). A live
+    /// transport variant owns real resources — a stdio child process plus
+    /// Windows Job Object handle, or an HTTP session — so it is stopped
+    /// BEFORE the union overwrite; dropping the variant raw would orphan the
+    /// child and leak the handle, and a later stop/deinit could never reach
+    /// them through the `.failed` arm (#384 bug 3). Stopping a transport also
+    /// invalidates its discovery cache, so the tools are cleared with it: a
+    /// non-connected lifecycle never carries tools, which is what keeps the
+    /// manager's reconcile re-launching connects for a failed server instead
+    /// of wedging it in CONNECTING with stale tools. On OOM the client ends
+    /// up cleanly `.disabled` (stopped, cache empty) rather than half-failed.
+    pub fn setError(self: *McpClient, io: std.Io, comptime fmt: []const u8, args: anytype) void {
+        switch (self.lifecycle) {
+            .stdio, .sse => self.stop(io),
+            else => {},
+        }
+        self.clearTools();
+        // Allocate the replacement before freeing the old reason: on OOM the
+        // client keeps a coherent (already-stopped) state instead of carrying
+        // a freed `.failed` reason.
+        const reason = std.fmt.allocPrint(self.gpa, fmt, args) catch {
+            log.warn("MCP '{s}': OOM formatting failure reason; left disabled instead of failed", .{self.name});
+            return;
+        };
         if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
-        const reason = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
         self.lifecycle = .{ .failed = .{ .reason = reason } };
+    }
+
+    /// Free every discovered tool record and empty the list, clearing the
+    /// pending-refresh flag with it. Owns the discovery-cache invariant the
+    /// disable/reconnect transitions rely on: the cache belongs to a live
+    /// transport, so stopping the transport without dropping the cache would
+    /// leave stale tools that wedge the next reconcile in CONNECTING (#384).
+    pub fn clearTools(self: *McpClient) void {
+        for (self.tools.items) |*tool| tool.deinit(self.gpa);
+        self.tools.clearRetainingCapacity();
+        self.pending_tools_refresh.store(false, .release);
     }
 
     /// Route a server-initiated notification captured during a request read.
@@ -404,8 +448,9 @@ pub const McpClient = struct {
         if (std.mem.eql(u8, method, "notifications/tools/list_changed")) {
             // Honor the capability flag — a server that didn't advertise
             // listChanged shouldn't be sending these, but we still set the
-            // flag: re-discovery is idempotent and harmless.
-            self.pending_tools_refresh = true;
+            // flag: re-discovery is idempotent and harmless. Release-store:
+            // pairs with the UI thread's swap below.
+            self.pending_tools_refresh.store(true, .release);
             return;
         }
         // Silently accept other notifications — they're informational.
@@ -414,13 +459,10 @@ pub const McpClient = struct {
     /// True when a `notifications/tools/list_changed` arrived since the last
     /// check. The App calls this on each tick and, when true, calls
     /// `refreshMcpTools` (which re-runs `tools/list` and reinjects schemas).
-    /// The flag is cleared atomically with the read.
+    /// Read-and-clear is one atomic swap: a notification landing between the
+    /// read and the clear survives to the next poll instead of being lost.
     pub fn pollToolsRefresh(self: *McpClient) bool {
-        if (self.pending_tools_refresh) {
-            self.pending_tools_refresh = false;
-            return true;
-        }
-        return false;
+        return self.pending_tools_refresh.swap(false, .acq_rel);
     }
 
     /// Spawn the MCP server subprocess (stdio transport).
@@ -993,17 +1035,17 @@ pub const McpClient = struct {
         defer self.gpa.free(response);
 
         const parsed = try schema_mod.parseResponse(self.gpa, response) orelse {
-            self.setError("handshake returned no result", .{});
+            self.setError(io, "handshake returned no result", .{});
             return error.McpHandshakeFailed;
         };
         defer parsed.deinit();
 
         const result = parsed.value.object.get("result") orelse {
-            self.setError("handshake result missing", .{});
+            self.setError(io, "handshake result missing", .{});
             return error.McpHandshakeFailed;
         };
         if (result != .object) {
-            self.setError("handshake result not an object", .{});
+            self.setError(io, "handshake result not an object", .{});
             return error.McpHandshakeFailed;
         }
         const result_obj = result.object;
@@ -1059,7 +1101,13 @@ pub const McpClient = struct {
         }
     }
 
-    /// Query tools/list and populate the client's tool list.
+    /// Query tools/list and REPLACE the client's tool list. On success the
+    /// cache equals exactly the server's response — tools removed server-side
+    /// disappear and re-discovery never duplicates records (the old append
+    /// path inflated every count on `tools/list_changed`, #384 bug 2). On
+    /// failure (request error, parse error, OOM) the previous list stays
+    /// fully intact: the replacement is built first and swapped in only once
+    /// every record is owned.
     pub fn listTools(self: *McpClient, io: std.Io) !void {
         const response = try self.sendRequest(io, "tools/list", null);
         defer self.gpa.free(response);
@@ -1073,25 +1121,23 @@ pub const McpClient = struct {
         const tools_val = result.object.get("tools") orelse return;
         if (tools_val != .array) return;
 
-        for (tools_val.array.items) |tool_val| {
-            if (tool_val != .object) continue;
-            const obj = tool_val.object;
-
-            const tool_name = if (obj.get("name")) |n| (if (n == .string) n.string else continue) else continue;
-            const description = if (obj.get("description")) |d| (if (d == .string) d.string else "") else "";
-            const input_schema = obj.get("inputSchema");
-            // addTool takes ownership on success; the errdefer covers the OOM
-            // window before the record is appended (raw capture or append
-            // failure), so the projection never leaks mid-discovery.
-            var schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(self.gpa, s)) else tools_common.Schema{ .properties = &.{} };
-            errdefer schema.deinit(self.gpa);
-            // Discovery-time capture: addTool dupes the borrowed form into the
-            // record, so the temporary is freed at the end of every iteration.
-            const raw_input_schema = try schema_mod.rawInputSchemaJson(self.gpa, input_schema);
-            defer if (raw_input_schema) |raw| self.gpa.free(raw);
-
-            try self.addTool(tool_name, description, schema, raw_input_schema);
+        var fresh: std.ArrayList(McpTool) = .empty;
+        errdefer {
+            for (fresh.items) |*tool| tool.deinit(self.gpa);
+            fresh.deinit(self.gpa);
         }
+        for (tools_val.array.items) |tool_val| {
+            var record = try toolRecordFromListEntry(self.gpa, self.name, tool_val) orelse continue;
+            fresh.append(self.gpa, record) catch |err| {
+                record.deinit(self.gpa);
+                return err;
+            };
+        }
+
+        // Full success: swap the replacement in and release the stale cache.
+        for (self.tools.items) |*tool| tool.deinit(self.gpa);
+        self.tools.deinit(self.gpa);
+        self.tools = fresh;
     }
 
     /// Call a tool via `tools/call` JSON-RPC.
@@ -1157,7 +1203,8 @@ pub const McpClient = struct {
     /// Register a mock or discovered tool for testing / dynamic loading.
     /// `raw_input_schema` is the server's original `inputSchema` JSON
     /// (borrowed; duped into the record) — pass null for mock tools that
-    /// have no source schema.
+    /// have no source schema. The record takes ownership of `schema` on
+    /// success; on error `schema` stays caller-owned.
     pub fn addTool(
         self: *McpClient,
         tool_name: []const u8,
@@ -1165,30 +1212,83 @@ pub const McpClient = struct {
         schema: tools_common.Schema,
         raw_input_schema: ?[]const u8,
     ) !void {
-        const full_name = try naming.toolFullName(self.gpa, self.name, tool_name);
-        errdefer self.gpa.free(full_name);
+        const record = try buildToolRecord(self.gpa, self.name, tool_name, description, schema, raw_input_schema);
+        // Append may fail; on failure the schema stays caller-owned (the
+        // discovery loop's errdefer frees it), so release every field the
+        // record owns EXCEPT the schema.
+        self.tools.append(self.gpa, record) catch |err| {
+            self.gpa.free(record.server_name);
+            self.gpa.free(record.name);
+            self.gpa.free(record.full_name);
+            self.gpa.free(record.description);
+            if (record.raw_input_schema) |raw| self.gpa.free(raw);
+            return err;
+        };
+    }
+
+    /// Build one owned tool record from borrowed discovery fields — the
+    /// shared construction behind `addTool` and `listTools`. On success the
+    /// record owns `schema`; on error nothing is allocated and `schema`
+    /// stays caller-owned.
+    fn buildToolRecord(
+        gpa: std.mem.Allocator,
+        server_name: []const u8,
+        tool_name: []const u8,
+        description: []const u8,
+        schema: tools_common.Schema,
+        raw_input_schema: ?[]const u8,
+    ) !McpTool {
+        const full_name = try naming.toolFullName(gpa, server_name, tool_name);
+        errdefer gpa.free(full_name);
 
         // Hoist the record's owned fields into locals so every errdefer below
-        // frees an initialized slice — `try` dupes inside the append's struct
+        // frees an initialized slice — `try` dupes inside the return's struct
         // literal would leave the earlier copies stranded when a later one
         // failed (same hazard `buildMcpTool` fixed in the registry bridge).
-        const server_name_owned = try self.gpa.dupe(u8, self.name);
-        errdefer self.gpa.free(server_name_owned);
-        const tool_name_owned = try self.gpa.dupe(u8, tool_name);
-        errdefer self.gpa.free(tool_name_owned);
-        const description_owned = try self.gpa.dupe(u8, description);
-        errdefer self.gpa.free(description_owned);
-        const raw_owned = if (raw_input_schema) |raw| try self.gpa.dupe(u8, raw) else null;
-        errdefer if (raw_owned) |raw| self.gpa.free(raw);
+        const server_name_owned = try gpa.dupe(u8, server_name);
+        errdefer gpa.free(server_name_owned);
+        const tool_name_owned = try gpa.dupe(u8, tool_name);
+        errdefer gpa.free(tool_name_owned);
+        const description_owned = try gpa.dupe(u8, description);
+        errdefer gpa.free(description_owned);
+        const raw_owned = if (raw_input_schema) |raw| try gpa.dupe(u8, raw) else null;
+        errdefer if (raw_owned) |raw| gpa.free(raw);
 
-        try self.tools.append(self.gpa, .{
+        return .{
             .server_name = server_name_owned,
             .name = tool_name_owned,
             .full_name = full_name,
             .description = description_owned,
             .schema = schema,
             .raw_input_schema = raw_owned,
-        });
+        };
+    }
+
+    /// Extract one `tools/list` entry into an owned record. Null when the
+    /// entry is malformed (skipped silently, matching the discovery
+    /// contract); an error only for allocation failure. On success the
+    /// record owns the schema projection and raw capture, so the caller's
+    /// errdefer scope can end at the return without ownership overlap.
+    fn toolRecordFromListEntry(
+        gpa: std.mem.Allocator,
+        server_name: []const u8,
+        tool_val: std.json.Value,
+    ) !?McpTool {
+        if (tool_val != .object) return null;
+        const obj = tool_val.object;
+
+        const tool_name = if (obj.get("name")) |n| (if (n == .string) n.string else return null) else return null;
+        const description = if (obj.get("description")) |d| (if (d == .string) d.string else "") else "";
+        const input_schema = obj.get("inputSchema");
+        var schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(gpa, s)) else tools_common.Schema{ .properties = &.{} };
+        // Covers the OOM window before the record takes ownership (raw
+        // capture or record construction); after that, deinit-ing here would
+        // double-free — the record now owns the projection.
+        errdefer schema.deinit(gpa);
+        const raw_input_schema = try schema_mod.rawInputSchemaJson(gpa, input_schema);
+        defer if (raw_input_schema) |raw| gpa.free(raw);
+
+        return try buildToolRecord(gpa, server_name, tool_name, description, schema, raw_input_schema);
     }
 };
 
@@ -1663,4 +1763,149 @@ test "Windows HTTP timeout cancels a stalled operation" {
         error.Timeout,
         client.runHttpVoidWithTimeout(io, .notification, stalledHttpOperation, .{io}),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Discovery-cache and failure-path invariants (#384)
+// ---------------------------------------------------------------------------
+
+test "McpClient listTools replaces the cache instead of appending" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try initMockClient(gpa, "rediscover", "default");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+
+    // Prime the cache with a record a previous discovery left behind and the
+    // server has since removed. Re-discovery REPLACES the cache: the result
+    // must be exactly the server's catalog, never the union of both lists
+    // (the old append path grew the list on every `tools/list_changed`).
+    try client.addTool("stale", "Removed server-side", .{ .properties = &.{} }, null);
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+
+    try client.listTools(io);
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqualStrings("greet", client.tools.items[0].name);
+    try std.testing.expectEqualStrings("mcp__rediscover__greet", client.tools.items[0].full_name);
+
+    // The list_changed path re-runs listTools on the same client — a second
+    // discovery must keep the count at the server's catalog size, with
+    // unique names (no duplicates).
+    try client.listTools(io);
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqualStrings("greet", client.tools.items[0].name);
+}
+
+test "McpClient keeps the previous tool list when re-discovery fails" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // malformed_tools: the discovery response is not JSON, so listTools
+    // fails (or finds no result) after the request itself round-trips.
+    var client = try initMockClient(gpa, "broken-list", "malformed_tools");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+
+    // Prime via the registration seam, as an earlier successful discovery
+    // would have: exactly one record, which the failed refresh must leave
+    // fully intact — a failed re-discovery never empties the cache.
+    try client.addTool("kept", "Survives the failed refresh", .{ .properties = &.{} }, null);
+
+    if (client.listTools(io)) |_| {
+        // parseResponse may also reject the line as a null result — a void
+        // success. Both outcomes must leave the cache untouched.
+    } else |_| {}
+
+    try std.testing.expectEqual(@as(usize, 1), client.tools.items.len);
+    try std.testing.expectEqualStrings("kept", client.tools.items[0].name);
+    try std.testing.expectEqualStrings("mcp__broken-list__kept", client.tools.items[0].full_name);
+    try std.testing.expectEqual(ServerStatus.connected, client.status());
+}
+
+test "McpClient setError stops a live stdio transport before failing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // hang mode: the child never exits on its own until it is stopped, so
+    // the process-death probe below can only pass if setError actually
+    // terminated it.
+    var client = try initMockClient(gpa, "leaky", "hang");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    // Prime the cache, as a completed discovery would have.
+    try client.addTool("cached", "Discovered before the failure", .{ .properties = &.{} }, null);
+
+    // Watch the child while the client still owns it — the watch survives
+    // the client closing its own process handle.
+    var watch: ?os.ChildExitWatch = os.ChildExitWatch.init(&client.lifecycle.stdio.process);
+    defer if (watch) |*w| w.deinit();
+    if (os.ChildExitWatch.supported) try std.testing.expect(watch != null);
+
+    const started = std.Io.Timestamp.now(io, .awake);
+    client.setError(io, "handshake exploded", .{});
+    const elapsed_ns = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+
+    // The stop-first teardown (pipe close, terminate, bounded reap) must
+    // stay bounded — an unbounded wait would wedge TUI teardown.
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+
+    try std.testing.expectEqual(ServerStatus.failed, client.status());
+    switch (client.lifecycle) {
+        .failed => |f| try std.testing.expectEqualStrings("handshake exploded", f.reason),
+        else => return error.UnexpectedLifecycle,
+    }
+    // The transport's discovery cache went down with it — a failed lifecycle
+    // never carries tools.
+    try std.testing.expectEqual(@as(usize, 0), client.tools.items.len);
+
+    // The orphan half of the bug: the process must actually be gone, not
+    // merely dropped from the lifecycle union.
+    if (watch) |*w| try std.testing.expect(w.awaitExit(io, 2_000));
+}
+
+test "pending_tools_refresh survives concurrent worker stores" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try McpClient.init(gpa, "hammer", "echo", &.{}, null);
+    defer client.deinit(io);
+
+    // Only the atomic flag is shared with the worker — no allocator use, so
+    // the plain testing allocator is safe on the UI side.
+    const Worker = struct {
+        fn run(flag: *std.atomic.Value(bool), stop_flag: *std.atomic.Value(bool)) void {
+            while (!stop_flag.load(.acquire)) flag.store(true, .release);
+        }
+    };
+    var stop_flag = std.atomic.Value(bool).init(false);
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{ &client.pending_tools_refresh, &stop_flag });
+
+    // The UI's swap must observe a store under concurrent writes — a lost
+    // notification deadlocks the UI's re-discovery into this deadline. (The
+    // clear-exactly-once half is pinned single-threaded by the
+    // handleNotification test above: after a worker store there is no
+    // deterministic flag value to assert once the hammer stops.)
+    var observed = false;
+    var spins: usize = 0;
+    while (!observed and spins < 5_000) : (spins += 1) {
+        observed = client.pollToolsRefresh();
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
+    stop_flag.store(true, .release);
+    worker.join();
+
+    try std.testing.expect(observed);
 }
