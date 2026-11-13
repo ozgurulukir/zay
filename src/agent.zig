@@ -19,7 +19,6 @@ const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const skill_context_mod = @import("context/skill_context.zig");
 const skill_history = @import("context/skill_history.zig");
-const stream_parser = @import("ai/stream_parser.zig");
 const text_tool_call = @import("ai/text_tool_call.zig");
 const tools = @import("tools.zig");
 const vcs = @import("vcs.zig");
@@ -34,6 +33,7 @@ const agent_workspace = @import("agent/workspace.zig");
 const WorkspaceScope = agent_workspace.WorkspaceScope;
 const agent_turn_budget = @import("agent/turn_budget.zig");
 const TurnBudget = agent_turn_budget.TurnBudget;
+const agent_stream_context = @import("agent/stream_context.zig");
 
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
@@ -55,10 +55,6 @@ const tool_call_truncation_hint =
     "The call was not executed. Re-emit the SAME tool call(s) with full arguments " ++
     "in a single request; avoid sending many parallel tool calls at once if " ++
     "truncation persists.";
-/// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
-/// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
-/// little gain; a comptime constant is simpler.
-const coalesce_threshold_bytes: usize = 1024;
 /// Defensive bound for the manual-compaction completion poll: 1000 yields
 /// before giving up with `error.CompactionNotReady` (a state that never
 /// resolves, e.g. a torn-down client the poll failed to clear).
@@ -655,7 +651,7 @@ pub const Agent = struct {
             try self.emitPendingSkillInventory(L, l);
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
-                .agent = self,
+                .gpa = self.gpa,
                 .listener = l,
             };
             defer stream_context.deinit();
@@ -687,10 +683,11 @@ pub const Agent = struct {
                 break :blk try self.client.prompt(prompt_messages, stream_context.observer());
             };
             // End-of-stream flush: emit any trailing coalesced bytes as their
-            // respective events BEFORE the assistant message is finalized (line
-            // 543) / tool batch is dispatched (line 564). This must preserve
-            // wire order: a trailing content delta after a tool delta would
-            // otherwise be flushed by `deinit` (line 489) AFTER
+            // respective events BEFORE the assistant message is finalized
+            // (`takeAssistantMessage` below) / the tool batch is dispatched
+            // (`runToolBatch`). This must preserve wire order: a trailing
+            // content delta after a tool delta would otherwise be flushed by
+            // the scope-exit `stream_context.deinit()` AFTER
             // `tool_call_finished`, reordering the event queue.
             try stream_context.flushPending();
             // Hoisted before the ownership branch: `Turn.deinit` sets
@@ -1063,152 +1060,20 @@ pub const Agent = struct {
         };
     }
 
-    /// Per-stream context shared between the agent and the ai client's
-    /// stream observer callbacks. Holds the typed listener plus once-per-tool
-    /// delta tracking. The `observer()` method builds a
-    /// `StreamObserver(*Self)` whose callbacks are comptime-baked wrappers
-    /// around this `StreamContext` and its typed listener — no
-    /// `@ptrCast` at the seam.
-    fn StreamContext(comptime L: type) type {
-        return struct {
-            agent: *Agent,
-            listener: L,
-            /// Fixed per-tool-slot "first delta seen" flags for the executor
-            /// bridge, replacing the old grown `ArrayList(bool)` scan with an
-            /// O(1) index. Sized by the SSOT `tool_call_array_cap`
-            /// (stream_parser.zig), which already bounds the tool slots.
-            tool_delta_seen: [stream_parser.tool_call_array_cap]bool = @splat(false),
-            /// Coalesced content bytes awaiting a flush. Multiple consecutive
-            /// `on_content` deltas accumulate here and are emitted as a single
-            /// `response_delta`, cutting per-token allocs/locks on the dominant
-            /// content path.
-            pending_content: std.ArrayList(u8) = .empty,
-            /// Coalesced reasoning bytes, flushed as a single `thinking_delta`.
-            pending_reasoning: std.ArrayList(u8) = .empty,
-            /// One-shot pre-sizing flags for the pending buffers (step #7); the
-            /// ArrayList grows on first append, so these — not `capacity == 0` —
-            /// are the reliable signal for the first-delta sizing hint.
-            content_sized: bool = false,
-            reasoning_sized: bool = false,
+    /// Wire-stream observation (agent/stream_context.zig): the per-stream
+    /// context, its coalescing buffers, and the typed observer wrappers
+    /// moved there; these unchanged-signature aliases keep the in-file
+    /// call sites — `run`'s construction, the `runToolBatch`/`ExecutorBridge`
+    /// wiring, and the stream-callback tests — reading as before.
+    const StreamContext = agent_stream_context.StreamContext;
+    const onContentDeltaImpl = agent_stream_context.onContentDeltaImpl;
+    const onReasoningDeltaImpl = agent_stream_context.onReasoningDeltaImpl;
+    const onToolDeltaImpl = agent_stream_context.onToolDeltaImpl;
+    const onDeltaEndImpl = agent_stream_context.onDeltaEndImpl;
 
-            const Self = @This();
-
-            fn deinit(self: *Self) void {
-                // Belt-and-suspenders flush: frees + flushes any bytes stranded
-                // on an early-return/error path that skipped the explicit
-                // end-of-stream flush. A no-op when that flush already cleared
-                // the buffers. `deinit` returns void, so the error is swallowed;
-                // the buffers are freed regardless (OOM is fatal to the turn).
-                self.flushPending() catch {};
-                self.pending_content.deinit(self.agent.gpa);
-                self.pending_reasoning.deinit(self.agent.gpa);
-            }
-
-            fn toolDeltaSeen(self: *const Self, tool_index: u32) bool {
-                if (tool_index >= self.tool_delta_seen.len) return false;
-                return self.tool_delta_seen[tool_index];
-            }
-
-            fn markToolDeltaSeen(self: *Self, tool_index: u32) void {
-                if (tool_index >= self.tool_delta_seen.len) return;
-                self.tool_delta_seen[tool_index] = true;
-            }
-
-            /// Emit any pending content/reasoning as a single event each and
-            /// reset the buffers, retaining capacity for the next batch.
-            fn flushPending(self: *Self) !void {
-                if (self.pending_reasoning.items.len > 0) {
-                    const owned = try self.agent.gpa.dupe(u8, self.pending_reasoning.items);
-                    try self.listener.emit(.{ .thinking_delta = owned });
-                    self.pending_reasoning.clearRetainingCapacity();
-                }
-                if (self.pending_content.items.len > 0) {
-                    const owned = try self.agent.gpa.dupe(u8, self.pending_content.items);
-                    try self.listener.emit(.{ .response_delta = owned });
-                    self.pending_content.clearRetainingCapacity();
-                }
-            }
-
-            fn observer(self: *Self) ai.StreamObserver(Self) {
-                return .{
-                    .ctx = self,
-                    .on_content = onContentDeltaImpl(L),
-                    .on_reasoning = onReasoningDeltaImpl(L),
-                    .on_tool_delta = onToolDeltaImpl(L),
-                    .on_delta_end = onDeltaEndImpl(L),
-                };
-            }
-
-            fn maybeSizeContent(self: *Self, delta: []const u8) !void {
-                if (self.content_sized) return;
-                try self.pending_content.ensureTotalCapacity(self.agent.gpa, delta.len * 4);
-                self.content_sized = true;
-            }
-
-            fn maybeSizeReasoning(self: *Self, delta: []const u8) !void {
-                if (self.reasoning_sized) return;
-                try self.pending_reasoning.ensureTotalCapacity(self.agent.gpa, delta.len * 4);
-                self.reasoning_sized = true;
-            }
-        };
-    }
-
-    fn onContentDeltaImpl(comptime L: type) *const fn (*StreamContext(L), []const u8) anyerror!void {
-        const F = struct {
-            fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
-                // Preserve wire order: flush reasoning before buffering content
-                // when a cross-type sequence fires reason-before-content.
-                if (ctx.pending_reasoning.items.len > 0) try ctx.flushPending();
-                try ctx.maybeSizeContent(delta);
-                try ctx.pending_content.appendSlice(ctx.agent.gpa, delta);
-                if (ctx.pending_content.items.len >= coalesce_threshold_bytes) {
-                    try ctx.flushPending();
-                }
-            }
-        };
-        return &F.call;
-    }
-
-    fn onReasoningDeltaImpl(comptime L: type) *const fn (*StreamContext(L), []const u8) anyerror!void {
-        const F = struct {
-            fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
-                // Preserve wire order: flush content before buffering reasoning.
-                if (ctx.pending_content.items.len > 0) try ctx.flushPending();
-                try ctx.maybeSizeReasoning(delta);
-                try ctx.pending_reasoning.appendSlice(ctx.agent.gpa, delta);
-                if (ctx.pending_reasoning.items.len >= coalesce_threshold_bytes) {
-                    try ctx.flushPending();
-                }
-            }
-        };
-        return &F.call;
-    }
-
-    fn onToolDeltaImpl(comptime L: type) *const fn (*StreamContext(L), ai.ToolDelta) anyerror!void {
-        const F = struct {
-            fn call(ctx: *StreamContext(L), delta: ai.ToolDelta) anyerror!void {
-                // Preserve wire order: flush any pending content/reasoning before
-                // the tool preview so the transcript sees text first.
-                try ctx.flushPending();
-                ctx.markToolDeltaSeen(delta.index);
-                try Agent.emitToolDelta(L, ctx.agent, ctx.listener, delta.index, delta.name, delta.arguments);
-            }
-        };
-        return &F.call;
-    }
-
-    fn onDeltaEndImpl(comptime L: type) *const fn (*StreamContext(L)) anyerror!void {
-        const F = struct {
-            fn call(ctx: *StreamContext(L)) anyerror!void {
-                // delta_end stays a pure no-op for coalescing: flushing here is
-                // handled by the byte threshold, the cross-type flush, the tool
-                // delta pre-flush, and the explicit post-prompt flush.
-                try ctx.listener.emit(.delta_end);
-            }
-        };
-        return &F.call;
-    }
-
+    /// Delegate to the extracted stream-context emitter
+    /// (agent/stream_context.zig); the allocator is the only Agent state
+    /// it needs.
     fn emitToolDelta(
         comptime L: type,
         self: *Agent,
@@ -1217,15 +1082,7 @@ pub const Agent = struct {
         name: []const u8,
         arguments: []const u8,
     ) !void {
-        const owned_name = try self.gpa.dupe(u8, name);
-        const owned_arguments = try self.gpa.dupe(u8, arguments);
-        try listener.emit(.{
-            .tool_delta = .{
-                .index = tool_index,
-                .name = owned_name,
-                .arguments = owned_arguments,
-            },
-        });
+        return agent_stream_context.emitToolDelta(L, self.gpa, listener, tool_index, name, arguments);
     }
 
     fn emitToolCallFinished(
@@ -1756,7 +1613,7 @@ test "streaming callbacks emit owned events" {
     defer seen.deinit(gpa);
     const Listener = Agent.Listener(Seen);
     var context: Agent.StreamContext(Listener) = .{
-        .agent = &agent,
+        .gpa = agent.gpa,
         .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
     };
     defer context.deinit();
@@ -1805,7 +1662,7 @@ test "StreamContext coalesces small content deltas into one response_delta" {
     defer seen.deinit(gpa);
     const Listener = Agent.Listener(Seen);
     var context: Agent.StreamContext(Listener) = .{
-        .agent = &agent,
+        .gpa = agent.gpa,
         .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
     };
     defer context.deinit();
@@ -1847,7 +1704,7 @@ test "StreamContext coalescing preserves wire order across types" {
     defer seen.deinit(gpa);
     const Listener = Agent.Listener(Seen);
     var context: Agent.StreamContext(Listener) = .{
-        .agent = &agent,
+        .gpa = agent.gpa,
         .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
     };
     defer context.deinit();
@@ -1892,7 +1749,7 @@ test "StreamContext coalesces the real per-chunk cadence" {
     defer seen.deinit(gpa);
     const Listener = Agent.Listener(Seen);
     var context: Agent.StreamContext(Listener) = .{
-        .agent = &agent,
+        .gpa = agent.gpa,
         .listener = .{ .ctx = &seen, .on_event = Seen.onEvent },
     };
     defer context.deinit();
@@ -1950,7 +1807,7 @@ test "stream callbacks do not double-free when the listener returns an error" {
     var failing: FailingListener = .{ .gpa = gpa };
     const Listener = Agent.Listener(FailingListener);
     var context: Agent.StreamContext(Listener) = .{
-        .agent = &agent,
+        .gpa = agent.gpa,
         .listener = .{ .ctx = &failing, .on_event = FailingListener.onEvent },
     };
     defer context.deinit();
