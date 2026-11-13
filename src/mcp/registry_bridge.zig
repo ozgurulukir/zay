@@ -67,7 +67,7 @@ pub fn runMcpTool(
     defer gpa.free(server_args);
 
     const result_text = blk: {
-        for (manager.clients.items) |*client| {
+        for (manager.clients.items) |client| {
             if (client.status() != .connected) continue;
             if (!std.mem.eql(u8, client.name, key.server_name)) continue;
             break :blk client.callTool(io, key.tool_name, server_args) catch |err| {

@@ -715,7 +715,7 @@ const McpMode = struct {
     /// the next binding.
     fn toggleSelectedMcpClient(app: *App) !bool {
         if (app.pickers.mcp.selection >= app.mcp_manager.clients.items.len) return false;
-        const client = &app.mcp_manager.clients.items[app.pickers.mcp.selection];
+        const client = app.mcp_manager.clients.items[app.pickers.mcp.selection];
         switch (client.status()) {
             .connected => {
                 // Disconnect through the manager, never with an inline stop:
@@ -729,7 +729,7 @@ const McpMode = struct {
                 app.mcp_manager.reconnectClient(app.io, app.pickers.mcp.selection);
             },
             else => {
-                client.markConnecting();
+                client.markConnecting(app.io);
             },
         }
         provider_model.injectMcpTools(app);
