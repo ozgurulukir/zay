@@ -361,8 +361,8 @@ pub const ExecutorService = struct {
     }
 
     /// Refresh `cwd` from the requester's live workspace after a `lane` call:
-    /// `enter`/`leave` write `Agent.workspace` (via `setWorkspace`) before the
-    /// tool returns, so the remaining calls in the batch must run at the new
+    /// `enter`/`leave` write the agent's workspace scope (via `setWorkspace`)
+    /// before the tool returns, so the remaining calls in the batch must run at the new
     /// root, not the batch-start snapshot. No-op when no requester is attached
     /// (headless/tests) or when the workspace didn't change.
     fn rerootFromRequester(self: *ExecutorService) void {

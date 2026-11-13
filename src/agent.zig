@@ -30,6 +30,9 @@ const agent_queue = @import("agent/queue.zig");
 const QueuedUserMessage = agent_queue.QueuedUserMessage;
 const MessageQueue = agent_queue.MessageQueue;
 
+const agent_workspace = @import("agent/workspace.zig");
+const WorkspaceScope = agent_workspace.WorkspaceScope;
+
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
 const snapshotter_mod = @import("agent/snapshotter.zig");
@@ -83,20 +86,12 @@ pub const Agent = struct {
     cwd: []const u8,
     /// Borrowed from the TUI worker for the duration of a turn.
     cancel_requested: ?*const std.atomic.Value(bool) = null,
-    /// Workspace-mode scoping (S5): when set (a borrowed lane worktree path),
-    /// tools root at this path instead of `cwd`; `effectiveCwd()` is the
-    /// single read. Written by the `lane` tool on this agent's worker thread
-    /// (`setWorkspace`), between tool batches; reset to null by the tool
-    /// (`lane leave`) or by the UI's S17 invariant while this agent's turn is
-    /// idle. The path is owned by the lane's `Thread`, never freed here.
-    ///
-    /// Cross-thread: the worker thread writes it (`lane enter`/`leave`), the
-    /// UI thread reads it (`driverWorkspace`, `clearWorkspaceBorrowForPath`).
-    /// A 16-byte slice store can tear, so the field is guarded by
-    /// `workspace_mutex`; `setWorkspace`/`workspaceBorrow`/`effectiveCwd` are
-    /// the only accessors. The lock is never held across tool dispatch.
-    workspace: ?[]const u8 = null,
-    workspace_mutex: std.Io.Mutex = .init,
+    /// Workspace-mode scoping (S5): when a lane worktree path is set, tools
+    /// root at it instead of `cwd`. The state (borrowed path + guarding
+    /// mutex) and the worker-writes/UI-reads contract live in
+    /// `agent/workspace.zig`; the accessor one-liners below are Agent's only
+    /// contact with it.
+    workspace_scope: WorkspaceScope = .{},
     /// Root-containment for lane workers: when set, the agent's bash tool
     /// refuses `cd` to a directory outside the project root (the lane
     /// worktree), so a worker can't drift into the main tree and write there.
@@ -243,29 +238,23 @@ pub const Agent = struct {
     /// The directory tools run in: the workspace root when entered in a lane
     /// (S5), else the session cwd. Read per tool batch by `runToolBatch` and
     /// per `@`-mention expansion by `addUserPrompt` — both on the worker
-    /// thread, but the UI thread reads the same field, so the read is guarded
-    /// by `workspace_mutex`. The returned slice is borrowed (the backing path
-    /// is Thread-owned and outlives the borrow).
+    /// thread, but the UI thread reads the same state. One-liner over
+    /// `WorkspaceScope.effectiveCwd`; the cross-thread contract lives in
+    /// `agent/workspace.zig`.
     pub fn effectiveCwd(self: *Agent) []const u8 {
-        self.workspace_mutex.lock(self.io) catch return self.cwd;
-        defer self.workspace_mutex.unlock(self.io);
-        return self.workspace orelse self.cwd;
+        return self.workspace_scope.effectiveCwd(self.io, self.cwd);
     }
 
     /// Set the workspace borrow (worker thread, `lane enter`/`leave`). The
     /// path is borrowed from the lane's `Thread`, never copied or freed here.
     pub fn setWorkspace(self: *Agent, path: ?[]const u8) void {
-        self.workspace_mutex.lock(self.io) catch return;
-        defer self.workspace_mutex.unlock(self.io);
-        self.workspace = path;
+        self.workspace_scope.setWorkspace(self.io, path);
     }
 
     /// Read the workspace borrow (UI thread). Returns a borrowed slice; the
     /// backing path is Thread-owned and outlives the borrow.
     pub fn workspaceBorrow(self: *Agent) ?[]const u8 {
-        self.workspace_mutex.lock(self.io) catch return null;
-        defer self.workspace_mutex.unlock(self.io);
-        return self.workspace;
+        return self.workspace_scope.workspaceBorrow(self.io);
     }
 
     /// The cached message projection the agent prompts with. Source of truth
@@ -928,7 +917,7 @@ pub const Agent = struct {
 
     /// Build the ExecutorService for a tool batch. Called only from the
     /// worker-thread batch path (`runToolBatch`): `effectiveCwd()` briefly
-    /// takes `workspace_mutex`, which is fine on the worker but would contend
+    /// takes the workspace scope's mutex, which is fine on the worker but would contend
     /// with the UI-thread lock users if this were constructed from the main
     /// thread. Every field is either a direct Agent mirror or derived exactly
     /// as the batch path needs — `toolExecutor bindings mirror the Agent
@@ -4156,7 +4145,7 @@ test "toolExecutor projected fields match the hand-built InitOptions wiring" {
     defer agent.deinit();
     agent.attachSessionWriter(&writer);
     agent.contained = true;
-    agent.workspace = "/tmp";
+    agent.setWorkspace("/tmp");
     agent.bash_classifier_url = try gpa.dupe(u8, "http://127.0.0.1:9");
     agent.database_server_url = try gpa.dupe(u8, "http://127.0.0.1:10");
     agent.database_auth_token = try gpa.dupe(u8, "token");

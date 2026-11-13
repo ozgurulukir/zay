@@ -808,6 +808,9 @@ test {
     _ = @import("at_mention_tests.zig");
     _ = @import("agent/compactor.zig");
     _ = @import("agent/queue.zig");
+    // Agent workspace scoping leaf (S5 lane-worktree borrow + its mutex),
+    // extracted from agent.zig; referenced explicitly so its inline tests run.
+    _ = @import("agent/workspace.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");
