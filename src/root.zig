@@ -814,6 +814,9 @@ test {
     // Agent per-turn continuation policy (tool-call budget + stop knobs),
     // extracted from agent.zig; referenced explicitly so its inline tests run.
     _ = @import("agent/turn_budget.zig");
+    // Agent tool-batch seam (ExecutorService wiring + ToolCallObserver bridge),
+    // extracted from agent.zig; referenced explicitly so its inline tests run.
+    _ = @import("agent/tool_batch.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");

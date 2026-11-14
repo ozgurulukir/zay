@@ -1,7 +1,8 @@
 //! Event types for the plugin system.
 //!
-//! Events are emitted by the agent loop (`Agent.ExecutorBridge`) at tool-call
-//! boundaries and dispatched to every plugin by `PluginManager.emitEvent`,
+//! Events are emitted by the agent loop (tool_batch.ExecutorBridge in
+//! agent/tool_batch.zig) at tool-call boundaries and dispatched to every
+//! plugin by `PluginManager.emitEvent`,
 //! which drains each plugin's `"zay_events"` Lua registry table.
 
 const std = @import("std");

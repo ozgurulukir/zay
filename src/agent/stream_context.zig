@@ -13,7 +13,7 @@
 //! `gpa` and reads no agent state, so there is no back-reference (the #367
 //! slice-4 seam, extraction over facade). The `on*Impl` wrappers are pub
 //! for agent.zig's stream-callback tests, which drive the wire path
-//! directly; `emitToolDelta` is also pub for the `Agent.emitToolDelta`
+//! directly; `emitToolDelta` is also pub for the `tool_batch.emitToolDelta`
 //! delegate (ExecutorBridge's synthesized tool_delta).
 
 const std = @import("std");
