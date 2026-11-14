@@ -1797,24 +1797,30 @@ pub fn drainMcpConnects(self: *App) bool {
 }
 
 /// Poll each connected MCP client for a pending `tools/list_changed` flag set
-/// by a server-initiated notification mid-request. When any client has it,
-/// re-run `tools/list` for that client and re-inject schemas into the live AI
-/// client. Called from the TUI tick (`lifecycle.handleTick`). Idempotent —
-/// returns false (no-op) when no client has a pending flag.
+/// by a server-initiated notification mid-request, and drain completed
+/// background re-discoveries. Never blocks the UI thread (#385): a pending
+/// flag hands the re-discovery to a manager-owned background job (the request
+/// can wait on `request_mutex` behind an in-flight tool call for up to
+/// `read_timeout_ms`); the outcome installs on a LATER tick via
+/// `drainToolRefreshes`. Returns true when any refresh landed so the caller
+/// re-injects schemas and redraws. Called from the TUI tick
+/// (`lifecycle.handleTick`).
 pub fn drainMcpNotifications(self: *App) bool {
-    var any_pending = false;
-    for (self.mcp_manager.clients.items) |*c| {
+    // Launch phase — non-blocking.
+    for (self.mcp_manager.clients.items) |c| {
         if (c.status() != .connected) continue;
-        if (c.pollToolsRefresh()) {
-            any_pending = true;
-            c.listTools(self.io) catch |err| {
-                log.warn("MCP '{s}': list_changed re-discovery failed err={s}", .{ c.name, @errorName(err) });
-                c.setError(self.io, "list_changed re-discovery failed: {s}", .{@errorName(err)});
-            };
-        }
+        if (c.pollToolsRefresh()) self.mcp_manager.launchToolRefresh(self.io, c.name);
     }
-    if (any_pending) injectAllTools(self);
-    return any_pending;
+    // Drain phase — install (or fail) on this thread, preserving the
+    // replace-not-append invariant and keeping discovery mutation UI-only.
+    // Retired clients parked by `retireClient` (tool-call worker still inside)
+    // are torn down here once their last capture bracket closes.
+    self.mcp_manager.drainPendingDestroys(self.io);
+    if (self.mcp_manager.drainToolRefreshes(self.io)) {
+        injectAllTools(self);
+        return true;
+    }
+    return false;
 }
 
 /// Add a remote (Streamable HTTP) MCP server from a URL typed in the overlay's
