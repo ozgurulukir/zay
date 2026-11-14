@@ -632,11 +632,6 @@ pub const McpClient = struct {
     /// stored session id. Servers may refuse DELETE; failures are ignored since
     /// the connection is being torn down regardless. Idempotent.
     ///
-    /// Guarded by `transport_mutex` (#385): the DELETE's header bytes borrow
-    /// Terminate the remote session via HTTP DELETE (best-effort) and free the
-    /// stored session id. Servers may refuse DELETE; failures are ignored since
-    /// the connection is being torn down regardless. Idempotent.
-    ///
     /// The session id is DETACHED under `transport_mutex` — a short section —
     /// and the DELETE runs outside the mutex (#385 review): the request is
     /// network I/O (unbounded connect on POSIX), and holding the mutex across
