@@ -1813,6 +1813,9 @@ pub fn drainMcpNotifications(self: *App) bool {
     }
     // Drain phase — install (or fail) on this thread, preserving the
     // replace-not-append invariant and keeping discovery mutation UI-only.
+    // Retired clients parked by `retireClient` (tool-call worker still inside)
+    // are torn down here once their last capture bracket closes.
+    self.mcp_manager.drainPendingDestroys(self.io);
     if (self.mcp_manager.drainToolRefreshes(self.io)) {
         injectAllTools(self);
         return true;

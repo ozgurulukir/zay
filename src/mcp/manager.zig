@@ -26,6 +26,14 @@ pub const McpManager = struct {
     /// clone trick does not apply) and the main thread installs the fresh
     /// records via `drainToolRefreshes`.
     pending_refreshes: std.ArrayList(*RefreshJob) = .empty,
+    /// Retired clients parked for deferred teardown (#385 review): a lane
+    /// tool-call worker can still be inside a replaced/removed client (capture
+    /// bracket open, `in_flight_requests > 0`), and destroying it immediately
+    /// would run that worker's release bracket on freed memory. No new capture
+    /// can start once the client is out of `clients`, so the count only
+    /// decreases; the UI tick destroys parked clients once it reaches 0.
+    /// Touched only from the main thread.
+    pending_destroys: std.ArrayList(*client_mod.McpClient) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) McpManager {
         return .{
@@ -42,8 +50,16 @@ pub const McpManager = struct {
         // a destroyed client.
         self.cancelAllConnects(io);
         self.cancelAllRefreshes(io);
+        // Parked retired clients with an open capture bracket: shutdown tears
+        // everything down anyway, so destroying here matches the pre-#385
+        // behavior (waiting for the bracket is not possible at deinit).
+        for (self.pending_destroys.items) |old| {
+            old.deinit(io);
+            self.gpa.destroy(old);
+        }
         self.pending_connects.deinit(self.gpa);
         self.pending_refreshes.deinit(self.gpa);
+        self.pending_destroys.deinit(self.gpa);
         for (self.clients.items) |client| {
             client.deinit(io);
             self.gpa.destroy(client);
@@ -467,13 +483,16 @@ pub const McpManager = struct {
         }
     }
 
-    /// Retire a client being replaced or removed while a background tool
-    /// refresh may still run against it (#385). If a pending refresh job holds
-    /// this pointer, the job takes over the client's deinit at drain time —
-    /// after `future.await` has proven the worker exited — and the refresh
-    /// outcome itself is discarded (the replacement's own connect handshake
-    /// installed a newer discovery). Otherwise the client is destroyed
-    /// immediately: no worker can be inside it. Main thread only, like every
+    /// Retire a client being replaced or removed while a background worker may
+    /// still run against it (#385). If a pending refresh job holds this
+    /// pointer, the job takes over the client's deinit at drain time — after
+    /// `future.await` has proven the worker exited — and the refresh outcome
+    /// itself is discarded (the replacement's own connect handshake installed
+    /// a newer discovery). Otherwise the client is destroyed immediately,
+    /// UNLESS a lane tool-call worker is still inside it (open capture
+    /// bracket, `in_flight_requests > 0`): that bracket's release runs on the
+    /// client, so the destroy parks in `pending_destroys` for the UI tick to
+    /// finish once the last bracket closes. Main thread only, like every
     /// other job-list mutation.
     fn retireClient(self: *McpManager, io: std.Io, old: *client_mod.McpClient) void {
         for (self.pending_refreshes.items) |job| {
@@ -482,8 +501,35 @@ pub const McpManager = struct {
                 return;
             }
         }
+        if (old.in_flight_requests.load(.acquire) > 0) {
+            self.pending_destroys.append(self.gpa, old) catch {
+                // OOM: fall back to the pre-#385 immediate destroy (same
+                // exposure as main); the warn keeps the downgrade visible.
+                log.warn("MCP '{s}': OOM parking retired client; destroying immediately", .{old.name});
+                old.deinit(io);
+                self.gpa.destroy(old);
+            };
+            return;
+        }
         old.deinit(io);
         self.gpa.destroy(old);
+    }
+
+    /// Destroy retired clients whose last capture bracket has closed. Called
+    /// from the TUI tick next to `drainToolRefreshes`; parked clients have no
+    /// references left in `clients`, so nothing can re-enter them.
+    pub fn drainPendingDestroys(self: *McpManager, io: std.Io) void {
+        var i: usize = 0;
+        while (i < self.pending_destroys.items.len) {
+            const old = self.pending_destroys.items[i];
+            if (old.in_flight_requests.load(.acquire) > 0) {
+                i += 1;
+                continue;
+            }
+            old.deinit(io);
+            self.gpa.destroy(old);
+            _ = self.pending_destroys.orderedRemove(i);
+        }
     }
 
     // ── Background tool re-discovery (#385) ──
@@ -498,7 +544,23 @@ pub const McpManager = struct {
     /// wait on `request_mutex` behind an in-flight tool call for up to
     /// `read_timeout_ms`) happens on the worker, off the UI thread.
     pub fn launchToolRefresh(self: *McpManager, io: std.Io, name: []const u8) void {
-        if (self.hasPendingRefresh(name)) return;
+        if (self.hasPendingRefresh(name)) {
+            // Dedup early-return, but the tick already consumed the refresh
+            // flag (atomic swap) — dropping it here would silently lose any
+            // list_changed that arrived while the in-flight job was running
+            // (e.g. on the replacement client after a mid-flight reconnect).
+            // Re-arm so the next tick retries; it keeps no-opping into this
+            // branch until the pending job drains, then the queued change is
+            // honored — the same never-silently-drop contract as
+            // `fail_launch` below.
+            if (self.findClient(name)) |client| {
+                if (client.status() == .connected) {
+                    log.debug("MCP '{s}': refresh already pending; re-arming flag", .{name});
+                    client.discovery.storeRefreshPending();
+                }
+            }
+            return;
+        }
         const client = self.findClient(name) orelse return;
         if (client.status() != .connected) return;
 
@@ -544,6 +606,11 @@ pub const McpManager = struct {
         };
         self.pending_refreshes.append(self.gpa, job) catch |err| {
             _ = job.future.cancel(io);
+            // The worker may have completed `.ok` before the cancel join: its
+            // fresh records are fully allocated and owned by the job. Same
+            // teardown as `cancelAllRefreshes` — skipping this leaks them.
+            for (job.fresh.items) |*tool| tool.deinit(self.gpa);
+            job.fresh.deinit(self.gpa);
             self.gpa.free(job.client_name);
             self.gpa.destroy(job);
             fail_launch(client, err);
@@ -581,6 +648,14 @@ pub const McpManager = struct {
     /// (so `drainToolRefreshes` keeps running) while this is true.
     pub fn hasPendingRefreshes(self: *const McpManager) bool {
         return self.pending_refreshes.items.len > 0;
+    }
+
+    /// True while retired clients are parked for deferred teardown — same
+    /// tick keep-alive contract as `hasPendingRefreshes`. Bounded in practice:
+    /// a parked client waits only on its in-flight request, which
+    /// `read_timeout_ms` caps.
+    pub fn hasPendingDestroys(self: *const McpManager) bool {
+        return self.pending_destroys.items.len > 0;
     }
 
     fn hasPendingRefresh(self: *const McpManager, name: []const u8) bool {
@@ -1689,4 +1764,79 @@ test "interleaved list_changed re-arms the refresh flag through the async path" 
     try drainUntilRefreshed(&manager, io);
     try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
     try std.testing.expectEqualStrings("mcp__interleaved__greet", manager.clients.items[0].discovery.tools.items[0].full_name);
+}
+
+test "retireClient parks a client with an open capture bracket and drains after it closes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "park-retire", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    const client = manager.clients.items[0];
+
+    // Simulate a lane tool-call worker inside the client (open capture
+    // bracket): retiring now must NOT destroy — the bracket's release runs
+    // on the client, so an immediate destroy would be a use-after-free.
+    client.in_flight_requests.store(1, .monotonic);
+
+    // Retire through the config-reconcile path: the server vanishes from
+    // config, so `removeStaleClients` retires it.
+    var empty_cfg: config_mod.Config = .{ .mcp_servers = &.{} };
+    manager.syncFromConfigEx(io, &empty_cfg);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_destroys.items.len);
+    try std.testing.expect(manager.hasPendingDestroys());
+    try std.testing.expect(manager.pending_destroys.items[0] == client);
+
+    // Close the bracket; the tick drain destroys the parked client.
+    _ = client.in_flight_requests.fetchSub(1, .acq_rel);
+    manager.drainPendingDestroys(io);
+    try std.testing.expectEqual(@as(usize, 0), manager.pending_destroys.items.len);
+    try std.testing.expect(!manager.hasPendingDestroys());
+}
+
+test "launchToolRefresh re-arms the refresh flag on the dedup early-return" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "dedup-rearm", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+
+    // First launch starts the job. Mirror the tick: `pollToolsRefresh`'s
+    // atomic swap consumes the flag BEFORE `launchToolRefresh` runs, so the
+    // first launch leaves the flag cleared.
+    manager.clients.items[0].discovery.storeRefreshPending();
+    try std.testing.expect(manager.clients.items[0].pollToolsRefresh());
+    manager.launchToolRefresh(io, "dedup-rearm");
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_refreshes.items.len);
+    try std.testing.expect(!manager.clients.items[0].discovery.pending_refresh.load(.acquire));
+
+    // A second launch while the job is pending hits the dedup branch and must
+    // re-arm the flag — otherwise a list_changed arriving mid-flight is
+    // silently dropped.
+    manager.launchToolRefresh(io, "dedup-rearm");
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_refreshes.items.len);
+    try std.testing.expect(manager.clients.items[0].discovery.pending_refresh.load(.acquire));
+
+    try drainUntilRefreshed(&manager, io);
 }

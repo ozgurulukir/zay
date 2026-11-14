@@ -445,6 +445,7 @@ fn decideShouldTick(root: *RootWidget) bool {
         naming_active or
         mcp_connect_pending or
         mcp_refresh_pending or
+        root.app.mcp_manager.hasPendingDestroys() or
         manual_compact_active or
         toasts_visible or
         worktree_async_active or
