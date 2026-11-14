@@ -21,6 +21,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../tui.zig");
 
 const agent_mod = @import("../agent.zig");
+const queue_ops = @import("../agent/queue_ops.zig");
 const ai = @import("../ai.zig");
 const at_search_mod = @import("at_search.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
@@ -1712,7 +1713,7 @@ test "begin submit shows notice when queued message queue is full" {
 
     var queued_count: usize = 0;
     while (queued_count < agent.message_queue_storage.len) : (queued_count += 1) {
-        try agent.enqueueUser("queued");
+        try queue_ops.enqueueUser(&agent, "queued");
     }
 
     try app.inputs.input.insertSliceAtCursor("later");
