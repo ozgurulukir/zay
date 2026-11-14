@@ -5,47 +5,19 @@ const std = @import("std");
 const log = std.log.scoped(.mcp);
 const config_mod = @import("../config/config.zig");
 const os = @import("../os.zig");
-const http = @import("../http.zig");
 const tools_common = @import("../tools/common.zig");
-const transport = @import("transport.zig");
 const schema_mod = @import("schema.zig");
 const discovery_mod = @import("discovery.zig");
 const wire = @import("wire.zig");
 
 const assert = std.debug.assert;
 
-// Streamable HTTP transport buffer/bound sizes.
-const http_body_buffer_bytes = 8 * 1024;
-const http_redirect_buffer_bytes = 16 * 1024;
-const http_transfer_buffer_bytes = 64 * 1024;
-const http_response_bytes_max = 64 * 1024 * 1024;
 const windows_child_stop_wait_ms = 1_000;
-
-const HttpRequestOutcome = union(enum) {
-    response: []u8,
-    failure: anyerror,
-};
-
-const HttpVoidOutcome = union(enum) {
-    success,
-    failure: anyerror,
-};
-
-const HttpSelectEvent = union(enum) {
-    request: HttpRequestOutcome,
-    notification: HttpVoidOutcome,
-    termination: HttpVoidOutcome,
-    timeout: void,
-};
 
 // MCP protocol version strings (spec-mandated — the server echoes one back
 // during `initialize` negotiation, so these values can never change).
 const protocol_version_stdio = "2024-11-05";
 const protocol_version_streamable_http = "2025-03-26";
-
-/// The Streamable HTTP `Accept` value: either a single JSON body or an SSE
-/// stream (MCP spec contract).
-const accept_streamable_http = http.content_type_json ++ ", " ++ http.media_type_event_stream;
 
 /// A zeroed `std.process.Child` placeholder. On Windows the `thread_handle`
 /// field is a non-nullable HANDLE, so `std.mem.zeroes` cannot be used; a
@@ -648,44 +620,25 @@ pub const McpClient = struct {
 
         const sid = session_id orelse return;
         if (os.is_windows) {
-            self.runHttpVoidWithTimeout(io, .termination, httpTerminationTask, .{ self, io, sid }) catch |err| {
+            wire.runHttpVoidWithTimeout(self, io, .termination, wire.httpTerminationTask, .{ self, io, sid }) catch |err| {
                 log.warn("MCP HTTP session termination failed err={s}", .{@errorName(err)});
             };
             return;
         }
 
-        self.terminateHttpSessionUnbounded(io, sid);
-    }
-
-    fn terminateHttpSessionUnbounded(self: *McpClient, io: std.Io, session_id: []const u8) void {
-        const url = switch (self.transport) {
-            .sse => |t| t.url,
-            .stdio => return,
-        };
-        var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
-        defer client.deinit();
-        const extra_headers = buildExtraHeadersWith(self.gpa, self.customHttpHeaders(), session_id) catch return;
-        defer self.gpa.free(extra_headers);
-        var req = client.request(.DELETE, std.Uri.parse(url) catch return, .{
-            .extra_headers = extra_headers,
-        }) catch return;
-        defer req.deinit();
-        // Best-effort: bound the send so teardown can't hang on a dead server,
-        // then send the termination without waiting for the response.
-        if (req.connection) |conn| self.applyHttpTimeout(conn);
-        req.sendBodiless() catch return;
+        wire.terminateHttpSessionUnbounded(self, io, sid);
     }
 
     /// Send a JSON-RPC request and read the response. Dispatches on the
-    /// transport: stdio reads a newline-delimited response line (the wire
-    /// spoke); Streamable HTTP POSTs and reads a JSON body or an SSE
-    /// stream. Returns the raw JSON-RPC response (owned, caller must
-    /// free). Serialized via request_mutex — concurrent calls queue, not
-    /// interleave.
+    /// transport — both arms are delegates to the wire spoke: stdio reads a
+    /// newline-delimited response line; Streamable HTTP POSTs and reads a
+    /// JSON body or an SSE stream. Returns the raw JSON-RPC response (owned,
+    /// caller must free). Serialized via request_mutex — concurrent calls
+    /// queue, not interleave.
     pub fn sendRequest(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
         return switch (self.transport) {
             .stdio => wire.sendRequestStdio(self, io, method, params_json),
-            .sse => self.sendRequestHttp(io, method, params_json),
+            .sse => wire.sendRequestHttp(self, io, method, params_json),
         };
     }
 
@@ -694,329 +647,8 @@ pub const McpClient = struct {
     pub fn sendNotification(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
         return switch (self.transport) {
             .stdio => wire.sendNotificationStdio(self, io, method, params_json),
-            .sse => self.sendNotificationHttp(io, method, params_json),
+            .sse => wire.sendNotificationHttp(self, io, method, params_json),
         };
-    }
-
-    // ── Streamable HTTP transport ──
-
-    /// Split a request timeout in milliseconds into the `(sec, usec)` components
-    /// of a POSIX `timeval` as used by `applyHttpTimeout`. Kept as a pure helper
-    /// so the rounding math is unit-testable cross-platform (`std.posix.timeval`
-    /// is not available on Windows, where the socket-timeout path is skipped).
-    fn httpTimeoutParts(read_timeout_ms: u32) struct { sec: i64, usec: i64 } {
-        return .{
-            .sec = @intCast(read_timeout_ms / 1000),
-            .usec = @intCast((read_timeout_ms % 1000) * 1000),
-        };
-    }
-
-    /// Apply a socket-level send/recv timeout so a server that accepts the
-    /// connection but then stalls — no response head, or a mid-body stop —
-    /// fails the handshake instead of blocking the worker forever.
-    ///
-    /// `std.http.Client` exposes no connect-phase timeout in Zig 0.16, so the
-    /// connect itself is bounded only by kernel TCP/DNS timeouts. Connects now
-    /// run on a worker thread (`McpManager.launchConnect`), so a connect hang
-    /// can never freeze the UI; this bounds everything after connect.
-    fn applyHttpTimeout(self: *McpClient, conn: *std.http.Client.Connection) void {
-        if (!os.is_windows) {
-            const parts = httpTimeoutParts(self.read_timeout_ms);
-            const tv: std.posix.timeval = .{
-                .sec = parts.sec,
-                // macOS suseconds_t is 32-bit c_int; usec is bounded to
-                // [0, 999_000] by the modulo in httpTimeoutParts.
-                .usec = @intCast(parts.usec),
-            };
-            std.posix.setsockopt(
-                conn.stream_reader.stream.socket.handle,
-                std.posix.SOL.SOCKET,
-                std.posix.SO.RCVTIMEO,
-                std.mem.asBytes(&tv),
-            ) catch {};
-            std.posix.setsockopt(
-                conn.stream_reader.stream.socket.handle,
-                std.posix.SOL.SOCKET,
-                std.posix.SO.SNDTIMEO,
-                std.mem.asBytes(&tv),
-            ) catch {};
-        }
-    }
-
-    /// Windows' std.Io socket backend does not expose a socket-level timeout
-    /// through `std.posix`, and the HTTP client has no request deadline of its
-    /// own. Race the whole HTTP operation — including DNS/connect, response
-    /// head, and an SSE body — against a timer so cancellation covers every
-    /// phase of the request.
-    fn runHttpRequestWithTimeout(
-        self: *McpClient,
-        io: std.Io,
-        method: []const u8,
-        params_json: ?[]const u8,
-    ) ![]u8 {
-        var events: [2]HttpSelectEvent = undefined;
-        var select = std.Io.Select(HttpSelectEvent).init(io, &events);
-        defer select.cancelDiscard();
-
-        try select.concurrent(.request, httpRequestTask, .{ self, io, method, params_json });
-        try select.concurrent(.timeout, httpTimeoutTask, .{ io, self.read_timeout_ms });
-
-        const event = select.await() catch |err| {
-            self.cancelHttpSelect(&select);
-            return err;
-        };
-        return switch (event) {
-            .request => |outcome| switch (outcome) {
-                .response => |response| response,
-                .failure => |err| err,
-            },
-            .timeout => {
-                self.cancelHttpSelect(&select);
-                return error.Timeout;
-            },
-            else => unreachable,
-        };
-    }
-
-    /// Run a void HTTP operation with the same deadline used for requests.
-    /// `field` is restricted by the call sites to `.notification` and
-    /// `.termination`; the union keeps the two operation families distinct so
-    /// a response allocation can never be mistaken for a void result.
-    fn runHttpVoidWithTimeout(
-        self: *McpClient,
-        io: std.Io,
-        comptime field: std.Io.Select(HttpSelectEvent).Field,
-        function: anytype,
-        args: std.meta.ArgsTuple(@TypeOf(function)),
-    ) !void {
-        var events: [2]HttpSelectEvent = undefined;
-        var select = std.Io.Select(HttpSelectEvent).init(io, &events);
-        defer select.cancelDiscard();
-
-        try select.concurrent(field, function, args);
-        try select.concurrent(.timeout, httpTimeoutTask, .{ io, self.read_timeout_ms });
-
-        const event = try select.await();
-        switch (event) {
-            .timeout => return error.Timeout,
-            .notification => |outcome| switch (outcome) {
-                .success => {},
-                .failure => |err| return err,
-            },
-            .termination => |outcome| switch (outcome) {
-                .success => {},
-                .failure => |err| return err,
-            },
-            .request => unreachable,
-        }
-    }
-
-    fn cancelHttpSelect(self: *McpClient, select: *std.Io.Select(HttpSelectEvent)) void {
-        while (select.cancel()) |event| {
-            switch (event) {
-                .request => |outcome| switch (outcome) {
-                    .response => |response| self.gpa.free(response),
-                    .failure => {},
-                },
-                .notification, .termination, .timeout => {},
-            }
-        }
-    }
-
-    /// POST a JSON-RPC request to the remote endpoint and return the matching
-    /// JSON-RPC response (owned). The response is either a single
-    /// `application/json` body or a `text/event-stream` searched for the
-    /// request `id`. Captures the server-assigned `Mcp-Session-Id`.
-    fn sendRequestHttp(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        if (os.is_windows) {
-            return self.runHttpRequestWithTimeout(io, method, params_json);
-        }
-        return self.sendRequestHttpUnbounded(io, method, params_json);
-    }
-
-    fn sendRequestHttpUnbounded(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        const url = switch (self.transport) {
-            .sse => |t| t.url,
-            .stdio => return error.NoHttpTransport,
-        };
-
-        try self.request_mutex.lock(io);
-        defer self.request_mutex.unlock(io);
-
-        const id = self.next_request_id;
-        self.next_request_id += 1;
-
-        const body = try transport.formatRequest(self.gpa, id, method, params_json);
-        defer self.gpa.free(body);
-
-        var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
-        defer client.deinit();
-
-        // Owned session-id snapshot (#385): immune to a concurrent
-        // stop→terminateHttpSession freeing the stored id while this request's
-        // header bytes still borrow it.
-        const session_snapshot = self.snapshotSessionId(io, self.gpa);
-        defer if (session_snapshot) |sid| self.gpa.free(sid);
-        const extra_headers = try buildExtraHeadersWith(self.gpa, self.customHttpHeaders(), session_snapshot);
-        defer self.gpa.free(extra_headers);
-        var req = try client.request(.POST, try std.Uri.parse(url), .{
-            .headers = .{ .content_type = .{ .override = http.content_type_json } },
-            .extra_headers = extra_headers,
-        });
-        defer req.deinit();
-        // Bound send + head + body reads so a stalled server fails fast.
-        if (req.connection) |conn| self.applyHttpTimeout(conn);
-        try writeBody(&req, body);
-
-        var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buffer);
-        const status_code: u16 = @intFromEnum(response.head.status);
-        if (status_code == 404) return error.McpSessionExpired;
-        if (status_code == 401 or status_code == 403) return error.McpUnauthorized;
-        if (!http.isSuccess(status_code)) return error.McpHttpRequestFailed;
-
-        // Capture session id + content type BEFORE the body reader invalidates
-        // the head's borrowed pointers.
-        try self.captureSessionId(io, response.head);
-        const is_sse = isEventStream(response.head);
-
-        if (is_sse) {
-            var transfer_buffer: [http_transfer_buffer_bytes]u8 = undefined;
-            const reader = response.reader(&transfer_buffer);
-            var notifications: std.ArrayList(transport.Notification) = .empty;
-            defer {
-                for (notifications.items) |*n| n.deinit(self.gpa);
-                notifications.deinit(self.gpa);
-            }
-            const response_body = try transport.readSseResponse(self.gpa, reader, id, &notifications);
-            // Route accumulated server notifications — they may mark the
-            // discovery cache stale, which the App polls on the next tick.
-            for (notifications.items) |n| self.handleNotification(n.method, n.payload);
-            return response_body;
-        }
-        return try readJsonBody(self.gpa, &response);
-    }
-
-    /// POST a JSON-RPC notification to the remote endpoint. Expects
-    /// 202 Accepted (or 200); the response body is not consumed.
-    fn sendNotificationHttp(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
-        if (os.is_windows) {
-            return self.runHttpVoidWithTimeout(io, .notification, httpNotificationTask, .{ self, io, method, params_json });
-        }
-        return self.sendNotificationHttpUnbounded(io, method, params_json);
-    }
-
-    fn sendNotificationHttpUnbounded(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) !void {
-        const url = switch (self.transport) {
-            .sse => |t| t.url,
-            .stdio => return error.NoHttpTransport,
-        };
-
-        try self.request_mutex.lock(io);
-        defer self.request_mutex.unlock(io);
-
-        const body = try transport.formatNotification(self.gpa, method, params_json);
-        defer self.gpa.free(body);
-
-        var client: std.http.Client = .{ .allocator = self.gpa, .io = io };
-        defer client.deinit();
-
-        // Owned session-id snapshot (#385) — same rationale as
-        // sendRequestHttpUnbounded.
-        const session_snapshot = self.snapshotSessionId(io, self.gpa);
-        defer if (session_snapshot) |sid| self.gpa.free(sid);
-        const extra_headers = try buildExtraHeadersWith(self.gpa, self.customHttpHeaders(), session_snapshot);
-        defer self.gpa.free(extra_headers);
-        var req = try client.request(.POST, try std.Uri.parse(url), .{
-            .headers = .{ .content_type = .{ .override = http.content_type_json } },
-            .extra_headers = extra_headers,
-        });
-        defer req.deinit();
-        // Bound send + head reads so a stalled server fails fast.
-        if (req.connection) |conn| self.applyHttpTimeout(conn);
-        try writeBody(&req, body);
-
-        var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
-        const response = try req.receiveHead(&redirect_buffer);
-        try self.captureSessionId(io, response.head);
-        const status_code: u16 = @intFromEnum(response.head.status);
-        if (status_code == 404) return error.McpSessionExpired;
-        if (status_code >= 400) return error.McpHttpRequestFailed;
-    }
-
-    /// Build the extra request headers: the Streamable HTTP `Accept` header,
-    /// `Mcp-Session-Id` once a session is established, and any custom headers
-    /// configured for the server (e.g. API keys). Returned slice is owned; free
-    /// with `gpa.free`.
-    ///
-    /// Reads `session_id`, so callers must hold `transport_mutex` — or use the
-    /// `snapshotSessionId` + `buildExtraHeadersWith` pair (#385), which hands
-    /// the request an owned dupe immune to a concurrent `terminateHttpSession`
-    /// freeing the stored id.
-    fn customHttpHeaders(self: *const McpClient) []const config_mod.McpHeader {
-        return switch (self.transport) {
-            .sse => |t| t.headers,
-            .stdio => &.{},
-        };
-    }
-
-    fn buildExtraHeaders(self: *const McpClient, gpa: std.mem.Allocator) ![]std.http.Header {
-        return buildExtraHeadersWith(gpa, self.customHttpHeaders(), self.session_id);
-    }
-
-    /// Pure header builder behind `buildExtraHeaders`; `session_id` is passed
-    /// in so a request can build headers from an owned snapshot instead of
-    /// borrowing the live field (#385).
-    fn buildExtraHeadersWith(gpa: std.mem.Allocator, custom: []const config_mod.McpHeader, session_id: ?[]const u8) ![]std.http.Header {
-        const count = 1 + custom.len + (if (session_id != null) @as(usize, 1) else 0);
-        const headers = try gpa.alloc(std.http.Header, count);
-        var i: usize = 0;
-        headers[i] = .{ .name = "Accept", .value = accept_streamable_http };
-        i += 1;
-        if (session_id) |sid| {
-            headers[i] = .{ .name = "Mcp-Session-Id", .value = sid };
-            i += 1;
-        }
-        for (custom) |h| {
-            headers[i] = .{ .name = h.name, .value = h.value };
-            i += 1;
-        }
-        return headers;
-    }
-
-    /// Owned copy of the live `session_id` under `transport_mutex` (#385), for
-    /// request paths that hold `request_mutex` and must not borrow the field a
-    /// concurrent `stop`→`terminateHttpSession` may free. null when there is
-    /// no session or the lock is canceled (the request then fails loudly
-    /// server-side rather than racing the free). Caller frees the result.
-    fn snapshotSessionId(self: *McpClient, io: std.Io, gpa: std.mem.Allocator) ?[]u8 {
-        self.transport_mutex.lock(io) catch return null;
-        defer self.transport_mutex.unlock(io);
-        const sid = self.session_id orelse return null;
-        return gpa.dupe(u8, sid) catch {
-            log.warn("MCP '{s}': OOM snapshotting session id; request goes out session-less", .{self.name});
-            return null;
-        };
-    }
-
-    /// Update `session_id` from the response's `Mcp-Session-Id` header (if
-    /// present). Header values borrow the response head, so the value is duped.
-    /// The free/dupe swap is guarded by `transport_mutex` (#385) — callers hold
-    /// `request_mutex`, so the lock order stays `request_mutex →
-    /// transport_mutex`.
-    fn captureSessionId(self: *McpClient, io: std.Io, head: std.http.Client.Response.Head) !void {
-        var it = head.iterateHeaders();
-        while (it.next()) |header| {
-            if (!std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) continue;
-            try self.transport_mutex.lock(io);
-            defer self.transport_mutex.unlock(io);
-            // Dupe BEFORE freeing the old value: on OOM the field keeps the
-            // coherent old id instead of dangling at freed memory.
-            const fresh = try self.gpa.dupe(u8, header.value);
-            if (self.session_id) |old| self.gpa.free(old);
-            self.session_id = fresh;
-            return;
-        }
     }
 
     /// Perform the MCP initialize handshake.
@@ -1237,94 +869,6 @@ pub const McpClient = struct {
     }
 };
 
-fn httpTimeoutTask(io: std.Io, timeout_ms: u32) void {
-    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .awake) catch {};
-}
-
-fn httpRequestTask(
-    self: *McpClient,
-    io: std.Io,
-    method: []const u8,
-    params_json: ?[]const u8,
-) HttpRequestOutcome {
-    const response = self.sendRequestHttpUnbounded(io, method, params_json) catch |err| {
-        return .{ .failure = err };
-    };
-    return .{ .response = response };
-}
-
-fn httpNotificationTask(
-    self: *McpClient,
-    io: std.Io,
-    method: []const u8,
-    params_json: ?[]const u8,
-) HttpVoidOutcome {
-    self.sendNotificationHttpUnbounded(io, method, params_json) catch |err| {
-        return .{ .failure = err };
-    };
-    return .success;
-}
-
-fn httpTerminationTask(self: *McpClient, io: std.Io, session_id: []const u8) HttpVoidOutcome {
-    self.terminateHttpSessionUnbounded(io, session_id);
-    return .success;
-}
-
-fn stalledHttpOperation(io: std.Io) HttpVoidOutcome {
-    io.sleep(std.Io.Duration.fromSeconds(30), .awake) catch |err| {
-        return .{ .failure = err };
-    };
-    return .success;
-}
-
-/// Write the request `body` with an explicit content-length and flush it, so
-/// the server receives a complete request before we read the response head.
-fn writeBody(req: *std.http.Client.Request, body: []const u8) !void {
-    req.transfer_encoding = .{ .content_length = body.len };
-    var body_buffer: [http_body_buffer_bytes]u8 = undefined;
-    var body_writer = try req.sendBodyUnflushed(&body_buffer);
-    try body_writer.writer.writeAll(body);
-    try body_writer.end();
-    try req.connection.?.flush();
-}
-
-/// True when the response `Content-Type` is `text/event-stream` (an SSE
-/// stream) rather than a single `application/json` body.
-fn isEventStream(head: std.http.Client.Response.Head) bool {
-    const content_type = head.content_type orelse return false;
-    return std.mem.indexOf(u8, content_type, http.media_type_event_stream) != null;
-}
-
-/// Read a single `application/json` response body, honouring content-encoding
-/// (mirrors `modelsdev.fetchApiJson`: Cloudflare-style hosts may gzip it).
-/// Returns the owned body; caller frees.
-fn readJsonBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
-    var empty_decompress_buffer: [0]u8 = .{};
-    var decompress_buffer: []u8 = &empty_decompress_buffer;
-    var decompress_buffer_owned = false;
-    switch (response.head.content_encoding) {
-        .identity => {},
-        .zstd => {
-            decompress_buffer = try gpa.alloc(u8, std.compress.zstd.default_window_len);
-            decompress_buffer_owned = true;
-        },
-        .deflate, .gzip => {
-            decompress_buffer = try gpa.alloc(u8, std.compress.flate.max_window_len);
-            decompress_buffer_owned = true;
-        },
-        .compress => return error.UnsupportedCompressionMethod,
-    }
-    defer if (decompress_buffer_owned) gpa.free(decompress_buffer);
-
-    var transfer_buffer: [http_transfer_buffer_bytes]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    return reader.allocRemaining(gpa, .limited(http_response_bytes_max)) catch |err| switch (err) {
-        error.StreamTooLong => error.McpResponseTooLarge,
-        else => |e| e,
-    };
-}
-
 /// Test-only fixture: spawn a mock MCP server in the given mode. Shared with
 /// the wire spoke's stdio tests (mcp/wire.zig); not part of the public API.
 pub fn initMockClient(gpa: std.mem.Allocator, name: []const u8, mode: []const u8) !McpClient {
@@ -1528,97 +1072,6 @@ test "McpClient callTool round-trip" {
 }
 
 // ---------------------------------------------------------------------------
-// Streamable HTTP transport tests
-// ---------------------------------------------------------------------------
-
-test "buildExtraHeaders sends Accept, session id, and custom headers" {
-    const gpa = std.testing.allocator;
-    var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
-    defer client.deinit(std.testing.io);
-
-    // No session, no custom headers → only Accept.
-    {
-        const headers = try client.buildExtraHeaders(gpa);
-        defer gpa.free(headers);
-        try std.testing.expectEqual(@as(usize, 1), headers.len);
-        try std.testing.expectEqualStrings("Accept", headers[0].name);
-        try std.testing.expectEqualStrings("application/json, text/event-stream", headers[0].value);
-    }
-
-    // With a session → Accept + Mcp-Session-Id.
-    client.session_id = try gpa.dupe(u8, "sess-1");
-    {
-        const headers = try client.buildExtraHeaders(gpa);
-        defer gpa.free(headers);
-        try std.testing.expectEqual(@as(usize, 2), headers.len);
-        try std.testing.expectEqualStrings("Mcp-Session-Id", headers[1].name);
-        try std.testing.expectEqualStrings("sess-1", headers[1].value);
-    }
-
-    // With a custom header → Accept + Mcp-Session-Id + custom (e.g. an API key).
-    client.transport.sse.headers = try config_mod.cloneHeaders(gpa, &[_]config_mod.McpHeader{
-        .{ .name = @constCast("CONTEXT7_API_KEY"), .value = @constCast("secret") },
-    });
-    {
-        const headers = try client.buildExtraHeaders(gpa);
-        defer gpa.free(headers);
-        try std.testing.expectEqual(@as(usize, 3), headers.len);
-        try std.testing.expectEqualStrings("CONTEXT7_API_KEY", headers[2].name);
-        try std.testing.expectEqualStrings("secret", headers[2].value);
-    }
-}
-
-test "captureSessionId + isEventStream read the response head" {
-    const gpa = std.testing.allocator;
-    var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
-    defer client.deinit(std.testing.io);
-
-    const json_head = try std.http.Client.Response.Head.parse(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-42\r\n\r\n",
-    );
-    try client.captureSessionId(std.testing.io, json_head);
-    try std.testing.expectEqualStrings("sess-42", client.session_id.?);
-    try std.testing.expect(!isEventStream(json_head));
-
-    const sse_head = try std.http.Client.Response.Head.parse(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-    );
-    try std.testing.expect(isEventStream(sse_head));
-}
-
-test "httpTimeoutParts derives timeval sec/usec from read_timeout_ms" {
-    // The per-server `requestTimeoutMs` knob flows into `read_timeout_ms` and
-    // feeds `applyHttpTimeout`'s socket timeval. Exact multiples land on zero
-    // usec; non-multiples carry the sub-second remainder.
-    const whole = McpClient.httpTimeoutParts(5000);
-    try std.testing.expectEqual(@as(i64, 5), whole.sec);
-    try std.testing.expectEqual(@as(i64, 0), whole.usec);
-
-    const partial = McpClient.httpTimeoutParts(1500);
-    try std.testing.expectEqual(@as(i64, 1), partial.sec);
-    try std.testing.expectEqual(@as(i64, 500_000), partial.usec);
-
-    // Sub-second values produce zero sec and the sub-second remainder in usec.
-    const sub_second = McpClient.httpTimeoutParts(250);
-    try std.testing.expectEqual(@as(i64, 0), sub_second.sec);
-    try std.testing.expectEqual(@as(i64, 250_000), sub_second.usec);
-}
-
-test "Windows HTTP timeout cancels a stalled operation" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var client = try McpClient.initSse(gpa, "timeout-test", "http://127.0.0.1/mcp");
-    defer client.deinit(io);
-    client.read_timeout_ms = 10;
-
-    try std.testing.expectError(
-        error.Timeout,
-        client.runHttpVoidWithTimeout(io, .notification, stalledHttpOperation, .{io}),
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Discovery-cache and failure-path invariants (#384)
 // ---------------------------------------------------------------------------
 
@@ -1780,31 +1233,4 @@ test "McpClient listToolsFresh errors on a malformed response and keeps the cach
     if (client.listToolsFresh(io)) |_| return error.ExpectedError else |_| {}
     try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
     try std.testing.expectEqualStrings("kept", client.discovery.tools.items[0].name);
-}
-
-test "snapshotSessionId dupes under transport_mutex and buildExtraHeadersWith keeps the header set" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var client = try McpClient.initSse(gpa, "x", "http://x/mcp");
-    defer client.deinit(io);
-
-    // No session yet.
-    try std.testing.expect(client.snapshotSessionId(io, gpa) == null);
-
-    client.session_id = try gpa.dupe(u8, "sess-42");
-    const snapshot = client.snapshotSessionId(io, gpa) orelse return error.SnapshotFailed;
-    defer gpa.free(snapshot);
-    try std.testing.expectEqualStrings("sess-42", snapshot);
-    // The snapshot is owned — freeing the original leaves it readable.
-    gpa.free(client.session_id.?);
-    client.session_id = null;
-    try std.testing.expectEqualStrings("sess-42", snapshot);
-
-    // The pure builder produces the identical header set for the same input.
-    const headers = try McpClient.buildExtraHeadersWith(gpa, &.{}, snapshot);
-    defer gpa.free(headers);
-    try std.testing.expectEqual(@as(usize, 2), headers.len);
-    try std.testing.expectEqualStrings("Accept", headers[0].name);
-    try std.testing.expectEqualStrings("Mcp-Session-Id", headers[1].name);
-    try std.testing.expectEqualStrings("sess-42", headers[1].value);
 }
