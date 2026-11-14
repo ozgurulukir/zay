@@ -808,6 +808,10 @@ test {
     _ = @import("at_mention_tests.zig");
     _ = @import("agent/compactor.zig");
     _ = @import("agent/queue.zig");
+    // Agent-bound queue operations (enqueue/drain/steer/clear over the owner's
+    // queue fields), extracted from agent.zig; referenced explicitly so its
+    // inline tests run.
+    _ = @import("agent/queue_ops.zig");
     // Agent workspace scoping leaf (S5 lane-worktree borrow + its mutex),
     // extracted from agent.zig; referenced explicitly so its inline tests run.
     _ = @import("agent/workspace.zig");

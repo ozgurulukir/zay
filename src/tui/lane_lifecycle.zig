@@ -8,6 +8,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const queue_ops = @import("../agent/queue_ops.zig");
 const agent_worker = @import("agent_worker.zig");
 const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
@@ -1357,7 +1358,7 @@ fn steerLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     if (LaneSnapshot.of(target).phase != .running) return laneOperationUnavailable(app, target, id, "steer");
     const agent = target.agent orelse return laneOperationUnavailable(app, target, id, "steer");
-    agent.enqueueSteer(text) catch |err| switch (err) {
+    queue_ops.enqueueSteer(agent, text) catch |err| switch (err) {
         error.QueueFull => return failResp(app.gpa, "lane: steer queue full\n", .{}),
         else => return failResp(app.gpa, "lane: steer failed: {s}\n", .{@errorName(err)}),
     };
@@ -2519,7 +2520,7 @@ test "lane steer is refused on a rested lane and reaches a running worker" {
     const run_resp = postAndService(io, &app, &run_req);
     defer app.gpa.free(run_resp.text);
     try std.testing.expectEqual(@as(u8, 0), run_resp.code);
-    try std.testing.expect(worker_agent.hasQueuedMessages());
+    try std.testing.expect(queue_ops.hasQueuedMessages(&worker_agent));
     try std.testing.expectEqual(@as(usize, 1), running.queued.items.len);
     try std.testing.expect(running.queued.items[0].steer);
 }

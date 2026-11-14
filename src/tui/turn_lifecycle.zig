@@ -4,6 +4,7 @@
 const std = @import("std");
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
+const queue_ops = @import("../agent/queue_ops.zig");
 const BoundedList = @import("bounded_list.zig").BoundedList;
 const agent_worker = @import("agent_worker.zig");
 const turn_cancel = @import("turn_cancel.zig");
@@ -396,7 +397,7 @@ pub fn startQueuedTurn(app: *App, lane: *Thread) !bool {
         // queue (raw entries are dropped unrendered; a stray mirror entry
         // would shift every `steerSelectedQueued` index).
         try queue_mod.flushQueuedUserMessagesToTranscript(app, lane, @intCast(lane.queued.items.len));
-        agent.clearQueue();
+        queue_ops.clearQueue(agent);
         return true;
     }
     try spawnTurn(app, lane, .{ .drain_queue_first = true });
