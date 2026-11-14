@@ -12,8 +12,8 @@
 //! free functions over `*McpClient`; the `windows` FFI struct and the HTTP
 //! select-event unions here carry no back-reference, so the mutual import
 //! with client.zig terminates at the type level (client.zig imports these
-//! functions; this file imports client.zig only for the `McpClient`,
-//! `ServerStatus`, and test-fixture types).
+//! functions; this file imports client.zig only for the `McpClient` and
+//! `ServerStatus` types and the test-fixture helper `initMockClient`).
 //! The lock-order invariants travel with the code
 //! (docs/patterns/providers-tools-and-wire-protocols.md): the pipe capture
 //! bracket is taken AFTER `request_mutex`; the `in_flight_requests`
