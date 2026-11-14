@@ -33,6 +33,7 @@ const WorkspaceScope = agent_workspace.WorkspaceScope;
 const agent_turn_budget = @import("agent/turn_budget.zig");
 const TurnBudget = agent_turn_budget.TurnBudget;
 const agent_stream_context = @import("agent/stream_context.zig");
+const queue_ops = @import("agent/queue_ops.zig");
 
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
@@ -273,49 +274,6 @@ pub const Agent = struct {
 
     pub fn addUser(self: *Agent, content: []const u8) !void {
         try self.appendMessage(.user, content);
-    }
-
-    pub fn enqueueUser(self: *Agent, content: []const u8) !void {
-        assert(content.len > 0);
-        const owned = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(owned);
-        try self.message_queue_mutex.lock(self.io);
-        defer self.message_queue_mutex.unlock(self.io);
-        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned })) return error.QueueFull;
-    }
-
-    /// Queue a machine-generated user message delivered verbatim (no `@`-mention
-    /// expansion or skill prefixing) at the next turn boundary. Thread-safe — the
-    /// `BackgroundManager` callers reach it from the UI thread while the worker
-    /// may be draining the same queue. See `QueuedUserMessage.raw`.
-    pub fn enqueueRaw(self: *Agent, content: []const u8) !void {
-        assert(content.len > 0);
-        const owned = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(owned);
-        try self.message_queue_mutex.lock(self.io);
-        defer self.message_queue_mutex.unlock(self.io);
-        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true })) return error.QueueFull;
-    }
-
-    /// Queue a user message marked to steer (inject after the next tool batch).
-    /// Atomic push + mark under one lock, so the lane-steer path can't
-    /// interleave a concurrent drain between `enqueueUser` and `setQueuedSteer`.
-    pub fn enqueueSteer(self: *Agent, content: []const u8) !void {
-        assert(content.len > 0);
-        const owned = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(owned);
-        try self.message_queue_mutex.lock(self.io);
-        defer self.message_queue_mutex.unlock(self.io);
-        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .steer = true })) return error.QueueFull;
-    }
-
-    /// Whether any user message is waiting in the queue. The UI uses this to
-    /// decide whether an idle lane should start a turn to deliver a background
-    /// completion that was enqueued while no turn was running.
-    pub fn hasQueuedMessages(self: *Agent) bool {
-        self.message_queue_mutex.lock(self.io) catch return false;
-        defer self.message_queue_mutex.unlock(self.io);
-        return self.message_queue.len() > 0;
     }
 
     /// Expand `@`-mentions in `prompt` (embedding text files inline, attaching
@@ -764,7 +722,7 @@ pub const Agent = struct {
             var finalization = Agent.runTurnFinalizationOutcome(
                 finish_reason,
                 tool_calls.len > 0,
-                self.hasQueuedMessages(),
+                queue_ops.hasQueuedMessages(self),
                 tool_calls_truncated,
                 truncation_retried,
             );
@@ -774,7 +732,7 @@ pub const Agent = struct {
                 // (steer or not) and continue, so anything still waiting is
                 // handled at the natural turn end. The user's queued message
                 // takes precedence over the automatic continuations below.
-                const drained_count = try self.drainQueuedUserMessage(false);
+                const drained_count = try queue_ops.drainQueuedUserMessage(self, false);
                 if (drained_count > 0) {
                     try l.emit(.{ .queued_messages_flushed = drained_count });
                     continue;
@@ -842,7 +800,7 @@ pub const Agent = struct {
             // only from the front so FIFO order holds — a default-queued
             // message ahead of a steer one keeps it waiting for turn end.
             var steered: u32 = 0;
-            while ((try self.drainQueuedUserMessage(true)) > 0) steered += 1;
+            while ((try queue_ops.drainQueuedUserMessage(self, true)) > 0) steered += 1;
             if (steered > 0) try l.emit(.{ .queued_messages_flushed = steered });
         }
         // Budget exhausted: soft stop ends the turn gracefully (drain + hint +
@@ -859,7 +817,7 @@ pub const Agent = struct {
     /// is the user's next submit).
     fn softStopOnBudget(self: *Agent, listener: anytype, tool_calls_executed: u32, iterations: u32) !void {
         log.warn("turn budget reached after {d} tool calls in {d} model iterations (limit {d}); soft-stopping", .{ tool_calls_executed, iterations, self.turn_budget.tool_call_limit_per_turn });
-        const drained = try self.drainAllQueuedToHistory();
+        const drained = try queue_ops.drainAllQueuedToHistory(self);
         if (drained > 0) try listener.emit(.{ .queued_messages_flushed = drained });
         try self.addUser(agent_turn_budget.tool_budget_continuation_hint);
         try listener.emit(.{ .tool_budget_exhausted = self.turn_budget.tool_call_limit_per_turn });
@@ -965,63 +923,6 @@ pub const Agent = struct {
                 .content = blocks,
             },
         };
-    }
-
-    fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
-        const queued = self.takeQueuedUserMessage(steer_only) orelse return 0;
-        defer self.gpa.free(queued.prompt);
-        // Raw (machine-generated) messages bypass `@`-mention expansion and skill
-        // prefixing so their body is never reinterpreted; user-typed prompts go
-        // through the full expansion path.
-        if (queued.raw) try self.addUser(queued.prompt) else try self.addUserPrompt(queued.prompt);
-        return 1;
-    }
-
-    /// Move every queued message into history in FIFO order, returning how many
-    /// were drained. Used to deliver a stranded queue as a fresh turn (e.g.
-    /// after a user interrupt): the leading messages become context and the
-    /// last one is the latest user message the next prompt answers.
-    pub fn drainAllQueuedToHistory(self: *Agent) !u32 {
-        var count: u32 = 0;
-        while ((try self.drainQueuedUserMessage(false)) > 0) count += 1;
-        return count;
-    }
-
-    /// Drop every queued message without delivering it. Thread-safe; the worker
-    /// drains under the same mutex.
-    pub fn clearQueue(self: *Agent) void {
-        if (self.message_queue_mutex.lock(self.io) catch null) |_| {
-            defer self.message_queue_mutex.unlock(self.io);
-            while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-                self.gpa.free(queued.prompt);
-            }
-        }
-    }
-
-    /// Pop and return the front queued message. When `steer_only` is set, only
-    /// pops if the front message is marked to steer (otherwise returns null,
-    /// leaving the queue untouched). Caller owns `queued.prompt`.
-    fn takeQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
-        if (self.message_queue_mutex.lock(self.io)) |_| {
-            defer self.message_queue_mutex.unlock(self.io);
-            if (steer_only) {
-                const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
-                if (!front.steer) return null;
-            }
-            return self.message_queue.pop(&self.message_queue_storage);
-        } else |_| {
-            return null;
-        }
-    }
-
-    /// Mark the queued message at logical `index` to steer (inject after the
-    /// next tool batch). Called from the UI thread; guarded by the queue mutex
-    /// the worker also holds while draining.
-    pub fn setQueuedSteer(self: *Agent, index: u32) void {
-        if (self.message_queue_mutex.lock(self.io) catch null) |_| {
-            defer self.message_queue_mutex.unlock(self.io);
-            if (self.message_queue.at(&self.message_queue_storage, index)) |entry| entry.steer = true;
-        }
     }
 
     fn takeAssistantMessage(self: *Agent, assistant: *ai.ChatMessage) !void {
@@ -1650,9 +1551,9 @@ test "queued user messages wait for completed assistant turn" {
     defer agent.deinit();
 
     try agent.addUser("first");
-    try agent.enqueueUser("queued");
+    try queue_ops.enqueueUser(&agent, "queued");
 
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
+    try std.testing.expectEqual(@as(u32, 1), try queue_ops.drainQueuedUserMessage(&agent, false));
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
     try std.testing.expectEqualStrings("queued", agent.messages()[1].text());
 }
@@ -2003,182 +1904,6 @@ test "context footprint includes wire tools before usage without counting them t
     try std.testing.expectEqual(@as(u32, @intCast(68040 - tool_tokens)), agent.currentContextTokens());
 }
 
-test "queued user messages drain one at a time" {
-    const gpa = std.testing.allocator;
-    var agent = Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-
-    try agent.enqueueUser("first");
-    try agent.enqueueUser("second");
-
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
-    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
-    try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
-    try std.testing.expectEqualStrings("first", agent.messages()[0].text());
-}
-
-test "steer-only drain pops a steered front but leaves default-queued messages" {
-    const gpa = std.testing.allocator;
-    var agent = Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-
-    try agent.enqueueUser("steer me");
-    try agent.enqueueUser("later");
-    agent.setQueuedSteer(0);
-
-    // The steered front injects mid-turn...
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(true));
-    try std.testing.expectEqualStrings("steer me", agent.messages()[0].text());
-    // ...but the default-queued one behind it waits for turn end.
-    try std.testing.expectEqual(@as(u32, 0), try agent.drainQueuedUserMessage(true));
-    try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
-    // The turn-end drain (steer_only = false) takes it.
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
-    try std.testing.expectEqualStrings("later", agent.messages()[1].text());
-}
-
-test "drain all queued moves the whole queue to history in FIFO order" {
-    const gpa = std.testing.allocator;
-    var agent = Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-
-    try agent.enqueueUser("a");
-    try agent.enqueueUser("b");
-    try agent.enqueueUser("c");
-
-    try std.testing.expectEqual(@as(u32, 3), try agent.drainAllQueuedToHistory());
-    try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
-    try std.testing.expectEqualStrings("a", agent.messages()[0].text());
-    try std.testing.expectEqualStrings("c", agent.messages()[2].text());
-    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
-}
-
-/// Mutex-wrapped allocator facade for the concurrency test below: the raw
-/// testing allocator is not thread-safe, and both the enqueuer and the
-/// drainer allocate through `agent.gpa`. (Same shape as tui/test_helpers'
-/// `LockedAllocator`, re-declared here so agent tests don't import the TUI.)
-const TestLockedAllocator = struct {
-    child: std.mem.Allocator,
-    io: std.Io,
-    mutex: std.Io.Mutex = .init,
-
-    pub fn allocator(self: *TestLockedAllocator) std.mem.Allocator {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .alloc = alloc,
-                .resize = resize,
-                .remap = remap,
-                .free = free,
-            },
-        };
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.child.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.child.rawResize(memory, alignment, new_len, ret_addr);
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *TestLockedAllocator = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.child.rawFree(memory, alignment, ret_addr);
-    }
-};
-
-test "concurrent enqueue and drain never deadlock or lose messages" {
-    // Test-gap closure (PRIORITY_ACTIONS): the UI thread enqueues while a
-    // worker-shaped task drains — the queue mutex guards only push/pop, and
-    // the lock-failure-tolerant paths (`clearQueue`/`setQueuedSteer` treat
-    // lock failure as a no-op) must not drop or corrupt entries under
-    // contention. FIFO order and the exact count are the assertion; a
-    // deadlock surfaces as the test runner's timeout.
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var safe_gpa = TestLockedAllocator{ .child = gpa, .io = io };
-    const alg = safe_gpa.allocator();
-
-    var agent = Agent.init(alg, io, ".", .none);
-    defer agent.deinit();
-
-    const Drainer = struct {
-        fn run(a: *Agent, done: *std.atomic.Value(bool)) void {
-            var spins: u32 = 0;
-            while (!done.load(.acquire)) : (spins += 1) {
-                if (spins > 100_000) return; // bounded: never spin forever
-                _ = a.drainAllQueuedToHistory() catch return;
-                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
-            }
-        }
-    };
-    var done = std.atomic.Value(bool).init(false);
-    var task = try io.concurrent(Drainer.run, .{ &agent, &done });
-
-    const total: usize = 200;
-    var buf: [32]u8 = undefined;
-    var i: usize = 0;
-    // Block-scoped errdefer: an enqueue-section failure still stops and joins
-    // the drainer before `agent.deinit` (the block exit guarantees it can
-    // never double-await the post-join section).
-    {
-        errdefer {
-            done.store(true, .release);
-            task.await(io);
-        }
-        while (i < total) : (i += 1) {
-            const text = try std.fmt.bufPrint(&buf, "m{d}", .{i});
-            // Retry on QueueFull: the drainer is consuming concurrently, so
-            // the 64-slot queue drains — the loop terminates.
-            var spins: u32 = 0;
-            while (true) : (spins += 1) {
-                try std.testing.expect(spins < 100_000);
-                agent.enqueueUser(text) catch |err| switch (err) {
-                    error.QueueFull => {
-                        io.sleep(.fromMilliseconds(1), .awake) catch {};
-                        continue;
-                    },
-                    else => return err,
-                };
-                break;
-            }
-            // Exercise the steer-marking path under contention too (mark the
-            // front entry; `drainAllQueuedToHistory` drains it regardless).
-            if (i % 50 == 0) agent.setQueuedSteer(0);
-        }
-    }
-    done.store(true, .release);
-    // Single await: the drainer exits within one 1 ms sleep of the flag.
-    task.await(io);
-    // Drain whatever the drainer hadn't reached when the flag flipped.
-    while (agent.message_queue.len() > 0) {
-        try std.testing.expect(try agent.drainAllQueuedToHistory() > 0);
-    }
-
-    // No loss, FIFO preserved, nothing left behind.
-    const messages = agent.messages();
-    try std.testing.expectEqual(total, messages.len);
-    try std.testing.expectEqualStrings("m0", messages[0].text());
-    try std.testing.expectEqualStrings("m199", messages[total - 1].text());
-    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
-}
-
 const BudgetSeen = struct {
     events: std.ArrayList(Agent.Event) = .empty,
 
@@ -2198,8 +1923,8 @@ test "softStopOnBudget drains queue, appends hint, emits events" {
     defer agent.deinit();
     agent.turn_budget.tool_call_limit_per_turn = 7;
 
-    try agent.enqueueUser("first");
-    try agent.enqueueUser("second");
+    try queue_ops.enqueueUser(&agent, "first");
+    try queue_ops.enqueueUser(&agent, "second");
 
     var seen: BudgetSeen = .{};
     defer seen.deinit(gpa);
@@ -2215,7 +1940,7 @@ test "softStopOnBudget drains queue, appends hint, emits events" {
     try std.testing.expectEqualStrings("second", agent.messages()[1].text());
     try std.testing.expect(std.mem.startsWith(u8, agent.messages()[2].text(), "[zay] This turn stopped"));
     try std.testing.expect(agent.messages()[2].role() == .user);
-    try std.testing.expect(!agent.hasQueuedMessages());
+    try std.testing.expect(!queue_ops.hasQueuedMessages(&agent));
 
     // Flush first (so the transcript shows the delivered user rows), then the
     // terminal budget event carrying the configured limit.
@@ -2759,7 +2484,7 @@ test "run drains a queued user message before spending the truncation retry" {
     var agent = Agent.init(gpa, io, ".", .{ .scripted = &client });
     defer agent.deinit();
     try agent.addUser("list the directory");
-    try agent.enqueueUser("queued while busy");
+    try queue_ops.enqueueUser(&agent, "queued while busy");
 
     var seen: BudgetSeen = .{};
     defer seen.deinit(gpa);
@@ -2782,7 +2507,7 @@ test "run drains a queued user message before spending the truncation retry" {
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 1), flushed);
-    try std.testing.expect(!agent.hasQueuedMessages());
+    try std.testing.expect(!queue_ops.hasQueuedMessages(&agent));
 
     // History pins the ordering: the drained message landed BEFORE the hint
     // (a retry-wins turn would put the hint first). The empty severed
@@ -2844,39 +2569,6 @@ test "run auto-continues once after a scripted length-cut (socket-free)" {
     try std.testing.expectEqualStrings("partial plan", messages[1].text());
     try std.testing.expect(std.mem.startsWith(u8, messages[2].text(), "[zay] Your previous response was cut off"));
     try std.testing.expectEqualStrings("continued", messages[3].text());
-}
-
-test "raw enqueued messages are delivered verbatim without @-mention expansion" {
-    const gpa = std.testing.allocator;
-    var agent = Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-
-    try std.testing.expect(!agent.hasQueuedMessages());
-    // A background completion notice may contain an `@` that must not be treated
-    // as a file mention.
-    try agent.enqueueRaw("Background command bg_1 (`echo @no/such/file`) finished — exit 0");
-    try std.testing.expect(agent.hasQueuedMessages());
-
-    try std.testing.expectEqual(@as(u32, 1), try agent.drainQueuedUserMessage(false));
-    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
-    try std.testing.expectEqualStrings(
-        "Background command bg_1 (`echo @no/such/file`) finished — exit 0",
-        agent.messages()[0].text(),
-    );
-    try std.testing.expect(!agent.hasQueuedMessages());
-}
-
-test "clear queue drops messages without delivering them" {
-    const gpa = std.testing.allocator;
-    var agent = Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-
-    try agent.enqueueUser("x");
-    try agent.enqueueUser("y");
-    agent.clearQueue();
-
-    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
-    try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }
 
 // ── P1: compaction / checkpoint core regression tests ──────────────────

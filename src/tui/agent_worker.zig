@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bounded_queue = @import("bounded_queue");
 const agent_mod = @import("../agent.zig");
+const queue_ops = @import("../agent/queue_ops.zig");
 const runtime_mod = @import("../runtime.zig");
 const BoundedList = @import("bounded_list.zig").BoundedList;
 
@@ -236,7 +237,7 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime
     }
 
     if (drain_queue_first) {
-        const flushed = agent.drainAllQueuedToHistory() catch |err| {
+        const flushed = queue_ops.drainAllQueuedToHistory(agent) catch |err| {
             postTurnFailed(worker_context, err);
             return;
         };
