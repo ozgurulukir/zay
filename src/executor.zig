@@ -1364,7 +1364,7 @@ fn addTestMcpSearchTool(gpa: std.mem.Allocator, manager: *mcp_mod.McpManager) !v
         },
     };
     try client.addTool("search", "Search the index", .{ .properties = props }, null);
-    try manager.clients.append(gpa, client);
+    try manager.addClient(client);
 }
 
 fn makeCall(gpa: std.mem.Allocator, id: []const u8, name: []const u8, args: []const u8) !ai.ToolCall {

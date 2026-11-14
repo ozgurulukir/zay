@@ -11,10 +11,29 @@ const assert = std.debug.assert;
 
 pub const McpManager = struct {
     gpa: std.mem.Allocator,
-    clients: std.ArrayList(client_mod.McpClient) = .empty,
+    /// Heap-stable client slots (#385): a background tool-refresh worker holds
+    /// a `*McpClient` across ticks, and by-value storage made that pointer
+    /// dangle through `removeStaleClients`' `orderedRemove` (slot shifting) and
+    /// `installConnectResult`'s slot overwrite. The manager owns every slot;
+    /// removal/replacement goes through `retireClient`.
+    clients: std.ArrayList(*client_mod.McpClient) = .empty,
     /// In-flight async connect jobs. Touched only from the main thread; each
     /// job's worker mutates only the job's private clone, never the live list.
     pending_connects: std.ArrayList(*ConnectJob) = .empty,
+    /// In-flight background tool re-discovery jobs (#385) — same ownership
+    /// contract as `pending_connects`, except the worker runs against the LIVE
+    /// client (stdio re-discovery must reuse the same server process, so the
+    /// clone trick does not apply) and the main thread installs the fresh
+    /// records via `drainToolRefreshes`.
+    pending_refreshes: std.ArrayList(*RefreshJob) = .empty,
+    /// Retired clients parked for deferred teardown (#385 review): a lane
+    /// tool-call worker can still be inside a replaced/removed client (capture
+    /// bracket open, `in_flight_requests > 0`), and destroying it immediately
+    /// would run that worker's release bracket on freed memory. No new capture
+    /// can start once the client is out of `clients`, so the count only
+    /// decreases; the UI tick destroys parked clients once it reaches 0.
+    /// Touched only from the main thread.
+    pending_destroys: std.ArrayList(*client_mod.McpClient) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) McpManager {
         return .{
@@ -24,13 +43,38 @@ pub const McpManager = struct {
     }
 
     pub fn deinit(self: *McpManager, io: std.Io) void {
-        // Join + tear down any in-flight connects so their spawned subprocesses
-        // (stdio) are reaped before the io runtime shuts down.
+        // Join + tear down any in-flight jobs so their spawned subprocesses
+        // (stdio) are reaped before the io runtime shuts down. Jobs run
+        // against live clients, so they must be joined BEFORE any client
+        // deinit — a refresh worker mid-`listToolsFresh` would otherwise touch
+        // a destroyed client.
         self.cancelAllConnects(io);
+        self.cancelAllRefreshes(io);
+        // Parked retired clients with an open capture bracket: shutdown tears
+        // everything down anyway, so destroying here matches the pre-#385
+        // behavior (waiting for the bracket is not possible at deinit).
+        for (self.pending_destroys.items) |old| {
+            old.deinit(io);
+            self.gpa.destroy(old);
+        }
         self.pending_connects.deinit(self.gpa);
-        for (self.clients.items) |*client| client.deinit(io);
+        self.pending_refreshes.deinit(self.gpa);
+        self.pending_destroys.deinit(self.gpa);
+        for (self.clients.items) |client| {
+            client.deinit(io);
+            self.gpa.destroy(client);
+        }
         self.clients.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// Append a client to the list, taking ownership. Heap slot per the
+    /// `clients` field doc (#385).
+    pub fn addClient(self: *McpManager, client: client_mod.McpClient) !void {
+        const slot = try self.gpa.create(client_mod.McpClient);
+        errdefer self.gpa.destroy(slot);
+        slot.* = client;
+        try self.clients.append(self.gpa, slot);
     }
 
     /// Reconcile client list against config: remove stale, add new, update status.
@@ -84,7 +128,7 @@ pub const McpManager = struct {
 
             if (self.findClient(server_cfg.name)) |c| {
                 if (server_cfg.enabled) {
-                    if (c.status() != .connected) c.markConnecting();
+                    if (c.status() != .connected) c.markConnecting(io);
                 } else {
                     // Mirrors `disconnectClient` (#384 bug 4): the raw
                     // `.disabled` write this replaced dropped the lifecycle
@@ -109,8 +153,8 @@ pub const McpManager = struct {
                 if (c.transport == .sse) {
                     c.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, expanded.transport.sse.headers);
                 }
-                if (server_cfg.enabled) c.markConnecting();
-                try self.clients.append(self.gpa, c);
+                if (server_cfg.enabled) c.markConnecting(io);
+                try self.addClient(c);
             }
         }
     }
@@ -227,11 +271,11 @@ pub const McpManager = struct {
     /// despite actually being live.
     pub fn reconnectClient(self: *McpManager, io: std.Io, index: usize) void {
         if (index >= self.clients.items.len) return;
-        const client = &self.clients.items[index];
+        const client = self.clients.items[index];
         client.stop(io);
         client.clearTools();
         client.latency_ms = 0;
-        client.markConnecting();
+        client.markConnecting(io);
         self.launchConnect(io, client.name);
     }
 
@@ -241,7 +285,7 @@ pub const McpManager = struct {
     /// lifecycle to `.disabled`, so no explicit lifecycle mutation here.
     pub fn disconnectClient(self: *McpManager, io: std.Io, index: usize) void {
         if (index >= self.clients.items.len) return;
-        const client = &self.clients.items[index];
+        const client = self.clients.items[index];
         client.stop(io);
         client.clearTools();
         client.latency_ms = 0;
@@ -338,12 +382,13 @@ pub const McpManager = struct {
     /// the main thread only. If the target was disconnected/removed while the
     /// connect was in flight, the outcome (clone + message) is torn down.
     fn installConnectResult(self: *McpManager, job: *ConnectJob, result: ConnectResult, io: std.Io) void {
-        const target = self.findClient(job.client_name) orelse {
+        const idx = self.findClientIdx(job.client_name) orelse {
             // Client removed while the connect was in flight.
             job.clone.deinit(io);
             if (job.failed_message) |msg| self.gpa.free(msg);
             return;
         };
+        const target = self.clients.items[idx];
         switch (result) {
             .ok => {
                 // Install only if the target is still connecting — the user may
@@ -352,8 +397,19 @@ pub const McpManager = struct {
                     job.clone.deinit(io);
                     return;
                 }
-                target.deinit(io);
-                target.* = job.clone;
+                // Heap slot swap (#385): the clone moves into a fresh slot
+                // entry; the retired original goes through `retireClient` in
+                // case a background refresh still runs against it. The clone
+                // is heap-boxed FIRST so an OOM here leaves the connecting
+                // target untouched (the reconcile relaunches the connect).
+                const moved = self.gpa.create(client_mod.McpClient) catch {
+                    log.warn("MCP '{s}': OOM boxing the connected client; keeping the connecting slot for the next reconcile", .{job.client_name});
+                    job.clone.deinit(io);
+                    return;
+                };
+                moved.* = job.clone;
+                self.retireClient(io, target);
+                self.clients.items[idx] = moved;
             },
             .failed => {
                 const msg = job.failed_message orelse (self.gpa.dupe(u8, "connect failed") catch return);
@@ -371,7 +427,10 @@ pub const McpManager = struct {
                 // leaves tools on a connecting client can re-create the
                 // stale-cache CONNECTING wedge through this arm.
                 target.clearTools();
-                target.lifecycle = .{ .failed = .{ .reason = msg } };
+                // adoptFailure serializes the variant swap against a worker's
+                // capture bracket (#385) — a background refresh may still be
+                // inside this client after a mid-flight reconnect.
+                target.adoptFailure(io, msg);
                 job.clone.deinit(io);
             },
         }
@@ -392,8 +451,13 @@ pub const McpManager = struct {
     }
 
     fn findClient(self: *McpManager, name: []const u8) ?*client_mod.McpClient {
-        for (self.clients.items) |*c| {
-            if (std.mem.eql(u8, c.name, name)) return c;
+        const idx = self.findClientIdx(name) orelse return null;
+        return self.clients.items[idx];
+    }
+
+    fn findClientIdx(self: *McpManager, name: []const u8) ?usize {
+        for (self.clients.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c.name, name)) return i;
         }
         return null;
     }
@@ -404,7 +468,7 @@ pub const McpManager = struct {
         var i: usize = self.clients.items.len;
         while (i > 0) {
             i -= 1;
-            const client = &self.clients.items[i];
+            const client = self.clients.items[i];
             var found = false;
             for (config.mcp_servers) |server_cfg| {
                 if (std.mem.eql(u8, client.name, server_cfg.name)) {
@@ -413,12 +477,304 @@ pub const McpManager = struct {
                 }
             }
             if (!found) {
-                client.deinit(io);
+                self.retireClient(io, client);
                 _ = self.clients.orderedRemove(i);
             }
         }
     }
+
+    /// Retire a client being replaced or removed while a background worker may
+    /// still run against it (#385). If a pending refresh job holds this
+    /// pointer, the job takes over the client's deinit at drain time — after
+    /// `future.await` has proven the worker exited — and the refresh outcome
+    /// itself is discarded (the replacement's own connect handshake installed
+    /// a newer discovery). Otherwise the client is destroyed immediately,
+    /// UNLESS a lane tool-call worker is still inside it (open capture
+    /// bracket, `in_flight_requests > 0`): that bracket's release runs on the
+    /// client, so the destroy parks in `pending_destroys` for the UI tick to
+    /// finish once the last bracket closes. Main thread only, like every
+    /// other job-list mutation.
+    fn retireClient(self: *McpManager, io: std.Io, old: *client_mod.McpClient) void {
+        for (self.pending_refreshes.items) |job| {
+            if (job.client == old) {
+                job.owns_client = true;
+                return;
+            }
+        }
+        if (old.in_flight_requests.load(.acquire) > 0) {
+            self.pending_destroys.append(self.gpa, old) catch {
+                // OOM: fall back to the pre-#385 immediate destroy (same
+                // exposure as main); the warn keeps the downgrade visible.
+                log.warn("MCP '{s}': OOM parking retired client; destroying immediately", .{old.name});
+                old.deinit(io);
+                self.gpa.destroy(old);
+            };
+            return;
+        }
+        old.deinit(io);
+        self.gpa.destroy(old);
+    }
+
+    /// Destroy retired clients whose last capture bracket has closed. Called
+    /// from the TUI tick next to `drainToolRefreshes`; parked clients have no
+    /// references left in `clients`, so nothing can re-enter them.
+    pub fn drainPendingDestroys(self: *McpManager, io: std.Io) void {
+        var i: usize = 0;
+        while (i < self.pending_destroys.items.len) {
+            const old = self.pending_destroys.items[i];
+            if (old.in_flight_requests.load(.acquire) > 0) {
+                i += 1;
+                continue;
+            }
+            old.deinit(io);
+            self.gpa.destroy(old);
+            _ = self.pending_destroys.orderedRemove(i);
+        }
+    }
+
+    // ── Background tool re-discovery (#385) ──
+
+    /// Launch an async tools/list re-discovery for the named client. No-op
+    /// when a job for that client is already pending, the client is missing,
+    /// or it isn't `.connected` — `pollToolsRefresh` only fires on connected
+    /// clients, so callers can pass the flag through unchecked. The worker
+    /// runs `listToolsFresh` on the LIVE client (stdio re-discovery must reuse
+    /// the same server process); the main thread installs the outcome via
+    /// `drainToolRefreshes`. Never blocks the caller — the request (which can
+    /// wait on `request_mutex` behind an in-flight tool call for up to
+    /// `read_timeout_ms`) happens on the worker, off the UI thread.
+    pub fn launchToolRefresh(self: *McpManager, io: std.Io, name: []const u8) void {
+        if (self.hasPendingRefresh(name)) {
+            // Dedup early-return, but the tick already consumed the refresh
+            // flag (atomic swap) — dropping it here would silently lose any
+            // list_changed that arrived while the in-flight job was running
+            // (e.g. on the replacement client after a mid-flight reconnect).
+            // Re-arm so the next tick retries; it keeps no-opping into this
+            // branch until the pending job drains, then the queued change is
+            // honored — the same never-silently-drop contract as
+            // `fail_launch` below.
+            if (self.findClient(name)) |client| {
+                if (client.status() == .connected) {
+                    log.debug("MCP '{s}': refresh already pending; re-arming flag", .{name});
+                    client.discovery.storeRefreshPending();
+                }
+            }
+            return;
+        }
+        const client = self.findClient(name) orelse return;
+        if (client.status() != .connected) return;
+
+        // Every failure exit below re-arms the refresh flag: the UI tick
+        // already consumed it (atomic swap) before calling this, so a silent
+        // return would drop the re-discovery request with NO retry and no
+        // signal — the stale list would persist indefinitely (#385 review).
+        // The re-armed flag makes the next tick retry; the warn keeps the
+        // failure visible in the log.
+        const fail_launch = struct {
+            fn warn(c: *client_mod.McpClient, err: anyerror) void {
+                log.warn("MCP '{s}': tool refresh launch failed err={s}; retrying next tick", .{ c.name, @errorName(err) });
+                c.discovery.storeRefreshPending();
+            }
+        }.warn;
+
+        const job = self.gpa.create(RefreshJob) catch |err| {
+            fail_launch(client, err);
+            return;
+        };
+        // Full-struct init: `create` hands back undefined memory, and the
+        // fields without explicit assignments below (`owns_client`, `fresh`,
+        // `err`, `done`) must come from the struct defaults. An uninitialized
+        // `done` reads as true, so `drainToolRefreshes` awaits a future whose
+        // worker never ran; uninitialized `fresh`/`err` free or read garbage.
+        job.* = .{
+            .gpa = self.gpa,
+            .io = io,
+            .client_name = undefined,
+            .client = client,
+            .future = undefined,
+        };
+        job.client_name = self.gpa.dupe(u8, name) catch |err| {
+            self.gpa.destroy(job);
+            fail_launch(client, err);
+            return;
+        };
+        job.future = io.concurrent(runRefresh, .{job}) catch |err| {
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+            fail_launch(client, err);
+            return;
+        };
+        self.pending_refreshes.append(self.gpa, job) catch |err| {
+            _ = job.future.cancel(io);
+            // The worker may have completed `.ok` before the cancel join: its
+            // fresh records are fully allocated and owned by the job. Same
+            // teardown as `cancelAllRefreshes` — skipping this leaks them.
+            for (job.fresh.items) |*tool| tool.deinit(self.gpa);
+            job.fresh.deinit(self.gpa);
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+            fail_launch(client, err);
+        };
+    }
+
+    /// Poll in-flight refresh jobs and install the completed ones. Called from
+    /// the TUI tick. Returns true when any job completed (caller should
+    /// re-inject tool schemas and redraw). Install semantics preserve the
+    /// #384 invariants: replace-not-append via `Discovery.replaceAll`, and a
+    /// failed re-discovery surfaces through `setError` on the main thread
+    /// (never from the worker — `setError` stops the transport, which is a
+    /// lifecycle write) while the old cache goes down with the transport per
+    /// the clear-on-stop choke points.
+    pub fn drainToolRefreshes(self: *McpManager, io: std.Io) bool {
+        var completed = false;
+        var i: usize = 0;
+        while (i < self.pending_refreshes.items.len) {
+            const job = self.pending_refreshes.items[i];
+            if (!job.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            const result = job.future.await(io);
+            _ = self.pending_refreshes.orderedRemove(i);
+            self.installRefreshResult(job, result, io);
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+            completed = true;
+        }
+        return completed;
+    }
+
+    /// True while any refresh job is still in flight. The TUI keeps ticking
+    /// (so `drainToolRefreshes` keeps running) while this is true.
+    pub fn hasPendingRefreshes(self: *const McpManager) bool {
+        return self.pending_refreshes.items.len > 0;
+    }
+
+    /// True while retired clients are parked for deferred teardown — same
+    /// tick keep-alive contract as `hasPendingRefreshes`. Bounded in practice:
+    /// a parked client waits only on its in-flight request, which
+    /// `read_timeout_ms` caps.
+    pub fn hasPendingDestroys(self: *const McpManager) bool {
+        return self.pending_destroys.items.len > 0;
+    }
+
+    fn hasPendingRefresh(self: *const McpManager, name: []const u8) bool {
+        for (self.pending_refreshes.items) |job| {
+            if (std.mem.eql(u8, job.client_name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Move a completed refresh's outcome into the live client. Runs on the
+    /// main thread only. Every discard path frees the worker-built records;
+    /// the `owns_client` handoff destroys the retired client here, after
+    /// `future.await` proved the worker exited.
+    fn installRefreshResult(self: *McpManager, job: *RefreshJob, result: RefreshResult, io: std.Io) void {
+        defer {
+            for (job.fresh.items) |*tool| tool.deinit(self.gpa);
+            job.fresh.deinit(self.gpa);
+            if (job.owns_client) {
+                job.client.deinit(io);
+                self.gpa.destroy(job.client);
+            }
+        }
+        // Client removed mid-flight (retired through a refresh-job handoff).
+        const idx = self.findClientIdx(job.client_name) orelse return;
+        const target = self.clients.items[idx];
+        // Client replaced mid-flight: `target` is the replacement, the job's
+        // client is the retired original — discard the stale snapshot (the
+        // replacement's own connect handshake installed a newer discovery).
+        if (target != job.client) {
+            log.debug("MCP '{s}': refresh outcome discarded (client replaced mid-flight)", .{job.client_name});
+            return;
+        }
+        // Client disabled/failed mid-flight: the transport is gone, its cache
+        // went down with it, and `setError` on a dead transport is meaningless.
+        if (target.status() != .connected) return;
+        switch (result) {
+            .ok => {
+                // Full success: swap the replacement in (replace-not-append).
+                target.discovery.replaceAll(job.fresh);
+                job.fresh = .empty;
+            },
+            .failed => {
+                // The log trail the old synchronous path kept (#385 review) —
+                // the lifecycle failure itself is UI-visible, the warn is for
+                // the log archaeologist.
+                const err = job.err orelse error.McpInvalidToolsResponse;
+                log.warn("MCP '{s}': list_changed re-discovery failed err={s}", .{ target.name, @errorName(err) });
+                target.setError(io, "list_changed re-discovery failed: {s}", .{@errorName(err)});
+            },
+        }
+    }
+
+    /// Join and tear down every in-flight refresh job. Used by `deinit` only —
+    /// on the hot path `drainToolRefreshes` cleans up lazily instead.
+    fn cancelAllRefreshes(self: *McpManager, io: std.Io) void {
+        for (self.pending_refreshes.items) |job| {
+            _ = job.future.cancel(io);
+            for (job.fresh.items) |*tool| tool.deinit(self.gpa);
+            job.fresh.deinit(self.gpa);
+            if (job.owns_client) {
+                job.client.deinit(io);
+                self.gpa.destroy(job.client);
+            }
+            self.gpa.free(job.client_name);
+            self.gpa.destroy(job);
+        }
+        self.pending_refreshes.clearRetainingCapacity();
+    }
 };
+
+/// Result of an async tool-refresh worker. The worker only fills the job's
+/// private fields; the main thread installs the outcome.
+const RefreshResult = enum { ok, failed };
+
+/// One in-flight background tools/list re-discovery (#385). Owned by the
+/// manager; the worker runs `listToolsFresh` on the LIVE client (stdio
+/// re-discovery must reuse the same server process — the connect-job clone
+/// trick does not apply) and only mutates the job's own fields plus the
+/// request-serialized client state; the main thread installs the fresh
+/// records via `drainToolRefreshes`.
+const RefreshJob = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Name of the live client this refresh belongs to — stable across list
+    /// churn, so the install looks the client up by name, not index.
+    client_name: []u8,
+    /// The live client the worker runs against. Heap-stable for the job's
+    /// lifetime; when the launched-at client is replaced or removed mid-flight
+    /// (`retireClient`), the job takes over its deinit via `owns_client` —
+    /// never destroyed while the worker can still be inside it.
+    client: *client_mod.McpClient,
+    /// Set by the main thread (`retireClient`) when the launched-at client is
+    /// replaced or removed while this job is pending.
+    owns_client: bool = false,
+    /// Worker-built fresh tool records, empty on failure. gpa-owned; the main
+    /// thread installs them via `Discovery.replaceAll` or frees them.
+    fresh: std.ArrayList(client_mod.McpTool) = .empty,
+    /// Worker failure, valid only when the result is `.failed`. Written before
+    /// `done.store(true, .release)` and read only after the main thread
+    /// observes the flag (same handoff contract as `ConnectJob.failed_message`).
+    err: ?anyerror = null,
+    future: std.Io.Future(RefreshResult),
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+/// Run tools/list against the live client on a concurrent worker thread (#385).
+/// Only `job.*` is written; the client's shared state touched here is exactly
+/// what `listToolsFresh` documents as worker-safe (request-serialized fields,
+/// atomic refresh flag) — never the discovery cache.
+fn runRefresh(job: *RefreshJob) RefreshResult {
+    defer job.done.store(true, .release);
+    if (job.client.listToolsFresh(job.io)) |fresh| {
+        job.fresh = fresh;
+        return .ok;
+    } else |err| {
+        job.err = err;
+        return .failed;
+    }
+}
 
 /// Result of an async connect worker. The worker never touches the live
 /// McpClient list; it builds `job.clone` and the main thread installs it.
@@ -770,7 +1126,7 @@ test "McpManager reconnect frees and re-captures raw inputSchemas" {
     manager.syncFromConfigEx(std.testing.io, &cfg);
     try drainUntilConnected(&manager, std.testing.io);
 
-    const client = &manager.clients.items[0];
+    const client = manager.clients.items[0];
     try std.testing.expectEqual(client_mod.ServerStatus.connected, client.status());
     const raw_before = try gpa.dupe(u8, client.discovery.tools.items[0].raw_input_schema.?);
     defer gpa.free(raw_before);
@@ -782,7 +1138,7 @@ test "McpManager reconnect frees and re-captures raw inputSchemas" {
     manager.reconnectClient(std.testing.io, 0);
     try drainUntilConnected(&manager, std.testing.io);
 
-    const refreshed = &manager.clients.items[0];
+    const refreshed = manager.clients.items[0];
     try std.testing.expectEqual(client_mod.ServerStatus.connected, refreshed.status());
     try std.testing.expectEqual(@as(usize, 1), refreshed.discovery.tools.items.len);
     const raw_after = refreshed.discovery.tools.items[0].raw_input_schema orelse return error.RawSchemaMissing;
@@ -1108,7 +1464,7 @@ test "McpManager relaunches a connect for a failed server with a cleared cache" 
     // lifecycle fails — and the discovery cache must go down with it, or
     // the reconcile wedges the server in CONNECTING with stale tools (bug
     // 1's shape through the failed arm).
-    const client = &manager.clients.items[0];
+    const client = manager.clients.items[0];
     try client.addTool("stale", "Cached before the failure", .{ .properties = &.{} }, null);
     client.setError(io, "list_changed re-discovery failed", .{});
     try std.testing.expectEqual(client_mod.ServerStatus.failed, client.status());
@@ -1123,6 +1479,364 @@ test "McpManager relaunches a connect for a failed server with a cleared cache" 
     try std.testing.expect(manager.hasPendingConnects());
     try drainUntilConnected(&manager, io);
 
-    try std.testing.expectEqual(client_mod.ServerStatus.connected, client.status());
-    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    // The completed connect replaced the heap slot (#385) — the retired
+    // original the assertions above held is gone; read the live slot.
+    const reconnected = manager.clients.items[0];
+    try std.testing.expect(reconnected != client);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, reconnected.status());
+    try std.testing.expectEqual(@as(usize, 1), reconnected.discovery.tools.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// Background tool re-discovery (#385): the UI tick never blocks on a
+// re-discovery request; outcomes install on the main thread via drain.
+// ---------------------------------------------------------------------------
+
+/// Poll `drainToolRefreshes` until every pending refresh job has completed
+/// and been installed (or discarded). Mirrors the TUI tick loop's role.
+fn drainUntilRefreshed(manager: *McpManager, io: std.Io) !void {
+    var deadline: usize = 0;
+    while (manager.hasPendingRefreshes()) : (deadline += 1) {
+        if (deadline > 2000) return error.RefreshTimedOut;
+        _ = manager.drainToolRefreshes(io);
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+}
+
+test "McpManager tool refresh launches off the tick thread and installs on drain" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // slow mode: a synchronous re-discovery (the pre-#385 UI-tick path)
+    // would block the caller for the request's full 500ms; the launched
+    // job must hand the wait to a background worker instead.
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "slow-refresh", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+
+    // A stale record the fresh discovery must fully replace.
+    try manager.clients.items[0].addTool("stale", "Cached before the refresh", .{ .properties = &.{} }, null);
+    manager.clients.items[0].discovery.storeRefreshPending();
+
+    const started = std.Io.Timestamp.now(io, .awake);
+    manager.launchToolRefresh(io, "slow-refresh");
+    const launch_elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+
+    // A/B signal: launching is non-blocking (the old synchronous path spent
+    // >= 500ms inside the request; launch itself must stay far below that).
+    try std.testing.expect(launch_elapsed < 100 * std.time.ns_per_ms);
+    try std.testing.expect(manager.hasPendingRefreshes());
+
+    try drainUntilRefreshed(&manager, io);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
+    try std.testing.expectEqualStrings("greet", manager.clients.items[0].discovery.tools.items[0].name);
+    try std.testing.expect(!manager.hasPendingRefreshes());
+}
+
+test "McpManager dedupes concurrent tool refresh launches" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "dedupe", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    manager.clients.items[0].discovery.storeRefreshPending();
+
+    manager.launchToolRefresh(io, "dedupe");
+    manager.launchToolRefresh(io, "dedupe");
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_refreshes.items.len);
+    try drainUntilRefreshed(&manager, io);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
+}
+
+test "launchToolRefresh initializes every RefreshJob field" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "lazy-refresh", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    manager.clients.items[0].discovery.storeRefreshPending();
+    manager.launchToolRefresh(io, "lazy-refresh");
+    try std.testing.expect(manager.hasPendingRefreshes());
+
+    // Read the job before its worker has had any chance to run: an
+    // uninitialized `done` reads as true, so `drainToolRefreshes` would
+    // await a future whose worker never ran; uninitialized `fresh`/`err`
+    // free or read garbage (0xAA fill in Debug).
+    const job = manager.pending_refreshes.items[0];
+    try std.testing.expect(job.fresh.items.len == 0);
+    try std.testing.expect(job.err == null);
+    try std.testing.expect(!job.owns_client);
+    try std.testing.expect(!job.done.load(.acquire));
+}
+
+test "McpManager tool refresh failure marks the client failed at drain and recovers" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "die-refresh", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    const client = manager.clients.items[0];
+
+    // Kill the child process directly (the client's own lifecycle stays
+    // `.connected`) while the refresh worker is inside its request: the
+    // worker fails loudly, and the DRAIN (main thread) — never the worker —
+    // routes the failure through setError, failing the lifecycle. (Calling
+    // `stop` here would disable the client, and the drain would discard the
+    // outcome instead of exercising the failure arm.)
+    client.discovery.storeRefreshPending();
+    manager.launchToolRefresh(io, "die-refresh");
+    try io.sleep(.fromMilliseconds(50), .awake);
+    client.lifecycle.stdio.process.kill(io);
+
+    try drainUntilRefreshed(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.failed, client.status());
+    switch (client.lifecycle) {
+        .failed => |f| try std.testing.expect(std.mem.indexOf(u8, f.reason, "list_changed re-discovery failed") != null),
+        else => return error.UnexpectedLifecycle,
+    }
+
+    // The #384 recovery contract extends to the async path: still enabled
+    // in config, the reconcile relaunches a connect for the failed server.
+    manager.syncFromConfigEx(io, &cfg);
+    try std.testing.expect(manager.hasPendingConnects());
+    try drainUntilConnected(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
+}
+
+test "McpManager discards a refresh outcome when the client is disconnected mid-flight" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "disc-refresh", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+
+    manager.clients.items[0].discovery.storeRefreshPending();
+    manager.launchToolRefresh(io, "disc-refresh");
+    manager.disconnectClient(io, 0);
+
+    try drainUntilRefreshed(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.disabled, manager.clients.items[0].status());
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items[0].discovery.tools.items.len);
+}
+
+test "McpManager discards a refresh outcome and retires the client when it is replaced mid-flight" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "repl-refresh", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    const old_client = manager.clients.items[0];
+
+    // Launch a refresh against the live client, then reconnect: stop-first
+    // teardown parks the pipes under the in-flight refresh worker (the
+    // transport-lifetime bracket), and the completed connect replaces the
+    // slot — the retired original is handed to the job and destroyed at
+    // drain, after future.await proved the worker exited.
+    old_client.discovery.storeRefreshPending();
+    manager.launchToolRefresh(io, "repl-refresh");
+    manager.reconnectClient(io, 0);
+
+    try drainUntilConnected(&manager, io);
+    try drainUntilRefreshed(&manager, io);
+
+    const replaced = manager.clients.items[0];
+    try std.testing.expect(replaced != old_client);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, replaced.status());
+    try std.testing.expectEqual(@as(usize, 1), replaced.discovery.tools.items.len);
+    try std.testing.expect(!manager.hasPendingRefreshes());
+}
+
+test "McpManager deinit while a tool refresh is in flight joins and tears down" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    // `deinit` is the code under test — no defer.
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "hang-refresh", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    manager.clients.items[0].discovery.storeRefreshPending();
+    manager.launchToolRefresh(io, "hang-refresh");
+    try std.testing.expect(manager.hasPendingRefreshes());
+    try io.sleep(.fromMilliseconds(100), .awake);
+
+    // Quit while the refresh is in flight: `deinit` must cancel the pending
+    // response wait instead of waiting out the request.
+    const started = std.Io.Timestamp.now(io, .awake);
+    manager.deinit(io);
+    const elapsed_ns = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "interleaved list_changed re-arms the refresh flag through the async path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // interleaved mode: the server pushes tools/list_changed before
+    // answering the first tools/list — the notification captured during
+    // discovery must leave the flag set for the next tick.
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "interleaved", "interleaved");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    try std.testing.expectEqual(client_mod.ServerStatus.connected, manager.clients.items[0].status());
+    try std.testing.expect(manager.clients.items[0].pollToolsRefresh());
+
+    // The full pipeline then still works: launch, drain, install. The mock
+    // echoes the CONFIG name (not the default "mock") into the namespace.
+    manager.launchToolRefresh(io, "interleaved");
+    try drainUntilRefreshed(&manager, io);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items[0].discovery.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__interleaved__greet", manager.clients.items[0].discovery.tools.items[0].full_name);
+}
+
+test "retireClient parks a client with an open capture bracket and drains after it closes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "park-retire", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+    const client = manager.clients.items[0];
+
+    // Simulate a lane tool-call worker inside the client (open capture
+    // bracket): retiring now must NOT destroy — the bracket's release runs
+    // on the client, so an immediate destroy would be a use-after-free.
+    client.in_flight_requests.store(1, .monotonic);
+
+    // Retire through the config-reconcile path: the server vanishes from
+    // config, so `removeStaleClients` retires it.
+    var empty_cfg: config_mod.Config = .{ .mcp_servers = &.{} };
+    manager.syncFromConfigEx(io, &empty_cfg);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_destroys.items.len);
+    try std.testing.expect(manager.hasPendingDestroys());
+    try std.testing.expect(manager.pending_destroys.items[0] == client);
+
+    // Close the bracket; the tick drain destroys the parked client.
+    _ = client.in_flight_requests.fetchSub(1, .acq_rel);
+    manager.drainPendingDestroys(io);
+    try std.testing.expectEqual(@as(usize, 0), manager.pending_destroys.items.len);
+    try std.testing.expect(!manager.hasPendingDestroys());
+}
+
+test "launchToolRefresh re-arms the refresh flag on the dedup early-return" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "dedup-rearm", "slow");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+
+    manager.syncFromConfigEx(io, &cfg);
+    try drainUntilConnected(&manager, io);
+
+    // First launch starts the job. Mirror the tick: `pollToolsRefresh`'s
+    // atomic swap consumes the flag BEFORE `launchToolRefresh` runs, so the
+    // first launch leaves the flag cleared.
+    manager.clients.items[0].discovery.storeRefreshPending();
+    try std.testing.expect(manager.clients.items[0].pollToolsRefresh());
+    manager.launchToolRefresh(io, "dedup-rearm");
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_refreshes.items.len);
+    try std.testing.expect(!manager.clients.items[0].discovery.pending_refresh.load(.acquire));
+
+    // A second launch while the job is pending hits the dedup branch and must
+    // re-arm the flag — otherwise a list_changed arriving mid-flight is
+    // silently dropped.
+    manager.launchToolRefresh(io, "dedup-rearm");
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_refreshes.items.len);
+    try std.testing.expect(manager.clients.items[0].discovery.pending_refresh.load(.acquire));
+
+    try drainUntilRefreshed(&manager, io);
 }

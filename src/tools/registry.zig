@@ -158,7 +158,7 @@ pub const ToolRegistry = struct {
     /// same contract as plugin re-registration.
     pub fn syncMcpTools(self: *ToolRegistry, gpa: std.mem.Allocator, manager: *mcp_mod.McpManager) !void {
         self.removePluginToolsWithPrefix(gpa, "mcp__");
-        for (manager.clients.items) |*client| {
+        for (manager.clients.items) |client| {
             if (client.status() != .connected) continue;
             for (client.discovery.tools.items) |*tool| {
                 const record = mcp_bridge.buildMcpTool(gpa, client.name, tool.name, tool.description, tool.schema, tool.raw_input_schema) catch |err| {
@@ -495,7 +495,7 @@ fn managerWithRichServer(gpa: std.mem.Allocator, io: std.Io) !mcp_mod.McpManager
     try client.listTools(io);
     // The list owns the client from here; manager.deinit (or the errdefer on
     // a failed append) stops the spawned server.
-    try manager.clients.append(gpa, client);
+    try manager.addClient(client);
     return manager;
 }
 
