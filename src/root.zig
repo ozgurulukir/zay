@@ -821,6 +821,9 @@ test {
     // Agent tool-batch seam (ExecutorService wiring + ToolCallObserver bridge),
     // extracted from agent.zig; referenced explicitly so its inline tests run.
     _ = @import("agent/tool_batch.zig");
+    // Agent text tool-call recovery seam (T3: collect/recover/inject window),
+    // extracted from agent.zig; referenced explicitly so its inline tests run.
+    _ = @import("agent/text_recovery.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");
