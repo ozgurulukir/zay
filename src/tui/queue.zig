@@ -6,6 +6,7 @@ const std = @import("std");
 const tui = @import("../tui.zig");
 const skill_mod = @import("../skill.zig");
 const skill_rows = @import("skill_rows.zig");
+const queue_ops = @import("../agent/queue_ops.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -30,7 +31,7 @@ pub fn enqueueSubmit(app: *App) !bool {
         app.gpa.free(prompt);
         return false;
     }
-    app.thread.agent.?.enqueueUser(prompt) catch |err| switch (err) {
+    queue_ops.enqueueUser(app.thread.agent.?, prompt) catch |err| switch (err) {
         error.QueueFull => {
             app.gpa.free(prompt);
             try appendMessageQueueFullNotice(app);
@@ -60,7 +61,7 @@ pub fn steerSelectedQueued(app: *App) void {
     if (items.len == 0) return;
     const index = @min(app.nav.queued_selection, items.len - 1);
     items[index].steer = true;
-    app.thread.agent.?.setQueuedSteer(@intCast(index));
+    queue_ops.setQueuedSteer(app.thread.agent.?, @intCast(index));
 }
 
 /// Mirror a machine-generated (raw) message into `lane`'s UI queue so the
@@ -80,7 +81,7 @@ pub fn mirrorRawEnqueue(app: *App, lane: *Thread, message: []const u8) void {
 /// written on either side (QueueFull, or the lane has no agent).
 pub fn enqueueRawMirrored(app: *App, lane: *Thread, message: []const u8) bool {
     const agent = lane.agent orelse return false;
-    agent.enqueueRaw(message) catch return false;
+    queue_ops.enqueueRaw(agent, message) catch return false;
     mirrorRawEnqueue(app, lane, message);
     return true;
 }
@@ -124,7 +125,7 @@ test "M2: raw delivery keeps the UI mirror 1:1 with the agent queue" {
     defer app.deinit();
 
     // A raw message enqueued on the agent queue, mirrored into the UI queue.
-    try agent.enqueueRaw("lane finished");
+    try queue_ops.enqueueRaw(&agent, "lane finished");
     mirrorRawEnqueue(&app, app.thread, "lane finished");
 
     // Mirror and agent queue are the same length; the entry is marked raw.
@@ -144,11 +145,11 @@ test "M2: steer marks the selected entry despite interleaved raw messages" {
 
     // Mirror [user, raw, user] — the raw entry is a machine-generated message
     // interleaved between two user messages.
-    try agent.enqueueUser("first");
+    try queue_ops.enqueueUser(&agent, "first");
     try app.thread.queued.append(gpa, .{ .text = try gpa.dupe(u8, "first") });
-    try agent.enqueueRaw("lane finished");
+    try queue_ops.enqueueRaw(&agent, "lane finished");
     mirrorRawEnqueue(&app, app.thread, "lane finished");
-    try agent.enqueueUser("third");
+    try queue_ops.enqueueUser(&agent, "third");
     try app.thread.queued.append(gpa, .{ .text = try gpa.dupe(u8, "third") });
 
     // Steer the third entry (mirror index 2) — the agent queue's third entry
@@ -191,7 +192,7 @@ test "M2: enqueueRawMirrored writes nothing on either side when the agent queue 
     defer app.deinit();
 
     // Fill the agent queue to capacity.
-    for (0..agent.message_queue_storage.len) |_| try agent.enqueueRaw("filler");
+    for (0..agent.message_queue_storage.len) |_| try queue_ops.enqueueRaw(&agent, "filler");
 
     // The mirrored enqueue must fail atomically: no agent entry, no mirror
     // entry — a mirror ahead of the agent queue shifts every steer index.
@@ -200,7 +201,7 @@ test "M2: enqueueRawMirrored writes nothing on either side when the agent queue 
     try std.testing.expectEqual(@as(u32, agent.message_queue_storage.len), agent.message_queue.len());
 
     // Success path: both sides gain exactly one entry, in lockstep.
-    agent.clearQueue();
+    queue_ops.clearQueue(&agent);
     try std.testing.expect(enqueueRawMirrored(&app, app.thread, "delivered"));
     try std.testing.expectEqual(@as(usize, 1), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());

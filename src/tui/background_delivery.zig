@@ -324,6 +324,7 @@ pub fn cancelSelectedBackgroundJob(app: *App) void {
 // ── Tests ──
 
 const agent_mod = @import("../agent.zig");
+const queue_ops = @import("../agent/queue_ops.zig");
 const runtime_mod = @import("../runtime.zig");
 const isolatedHome = @import("test_fixture.zig").isolatedHome;
 
@@ -492,7 +493,7 @@ test "M2: a QueueFull background drop gains no mirror entry" {
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
 
     // Fill the agent queue to capacity so the delivery's enqueue fails.
-    for (0..runtime.agent.message_queue_storage.len) |_| try runtime.agent.enqueueRaw("filler");
+    for (0..runtime.agent.message_queue_storage.len) |_| try queue_ops.enqueueRaw(&runtime.agent, "filler");
 
     try app.background_modal_state.pending.append(app.gpa, .{
         .owner_generation = 1,
