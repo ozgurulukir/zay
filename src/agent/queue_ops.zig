@@ -104,7 +104,7 @@ pub fn clearQueue(self: *Agent) void {
 /// Pop and return the front queued message. When `steer_only` is set, only
 /// pops if the front message is marked to steer (otherwise returns null,
 /// leaving the queue untouched). Caller owns `queued.prompt`.
-pub fn takeQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
+fn takeQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
     if (self.message_queue_mutex.lock(self.io)) |_| {
         defer self.message_queue_mutex.unlock(self.io);
         if (steer_only) {
