@@ -34,6 +34,7 @@ const TurnBudget = agent_turn_budget.TurnBudget;
 const agent_stream_context = @import("agent/stream_context.zig");
 const queue_ops = @import("agent/queue_ops.zig");
 const text_recovery = @import("agent/text_recovery.zig");
+const skill_ops = @import("agent/skill_context_ops.zig");
 
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
@@ -297,12 +298,10 @@ pub const Agent = struct {
         }
         const skill_count = self.skill_context.entries.items.len;
         errdefer self.skill_context.rollbackTo(self.gpa, skill_count);
-        try self.prependSkillBlocks(prompt, blocks);
+        try skill_ops.prependBlocks(self, prompt, blocks);
         try self.context_manager.appendPersisted(.{ .user = .{ .content = blocks } });
         if (self.skill_context.entries.items.len != skill_count) {
-            self.skill_context_dirty = true;
-            self.skill_context_changed_pending = true;
-            self.persistSkillContext() catch |err| log.warn("session skill context write failed: {s}", .{@errorName(err)});
+            skill_ops.noteChange(self);
         }
     }
 
@@ -369,27 +368,6 @@ pub const Agent = struct {
         }
     }
 
-    fn prependSkillBlocks(self: *Agent, prompt: []const u8, blocks: []ai.ContentBlock) !void {
-        assert(blocks.len > 0);
-        assert(blocks[0] == .text);
-        var loaded_names: [skill_context_mod.SkillContext.entries_max][]const u8 = undefined;
-        for (self.skill_context.entries.items, 0..) |entry, index| loaded_names[index] = entry.name;
-        const prefix = try skill_mod.promptPrefixWithNames(self.gpa, self.skills, prompt, loaded_names[0..self.skill_context.entries.items.len]);
-        defer self.gpa.free(prefix.text);
-        defer self.gpa.free(prefix.names);
-        if (prefix.text.len == 0) return;
-
-        for (prefix.names) |name| {
-            const loaded = skill_mod.find(self.skills, name) orelse continue;
-            _ = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
-        }
-
-        const old_text = blocks[0].text.text;
-        const new_text = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ prefix.text, old_text });
-        self.gpa.free(old_text);
-        blocks[0].text.text = new_text;
-    }
-
     pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {
         const mark = self.skill_context.entries.items.len;
         errdefer self.skill_context.rollbackTo(self.gpa, mark);
@@ -400,8 +378,7 @@ pub const Agent = struct {
         try skill_history.rebuild(&self.skill_context, self.gpa, history, self.skills);
         try self.context_manager.appendUnpersisted(message);
         if (self.skill_context.entries.items.len != mark) {
-            self.skill_context_dirty = true;
-            self.skill_context_changed_pending = true;
+            skill_ops.noteChangeDeferred(self);
         }
     }
 
@@ -606,7 +583,7 @@ pub const Agent = struct {
             const turn_allocator = turn_arena.allocator();
 
             try self.persistSkillContext();
-            try self.emitPendingSkillInventory(L, l);
+            try skill_ops.emitPendingInventory(self, L, l);
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
                 .gpa = self.gpa,
@@ -727,7 +704,7 @@ pub const Agent = struct {
                 truncation_retried,
             );
             if (finalization == .continue_after_queued_drain) {
-                try self.emitPendingSkillInventory(L, l);
+                try skill_ops.emitPendingInventory(self, L, l);
                 // Turn would otherwise go idle: drain the front queued message
                 // (steer or not) and continue, so anything still waiting is
                 // handled at the natural turn end. The user's queued message
@@ -744,7 +721,7 @@ pub const Agent = struct {
                 finalization = Agent.runTurnFinalizationOutcome(finish_reason, false, false, tool_calls_truncated, truncation_retried);
             }
             if (finalization != .dispatch) {
-                try self.emitPendingSkillInventory(L, l);
+                try skill_ops.emitPendingInventory(self, L, l);
             }
             switch (finalization) {
                 .dispatch => {},
@@ -788,7 +765,7 @@ pub const Agent = struct {
             const calls_to_dispatch = @min(tool_calls.len, calls_remaining);
             const batch_exceeds_budget = calls_to_dispatch < tool_calls.len;
             const end_turn = try tool_batch.runToolBatch(L, self, tool_calls[0..calls_to_dispatch], &stream_context, l, turn_allocator);
-            try self.emitPendingSkillInventory(L, l);
+            try skill_ops.emitPendingInventory(self, L, l);
             tool_calls_executed += @intCast(calls_to_dispatch);
             if (batch_exceeds_budget) {
                 try self.reconcileUnresolvedToolCalls(budget_skipped_tool_result, "budget");
@@ -840,26 +817,6 @@ pub const Agent = struct {
         try listener.emit(.{ .length_cut = .auto_continued });
         try self.addUser(agent_turn_budget.length_cut_continuation_hint);
         return true;
-    }
-
-    fn skillInventorySnapshot(self: *Agent) ![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(self.gpa);
-        for (self.skill_context.entries.items, 0..) |entry, index| {
-            if (index > 0) try out.append(self.gpa, '\n');
-            try out.appendSlice(self.gpa, entry.name);
-        }
-        return out.toOwnedSlice(self.gpa);
-    }
-
-    fn emitPendingSkillInventory(self: *Agent, comptime L: type, listener: L) !void {
-        if (!self.skill_context_changed_pending) return;
-        const names = try self.skillInventorySnapshot();
-        self.skill_context_changed_pending = false;
-        listener.emit(.{ .skill_inventory_changed = .{ .names = names } }) catch |err| {
-            self.skill_context_changed_pending = true;
-            return err;
-        };
     }
 
     /// Wire-stream observation (agent/stream_context.zig): the per-stream
@@ -942,7 +899,7 @@ pub const Agent = struct {
             const skill_count = self.skill_context.entries.items.len;
             errdefer self.skill_context.rollbackTo(self.gpa, skill_count);
             if (std.mem.eql(u8, r.name, "skill")) {
-                if (try self.skillForResult(r)) |loaded| {
+                if (try skill_ops.forResult(self, r)) |loaded| {
                     const already_loaded = self.skill_context.contains(loaded.name);
                     if (!r.failed or already_loaded) {
                         const activation = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
@@ -982,45 +939,15 @@ pub const Agent = struct {
             r.* = undefined;
             moved += 1;
             if (self.skill_context.entries.items.len != skill_count) {
-                self.skill_context_dirty = true;
-                self.skill_context_changed_pending = true;
-                self.persistSkillContext() catch |err| log.warn("session skill context write failed: {s}", .{@errorName(err)});
+                skill_ops.noteChange(self);
             }
         }
     }
 
-    fn skillForResult(self: *Agent, result: *const executor_mod.ToolResult) !?skill_context_mod.SkillContext.Entry {
-        var index = self.messages().len;
-        while (index > 0) {
-            index -= 1;
-            const message = self.messages()[index];
-            if (message != .assistant) continue;
-            for (message.assistant.content) |block| {
-                if (block != .tool_call) continue;
-                const call = block.tool_call;
-                if (!std.mem.eql(u8, call.call_id.slice(), result.call_id.slice())) continue;
-                if (!std.mem.eql(u8, call.name, "skill")) return null;
-                var args = @import("tools/skill.zig").parseArgs(self.gpa, call.arguments) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    return null;
-                };
-                defer args.deinit(self.gpa);
-                if (args.resource != null or args.command != null) return null;
-                for (self.skill_context.entries.items) |entry| {
-                    if (std.ascii.eqlIgnoreCase(entry.name, args.name)) return entry;
-                }
-                if (skill_mod.find(self.skills, args.name)) |source| return .{ .name = source.name, .body = source.body };
-                return null;
-            }
-            return null;
-        }
-        return null;
-    }
-
+    /// Pub delegate: the body moved to `agent/skill_context_ops.zig`
+    /// (`persist`); external callers (tui/session_switcher) keep this seam.
     pub fn persistSkillContext(self: *Agent) !void {
-        if (!self.skill_context_dirty) return;
-        if (self.context_manager.session_writer) |writer| try writer.appendSkillContext(&self.skill_context);
-        self.skill_context_dirty = false;
+        return skill_ops.persist(self);
     }
 
     /// Keep the prompt within the model's window using a background summarizer,
@@ -1534,34 +1461,6 @@ test "skill context repeated inline and model activation preserves protocol resu
     try agent.addUserPrompt("again $HOW");
     try std.testing.expectEqualStrings("again $HOW", agent.messages()[1].text());
     try std.testing.expectEqual(@as(usize, 1), agent.skill_context.entries.items.len);
-}
-
-test "skill context metadata enqueue failure retains admitted activation and retries" {
-    const gpa = std.testing.allocator;
-    var manager = try session_mod.SessionManager.init(gpa, std.testing.io, ":memory:");
-    const session = try manager.create("/tmp/zay", .{});
-    var writer: session_mod.SessionWriter = undefined;
-    try writer.initWithSession(gpa, std.testing.io, manager, session, 4);
-    defer writer.deinit();
-    var agent = Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-    agent.attachSessionWriter(&writer);
-    try agent.addUser("admitted message");
-    _ = try agent.skill_context.activate(gpa, "how", "admitted instructions");
-    agent.skill_context_dirty = true;
-    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
-    writer.gpa = failing.allocator();
-    try std.testing.expectError(error.OutOfMemory, agent.persistSkillContext());
-    writer.gpa = gpa;
-    try std.testing.expect(agent.skill_context_dirty);
-    try std.testing.expectEqualStrings("admitted instructions", agent.skill_context.body("how").?);
-    try std.testing.expectEqualStrings("admitted message", agent.messages()[0].text());
-    try std.testing.expectError(error.SkillContextNotPersisted, agent.reloadFromSession());
-    try agent.persistSkillContext();
-    try std.testing.expect(!agent.skill_context_dirty);
-    try agent.reloadFromSession();
-    try std.testing.expectEqualStrings("admitted instructions", agent.skill_context.body("how").?);
-    try std.testing.expectEqualStrings("admitted message", agent.messages()[0].text());
 }
 
 test "skill context inline admission OOM never falsely activates a skill" {
