@@ -407,7 +407,7 @@ test "McpClient keeps the previous tool list when re-discovery fails" {
 }
 
 // ---------------------------------------------------------------------------
-// Transport-lifetime races + background re-discovery (#385)
+// Discovery-cache fetch-only semantics + background re-discovery (#385)
 // ---------------------------------------------------------------------------
 
 test "McpClient listToolsFresh returns owned records and never touches the cache" {
