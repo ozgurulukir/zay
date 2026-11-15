@@ -31,7 +31,6 @@ const ai = @import("../ai.zig");
 const executor_mod = @import("../executor.zig");
 const session_mod = @import("../session.zig");
 const skill_context_mod = @import("../context/skill_context.zig");
-const skill_history = @import("../context/skill_history.zig");
 const skill_mod = @import("../skill.zig");
 
 const Agent = agent_mod.Agent;
