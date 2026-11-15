@@ -331,6 +331,7 @@ pub fn run(self: *Agent, listener: anytype) !void {
     if (self.turn_budget.soft_stop_on_tool_call_limit) return softStopOnBudget(self, l, tool_calls_executed, iterations);
     return error.ToolCallLimit;
 }
+
 /// Graceful budget exhaustion: deliver everything the user queued mid-run
 /// (a queued "continue" must land in history, not be cleared at turn
 /// end), leave the continuation hint as the trailing message, and report
@@ -413,6 +414,8 @@ pub fn reconcileUnresolvedToolCalls(self: *Agent, result_text: []const u8, displ
         });
     }
 }
+
+/// True when the assistant message carries content the chat-completions wire
 /// format can represent: non-empty text or a tool call. Reasoning blocks are
 /// dropped by the serializer, so a reasoning-only message would go out as
 /// empty content with no tool_calls — rejected by strict providers.
