@@ -35,6 +35,8 @@ const agent_stream_context = @import("agent/stream_context.zig");
 const queue_ops = @import("agent/queue_ops.zig");
 const skill_ops = @import("agent/skill_context_ops.zig");
 const run_loop = @import("agent/run_loop.zig");
+const compaction_ops = @import("agent/compaction_ops.zig");
+const message_ops = @import("agent/message_ops.zig");
 
 const agent_compactor = @import("agent/compactor.zig");
 const auto_compactor_mod = @import("context/auto_compactor.zig");
@@ -46,11 +48,6 @@ const Compactor = agent_compactor.Compactor;
 /// path backs off (emitting one notice); the manual `/compact` command is
 /// never gated (TD-6). Alias of the AutoCompactor's own limit — one SSOT.
 pub const compaction_failure_limit: u32 = auto_compactor_mod.failure_limit;
-/// Defensive bound for the manual-compaction completion poll: 1000 yields
-/// before giving up with `error.CompactionNotReady` (a state that never
-/// resolves, e.g. a torn-down client the poll failed to clear).
-const manual_compact_poll_spins_max: u32 = 1000;
-
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -227,7 +224,7 @@ pub const Agent = struct {
     }
 
     pub fn addSystem(self: *Agent, content: []const u8) !void {
-        try self.appendMessage(.system, content);
+        try message_ops.appendMessage(self, .system, content);
     }
 
     /// Replace the one in-memory system prompt at a turn boundary. System
@@ -244,7 +241,7 @@ pub const Agent = struct {
         self.result_cache.deinit();
         // Wait for any background summarizer before tearing down the state it
         // reads (the client), then release its result.
-        self.drainBackgroundCompaction();
+        compaction_ops.drainBackgroundCompaction(self);
         self.context_manager.deinit();
         self.skill_context.deinit(self.gpa);
         if (self.message_queue_mutex.lock(self.io)) |_| {
@@ -263,7 +260,7 @@ pub const Agent = struct {
     }
 
     pub fn addUser(self: *Agent, content: []const u8) !void {
-        try self.appendMessage(.user, content);
+        try message_ops.appendMessage(self, .user, content);
     }
 
     /// Expand `@`-mentions in `prompt` (embedding text files inline, attaching
@@ -300,32 +297,6 @@ pub const Agent = struct {
     /// A no-op when every call already has a result.
     fn reconcileInterruptedToolCalls(self: *Agent) !void {
         try run_loop.reconcileUnresolvedToolCalls(self, run_loop.interrupted_tool_result, "cancelled");
-    }
-
-    pub fn takeMessage(self: *Agent, message: ai.ChatMessage) !void {
-        const mark = self.skill_context.entries.items.len;
-        errdefer self.skill_context.rollbackTo(self.gpa, mark);
-        const history = try self.gpa.alloc(ai.ChatMessage, self.messages().len + 1);
-        defer self.gpa.free(history);
-        @memcpy(history[0..self.messages().len], self.messages());
-        history[history.len - 1] = message;
-        try skill_history.rebuild(&self.skill_context, self.gpa, history, self.skills);
-        try self.context_manager.appendUnpersisted(message);
-        if (self.skill_context.entries.items.len != mark) {
-            skill_ops.noteChangeDeferred(self);
-        }
-    }
-
-    /// Drop every non-system message, freeing it. Keeps the system prompt(s) in
-    /// place so the conversation can be rehydrated from a different branch (see
-    /// `AgentRuntime.reloadMessages`). Only safe at a turn boundary, never while
-    /// a response is streaming.
-    pub fn clearNonSystemMessages(self: *Agent) void {
-        self.tool_view_cache.clear(self.gpa);
-        self.context_manager.clearNonSystem();
-        self.skill_context.clear(self.gpa);
-        self.skill_context_dirty = false;
-        self.skill_context_changed_pending = true;
     }
 
     /// The tagged union the agent emits to describe what is happening.
@@ -457,263 +428,28 @@ pub const Agent = struct {
     /// issue #367 slice 14.
     pub const hasWireContent = run_loop.hasWireContent;
 
-    fn appendMessage(self: *Agent, role: ai.Role, content: []const u8) !void {
-        if (role == .user) {
-            try self.reconcileInterruptedToolCalls();
-        }
-        var message = try self.makeTextMessage(role, content);
-        errdefer message.deinit(self.gpa);
-        try self.context_manager.appendPersisted(message);
-    }
-
-    fn makeTextMessage(self: *Agent, role: ai.Role, content: []const u8) !ai.ChatMessage {
-        assert(content.len > 0);
-        const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
-        errdefer self.gpa.free(blocks);
-        blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
-        errdefer blocks[0].deinit(self.gpa);
-        return switch (role) {
-            .system => .{ .system = .{ .content = blocks } },
-            .user => .{ .user = .{ .content = blocks } },
-            .assistant => .{ .assistant = .{ .content = blocks } },
-            .tool => error.InvalidToolRole,
-        };
-    }
-
-    /// Build a fake tool message for tests that need a tool result without
-    /// going through the executor. `call_id` defaults to "test_call".
-    fn makeToolMessage(self: *Agent, content: []const u8) !ai.ChatMessage {
-        assert(content.len > 0);
-        const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
-        errdefer self.gpa.free(blocks);
-        blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, content) } };
-        errdefer blocks[0].deinit(self.gpa);
-        return .{
-            .tool = .{
-                .call_id = .{ .value = try self.gpa.dupe(u8, "test_call") },
-                .content = blocks,
-            },
-        };
-    }
-
-    pub fn takeToolResults(self: *Agent, results: []executor_mod.ToolResult) !void {
-        assert(results.len > 0);
-        var moved: usize = 0;
-        errdefer {
-            for (results[moved..]) |*r| r.deinit(self.gpa);
-        }
-        for (results) |*r| {
-            assert(r.call_id.value.len > 0);
-            const skill_count = self.skill_context.entries.items.len;
-            errdefer self.skill_context.rollbackTo(self.gpa, skill_count);
-            if (std.mem.eql(u8, r.name, "skill")) {
-                if (try skill_ops.forResult(self, r)) |loaded| {
-                    const already_loaded = self.skill_context.contains(loaded.name);
-                    if (!r.failed or already_loaded) {
-                        const activation = try self.skill_context.activate(self.gpa, loaded.name, loaded.body);
-                        if (activation == .already_loaded) {
-                            const notice = try self.gpa.dupe(u8, skill_context_mod.loaded_notice);
-                            self.gpa.free(r.content);
-                            r.content = notice;
-                            r.failed = false;
-                        }
-                    }
-                }
-            }
-            const failed = r.failed;
-            // Drops name / expanded label / body / stderr and hands us the
-            // history trio; the result becomes a deinit-safe shell, so the
-            // errdefer loop above would free nothing twice if persistence
-            // fails after this point.
-            const channels = r.takeHistoryChannels(self.gpa);
-            errdefer {
-                // The moved channels are ours until persistence succeeds
-                // (appendPersisted failure leaves ownership with the caller).
-                self.gpa.free(channels.call_id.value);
-                self.gpa.free(channels.content);
-                self.gpa.free(channels.display_label);
-            }
-            const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
-            errdefer self.gpa.free(blocks);
-            blocks[0] = .{ .text = .{ .text = channels.content } };
-            try self.context_manager.appendPersisted(.{
-                .tool = .{
-                    .content = blocks,
-                    .call_id = channels.call_id,
-                    .display_label = channels.display_label,
-                    .failed = failed,
-                },
-            });
-            r.* = undefined;
-            moved += 1;
-            if (self.skill_context.entries.items.len != skill_count) {
-                skill_ops.noteChange(self);
-            }
-        }
-    }
-
     /// Pub delegate: the body moved to `agent/skill_context_ops.zig`
     /// (`persist`); external callers (tui/session_switcher) keep this seam.
     pub fn persistSkillContext(self: *Agent) !void {
         return skill_ops.persist(self);
     }
-
-    /// Keep the prompt within the model's window using a background summarizer,
-    /// so the agent never waits. Two watermarks: start the summary at the lower
-    /// one (giving it time to finish), and swap it into history at the higher
-    /// one (by when it is normally ready, so the swap is instant). Messages
-    /// appended between the two watermarks survive the swap verbatim — the
-    /// boundary references a tree entry id and the projection emits from it to
-    /// the leaf. Best-effort: every failure is logged and swallowed so
-    /// compaction never aborts the turn.
-    /// Build the per-call environment for the auto-compactor from the live
-    /// fields. Rebuilt on every call, so nothing borrows stale state across
-    /// a client swap or session re-attach.
-    fn compactionEnv(self: *Agent) auto_compactor_mod.Env {
-        return .{
-            .ctx = self,
-            .gpa = self.gpa,
-            .io = self.io,
-            .client = self.compaction_client,
-            .limiter = self.request_limiter,
-            .session = self.context_manager.session_writer,
-            .context_window_tokens = self.context_window_tokens,
-            .settings = self.compaction_settings,
-            .tool_tokens = self.client.estimateToolTokens(),
-            .historyCount = historyCount,
-            .estimateTrailing = estimateTrailingTokensCb,
-            .estimateAll = estimateAllTokensCb,
-            .swap = swapHistory,
-        };
-    }
-
-    fn historyCount(ctx: *anyopaque) u32 {
-        const self: *Agent = @ptrCast(@alignCast(ctx));
-        return self.context_manager.count();
-    }
-
-    fn estimateTrailingTokensCb(ctx: *anyopaque, anchor_count: u32) u32 {
-        const self: *Agent = @ptrCast(@alignCast(ctx));
-        return context_assembly.estimatePrunedTokensRangeWithSkills(
-            self.context_manager.items(),
-            anchor_count,
-            self.compaction_settings.keep_recent_tool_turns,
-            self.compaction_settings.tool_output_cap_bytes,
-            self.compaction_settings.evict_history_images,
-            &self.skill_context,
-        );
-    }
-
-    fn estimateAllTokensCb(ctx: *anyopaque) u32 {
-        const self: *Agent = @ptrCast(@alignCast(ctx));
-        return context_assembly.estimatePrunedTokensRangeWithSkills(
-            self.context_manager.items(),
-            0,
-            self.compaction_settings.keep_recent_tool_turns,
-            self.compaction_settings.tool_output_cap_bytes,
-            self.compaction_settings.evict_history_images,
-            &self.skill_context,
-        );
-    }
-
-    /// Persist the compaction boundary, then reproject the cache — the
-    /// swap. Order is the persist-before-cache invariant: the session tree
-    /// is the source of truth, so a failed reprojection leaves the live
-    /// cache intact instead of stranded with only the system prompt (TD-5).
-    fn swapHistory(ctx: *anyopaque, first_kept_id: []const u8, stored_summary: []const u8) anyerror!void {
-        const self: *Agent = @ptrCast(@alignCast(ctx));
-        const session_writer = self.context_manager.session_writer orelse return error.NoSessionWriter;
-        try self.persistSkillContext();
-        try session_writer.appendCompaction(first_kept_id, stored_summary);
-        try self.reloadFromSession();
-    }
-
-    /// Per-turn-iteration hook — delegates to the extracted state machine.
-    pub fn maybeCompact(self: *Agent, listener: anytype) void {
-        self.compactor.maybeCompact(self.compactionEnv(), listener);
-    }
-
-    /// Synchronous full compaction (headless/test path). See
-    /// `AutoCompactor.forceCompact`.
-    pub fn forceCompact(self: *Agent) !auto_compactor_mod.HistoryCompacted {
-        return self.compactor.forceCompact(self.compactionEnv());
-    }
-
-    /// Non-blocking phase 1 of the manual `/compact`.
-    pub fn requestManualCompact(self: *Agent) !void {
-        return self.compactor.requestManualCompact(self.compactionEnv());
-    }
-
-    /// Non-blocking phase 2 of the manual `/compact`, polled by the TUI tick.
-    pub fn pollManualCompact(self: *Agent) !?auto_compactor_mod.HistoryCompacted {
-        return self.compactor.pollManualCompact(self.compactionEnv());
-    }
-
-    /// Whether a manual `/compact` is mid-flight (drives the TUI's submit
-    /// gate and waiting row).
-    pub fn manualCompactPending(self: *const Agent) bool {
-        return self.compactor.manual_pending;
-    }
-
-    /// Wait for any in-flight background summary and discard it. Call before
-    /// freeing or replacing `compaction_client` (teardown, reconnect).
-    pub fn drainBackgroundCompaction(self: *Agent) void {
-        self.compactor.drain(self.compactionEnv());
-    }
-
-    /// Best estimate of the footprint the *next* request will carry: the
-    /// last turn's real reported usage as an anchor plus trailing estimates
-    /// (see `AutoCompactor.currentContextTokens`).
-    pub fn currentContextTokens(self: *Agent) u32 {
-        return self.compactor.currentContextTokens(self.compactionEnv());
-    }
-
-    /// Record a completed turn's usage as the watermark anchor.
-    pub fn recordUsage(self: *Agent, usage: ?ai.Usage) void {
-        self.compactor.recordUsage(self.compactionEnv(), usage);
-        if (usage) |measured| {
-            if (self.context_manager.session_writer) |writer| {
-                writer.recordUsage(measured) catch |err| log.warn("session usage write failed: {s}", .{@errorName(err)});
-            }
-        }
-    }
-
-    /// Drop the usage anchor, forcing a full re-estimate next turn. Used
-    /// after the history is rebuilt (compaction, branch switch).
-    pub fn resetContextUsage(self: *Agent) void {
-        self.compactor.resetUsage();
-    }
-
-    /// Rehydrate the cached message list from the session projection after a
-    /// compaction boundary was written — the swap. Keeps the system prompt.
-    /// Called between turn iterations, where every message is already
-    /// persisted and no stream is active; never mid-stream.
-    pub fn reloadFromSession(self: *Agent) !void {
-        const session_writer = self.context_manager.session_writer orelse return;
-        if (self.skill_context_dirty) return error.SkillContextNotPersisted;
-        // Project first, swap second: a failed reprojection leaves the live
-        // cache intact instead of stranded with only the system prompt (TD-5).
-        var projected = try session_writer.conversation(self.gpa);
-        defer projected.deinit(self.gpa);
-        try self.replaceConversation(&projected);
-    }
-
-    /// Consume both projections on success. Reservation happens before either
-    /// live owner is discarded, so an allocation failure preserves both.
-    pub fn replaceConversation(self: *Agent, projected: *session_mod.SessionWriter.Conversation) !void {
-        const prior_count = projected.skill_context.entries.items.len;
-        try skill_history.rebuild(&projected.skill_context, self.gpa, projected.messages, self.skills);
-        try self.context_manager.replaceConversation(projected.messages);
-        self.gpa.free(projected.messages);
-        projected.messages = &.{};
-        self.skill_context.deinit(self.gpa);
-        self.skill_context = projected.skill_context;
-        projected.skill_context = .{};
-        self.skill_context_dirty = self.skill_context.entries.items.len != prior_count;
-        self.skill_context_changed_pending = true;
-        self.tool_view_cache.clear(self.gpa);
-    }
 };
+// Issue #367 slice 15 re-exports: the bodies moved to the spokes; external
+// callers keep importing this module and pass the `*Agent` explicitly.
+pub const takeMessage = message_ops.takeMessage;
+pub const clearNonSystemMessages = message_ops.clearNonSystemMessages;
+pub const takeToolResults = message_ops.takeToolResults;
+pub const maybeCompact = compaction_ops.maybeCompact;
+pub const forceCompact = compaction_ops.forceCompact;
+pub const requestManualCompact = compaction_ops.requestManualCompact;
+pub const pollManualCompact = compaction_ops.pollManualCompact;
+pub const manualCompactPending = compaction_ops.manualCompactPending;
+pub const drainBackgroundCompaction = compaction_ops.drainBackgroundCompaction;
+pub const currentContextTokens = compaction_ops.currentContextTokens;
+pub const recordUsage = compaction_ops.recordUsage;
+pub const resetContextUsage = compaction_ops.resetContextUsage;
+pub const reloadFromSession = compaction_ops.reloadFromSession;
+pub const replaceConversation = compaction_ops.replaceConversation;
 
 /// Synchronous bash-approval hook. The TUI worker attaches a
 /// `*Context` via the opaque `ptr`; `requestBashApproval` (in
@@ -1058,7 +794,7 @@ test "skill context repeated inline and model activation preserves protocol resu
     try std.testing.expectEqual(@as(usize, 1), inventory_events);
     try agent.addUserPrompt("$how $HOW");
     try std.testing.expectEqualStrings("$how $HOW", agent.messages()[agent.messages().len - 1].text());
-    agent.clearNonSystemMessages();
+    message_ops.clearNonSystemMessages(&agent);
     try agent.addUserPrompt("$how $HOW");
     const injected_names = try skill_mod.collectInjectedSkillNames(gpa, agent.messages()[0].text());
     defer {
@@ -1122,19 +858,19 @@ test "skill context conversation swap is atomic on OOM and restores persisted bo
     _ = try projected.skill_context.activate(gpa, "missing-source", "persisted instructions");
     var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
     agent.context_manager.gpa = failing.allocator();
-    try std.testing.expectError(error.OutOfMemory, agent.replaceConversation(&projected));
+    try std.testing.expectError(error.OutOfMemory, compaction_ops.replaceConversation(&agent, &projected));
     agent.context_manager.gpa = gpa;
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
     try std.testing.expectEqualStrings("original message", agent.messages()[1].text());
     try std.testing.expectEqualStrings("original instructions", agent.skill_context.body("original").?);
     try std.testing.expectEqual(@as(usize, 32), projected.messages.len);
-    try agent.replaceConversation(&projected);
+    try compaction_ops.replaceConversation(&agent, &projected);
     try std.testing.expectEqual(@as(usize, 33), agent.messages().len);
     try std.testing.expectEqualStrings("system", agent.messages()[0].text());
     try std.testing.expect(!agent.skill_context.contains("original"));
     try std.testing.expectEqualStrings("persisted instructions", agent.skill_context.body("missing-source").?);
     try std.testing.expectEqual(@as(usize, 0), projected.messages.len);
-    agent.clearNonSystemMessages();
+    message_ops.clearNonSystemMessages(&agent);
     try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
     try std.testing.expectEqual(@as(usize, 0), agent.skill_context.entries.items.len);
 }
@@ -1199,13 +935,13 @@ test "context token estimate anchors on usage plus trailing messages" {
     defer agent.deinit();
 
     // Anchor on a reported usage just after an assistant reply (1 message).
-    try agent.context_manager.appendUnpersisted(try agent.makeTextMessage(.assistant, "a" ** 40));
-    agent.recordUsage(.{ .input_tokens = 1000, .output_tokens = 200, .total_tokens = 1200 });
+    try agent.context_manager.appendUnpersisted(try message_ops.makeTextMessage(&agent, .assistant, "a" ** 40));
+    compaction_ops.recordUsage(&agent, .{ .input_tokens = 1000, .output_tokens = 200, .total_tokens = 1200 });
     // A tool result appended afterwards (~40 bytes -> 10 estimated tokens).
-    try agent.context_manager.appendUnpersisted(try agent.makeToolMessage("b" ** 40));
+    try agent.context_manager.appendUnpersisted(try message_ops.makeToolMessage(&agent, "b" ** 40));
 
     // anchor total (1000 + 200) + trailing estimate (10) = 1210
-    try std.testing.expectEqual(@as(u32, 1210), agent.currentContextTokens());
+    try std.testing.expectEqual(@as(u32, 1210), compaction_ops.currentContextTokens(&agent));
 }
 
 test "context footprint includes wire tools before usage without counting them twice" {
@@ -1221,13 +957,13 @@ test "context footprint includes wire tools before usage without counting them t
     defer client.deinit();
     var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &client });
     defer agent.deinit();
-    try agent.context_manager.appendUnpersisted(try agent.makeTextMessage(.user, "hi"));
+    try agent.context_manager.appendUnpersisted(try message_ops.makeTextMessage(&agent, .user, "hi"));
     const tool_tokens = client.tools_json.len / 4 + @intFromBool(client.tools_json.len % 4 != 0);
-    try std.testing.expectEqual(@as(u32, @intCast(tool_tokens + 1)), agent.currentContextTokens());
-    agent.recordUsage(.{ .input_tokens = 68000, .output_tokens = 40, .total_tokens = 68040 });
-    try std.testing.expectEqual(@as(u32, 68040), agent.currentContextTokens());
+    try std.testing.expectEqual(@as(u32, @intCast(tool_tokens + 1)), compaction_ops.currentContextTokens(&agent));
+    compaction_ops.recordUsage(&agent, .{ .input_tokens = 68000, .output_tokens = 40, .total_tokens = 68040 });
+    try std.testing.expectEqual(@as(u32, 68040), compaction_ops.currentContextTokens(&agent));
     try client.updateTools(&.{});
-    try std.testing.expectEqual(@as(u32, @intCast(68040 - tool_tokens)), agent.currentContextTokens());
+    try std.testing.expectEqual(@as(u32, @intCast(68040 - tool_tokens)), compaction_ops.currentContextTokens(&agent));
 }
 
 const BudgetSeen = struct {
@@ -1926,7 +1662,7 @@ test "maybeCompact: disabled auto stays a no-op below the watermark" {
         .ctx = &noop,
         .on_event = NoopListener.onEvent,
     };
-    agent.maybeCompact(listener);
+    compaction_ops.maybeCompact(&agent, listener);
 
     // Compactor never left idle, no event emitted (noop listener would error
     // otherwise — there is nothing to assert beyond not panicking).
@@ -1939,7 +1675,7 @@ test "forceCompact: no compaction client returns NoCompactionClient without swap
     defer agent.deinit();
 
     // The very first guard: compaction_client == .none.
-    try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
+    try std.testing.expectError(error.NoCompactionClient, compaction_ops.forceCompact(&agent));
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
@@ -1953,7 +1689,7 @@ test "forceCompact: window guard fires before the writer guard" {
     // guard wins regardless of the other fields, so the function never reaches
     // the writer check — confirming the order matches the source.
     agent.context_window_tokens = 4096; // would pass the window guard
-    try std.testing.expectError(error.NoCompactionClient, agent.forceCompact());
+    try std.testing.expectError(error.NoCompactionClient, compaction_ops.forceCompact(&agent));
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
 }
 
@@ -1979,13 +1715,13 @@ test "requestManualCompact: guard order matches forceCompact" {
     defer agent.deinit();
 
     // The very first guard: compaction_client == .none.
-    try std.testing.expectError(error.NoCompactionClient, agent.requestManualCompact());
+    try std.testing.expectError(error.NoCompactionClient, compaction_ops.requestManualCompact(&agent));
     try std.testing.expect(!agent.compactor.manual_pending);
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
 
     // Window guard fires before the writer guard (same order as forceCompact).
     agent.context_window_tokens = 4096;
-    try std.testing.expectError(error.NoCompactionClient, agent.requestManualCompact());
+    try std.testing.expectError(error.NoCompactionClient, compaction_ops.requestManualCompact(&agent));
     try std.testing.expect(!agent.compactor.manual_pending);
 }
 
@@ -2016,13 +1752,13 @@ test "requestManualCompact: defers to a stale run instead of starting a second" 
     // A stale auto-run is in flight: request must defer, not spawn a second
     // thread or disturb the running state.
     agent.compactor.core.state.store(.running, .release);
-    try agent.requestManualCompact();
+    try compaction_ops.requestManualCompact(&agent);
     try std.testing.expect(agent.compactor.manual_pending);
     try std.testing.expect(!agent.compactor.manual_started);
     try std.testing.expect(agent.compactor.core.stateIs(.running));
 
     // A second request while pending is refused.
-    try std.testing.expectError(error.CompactionInProgress, agent.requestManualCompact());
+    try std.testing.expectError(error.CompactionInProgress, compaction_ops.requestManualCompact(&agent));
 }
 
 test "requestManualCompact starts a run; poll fails it against a dead server" {
@@ -2050,7 +1786,7 @@ test "requestManualCompact starts a run; poll fails it against a dead server" {
     agent.context_window_tokens = 4096;
     try fillSessionForCompaction(&agent, 10);
 
-    try agent.requestManualCompact();
+    try compaction_ops.requestManualCompact(&agent);
     try std.testing.expect(agent.compactor.manual_pending);
     try std.testing.expect(agent.compactor.manual_started);
     try std.testing.expect(agent.compactor.core.stateIs(.running));
@@ -2062,7 +1798,7 @@ test "requestManualCompact starts a run; poll fails it against a dead server" {
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expect(agent.compactor.core.stateIs(.failed));
-    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expectError(error.CompactionFailed, compaction_ops.pollManualCompact(&agent));
     try std.testing.expect(!agent.compactor.manual_pending);
     try std.testing.expect(!agent.compactor.manual_started);
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
@@ -2082,7 +1818,7 @@ test "pollManualCompact: returns null while the summarizer is running" {
     agent.compactor.manual_started = true;
     agent.compactor.core.state.store(.running, .release);
 
-    try std.testing.expect((try agent.pollManualCompact()) == null);
+    try std.testing.expect((try compaction_ops.pollManualCompact(&agent)) == null);
     try std.testing.expect(agent.compactor.manual_pending);
 }
 
@@ -2094,7 +1830,7 @@ test "pollManualCompact: torn-down client aborts and clears the pending flags" {
     agent.compactor.manual_started = true;
 
     // compaction_client stays .none — simulates a disconnect mid-compact.
-    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expectError(error.CompactionFailed, compaction_ops.pollManualCompact(&agent));
     try std.testing.expect(!agent.compactor.manual_pending);
     try std.testing.expect(!agent.compactor.manual_started);
 }
@@ -2132,7 +1868,7 @@ test "pollManualCompact: a failed summarizer surfaces CompactionFailed and clear
     }
     try std.testing.expect(agent.compactor.core.stateIs(.failed));
 
-    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expectError(error.CompactionFailed, compaction_ops.pollManualCompact(&agent));
     try std.testing.expect(!agent.compactor.manual_pending);
     try std.testing.expect(!agent.compactor.manual_started);
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
@@ -2175,7 +1911,7 @@ test "pollManualCompact: discards a stale background result before the manual ru
 
     // First poll: the stale result is discarded (TD-1) and the manual run
     // starts. Returns null — the manual run is now in flight.
-    try std.testing.expect((try agent.pollManualCompact()) == null);
+    try std.testing.expect((try compaction_ops.pollManualCompact(&agent)) == null);
     try std.testing.expect(agent.compactor.manual_started);
 
     // The manual run fails against the dead server; the poll surfaces it.
@@ -2184,7 +1920,7 @@ test "pollManualCompact: discards a stale background result before the manual ru
         std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expect(agent.compactor.core.stateIs(.failed));
-    try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+    try std.testing.expectError(error.CompactionFailed, compaction_ops.pollManualCompact(&agent));
     try std.testing.expect(!agent.compactor.manual_pending);
     try std.testing.expect(!agent.compactor.manual_started);
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
@@ -2222,7 +1958,7 @@ test "drain discards a ready summary and returns the compactor to idle" {
     };
     agent.compactor.core.state.store(.ready, .release);
 
-    agent.drainBackgroundCompaction();
+    compaction_ops.drainBackgroundCompaction(&agent);
 
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
     try std.testing.expect(agent.compactor.core.result == null);
@@ -2282,7 +2018,7 @@ test "drain and failed compaction preserve live and persisted context" {
         const history_before = agent.messages().len;
         const text_before = try gpa.dupe(u8, agent.messages()[0].text());
         defer gpa.free(text_before);
-        try agent.requestManualCompact();
+        try compaction_ops.requestManualCompact(&agent);
         var spins: u32 = 0;
         while (server.connection_count.load(.acquire) == 0 and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(2), .awake);
         try std.testing.expect(server.connection_count.load(.acquire) == 1);
@@ -2292,20 +2028,20 @@ test "drain and failed compaction preserve live and persisted context" {
             const started = std.Io.Timestamp.now(io, .awake);
             if (scenario == .stalled_error_body)
                 try std.testing.expectError(error.Canceled, agent.compactor.core.task.?.cancel(io));
-            agent.drainBackgroundCompaction();
+            compaction_ops.drainBackgroundCompaction(&agent);
             const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake));
             try std.testing.expect(elapsed.nanoseconds < 600 * std.time.ns_per_ms);
         } else {
             spins = 0;
             while (agent.compactor.core.stateIs(.running) and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(2), .awake);
             if (scenario == .success) {
-                try std.testing.expect((try agent.pollManualCompact()) != null);
+                try std.testing.expect((try compaction_ops.pollManualCompact(&agent)) != null);
             } else {
-                try std.testing.expectError(error.CompactionFailed, agent.pollManualCompact());
+                try std.testing.expectError(error.CompactionFailed, compaction_ops.pollManualCompact(&agent));
             }
         }
         // Repeated teardown is harmless, including manual-submit flags.
-        agent.drainBackgroundCompaction();
+        compaction_ops.drainBackgroundCompaction(&agent);
         try std.testing.expect(agent.compactor.core.stateIs(.idle));
         try std.testing.expect(agent.compactor.core.task == null);
         try std.testing.expect(agent.compactor.core.result == null);
@@ -2354,7 +2090,7 @@ test "drain joins a running summarizer that fails against a dead server" {
     }
     try std.testing.expect(agent.compactor.core.stateIs(.failed));
 
-    agent.drainBackgroundCompaction();
+    compaction_ops.drainBackgroundCompaction(&agent);
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
     try std.testing.expect(agent.compactor.core.task == null);
 }
@@ -2401,19 +2137,19 @@ test "compaction breaker trips after repeated failures and backs off automatical
     const listener: Listener = .{ .ctx = &seen, .on_event = Seen.onEvent };
 
     // Tripped: maybeCompact emits the one-shot breaker notice and backs off.
-    agent.maybeCompact(listener);
+    compaction_ops.maybeCompact(&agent, listener);
     try std.testing.expectEqual(@as(usize, 1), seen.notices.items.len);
     try std.testing.expectEqual(Agent.Event.CompactionNotice.breaker_tripped, seen.notices.items[0]);
     try std.testing.expect(agent.compactor.core.stateIs(.idle));
 
     // The notice is one-shot: a second call emits nothing new.
-    agent.maybeCompact(listener);
+    compaction_ops.maybeCompact(&agent, listener);
     try std.testing.expectEqual(@as(usize, 1), seen.notices.items.len);
 
     // Failure bookkeeping: each failed apply increments toward the limit.
     agent.compactor.failures = compaction_failure_limit - 1;
     agent.compactor.core.state.store(.failed, .release);
-    try agent.compactor.applyReadyCompaction(agent.compactionEnv(), listener);
+    try agent.compactor.applyReadyCompaction(compaction_ops.compactionEnv(&agent), listener);
     try std.testing.expectEqual(compaction_failure_limit, agent.compactor.failures);
 }
 
@@ -2457,7 +2193,7 @@ test "applyReadyCompaction resets the breaker on a successful swap" {
     const Listener = Agent.Listener(Seen);
     const listener: Listener = .{ .ctx = &seen, .on_event = Seen.onEvent };
 
-    try agent.compactor.applyReadyCompaction(agent.compactionEnv(), listener);
+    try agent.compactor.applyReadyCompaction(compaction_ops.compactionEnv(&agent), listener);
 
     // A successful swap proves the pipeline works: breaker cleared, notices
     // re-armed for a future episode.
@@ -2573,7 +2309,7 @@ test "skill context canceled result preserves call pairing without activating" {
         .name = try gpa.dupe(u8, "skill"),
         .arguments = try gpa.dupe(u8, "{\"name\":\"how\"}"),
     } };
-    try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+    try message_ops.takeMessage(&agent, .{ .assistant = .{ .content = blocks } });
     var results = [_]executor_mod.ToolResult{try executor_mod.ToolResult.init(gpa, .{
         .call_id = "canceled-call",
         .name = "skill",
@@ -2582,7 +2318,7 @@ test "skill context canceled result preserves call pairing without activating" {
         .display = .{ .label = try gpa.dupe(u8, "skill how") },
         .display_body = try gpa.dupe(u8, "Tool canceled"),
     })};
-    try agent.takeToolResults(&results);
+    try message_ops.takeToolResults(&agent, &results);
     try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
     try std.testing.expect(agent.messages()[1].tool.failed);
     try std.testing.expectEqualStrings("canceled-call", agent.messages()[1].tool.call_id.slice());
@@ -2609,7 +2345,7 @@ test "skill command results neither activate instructions nor become loaded noti
             .name = try gpa.dupe(u8, "skill"),
             .arguments = try gpa.dupe(u8, "{\"name\":\"how\",\"command\":\"python3 scripts/check.py\"}"),
         } };
-        try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+        try message_ops.takeMessage(&agent, .{ .assistant = .{ .content = blocks } });
         var results = [_]executor_mod.ToolResult{try executor_mod.ToolResult.init(gpa, .{
             .call_id = "script-call",
             .name = "skill",
@@ -2618,7 +2354,7 @@ test "skill command results neither activate instructions nor become loaded noti
             .display = .{ .label = try gpa.dupe(u8, "Run how skill") },
             .display_body = try gpa.dupe(u8, "Script result"),
         })};
-        try agent.takeToolResults(&results);
+        try message_ops.takeToolResults(&agent, &results);
         try std.testing.expectEqualStrings("Script result", agent.messages()[1].text());
         try std.testing.expectEqual(already_active, agent.skill_context.contains("how"));
         if (already_active) try std.testing.expectEqualStrings(fixture.body, agent.skill_context.body("how").?);

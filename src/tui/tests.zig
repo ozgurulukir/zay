@@ -3854,7 +3854,7 @@ test "assistant classification restores every typed answer and reasoning block" 
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "First answer") } };
     blocks[1] = .{ .reasoning = .{ .text = try gpa.dupe(u8, "Check") } };
     blocks[2] = .{ .text = .{ .text = try gpa.dupe(u8, "Final answer") } };
-    try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+    try agent_mod.takeMessage(&agent, .{ .assistant = .{ .content = blocks } });
     try app.rebuildTranscriptFromAgent();
     const messages = app.thread.transcript.messages.items;
     try std.testing.expectEqual(@as(usize, 3), messages.len);
@@ -3875,7 +3875,7 @@ test "resumed skill metadata stays in lane inventory, not transcript" {
     try agent.addUser("hello");
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "answer") } };
-    try agent.takeMessage(.{ .assistant = .{ .content = blocks } });
+    try agent_mod.takeMessage(&agent, .{ .assistant = .{ .content = blocks } });
     _ = try agent.skill_context.activate(gpa, "how", "durable instructions");
 
     try app.rebuildTranscriptFromAgent();
@@ -3898,7 +3898,7 @@ test "resumed tool messages keep the tool icon" {
 
     const blocks = try gpa.alloc(ai.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "done") } };
-    try agent.takeMessage(.{
+    try agent_mod.takeMessage(&agent, .{
         .tool = .{
             .content = blocks,
             .call_id = .{ .value = try gpa.dupe(u8, "test_call") },

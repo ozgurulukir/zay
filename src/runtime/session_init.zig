@@ -340,10 +340,10 @@ pub fn reloadMessages(self: *AgentRuntime) !void {
     if (self.agent.skill_context_dirty) return error.SkillContextNotPersisted;
     var projected = try self.session_writer.conversation(self.gpa);
     defer projected.deinit(self.gpa);
-    try self.agent.replaceConversation(&projected);
+    try agent_mod.replaceConversation(&self.agent, &projected);
     // The conversation is now a different branch; the usage anchor no
     // longer refers to these messages.
-    self.agent.resetContextUsage();
+    agent_mod.resetContextUsage(&self.agent);
 }
 
 test "runtime agent aliases the owned cwd, not the borrowed input" {

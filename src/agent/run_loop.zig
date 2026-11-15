@@ -20,6 +20,7 @@ const log = std.log.scoped(.agent);
 const assert = std.debug.assert;
 
 const agent_mod = @import("../agent.zig");
+const compaction_ops = @import("compaction_ops.zig");
 const ai = @import("../ai.zig");
 const context_assembly = @import("../context/assembly.zig");
 const stream_context_mod = @import("stream_context.zig");
@@ -130,7 +131,7 @@ pub fn run(self: *Agent, listener: anytype) !void {
 
         try self.persistSkillContext();
         try skill_ops.emitPendingInventory(self, L, l);
-        self.maybeCompact(l);
+        compaction_ops.maybeCompact(self, l);
         var stream_context: stream_context_mod.StreamContext(L) = .{
             .gpa = self.gpa,
             .listener = l,
@@ -235,7 +236,7 @@ pub fn run(self: *Agent, listener: anytype) !void {
         }
         // Anchor after the assistant reply is in history: `usage` accounts
         // for everything up to and including it; later appends are trailing.
-        self.recordUsage(usage);
+        compaction_ops.recordUsage(self, usage);
 
         // Turn finalization (issue #340): one pure policy read decides
         // what this turn becomes; every side effect below stays in the

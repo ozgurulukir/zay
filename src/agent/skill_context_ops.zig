@@ -151,10 +151,10 @@ test "skill context metadata enqueue failure retains admitted activation and ret
     try std.testing.expect(agent.skill_context_dirty);
     try std.testing.expectEqualStrings("admitted instructions", agent.skill_context.body("how").?);
     try std.testing.expectEqualStrings("admitted message", agent.messages()[0].text());
-    try std.testing.expectError(error.SkillContextNotPersisted, agent.reloadFromSession());
+    try std.testing.expectError(error.SkillContextNotPersisted, agent_mod.reloadFromSession(&agent));
     try persist(&agent);
     try std.testing.expect(!agent.skill_context_dirty);
-    try agent.reloadFromSession();
+    try agent_mod.reloadFromSession(&agent);
     try std.testing.expectEqualStrings("admitted instructions", agent.skill_context.body("how").?);
     try std.testing.expectEqualStrings("admitted message", agent.messages()[0].text());
 }
