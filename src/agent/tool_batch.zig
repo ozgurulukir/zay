@@ -104,7 +104,7 @@ pub fn runToolBatch(
     // marks every moved result undefined on success. Do not add an
     // errdefer over `results` here: listener errors arrive after the move
     // and would otherwise deinitialize already-moved fields.
-    try self.takeToolResults(results);
+    try agent_mod.takeToolResults(self, results);
     snapshotAfterBatch(self);
     try listener.emit(.tool_batch_finished);
     return end_turn;
