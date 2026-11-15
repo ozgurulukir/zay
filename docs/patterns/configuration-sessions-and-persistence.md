@@ -83,7 +83,7 @@ The picker must mirror a model switch into the session DB, not only `config.json
 
 ### Manual compaction trigger pattern
 
-`Agent.forceCompact()` is a synchronous public method that runs the full compaction cycle (snapshot → summarize → swap) and returns `!Event.HistoryCompacted` with token counts before/after. Unlike the automatic path (which runs between turns inside `agent.run()`), this is callable from the TUI command handler. The caller is responsible for turn-safety: check `app.thread.turn.isActive()` before calling. Errors are surfaced to the user via transcript notices rather than swallowed in logs.
+`compaction_ops.forceCompact(`Agent.forceCompact()` is a synchronous public method that runsagent)` (re-exported as `agent_mod.forceCompact`) is a synchronous free function that runs the full compaction cycle (snapshot → summarize → swap) and returns `!Event.HistoryCompacted` with token counts before/after. Unlike the automatic path (which runs between turns inside `agent.run()`), this is callable from the TUI command handler. The caller is responsible for turn-safety: check `app.thread.turn.isActive()` before calling. Errors are surfaced to the user via transcript notices rather than swallowed in logs.
 
 ### Config layering pattern
 
