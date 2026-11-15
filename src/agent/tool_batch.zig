@@ -144,18 +144,33 @@ pub fn emitToolCallFinished(
     stderr: ?[]const u8,
     failed: bool,
 ) !void {
+    var transferred = false;
     const owned_id = try self.gpa.dupe(u8, call_id);
+    errdefer if (!transferred) self.gpa.free(owned_id);
     const owned_name = try self.gpa.dupe(u8, name);
+    errdefer if (!transferred) self.gpa.free(owned_name);
     const owned_label = try self.gpa.dupe(u8, display_label);
+    errdefer if (!transferred) self.gpa.free(owned_label);
     const owned_expanded_label: ?[]u8 = if (display_expanded_label) |label|
         try self.gpa.dupe(u8, label)
     else
         null;
+    errdefer if (!transferred) {
+        if (owned_expanded_label) |label| self.gpa.free(label);
+    };
     const owned_body = try self.gpa.dupe(u8, display_body);
+    errdefer if (!transferred) self.gpa.free(owned_body);
     const owned_stderr: ?[]u8 = if (stderr) |s|
         try self.gpa.dupe(u8, s)
     else
         null;
+    errdefer if (!transferred) {
+        if (owned_stderr) |s| self.gpa.free(s);
+    };
+
+    // The listener takes ownership of the event and its owned fields; on error,
+    // postAgentEvent deinitializes the event. Disarm local cleanup before emit.
+    transferred = true;
     try listener.emit(.{
         .tool_call_finished = .{
             .index = tool_index,
@@ -417,4 +432,36 @@ test "snapshotAfterBatch: no session writer short-circuits silently" {
     // No panic, no error; the latch was untouched because the short-circuit
     // never reached the git-availability probe.
     try std.testing.expect(!agent.snapshotter.?.disabled);
+}
+
+test "emitToolCallFinished transfers ownership to listener and cleans up on error" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    const FailingListener = struct {
+        allocator: std.mem.Allocator,
+        fn emit(self: @This(), event: Agent.Event) !void {
+            var ev = event;
+            ev.deinit(self.allocator);
+            return error.SimulatedListenerFailure;
+        }
+    };
+    const listener: FailingListener = .{ .allocator = gpa };
+
+    const err = emitToolCallFinished(
+        FailingListener,
+        &agent,
+        listener,
+        0,
+        "call_123",
+        "bash",
+        "Run bash",
+        "bash: echo 1",
+        "stdout output",
+        .text,
+        "stderr output",
+        false,
+    );
+    try std.testing.expectError(error.SimulatedListenerFailure, err);
 }

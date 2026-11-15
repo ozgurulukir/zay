@@ -1071,6 +1071,24 @@ test "handleLengthCut with the knob off only emits the stopped event" {
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
 }
 
+test "ensureAssistantBeforeContinuation inserts placeholder when turn_owned is true" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try agent.addUser("user prompt");
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expect(agent.messages()[0].role() == .user);
+
+    try run_loop.ensureAssistantBeforeContinuation(&agent, true);
+    try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
+    try std.testing.expect(agent.messages()[1].role() == .assistant);
+    try std.testing.expect(std.mem.indexOf(u8, agent.messages()[1].text(), "Response truncated") != null);
+
+    try run_loop.ensureAssistantBeforeContinuation(&agent, false);
+    try std.testing.expectEqual(@as(usize, 2), agent.messages().len);
+}
+
 const mock_http_server = @import("ai/mock_http_server.zig");
 const MockHttpServer = mock_http_server.MockHttpServer;
 

@@ -669,11 +669,8 @@ pub const ExecutorService = struct {
     }
 
     fn produceViaRegistry(self: *ExecutorService, call: ai.ToolCall) tools.Error!tools.Output {
-        if (self.tool_registry) |r| {
-            const slice = try r.all(self.gpa);
-            return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments, &self.ctx);
-        }
-        return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments, &self.ctx);
+        const tool = self.lookupTool(call.name) orelse return tool_common.failFmt(self.gpa, 2, "unknown tool: {s}\n", .{call.name});
+        return tool.run(self.gpa, self.io, self.cwd, call.arguments, .{ .ctx = &self.ctx, .userdata = tool.userdata });
     }
 
     /// Validation error — the tool never ran; the model sent bad arguments.
@@ -740,7 +737,9 @@ pub const ExecutorService = struct {
 fn makeLargeResultPreview(gpa: std.mem.Allocator, source: []const u8, footer: []const u8, cap_bytes: u32) ![]u8 {
     const footer_block = try std.fmt.allocPrint(gpa, "\n\n{s}", .{footer});
     defer gpa.free(footer_block);
-    if (footer_block.len >= cap_bytes) return error.ResultFooterTooLarge;
+    if (footer_block.len >= cap_bytes) {
+        return tool_common.pruneToolText(gpa, source, cap_bytes);
+    }
 
     const excerpt_limit = cap_bytes - @as(u32, @intCast(footer_block.len));
     const excerpt = try tool_common.pruneToolText(gpa, source, excerpt_limit);
@@ -2407,4 +2406,77 @@ test "ExecutorService runErrorResult resolves custom display via tool_registry" 
 
     try std.testing.expect(result.failed);
     try std.testing.expectEqualStrings("Plugin Display Formatter", result.display_label);
+}
+
+test "makeLargeResultPreview bounds when cap_bytes is smaller than footer without failing" {
+    const gpa = std.testing.allocator;
+    const source = "This is a very long command output that exceeds caps.";
+    const footer = "This is a footer that is longer than the cap bytes limit";
+    const cap_bytes: u32 = 20;
+
+    const preview = try makeLargeResultPreview(gpa, source, footer, cap_bytes);
+    defer gpa.free(preview);
+
+    try std.testing.expect(preview.len <= cap_bytes);
+}
+
+test "ExecutorService produceViaRegistry dispatches via direct lookup without mutating registry scratch" {
+    const gpa = std.testing.allocator;
+
+    const fake_tool_fn = struct {
+        fn run(alloc: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: tool_common.Env) tools.Error!tools.Output {
+            return .{
+                .stdout = try alloc.dupe(u8, "fake success"),
+                .stderr = try alloc.dupe(u8, ""),
+                .code = 0,
+            };
+        }
+        fn display(alloc: std.mem.Allocator, _: []const u8, _: tool_common.Env) std.mem.Allocator.Error!tool_common.ToolDisplay {
+            return .{ .label = try alloc.dupe(u8, "fake") };
+        }
+    };
+
+    var reg = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const plugin_name = try gpa.dupe(u8, "test__fake_tool");
+    const plugin_desc = try gpa.dupe(u8, "Fake test tool");
+    try reg.addPluginTool(gpa, .{
+        .name = plugin_name,
+        .description = plugin_desc,
+        .schema = .{ .properties = &.{} },
+        .run = fake_tool_fn.run,
+        .display = fake_tool_fn.display,
+    });
+
+    // Populate scratch with a marker to verify produceViaRegistry does not mutate scratch
+    try reg.scratch.append(gpa, .{
+        .name = "marker",
+        .description = "marker",
+        .schema = .{ .properties = &.{} },
+        .run = fake_tool_fn.run,
+        .display = fake_tool_fn.display,
+    });
+    const scratch_len_before = reg.scratch.items.len;
+
+    var executor = ExecutorService.init(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .cwd = "/tmp",
+        .tool_registry = &reg,
+    });
+
+    const call = try makeCall(gpa, "call_test", "test__fake_tool", "{}");
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var output = try executor.produceViaRegistry(call);
+    defer output.deinit(gpa);
+
+    try std.testing.expectEqualStrings("fake success", output.stdout);
+    // Registry scratch must remain untouched by produceViaRegistry!
+    try std.testing.expectEqual(scratch_len_before, reg.scratch.items.len);
 }

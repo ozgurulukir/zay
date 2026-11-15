@@ -1328,8 +1328,11 @@ fn awaitLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     if (isPrimaryId(id)) return failResp(app.gpa, "lane: [0] is the primary driver lane — await is for spawned background worker lanes.\n", .{});
     const target = resolveLane(app, id) orelse return failUnknownWorkerLane(app, id);
     const now_ms = std.Io.Clock.now(.awake, app.io).toMilliseconds();
-    if (target.turn.state == .active and laneStalled(target, now_ms) and !target.stall_warned) {
+    const should_warn_stall = target.turn.state == .active and laneStalled(target, now_ms) and
+        (!target.stall_warned or (target.last_stall_warn_ms != 0 and now_ms - target.last_stall_warn_ms >= worker_stall_ms));
+    if (should_warn_stall) {
         target.stall_warned = true;
+        target.last_stall_warn_ms = now_ms;
         const silent_s: i64 = @max(0, @divTrunc(now_ms - target.last_activity_ms, std.time.ms_per_s));
         return resp(
             app.gpa,
@@ -2398,8 +2401,8 @@ test "lane await resolves a stalled worker once, then latches the stall warning"
     try std.testing.expect(stalled.stall_warned);
 
     // Re-awaiting while the same silent stretch continues must NOT resolve
-    // again every tick — it commits to waiting (the latch held until the
-    // worker emits again).
+    // again immediately on the next tick — it commits to waiting (the latch held
+    // until another stall window passes or the worker emits again).
     var req2 = lane_bridge.Request{ .op = .await, .lane = try gpa.dupe(u8, "stalled"), .requester = &agent };
     defer req2.deinit(gpa);
     const bridge = app.lane_bridge.?;
@@ -2409,6 +2412,13 @@ test "lane await resolves a stalled worker once, then latches the stall warning"
     serviceLaneBridge(&app);
     try std.testing.expect(bridge.pending == &req2); // back to blocking
     bridge.pending = null;
+
+    // After another full stall window passes without output, awaiting again surfaces an updated warning:
+    stalled.last_stall_warn_ms -= worker_stall_ms + 1000;
+    const result2 = postAndService(io, &app, &req2);
+    defer app.gpa.free(result2.text);
+    try std.testing.expectEqual(@as(u8, 0), result2.code);
+    try std.testing.expect(std.mem.indexOf(u8, result2.text, "may be stalled") != null);
 }
 
 test "lane read reports activity and does not acknowledge a running worker" {

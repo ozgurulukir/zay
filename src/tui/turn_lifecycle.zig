@@ -317,6 +317,7 @@ pub fn resetTurnState(app: *App, lane: *Thread) void {
     lane.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
     lane.turn_tool_calls = 0;
     lane.stall_warned = false;
+    lane.last_stall_warn_ms = 0;
 }
 
 /// The one turn-spawn sequence every starter shares: reset the turn
@@ -489,6 +490,7 @@ pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !
     // (progress resumed), and tally tool calls.
     lane.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
     lane.stall_warned = false;
+    lane.last_stall_warn_ms = 0;
     switch (event) {
         .tool_call_finished => lane.turn_tool_calls += 1,
         .skill_inventory_changed => |inventory| {
