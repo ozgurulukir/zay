@@ -824,6 +824,10 @@ test {
     // Agent text tool-call recovery seam (T3: collect/recover/inject window),
     // extracted from agent.zig; referenced explicitly so its inline tests run.
     _ = @import("agent/text_recovery.zig");
+    // Agent skill-context ops seam (dirty-flag lifecycle, persistence,
+    // inventory events, skill-result admission), extracted from agent.zig;
+    // referenced explicitly so its inline tests run.
+    _ = @import("agent/skill_context_ops.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");
