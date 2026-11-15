@@ -828,6 +828,13 @@ test {
     // inventory events, skill-result admission), extracted from agent.zig;
     // referenced explicitly so its inline tests run.
     _ = @import("agent/skill_context_ops.zig");
+    // Agent message ops seam (take/append/make message cluster + takeToolResults),
+    // extracted from agent.zig; referenced explicitly so its inline tests run.
+    _ = @import("agent/message_ops.zig");
+    // Agent compaction ops seam (Env callbacks, swap/watermark compaction,
+    // reload/replace conversation), extracted from agent.zig; referenced
+    // explicitly so its inline tests run.
+    _ = @import("agent/compaction_ops.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/database_backend.zig");
     _ = @import("config/plugin_tests.zig");

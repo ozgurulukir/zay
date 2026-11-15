@@ -79,11 +79,11 @@ The picker must mirror a model switch into the session DB, not only `config.json
 
 ### Typed callback pattern
 
-`agent.Listener(Ctx)` and `executor.ToolCallObserver(Ctx)` are generic over the consumer's context type. The `*anyopaque` + `@ptrCast` vtable is replaced by `*Ctx` + typed callback functions. `StreamContext(L)` and `ExecutorBridge(L)` are generic over the listener type. The only remaining `@ptrCast` **on the listener/observer seam** is `BashApproval` (1 site, deferred because making it generic would require `Agent` itself to be generic); the compaction `Env` still uses a separate `*anyopaque` callback table (`agent.zig`).
+`agent.Listener(Ctx)` and `executor.ToolCallObserver(Ctx)` are generic over the consumer's context type. The `*anyopaque` + `@ptrCast` vtable is replaced by `*Ctx` + typed callback functions. `StreamContext(L)` and `ExecutorBridge(L)` are generic over the listener type. The only remaining `@ptrCast` **on the listener/observer seam** is `BashApproval` (1 site, deferred because making it generic would require `Agent` itself to be generic); the compaction `Env` still uses a separate `*anyopaque` callback table (`agent/compaction_ops.zig`).
 
 ### Manual compaction trigger pattern
 
-`compaction_ops.forceCompact(`Agent.forceCompact()` is a synchronous public method that runsagent)` (re-exported as `agent_mod.forceCompact`) is a synchronous free function that runs the full compaction cycle (snapshot → summarize → swap) and returns `!Event.HistoryCompacted` with token counts before/after. Unlike the automatic path (which runs between turns inside `agent.run()`), this is callable from the TUI command handler. The caller is responsible for turn-safety: check `app.thread.turn.isActive()` before calling. Errors are surfaced to the user via transcript notices rather than swallowed in logs.
+`compaction_ops.forceCompact(agent)` (re-exported as `agent_mod.forceCompact`) is a synchronous free function that runs the full compaction cycle (snapshot → summarize → swap) and returns `!Event.HistoryCompacted` with token counts before/after. Unlike the automatic path (which runs between turns inside `agent.run()`), this is callable from the TUI command handler. The caller is responsible for turn-safety: check `app.thread.turn.isActive()` before calling. Errors are surfaced to the user via transcript notices rather than swallowed in logs.
 
 ### Config layering pattern
 

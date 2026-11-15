@@ -48,9 +48,6 @@ const Compactor = agent_compactor.Compactor;
 /// path backs off (emitting one notice); the manual `/compact` command is
 /// never gated (TD-6). Alias of the AutoCompactor's own limit — one SSOT.
 pub const compaction_failure_limit: u32 = auto_compactor_mod.failure_limit;
-/// Defensive bound for the manual-compaction completion poll: 1000 yields
-/// before giving up with `error.CompactionNotReady` (a state that never
-/// resolves, e.g. a torn-down client the poll failed to clear).
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
