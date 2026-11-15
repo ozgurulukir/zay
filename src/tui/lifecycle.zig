@@ -248,7 +248,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         const alpha = root.app.cached_config.tui.velocity_smoothing_alpha;
         root.app.metrics.telemetry.updateVelocity(now_ns, root.app.metrics.streamed_bytes / 4, alpha);
         if (root.app.liveRuntime()) |rt| {
-            root.app.metrics.context_tokens_used = rt.agent.currentContextTokens();
+            root.app.metrics.context_tokens_used = agent_mod.currentContextTokens(&rt.agent);
             root.app.metrics.context_tokens_max = rt.agent.context_window_tokens;
         }
     }

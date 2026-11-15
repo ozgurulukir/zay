@@ -43,6 +43,7 @@ const config_mod = @import("../config/config.zig");
 const provider_types = @import("../config/provider.zig");
 const modelsdev = @import("../models/registry.zig");
 const runtime_mod = @import("../runtime.zig");
+const agent_mod = @import("../agent.zig");
 const tools_mod = @import("../tools.zig");
 
 const AgentRuntime = runtime_mod.AgentRuntime;
@@ -549,7 +550,7 @@ fn attachClients(self: *AgentRuntime, plan: AttachPlan) !void {
     // `replaceClient` runs, or `main_client` would leak.
     replaceClient(self, main_client);
     self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
-    self.agent.resetContextUsage();
+    agent_mod.resetContextUsage(&self.agent);
 
     attach_compaction: {
         const compaction_config = attachSecondaryConfig(main_config, compaction.summarizer_system_prompt);
@@ -670,7 +671,7 @@ fn assembleToolSpecs(self: *AgentRuntime, gpa: std.mem.Allocator) anyerror![]ai.
 /// previous one. Connecting happens between turns, so no summarizer is in
 /// flight against the old client when it is freed.
 fn setCompactionClient(self: *AgentRuntime, next: OwnedClient) void {
-    self.agent.drainBackgroundCompaction();
+    agent_mod.drainBackgroundCompaction(&self.agent);
     if (self.owned_compaction_client) |old| old.deinit(self.gpa);
     self.owned_compaction_client = next;
     self.agent.compaction_client = next.languageModel();
@@ -679,7 +680,7 @@ fn setCompactionClient(self: *AgentRuntime, next: OwnedClient) void {
 /// Tear down the background-summarizer client (after draining any in-flight
 /// summary), disabling compaction until the next connect.
 fn clearCompactionClient(self: *AgentRuntime) void {
-    self.agent.drainBackgroundCompaction();
+    agent_mod.drainBackgroundCompaction(&self.agent);
     if (self.owned_compaction_client) |old| old.deinit(self.gpa);
     self.owned_compaction_client = null;
     self.agent.compaction_client = .none;

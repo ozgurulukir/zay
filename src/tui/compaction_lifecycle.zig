@@ -14,6 +14,7 @@
 const std = @import("std");
 
 const tui = @import("../tui.zig");
+const agent_mod = @import("../agent.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -42,7 +43,7 @@ pub fn manualCompactActive(app: *const App) bool {
     for (app.threads.slice()) |lane| {
         if (lane.manual_compact_waiting_row != null) return true;
         if (lane.agent) |agent| {
-            if (agent.manualCompactPending()) return true;
+            if (agent_mod.manualCompactPending(agent)) return true;
         }
     }
     return false;
@@ -61,7 +62,7 @@ pub fn requestManualCompact(app: *App) !bool {
         _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", "No active session — compaction unavailable");
         return false;
     };
-    agent.requestManualCompact() catch |err| {
+    agent_mod.requestManualCompact(agent) catch |err| {
         _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", compactErrorText(err));
         return false;
     };
@@ -82,7 +83,7 @@ pub fn requestManualCompact(app: *App) !bool {
 pub fn drainManualCompactions(app: *App) !bool {
     var visible_change = false;
     for (app.threads.slice()) |lane| {
-        const pending = if (lane.agent) |a| a.manualCompactPending() else false;
+        const pending = if (lane.agent) |a| agent_mod.manualCompactPending(a) else false;
         if (!pending and lane.manual_compact_waiting_row == null) continue;
 
         // The compact was aborted out-of-band (disconnect drained the compactor
@@ -95,7 +96,7 @@ pub fn drainManualCompactions(app: *App) !bool {
         }
 
         const agent = lane.agent.?;
-        const result = agent.pollManualCompact() catch |err| {
+        const result = agent_mod.pollManualCompact(agent) catch |err| {
             removeWaitingRow(lane, app.gpa);
             _ = try lane.transcript.append(app.gpa, .notice, "compaction", compactErrorText(err));
             visible_change = true;

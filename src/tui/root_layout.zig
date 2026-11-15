@@ -19,6 +19,7 @@ const telemetry = @import("telemetry.zig");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
+const agent_mod = @import("../agent.zig");
 const root_layout = @import("layout.zig");
 const lane_column = @import("lane_column.zig");
 const diff_viewer_overlay = @import("diff_viewer_overlay.zig");
@@ -60,7 +61,7 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
         else
             128000;
         const live_used: u32 = if (rt) |r|
-            r.agent.currentContextTokens()
+            agent_mod.currentContextTokens(&r.agent)
         else if (app.metrics.context_tokens_used > 0)
             app.metrics.context_tokens_used
         else
@@ -145,7 +146,7 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
     // running, a stop glyph while interrupting, a quiet dot when idle. A
     // manual /compact on this lane spins the same frame — the "lane is
     // busy" signal the model watches for.
-    const compacting = if (lane.agent) |agent| agent.manualCompactPending() else false;
+    const compacting = if (lane.agent) |agent| agent_mod.manualCompactPending(agent) else false;
     const state_glyph: []const u8 = if (compacting)
         tui_message.loading_frames[app.metrics.loading_frame % tui_message.loading_frames.len]
     else switch (lane.turn.state) {

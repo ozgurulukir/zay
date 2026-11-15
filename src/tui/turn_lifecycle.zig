@@ -195,7 +195,7 @@ pub fn beginSubmit(app: *App) !bool {
     // the context on the UI thread, so starting a turn now would race that
     // reload. Keep the input — the user can submit once the notice lands.
     if (app.thread.agent) |agent| {
-        if (agent.manualCompactPending()) {
+        if (agent_mod.manualCompactPending(agent)) {
             _ = try app.thread.transcript.append(app.gpa, .notice, "compaction", "Compaction in progress — wait for the summary before submitting.");
             return false;
         }
