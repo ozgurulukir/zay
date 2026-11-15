@@ -6,15 +6,25 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-11-15
+
 ### Changed
+- Agent/MCP decomposition (#367): Agent and McpClient spokes are extracted behind stable seams — workspace scoping (#381), per-turn continuation policy (`turn_budget.zig`) (#383), MCP discovery cache (#387), agent wire-stream context (#388), runtime connection/attach (#389), MCP stdio and HTTP wire families (`mcp/wire.zig`) (#391, #392), the tool-batch seam (#393), queue operations (#394), text tool-call recovery (#395), skill-context ops (#396), MCP client lifecycle (#397), MCP session protocol (#398), runtime session init and prompt refresh (#399), the agent run loop (#400), and message/compaction ops (#401).
 - Lua: route sandboxed-state teardown through `destroySandboxedState` (#360) and own the teardown path plus the budget API boundary (#356); rename `freeHookData` to `capFinalizerDeadline` to say what it does (#351).
 - Executor: own the ToolResult history move/free split (#359).
 - TUI: dedupe settings pending-state helpers into `settings_lifecycle` (#358); centralize the mode text-input activation predicate (#354); dedupe single-line form editors into `FormField` (#353).
-- Config: extract database backend vocabulary into a leaf module (#355).
+- Config: extract database backend vocabulary into a leaf module (#355); map `parse.zig`'s production/test regions with banners (#377) and put production code before tests (#382).
 - Tools: funnel plugin record release through `freePluginRecord` (#352).
+- Docs: resolve the App facade discussion — extraction over facade (#380).
 
 ### Fixed
+- MCP: stop-first disable transitions and replace-not-append rediscovery; re-arm the consumed refresh flag on dedup, defer retired-client teardown, unblock UI-tick re-discovery, and guard transport lifetime (#385, #386).
+- Storage: persisted state is safe to write and migrate (#375).
 - TUI: commit the settings text edit on Enter; `submitMode` now owns every Enter press (#357).
+
+### Tests
+- Cover the ten production files that had no inline tests (#378); fail the suite when a test-bearing file is unreachable from the root test walk (#376).
+- CI: enforce the docs verification gate; repair changelog and doc routing (#374).
 
 ## [0.11.10] - 2026-11-08
 
@@ -152,7 +162,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.10...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.11...HEAD
+[0.11.11]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.11
 [0.11.10]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.10
 [0.11.9]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.9
 [0.11.8]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.8
