@@ -136,6 +136,7 @@ completion_delivered: bool = false,
 last_activity_ms: i64 = 0,
 turn_tool_calls: u32 = 0,
 stall_warned: bool = false,
+last_stall_warn_ms: i64 = 0,
 /// Why the lane's last turn failed (the `turn_failed` notice text), or null
 /// when the turn finished cleanly. Owned. Set by `applyAgentEvent`, read by
 /// spawned-worker completion delivery so a failed worker is reported to its

@@ -29,6 +29,7 @@ const queue_ops = @import("queue_ops.zig");
 const skill_ops = @import("skill_context_ops.zig");
 const text_recovery = @import("text_recovery.zig");
 const tool_batch = @import("tool_batch.zig");
+const message_ops = @import("message_ops.zig");
 
 const Agent = agent_mod.Agent;
 
@@ -296,9 +297,15 @@ pub fn run(self: *Agent, listener: anytype) !void {
             .length_cut_pending => {
                 // A provider output-token cap severed the response before the
                 // tool_call section (observed: prose announcing an action,
-                // then a clean close). The partial prose is already in
-                // history (`takeAssistantMessage` ran above), so the wire
+                // then a clean close). If the partial prose is already in
+                // history (`takeAssistantMessage` ran above), the wire
                 // shape for the continuation stays [.., assistant, user-hint].
+                // If there was no wire content (e.g. reasoning-only tokens cut
+                // before prose), inject an assistant placeholder so the wire
+                // shape remains valid.
+                if (self.turn_budget.auto_continue_on_length_cut and !length_continued) {
+                    try ensureAssistantBeforeContinuation(self, turn_owned);
+                }
                 if (try handleLengthCut(self, l, length_continued)) {
                     length_continued = true;
                     continue;
@@ -432,4 +439,10 @@ fn takeAssistantMessage(self: *Agent, assistant: *ai.ChatMessage) !void {
     assert(assistant.* == .assistant);
     try self.context_manager.appendPersisted(assistant.*);
     assistant.* = undefined;
+}
+
+pub fn ensureAssistantBeforeContinuation(self: *Agent, turn_owned: bool) !void {
+    if (turn_owned) {
+        try message_ops.appendMessage(self, .assistant, "[Response truncated before text was emitted]");
+    }
 }
