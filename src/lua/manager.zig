@@ -16,7 +16,6 @@ const sandbox = @import("sandbox.zig");
 const plugin_api = @import("plugin_api.zig");
 const events = @import("events.zig");
 const execution = @import("execution.zig");
-const bridge = @import("bridge.zig");
 const tool_snapshot = @import("tool_snapshot.zig");
 const Manifest = @import("manifest.zig").Manifest;
 const plugin_config = @import("../config/plugin.zig");
@@ -72,17 +71,19 @@ pub const PluginInstance = struct {
     const Self = @This();
 
     /// The guard lives outside pcall, so Lua longjmp cannot skip its unlock.
-    fn lockExecution(self: *Self, io: std.Io, wait_ms: u32) !void {
+    /// `cancel` is the dispatch window's cancellation flag (null outside a
+    /// batch window: state save/restore never cancel-waits).
+    fn lockExecution(self: *Self, io: std.Io, wait_ms: u32, cancel: ?*const std.atomic.Value(bool)) !void {
         const deadline = std.Io.Timestamp.now(io, .awake).nanoseconds + @as(i96, wait_ms) * std.time.ns_per_ms;
         while (true) {
             try io.checkCancel();
-            if (bridge.cancel_requested_slot) |flag| if (flag.load(.acquire)) return error.Canceled;
+            if (cancel) |flag| if (flag.load(.acquire)) return error.Canceled;
             if (self.execution_mutex.tryLock()) {
                 io.checkCancel() catch |err| {
                     self.execution_mutex.unlock(io);
                     return err;
                 };
-                if (bridge.cancel_requested_slot) |flag| {
+                if (cancel) |flag| {
                     if (flag.load(.acquire)) {
                         self.execution_mutex.unlock(io);
                         return error.Canceled;
@@ -432,19 +433,29 @@ pub const PluginManager = struct {
 
     /// Dispatch a tool call to a loaded plugin by name.
     /// `params_json` is forwarded to the Lua handler as a JSON string.
+    /// `ctx` arms the dispatch window's executor-owned values (cwd,
+    /// cancellation flag, classifier URL) for the Lua bridges; the zero
+    /// context keeps the degraded fallbacks.
     /// Returns the handler's owned text and status.
     pub fn callTool(
         self: *Self,
         plugin_name: []const u8,
         tool_name: []const u8,
         params_json: []const u8,
+        ctx: execution.DispatchCtx,
     ) !plugin_api.ToolHandlerResult {
         try self.beginUse();
         defer self.endUse();
         const plugin = self.plugins.get(plugin_name) orelse return error.PluginNotFound;
         if (!plugin.active) return error.PluginDisabled;
-        try plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms);
+        try plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms, ctx.cancel);
         defer plugin.execution_mutex.unlock(self.io);
+        execution.setDispatchCtx(plugin.state.handle, ctx);
+        // Bound the dispatch window: unlike the threadlocal slots this
+        // replaced, Budget.ctx persists on the state — leaving it armed
+        // would let save/restore and other outside-window pcalls silently
+        // inherit a stale cwd/classifier/cancel flag.
+        defer execution.setDispatchCtx(plugin.state.handle, .{});
         const top = c.lua_gettop(plugin.state.handle);
         defer c.lua_settop(plugin.state.handle, top);
         for (plugin.tool_snapshots) |snapshot| {
@@ -456,7 +467,7 @@ pub const PluginManager = struct {
                         return error.Canceled;
                     }
                 }
-                if (bridge.cancel_requested_slot) |flag| {
+                if (ctx.cancel) |flag| {
                     if (flag.load(.acquire)) {
                         result.deinit(self.allocator);
                         return error.Canceled;
@@ -484,9 +495,11 @@ pub const PluginManager = struct {
     /// every stored callback ref with the event payload as a Lua table.
     ///
     /// Errors in individual callbacks are logged and do not stop delivery to
-    /// other plugins. Called at tool boundaries on the emitting worker; each
-    /// state is exclusively held, even when another lane is in a handler.
-    pub fn emitEvent(self: *Self, event: events.Event) void {
+    /// other plugins. `ctx` arms the dispatch window's executor-owned values
+    /// for the Lua bridges (see `callTool`). Called at tool boundaries on the
+    /// emitting worker; each state is exclusively held, even when another
+    /// lane is in a handler.
+    pub fn emitEvent(self: *Self, event: events.Event, ctx: execution.DispatchCtx) void {
         self.beginUse() catch return;
         defer self.endUse();
         const event_name = event.name();
@@ -497,12 +510,14 @@ pub const PluginManager = struct {
             if (!plugin.active or !events.subscribed(&plugin.event_subscriptions, event)) continue;
             const remaining = @max(0, deadline - std.Io.Timestamp.now(self.io, .awake).nanoseconds);
             const remaining_ms: u32 = @intCast(@divFloor(remaining, std.time.ns_per_ms));
-            plugin.lockExecution(self.io, remaining_ms) catch |err| {
+            plugin.lockExecution(self.io, remaining_ms, ctx.cancel) catch |err| {
                 if (err == error.Canceled) return;
                 log.warn("plugin.event.skipped plugin={s} event={s} err={s}", .{ plugin.manifest.name, event_name, @errorName(err) });
                 continue;
             };
             defer plugin.execution_mutex.unlock(self.io);
+            execution.setDispatchCtx(plugin.state.handle, ctx);
+            defer execution.setDispatchCtx(plugin.state.handle, .{});
             const top = c.lua_gettop(plugin.state.handle);
             defer c.lua_settop(plugin.state.handle, top);
             sandbox.resetInstructionBudget(plugin.state.handle);
@@ -834,7 +849,7 @@ pub const PluginManager = struct {
 
     /// Save plugin state by calling get_state() in the plugin.
     fn savePluginState(self: *Self, plugin: *PluginInstance) ?[]u8 {
-        plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms) catch return null;
+        plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms, null) catch return null;
         defer plugin.execution_mutex.unlock(self.io);
         const top = c.lua_gettop(plugin.state.handle);
         defer c.lua_settop(plugin.state.handle, top);
@@ -857,7 +872,7 @@ pub const PluginManager = struct {
 
     /// Restore plugin state by calling set_state(state) in the plugin.
     fn restorePluginState(self: *Self, plugin: *PluginInstance, state: []const u8) void {
-        plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms) catch return;
+        plugin.lockExecution(self.io, self.execution_policy.tool_wait_ms, null) catch return;
         defer plugin.execution_mutex.unlock(self.io);
         const top = c.lua_gettop(plugin.state.handle);
         defer c.lua_settop(plugin.state.handle, top);
@@ -1126,7 +1141,7 @@ test "plugin manager: settings reach init.lua and tool handlers via get_config (
     c.lua_pop(instance.state.handle, 1);
 
     // And the per-call read inside a tool handler returns the same value.
-    var out = try manager.callTool("cfg_plugin", "theme_tool", "{}");
+    var out = try manager.callTool("cfg_plugin", "theme_tool", "{}", .{});
     defer out.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), out.code);
     try testing.expectEqualStrings("dark", out.text);
@@ -1167,26 +1182,26 @@ test "plugin manager: handler result contract preserves status and stack balance
     const instance = try manager.loadOne(plugin_dir, false);
     const stack_depth = c.lua_gettop(instance.state.handle);
 
-    var success = try manager.callTool("result_plugin", "success", "{}");
+    var success = try manager.callTool("result_plugin", "success", "{}", .{});
     defer success.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), success.code);
     try testing.expectEqualStrings("Error: this is valid output text", success.text);
     try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
 
-    var failure = try manager.callTool("result_plugin", "failure", "{}");
+    var failure = try manager.callTool("result_plugin", "failure", "{}", .{});
     defer failure.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), failure.code);
     try testing.expectEqualStrings("diagnostic from handler", failure.text);
     try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
 
-    var exception = try manager.callTool("result_plugin", "exception", "{}");
+    var exception = try manager.callTool("result_plugin", "exception", "{}", .{});
     defer exception.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), exception.code);
     try testing.expect(std.mem.startsWith(u8, exception.text, "Lua tool error:"));
     try testing.expect(std.mem.indexOf(u8, exception.text, "boom") != null);
     try testing.expectEqual(stack_depth, c.lua_gettop(instance.state.handle));
 
-    var malformed = try manager.callTool("result_plugin", "malformed", "{}");
+    var malformed = try manager.callTool("result_plugin", "malformed", "{}", .{});
     defer malformed.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), malformed.code);
     try testing.expectEqualStrings(
@@ -1306,7 +1321,7 @@ test "plugin manager: emitEvent delivers to plugin callbacks" {
     // Emit a tool_call_started event; the callback should record the name.
     manager.emitEvent(.{
         .tool_call_started = .{ .name = "bash", .call_id = "call-1" },
-    });
+    }, .{});
 
     // Read back the global the callback set.
     _ = c.lua_getglobal(instance.state.handle, "received_tool");
@@ -1329,12 +1344,12 @@ test "plugin manager: file-watcher counts a real failed/successful completion ev
     try testing.expect(instance.active);
     manager.emitEvent(.{
         .tool_call_finished = .{ .name = "lua__file-tools__write", .call_id = "call-ok", .success = true },
-    });
+    }, .{});
     manager.emitEvent(.{
         .tool_call_finished = .{ .name = "lua__file-tools__write", .call_id = "call-failed", .success = false },
-    });
+    }, .{});
 
-    var result = try manager.callTool("file-watcher", "file_stats", "{}");
+    var result = try manager.callTool("file-watcher", "file_stats", "{}", .{});
     defer result.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), result.code);
     try testing.expect(std.mem.indexOf(u8, result.text, "write=1") != null);

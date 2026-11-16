@@ -31,6 +31,7 @@ const c = @import("c");
 const os = @import("../os.zig");
 const State = @import("state.zig").State;
 const bridge = @import("bridge.zig");
+const execution = @import("execution.zig");
 const bash_exec = @import("../tools/bash_exec.zig");
 const pwsh_exec = @import("../tools/pwsh_exec.zig");
 const bash_safety = @import("../tools/bash_safety.zig");
@@ -1526,7 +1527,7 @@ test "RunOptions.stdin bypasses shell interpretation" {
 
 test "searchFiles clamps a negative max_results without panicking" {
     const sandbox = @import("sandbox.zig");
-    // Hermetic root: without a plugin_cwd_slot the search would walk the
+    // Hermetic root: without a dispatch cwd the search would walk the
     // whole process CWD (the repo during suite runs) and the wall-clock
     // budget could expire under load before the clamp path is exercised.
     var tmp = std.testing.tmpDir(.{});
@@ -1534,11 +1535,13 @@ test "searchFiles clamps a negative max_results without panicking" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "needle here\nplain line\n" });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    const prev_cwd_slot = bridge.plugin_cwd_slot;
-    bridge.plugin_cwd_slot = root_buf[0..root_len];
-    defer bridge.plugin_cwd_slot = prev_cwd_slot;
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
+    // Hermetic root: with the default (process-cwd) context the search
+    // would walk the whole process CWD (the repo during suite runs) and
+    // the wall-clock budget could expire under load before the clamp path
+    // is exercised.
+    execution.setDispatchCtx(L.handle, .{ .cwd = root_buf[0..root_len] });
     // A negative max_results used to be `@intCast(v)` on the raw i64 — a cast
     // panic in safe builds. It must now clamp to 1 and return a normal result.
     try expectLuaOk(&L,
@@ -1555,11 +1558,13 @@ test "findFiles clamps a negative max_results without panicking" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "needle here\n" });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    const prev_cwd_slot = bridge.plugin_cwd_slot;
-    bridge.plugin_cwd_slot = root_buf[0..root_len];
-    defer bridge.plugin_cwd_slot = prev_cwd_slot;
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
+    // Hermetic root: with the default (process-cwd) context the search
+    // would walk the whole process CWD (the repo during suite runs) and
+    // the wall-clock budget could expire under load before the clamp path
+    // is exercised.
+    execution.setDispatchCtx(L.handle, .{ .cwd = root_buf[0..root_len] });
     try expectLuaOk(&L,
         \\local r = zay.find_files(".", "no-such-glob-xyz", { max_results = -1 })
         \\assert(type(r) == "table", "clamped find returns a table")
@@ -1606,7 +1611,8 @@ test "runBash blocks unsafe commands via the local matcher (P5)" {
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
-    bridge.bash_classifier_url_slot = null;
+    // A fresh dispatch context carries a null classifier_url, matching the
+    // old unset slot: the always-armed local matcher handles the gate.
     try expectLuaOk(&L,
         \\local r, err = zay.run_bash("rm -rf /")
         \\assert(r == nil, "unsafe command returns nil")
@@ -1624,9 +1630,7 @@ test "runBash safety gate holds with a configured-but-unreachable classifier (P5
     const sandbox = @import("sandbox.zig");
     var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
-    const prev = bridge.bash_classifier_url_slot;
-    defer bridge.bash_classifier_url_slot = prev;
-    bridge.bash_classifier_url_slot = "http://127.0.0.1:1/classify";
+    execution.setDispatchCtx(L.handle, .{ .classifier_url = "http://127.0.0.1:1/classify" });
     if (os.is_windows) return error.SkipZigTest;
 
     try expectLuaOk(&L,
@@ -1772,7 +1776,7 @@ test "sanitizePath rejects a symlink escaping the project root" {
     // Reading through the symlink must be rejected.
     const target = try std.fs.path.join(gpa, &.{ link_path, "zay_symlink_marker" });
     defer gpa.free(target);
-    try std.testing.expectError(error.PathTraversal, sanitizePath(io, target));
+    try std.testing.expectError(error.PathTraversal, sanitizePath(io, target, null));
 }
 
 test "sanitizePath allows a nonexistent new-file path (realpath-failure fallback)" {
@@ -1790,7 +1794,7 @@ test "sanitizePath allows a nonexistent new-file path (realpath-failure fallback
     defer gpa.free(new_file);
 
     // The file does not exist yet; realpath fails and the lexical verdict holds.
-    const resolved = try sanitizePath(io, new_file);
+    const resolved = try sanitizePath(io, new_file, null);
     defer std.heap.page_allocator.free(resolved);
     try std.testing.expect(std.mem.endsWith(u8, resolved, "brand-new.txt"));
 }
@@ -1854,8 +1858,7 @@ test "git bridges return strings inside a repo (S4 success path)" {
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer sandbox.destroySandboxedState(&L);
 
-    bridge.plugin_cwd_slot = abs_test_dir;
-    defer bridge.plugin_cwd_slot = null;
+    execution.setDispatchCtx(L.handle, .{ .cwd = abs_test_dir });
 
     try expectLuaOk(&L,
         \\local s = zay.git_status()
@@ -1919,7 +1922,7 @@ test "plugin_api: deletePath removes regular file, empty dir, and recursive tree
     );
 }
 
-test "plugin_api: sanitizePath respects bridge.plugin_cwd_slot" {
+test "plugin_api: sanitizePath honors the dispatch context cwd" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
@@ -1931,12 +1934,7 @@ test "plugin_api: sanitizePath respects bridge.plugin_cwd_slot" {
     const abs_worktree = try std.fs.path.resolve(gpa, &.{fake_worktree});
     defer gpa.free(abs_worktree);
 
-    bridge.plugin_cwd_slot = abs_worktree;
-    defer {
-        bridge.plugin_cwd_slot = null;
-    }
-
-    const sanitized = try sanitizePath(io, "file.txt");
+    const sanitized = try sanitizePath(io, "file.txt", abs_worktree);
     defer std.heap.page_allocator.free(sanitized);
 
     try std.testing.expect(std.mem.startsWith(u8, sanitized, abs_worktree));
@@ -1962,7 +1960,7 @@ test "plugin_api: findGitRoot finds directory .git and file .git worktree" {
     const abs_dir_nested = try std.fs.path.resolve(gpa, &.{ root, dir_repo ++ "/src/nested" });
     defer gpa.free(abs_dir_nested);
 
-    const root1 = try findGitRoot(io, abs_dir_nested);
+    const root1 = try findGitRoot(io, abs_dir_nested, null);
     defer std.heap.page_allocator.free(root1);
 
     const abs_dir_repo = try std.fs.path.resolve(gpa, &.{ root, dir_repo });
@@ -1978,7 +1976,7 @@ test "plugin_api: findGitRoot finds directory .git and file .git worktree" {
     const abs_file_nested = try std.fs.path.resolve(gpa, &.{ root, file_repo ++ "/src/nested" });
     defer gpa.free(abs_file_nested);
 
-    const root2 = try findGitRoot(io, abs_file_nested);
+    const root2 = try findGitRoot(io, abs_file_nested, null);
     defer std.heap.page_allocator.free(root2);
 
     const abs_file_repo = try std.fs.path.resolve(gpa, &.{ root, file_repo });
@@ -1986,7 +1984,7 @@ test "plugin_api: findGitRoot finds directory .git and file .git worktree" {
     try std.testing.expectEqualStrings(abs_file_repo, root2);
 }
 
-test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
+test "plugin_api: get_cwd and get_project_root honor the dispatch context cwd" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
@@ -2012,8 +2010,7 @@ test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer sandbox.destroySandboxedState(&L);
 
-    bridge.plugin_cwd_slot = abs_nested;
-    defer bridge.plugin_cwd_slot = null;
+    execution.setDispatchCtx(L.handle, .{ .cwd = abs_nested });
 
     try expectLuaOk(&L,
         \\local cwd = zay.get_cwd()
@@ -2024,7 +2021,7 @@ test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
     );
 }
 
-test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
+test "plugin_api: git read bridges run in the dispatch context cwd" {
     if (!gitAvailable()) return;
 
     const io = std.testing.io;
@@ -2044,8 +2041,7 @@ test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
     var L = try sandbox.createSandboxedStateWithIo(.{}, io);
     defer sandbox.destroySandboxedState(&L);
 
-    bridge.plugin_cwd_slot = abs_test_dir;
-    defer bridge.plugin_cwd_slot = null;
+    execution.setDispatchCtx(L.handle, .{ .cwd = abs_test_dir });
 
     try expectLuaOk(&L,
         \\local branch = zay.git_branch()

@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("c");
 const State = @import("../state.zig").State;
 const bridge = @import("../bridge.zig");
+const execution = @import("../execution.zig");
 const shell_bridge = @import("shell.zig");
 const fs_bridge = @import("fs.zig");
 
@@ -60,7 +61,7 @@ pub fn searchFiles(L: ?*c.lua_State) callconv(.c) c_int {
         if (bridge.getTableInteger(&state, 3, "max_results")) |v| max_results = @intCast(std.math.clamp(v, 1, max_search_results));
     }
 
-    const clean_root = sanitizePath(io, root) catch |err| {
+    const clean_root = sanitizePath(io, root, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -119,7 +120,7 @@ pub fn findFiles(L: ?*c.lua_State) callconv(.c) c_int {
         }
     }
 
-    const clean_root = sanitizePath(io, root) catch |err| {
+    const clean_root = sanitizePath(io, root, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;

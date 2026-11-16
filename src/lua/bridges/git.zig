@@ -71,15 +71,17 @@ pub fn gitErrorString(stderr: []const u8, code: u32) []const u8 {
 
 pub threadlocal var git_err_buf: [64]u8 = undefined;
 
-/// Find git repository root by walking up from `cwd`.
-pub fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
+/// Find git repository root by walking up from `cwd`. When `cwd` is relative
+/// it resolves against `ctx_cwd` (the dispatch context's cwd; null falls back
+/// to the process cwd).
+pub fn findGitRoot(io: std.Io, cwd: []const u8, ctx_cwd: ?[]const u8) ![]u8 {
     var abs_cwd_buf: ?[]u8 = null;
     defer if (abs_cwd_buf) |b| std.heap.page_allocator.free(b);
 
     const abs_cwd = if (std.fs.path.isAbsolute(cwd))
         cwd
     else blk: {
-        var resolved_cwd = bridge.resolvePluginCwd(io) orelse return error.OutOfMemory;
+        var resolved_cwd = bridge.resolvePluginCwd(io, ctx_cwd) orelse return error.OutOfMemory;
         defer resolved_cwd.deinit();
         abs_cwd_buf = try std.fs.path.resolve(std.heap.page_allocator, &.{ resolved_cwd.path, cwd });
         break :blk abs_cwd_buf.?;
@@ -125,7 +127,7 @@ pub fn gitStatus(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -158,7 +160,7 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     const io = getIo(L_ptr);
 
     const path = bridge.pullValue(&state, []const u8, 1);
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -215,7 +217,7 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     var n: u32 = 10;
     if (bridge.pullValue(&state, i64, 1)) |v| n = @intCast(@max(v, 1));
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -254,7 +256,7 @@ pub fn gitBranch(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -294,7 +296,7 @@ pub fn gitAdd(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     }
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -389,7 +391,7 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -555,7 +557,7 @@ fn runGitCommand(L: *c.lua_State, io: std.Io, cwd: []const u8, command: []const 
         .cwd = cwd,
         .command = command,
         .stdin = stdin,
-        .cancel_requested = bridge.cancel_requested_slot,
+        .cancel_requested = execution.dispatchCtx(L).cancel,
         .timeout = execution.ioTimeout(L, bash_exec.timeout_seconds_default),
     }) catch |err| {
         execution.noteError(L, err);
