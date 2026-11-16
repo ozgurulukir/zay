@@ -187,7 +187,7 @@ pub const settings_registry_key = "zay_plugin_settings";
 /// embedded plugins and the Lua test runner.
 fn registerPluginTable(L: *c.lua_State) void {
     c.lua_newtable(L);
-    c.lua_pushcfunction(L, plugin_api.pluginGetConfig);
+    execution.pushGuardedFunction(L, plugin_api.pluginGetConfig);
     _ = c.lua_setfield(L, -2, "get_config");
     c.lua_setglobal(L, "plugin");
 }
@@ -296,9 +296,9 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
             c.lua_setfield(L, os_index, "execute");
         }
         if (permissions.allow_os_remove) {
-            c.lua_pushcfunction(L, plugin_api.deletePath);
+            execution.pushGuardedFunction(L, plugin_api.deletePath);
             c.lua_setfield(L, os_index, "remove");
-            c.lua_pushcfunction(L, plugin_api.movePath);
+            execution.pushGuardedFunction(L, plugin_api.movePath);
             c.lua_setfield(L, os_index, "rename");
         }
     }

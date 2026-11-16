@@ -69,19 +69,26 @@ pub fn sanitizePath(io: std.Io, path: []const u8, ctx_cwd: ?[]const u8) ![]u8 {
     if (resolved.len > cwd.len and resolved[cwd.len] != std.fs.path.sep) return error.PathTraversal;
 
     if (!os.is_windows) {
-        const resolved_z = std.heap.page_allocator.dupeZ(u8, resolved) catch return resolved;
-        defer std.heap.page_allocator.free(resolved_z);
-        var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const real_ptr = std.c.realpath(resolved_z.ptr, &real_buf);
-        if (real_ptr) |rp| {
-            const real = std.mem.span(rp);
-            const cwd_z = std.heap.page_allocator.dupeZ(u8, cwd) catch return resolved;
-            defer std.heap.page_allocator.free(cwd_z);
-            var real_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const rcwd_ptr = std.c.realpath(cwd_z.ptr, &real_cwd_buf);
-            const real_cwd = if (rcwd_ptr) |rcp| std.mem.span(rcp) else cwd;
-            if (!std.mem.startsWith(u8, real, real_cwd)) return error.PathTraversal;
-            if (real.len > real_cwd.len and real[real_cwd.len] != std.fs.path.sep) return error.PathTraversal;
+        const cwd_z = std.heap.page_allocator.dupeZ(u8, cwd) catch return resolved;
+        defer std.heap.page_allocator.free(cwd_z);
+        var real_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const rcwd_ptr = std.c.realpath(cwd_z.ptr, &real_cwd_buf);
+        const real_cwd = if (rcwd_ptr) |rcp| std.mem.span(rcp) else cwd;
+
+        // Walk up to the deepest existing ancestor so a symlink escaping the
+        // workspace cannot be bypassed by targeting a nonexistent leaf (#415).
+        var probe: []const u8 = resolved;
+        while (true) {
+            const probe_z = std.heap.page_allocator.dupeZ(u8, probe) catch return resolved;
+            defer std.heap.page_allocator.free(probe_z);
+            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.c.realpath(probe_z.ptr, &real_buf)) |rp| {
+                const real = std.mem.span(rp);
+                if (!std.mem.startsWith(u8, real, real_cwd)) return error.PathTraversal;
+                if (real.len > real_cwd.len and real[real_cwd.len] != std.fs.path.sep) return error.PathTraversal;
+                break;
+            }
+            probe = std.fs.path.dirname(probe) orelse return error.PathTraversal;
         }
     }
 
@@ -205,7 +212,7 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
     if (state.getTop() >= 2 and state.isTable(2)) {
         if (bridge.getTableString(&state, 2, "cwd")) |v| cwd = v;
         if (bridge.getTableString(&state, 2, "stdin")) |v| stdin_bytes = v;
-        if (bridge.getTableInteger(&state, 2, "timeout")) |v| timeout_seconds = @min(@max(@as(u32, @intCast(@max(v, 1))), 1), bash_exec.timeout_seconds_max);
+        if (bridge.getTableInteger(&state, 2, "timeout")) |v| timeout_seconds = @intCast(std.math.clamp(v, 1, @as(i64, bash_exec.timeout_seconds_max)));
     }
 
     const ctx_cwd = execution.dispatchCtx(L_ptr).cwd;
@@ -347,4 +354,33 @@ test "shellBackendErrorMessage maps only FileNotFound" {
     try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .pwsh), "ShellUnavailable: pwsh not found") != null);
     try std.testing.expectEqualStrings("Timeout", shellBackendErrorMessage(error.Timeout, .bash));
     try std.testing.expectEqualStrings("StreamTooLong", shellBackendErrorMessage(error.StreamTooLong, .pwsh));
+}
+
+test "sanitizePath rejects escaping symlink even when leaf does not exist (#415)" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_rel = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(base_rel);
+    const cwd_root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_root);
+    const base_abs = try std.fs.path.join(gpa, &.{ cwd_root, base_rel });
+    defer gpa.free(base_abs);
+
+    const workspace = try std.fs.path.join(gpa, &.{ base_abs, "ws" });
+    defer gpa.free(workspace);
+    const outside = try std.fs.path.join(gpa, &.{ base_abs, "outside" });
+    defer gpa.free(outside);
+    try std.Io.Dir.createDirPath(.cwd(), io, workspace);
+    try std.Io.Dir.createDirPath(.cwd(), io, outside);
+
+    var ws_dir = try std.Io.Dir.openDir(.cwd(), io, workspace, .{});
+    defer ws_dir.close(io);
+    try ws_dir.symLink(io, outside, "link", .{ .is_directory = true });
+
+    try std.testing.expectError(error.PathTraversal, sanitizePath(io, "link/nonexistent.txt", workspace));
+    try std.testing.expectError(error.PathTraversal, sanitizePath(io, "link/sub/nonexistent.txt", workspace));
 }

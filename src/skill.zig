@@ -324,6 +324,11 @@ fn skipSkill(report: ?*ScanReport, path: []const u8, err: anyerror) void {
 }
 
 fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include_root_files: bool, skills: *std.ArrayList(Skill), depth: u32, report: ?*ScanReport) !void {
+    if (depth >= max_skill_depth) {
+        log.warn("skill directory too deep, skipping: {s}", .{dir_path});
+        if (report) |r| r.record(dir_path, "directory depth exceeds max_skill_depth");
+        return;
+    }
     var dir = std.Io.Dir.openDir(.cwd(), io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         error.NotDir => return,
@@ -349,7 +354,7 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
         const child = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
         defer gpa.free(child);
         switch (entry.kind) {
-            .directory => try loadFromDir(gpa, io, child, false, skills, depth, report),
+            .directory => try loadFromDir(gpa, io, child, false, skills, depth + 1, report),
             .file => if (include_root_files and std.mem.endsWith(u8, entry.name, ".md")) {
                 try loadLooseRootMd(gpa, io, child, entry.name, skills, report);
             },
@@ -1456,4 +1461,32 @@ test "loadProject skips an uppercase project skill and retains the valid global 
     // Assert
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("global description", skills[0].description);
+}
+
+test "loadFromDir skips real directories deeper than max_skill_depth (#417)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const full_dir = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "skill-depth-cap-test" });
+    defer gpa.free(full_dir);
+    try resetTestFixture(io, full_dir);
+
+    var deep_parts: [max_skill_depth + 2][]const u8 = undefined;
+    deep_parts[0] = full_dir;
+    for (1..deep_parts.len) |i| deep_parts[i] = "sub";
+    const deep_dir = try std.fs.path.join(gpa, &deep_parts);
+    defer gpa.free(deep_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, deep_dir);
+    try writeSkillMd(io, gpa, deep_dir, "too-deep", "---\nname: too-deep\ndescription: should be skipped\n---\nbody\n");
+
+    var skills: std.ArrayList(Skill) = .empty;
+    defer deinitAll(gpa, skills.items);
+    var report_out: std.Io.Writer.Allocating = .init(gpa);
+    defer report_out.deinit();
+    var report: ScanReport = .{ .writer = &report_out.writer };
+
+    try loadFromDir(gpa, io, full_dir, false, &skills, 0, &report);
+    try std.testing.expectEqual(@as(usize, 0), skills.items.len);
+    try std.testing.expect(report.count >= 1);
 }
