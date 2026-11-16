@@ -16,6 +16,30 @@ pub const McpHeader = struct {
     value: []u8,
 };
 
+/// Header names must be non-empty and free of `:`, whitespace, and CR/LF.
+pub fn isValidHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (c == ':' or c == '\r' or c == '\n' or c == ' ') return false;
+    }
+    return true;
+}
+
+/// Header values must not contain CR/LF (which would inject into the HTTP wire
+/// format). Empty values are permitted post-expansion (e.g. unset `{env:VAR}`).
+pub fn isValidHeaderValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c == '\r' or c == '\n') return false;
+    }
+    return true;
+}
+
+/// Header fields at parse time must be non-empty, single-line, and token-safe.
+pub fn isValidHeaderField(name: []const u8, value: []const u8) bool {
+    if (value.len == 0) return false;
+    return isValidHeaderName(name) and isValidHeaderValue(value);
+}
+
 /// Deep-copy a header list. Returns the empty static slice for an empty input.
 pub fn cloneHeaders(gpa: std.mem.Allocator, headers: []const McpHeader) ![]McpHeader {
     if (headers.len == 0) return &.{};
@@ -155,7 +179,14 @@ pub fn mcpServerFromUrl(gpa: std.mem.Allocator, name: []const u8, raw_url: []con
 pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServerConfig {
     var env_map = try loadEnvMap(gpa);
     defer env_map.deinit();
+    return expandMcpServerWithEnv(gpa, server, &env_map);
+}
 
+fn expandMcpServerWithEnv(
+    gpa: std.mem.Allocator,
+    server: McpServerConfig,
+    env_map: *const std.process.Environ.Map,
+) !McpServerConfig {
     var out: McpServerConfig = .{
         .name = try gpa.dupe(u8, server.name),
         .enabled = server.enabled,
@@ -175,7 +206,7 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
         // errdefers are block-scoped, so a failure in a fallible call AFTER
         // their block exits would leak the already-expanded entries.
         .stdio => |t| {
-            const command = try expandEnvVars(gpa, t.command, &env_map);
+            const command = try expandEnvVars(gpa, t.command, env_map);
             errdefer gpa.free(command);
             var args: [][]u8 = &.{};
             if (t.args.len > 0) {
@@ -186,7 +217,7 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
                     gpa.free(expanded);
                 }
                 for (t.args, 0..) |arg, i| {
-                    expanded[i] = try expandEnvVars(gpa, arg, &env_map);
+                    expanded[i] = try expandEnvVars(gpa, arg, env_map);
                     done += 1;
                 }
                 args = expanded;
@@ -197,27 +228,31 @@ pub fn expandMcpServer(gpa: std.mem.Allocator, server: McpServerConfig) !McpServ
             } };
         },
         .sse => |t| {
-            const url = try expandEnvVars(gpa, t.url, &env_map);
+            const url = try expandEnvVars(gpa, t.url, env_map);
             errdefer gpa.free(url);
             var headers: []McpHeader = &.{};
             if (t.headers.len > 0) {
-                const expanded = try gpa.alloc(McpHeader, t.headers.len);
-                var done: usize = 0;
+                var list: std.ArrayList(McpHeader) = .empty;
                 errdefer {
-                    for (expanded[0..done]) |h| {
+                    for (list.items) |h| {
                         gpa.free(h.name);
                         gpa.free(h.value);
                     }
-                    gpa.free(expanded);
+                    list.deinit(gpa);
                 }
-                for (t.headers, 0..) |h, i| {
-                    expanded[i] = .{
-                        .name = try gpa.dupe(u8, h.name),
-                        .value = try expandEnvVars(gpa, h.value, &env_map),
-                    };
-                    done += 1;
+                for (t.headers) |h| {
+                    const value = try expandEnvVars(gpa, h.value, env_map);
+                    if (!isValidHeaderName(h.name) or !isValidHeaderValue(value)) {
+                        log.warn("MCP server '{s}' header '{s}' expanded to an invalid value; skipping", .{ server.name, h.name });
+                        gpa.free(value);
+                        continue;
+                    }
+                    errdefer gpa.free(value);
+                    const name = try gpa.dupe(u8, h.name);
+                    errdefer gpa.free(name);
+                    try list.append(gpa, .{ .name = name, .value = value });
                 }
-                headers = expanded;
+                headers = try list.toOwnedSlice(gpa);
             }
             out.transport = .{ .sse = .{
                 .url = url,
@@ -426,4 +461,31 @@ test "McpServerConfig.clone clones stdio and sse without leaks" {
     try std.testing.expectEqualStrings("https://example.com/sse", c2.transport.sse.url);
     try std.testing.expectEqualStrings("X-Auth", c2.transport.sse.headers[0].name);
     try std.testing.expectEqualStrings("token", c2.transport.sse.headers[0].value);
+}
+
+test "expandMcpServerWithEnv drops SSE headers whose expanded value contains CR/LF" {
+    const gpa = std.testing.allocator;
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("DIRTY_TOKEN", "secret\nX-Injected: yes");
+    try env_map.put("CLEAN_TOKEN", "ok-token");
+
+    var headers = try gpa.alloc(McpHeader, 2);
+    headers[0] = .{ .name = try gpa.dupe(u8, "X-Dirty"), .value = try gpa.dupe(u8, "Bearer {env:DIRTY_TOKEN}") };
+    headers[1] = .{ .name = try gpa.dupe(u8, "X-Clean"), .value = try gpa.dupe(u8, "Bearer {env:CLEAN_TOKEN}") };
+    var server: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "remote"),
+        .transport = .{ .sse = .{
+            .url = try gpa.dupe(u8, "https://example.com/mcp"),
+            .headers = headers,
+        } },
+    };
+    defer server.deinit(gpa);
+
+    var expanded = try expandMcpServerWithEnv(gpa, server, &env_map);
+    defer expanded.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), expanded.transport.sse.headers.len);
+    try std.testing.expectEqualStrings("X-Clean", expanded.transport.sse.headers[0].name);
+    try std.testing.expectEqualStrings("Bearer ok-token", expanded.transport.sse.headers[0].value);
 }

@@ -754,7 +754,7 @@ fn parseObject(
         switch (ver) {
             .string => |s| out.version = try gpa.dupe(u8, s),
             .integer => |v| out.version = try std.fmt.allocPrint(gpa, "{d}.0.0", .{v}),
-            else => {},
+            else => try appendConfigError(gpa, diagnostics, path, "'version' must be a string or integer; ignoring", .{}),
         }
     }
 
@@ -769,14 +769,26 @@ fn parseObject(
         }
     }
     if (value.object.get("providers")) |providers_value| {
-        if (providers_value == .object) out.providers = try parseProviders(gpa, providers_value);
+        if (providers_value == .object) {
+            out.providers = try parseProviders(gpa, path, providers_value, diagnostics);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'providers' must be an object; ignoring", .{});
+        }
     }
     const mcp_val = value.object.get("mcpServers") orelse value.object.get("mcp_servers") orelse value.object.get("mcp");
     if (mcp_val) |val| {
-        if (val == .object) out.mcp_servers = try parseMcpServers(gpa, val);
+        if (val == .object) {
+            out.mcp_servers = try parseMcpServers(gpa, path, val, diagnostics);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'mcpServers' must be an object; ignoring", .{});
+        }
     }
     if (value.object.get("plugins")) |plugins_val| {
-        if (plugins_val == .object) out.plugins = try parsePlugins(gpa, path, plugins_val, diagnostics);
+        if (plugins_val == .object) {
+            out.plugins = try parsePlugins(gpa, path, plugins_val, diagnostics);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'plugins' must be an object; ignoring", .{});
+        }
     }
 
     // Scalar fields: camelCase primary, snake_case fallback.
@@ -820,22 +832,38 @@ fn parseObject(
 
     // Context window and compaction settings.
     if (value.object.get("context")) |ctx_val| {
-        if (ctx_val == .object) out.context = parseContext(ctx_val);
+        if (ctx_val == .object) {
+            out.context = parseContext(ctx_val);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'context' must be an object; ignoring", .{});
+        }
     }
 
     // Toast notification settings.
     if (value.object.get("toast")) |toast_val| {
-        if (toast_val == .object) out.toast = try parseToast(gpa, toast_val);
+        if (toast_val == .object) {
+            out.toast = try parseToast(gpa, toast_val);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'toast' must be an object; ignoring", .{});
+        }
     }
 
     // TUI appearance / live preview / picker settings.
     if (value.object.get("tui")) |tui_val| {
-        if (tui_val == .object) out.tui = try parseTui(gpa, tui_val);
+        if (tui_val == .object) {
+            out.tui = try parseTui(gpa, tui_val);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'tui' must be an object; ignoring", .{});
+        }
     }
 
     // Database backend configuration.
     if (value.object.get("database")) |db_val| {
-        if (db_val == .object) out.database = try parseDatabase(gpa, path, db_val, diagnostics);
+        if (db_val == .object) {
+            out.database = try parseDatabase(gpa, path, db_val, diagnostics);
+        } else {
+            try appendConfigError(gpa, diagnostics, path, "'database' must be an object; ignoring", .{});
+        }
     }
 
     // Populate the typed `model_selection` when all required fields
@@ -887,16 +915,24 @@ fn parseObject(
 }
 
 /// String field with camelCase primary and snake_case fallback.
+/// A wrong-typed camelCase key does not shadow a valid snake_case fallback.
 fn stringFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) ?[]const u8 {
-    if (fieldCompat(value.object, camel, snake)) |field| {
+    if (value.object.get(camel)) |field| {
+        if (field == .string) return field.string;
+    }
+    if (value.object.get(snake)) |field| {
         if (field == .string) return field.string;
     }
     return null;
 }
 
 /// Bool field with camelCase primary and snake_case fallback.
+/// A wrong-typed camelCase key does not shadow a valid snake_case fallback.
 fn boolFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) ?bool {
-    if (fieldCompat(value.object, camel, snake)) |field| {
+    if (value.object.get(camel)) |field| {
+        if (field == .bool) return field.bool;
+    }
+    if (value.object.get(snake)) |field| {
         if (field == .bool) return field.bool;
     }
     return null;
@@ -906,7 +942,10 @@ fn boolFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) 
 /// values yield null exactly like `u32field` — the lower/upper-bound checks
 /// stay at the call site so per-field bands are explicit.
 fn u32fieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) ?u32 {
-    if (fieldCompat(value.object, camel, snake)) |field| {
+    if (value.object.get(camel)) |field| {
+        if (field == .integer) return std.math.cast(u32, field.integer);
+    }
+    if (value.object.get(snake)) |field| {
         if (field == .integer) return std.math.cast(u32, field.integer);
     }
     return null;
@@ -1058,7 +1097,12 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
     return tui;
 }
 
-fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConfig {
+fn parseProviders(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    value: std.json.Value,
+    diagnostics: *std.ArrayList(Diagnostic),
+) ![]ProviderConfig {
     var providers: std.ArrayList(ProviderConfig) = .empty;
     errdefer {
         for (providers.items) |*provider| provider.deinit(gpa);
@@ -1070,12 +1114,17 @@ fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConf
         // Builtin labels resolve to their enum; unknown keys are custom
         // providers using the openai_compatible adapter.
         const provider = providers_by_name.get(entry.key_ptr.*) orelse .openai_compatible;
-        try providers.append(gpa, try parseProviderConfig(gpa, entry.key_ptr.*, provider, entry.value_ptr.*));
+        try providers.append(gpa, try parseProviderConfig(gpa, path, entry.key_ptr.*, provider, entry.value_ptr.*, diagnostics));
     }
     return try providers.toOwnedSlice(gpa);
 }
 
-fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerConfig {
+fn parseMcpServers(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    value: std.json.Value,
+    diagnostics: *std.ArrayList(Diagnostic),
+) ![]McpServerConfig {
     var servers: std.ArrayList(McpServerConfig) = .empty;
     errdefer {
         for (servers.items) |*server| server.deinit(gpa);
@@ -1093,12 +1142,12 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
         const cmd = stringField(val, "command");
         const url = stringField(val, "url");
         // Exactly one transport: stdio (command) or remote (url). Both or
-        // neither is invalid — mirrors the transport union and the
-        // MCPServerConfig oneOf in schema/config.schema.json. Checked before
-        // `server`/its errdefer so a rejection never deinits a server whose
-        // transport is still undefined.
-        if (cmd != null and url != null) return error.InvalidMcpServerConfig;
-        if (cmd == null and url == null) return error.InvalidMcpServerConfig;
+        // neither is invalid — skip with a diagnostic instead of failing the
+        // whole config layer.
+        if ((cmd != null and url != null) or (cmd == null and url == null)) {
+            try appendConfigError(gpa, diagnostics, path, "MCP server '{s}': must specify exactly one of 'command' or 'url'; skipping", .{entry.key_ptr.*});
+            continue;
+        }
 
         // The name becomes part of the `mcp__<server>__<tool>` wire tool name
         // (see mcp/naming.zig); a `__` inside it would make that name
@@ -1152,6 +1201,10 @@ fn parseMcpServers(gpa: std.mem.Allocator, value: std.json.Value) ![]McpServerCo
                     var header_it = headers_val.object.iterator();
                     while (header_it.next()) |header_entry| {
                         if (header_entry.value_ptr.* != .string) continue;
+                        if (!mcp_types.isValidHeaderField(header_entry.key_ptr.*, header_entry.value_ptr.string)) {
+                            try appendConfigError(gpa, diagnostics, path, "MCP server '{s}' header '{s}' contains invalid bytes; skipping", .{ entry.key_ptr.*, header_entry.key_ptr.* });
+                            continue;
+                        }
                         try headers_list.append(gpa, .{
                             .name = try gpa.dupe(u8, header_entry.key_ptr.*),
                             .value = try gpa.dupe(u8, header_entry.value_ptr.string),
@@ -1255,19 +1308,31 @@ fn writeResponsePolicy(writer: *std.Io.Writer, policy: response_policy.Overrides
     try writer.writeByte('}');
 }
 
-fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provider, value: std.json.Value) !ProviderConfig {
+fn parseProviderConfig(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    name: []const u8,
+    provider: Provider,
+    value: std.json.Value,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !ProviderConfig {
     var out: ProviderConfig = .{
         .name = try gpa.dupe(u8, name),
         .provider = provider,
     };
     errdefer out.deinit(gpa);
     if (stringFieldCompat(value, "baseURL", "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
-    if (value.object.get("responsePolicy")) |policy| out.response_policy = try parseResponsePolicy(policy);
+    if (value.object.get("responsePolicy")) |policy| {
+        out.response_policy = parseResponsePolicy(policy) catch blk: {
+            try appendConfigError(gpa, diagnostics, path, "provider '{s}' has invalid responsePolicy; using default", .{name});
+            break :blk .{};
+        };
+    }
     if (value.object.get("headers")) |headers_value| {
         if (headers_value == .object) out.headers = try parseProviderHeaders(gpa, headers_value);
     }
     if (value.object.get("models")) |models_value| {
-        if (models_value == .object) out.models = try parseProviderModels(gpa, name, models_value);
+        if (models_value == .object) out.models = try parseProviderModels(gpa, path, name, models_value, diagnostics);
     }
     return out;
 }
@@ -1284,21 +1349,6 @@ fn isReservedHeaderName(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, reserved)) return true;
     }
     return false;
-}
-
-/// Header fields must be single-line and token-safe: a `:`/whitespace in
-/// the name or a CR/LF in either field would corrupt or inject into the
-/// wire format.
-fn isValidHeaderField(name: []const u8, value: []const u8) bool {
-    if (name.len == 0) return false;
-    if (value.len == 0) return false;
-    for (name) |c| {
-        if (c == ':' or c == '\r' or c == '\n' or c == ' ') return false;
-    }
-    for (value) |c| {
-        if (c == '\r' or c == '\n') return false;
-    }
-    return true;
 }
 
 /// Parse `providers.<name>.headers` (object of string → string). Invalid
@@ -1320,7 +1370,7 @@ fn parseProviderHeaders(gpa: std.mem.Allocator, value: std.json.Value) ![]Provid
         if (entry.value_ptr.* != .string) continue;
         const name = entry.key_ptr.*;
         const header_value = entry.value_ptr.string;
-        if (!isValidHeaderField(name, header_value)) {
+        if (!mcp_types.isValidHeaderField(name, header_value)) {
             log.warn("ignoring invalid provider header '{s}' (empty field, whitespace/colon in name, or line break)", .{name});
             continue;
         }
@@ -1354,7 +1404,13 @@ fn writeHeaderMap(writer: *std.Io.Writer, headers: []const McpHeader) !void {
     try writer.writeByte('}');
 }
 
-fn parseProviderModels(gpa: std.mem.Allocator, provider_name: []const u8, value: std.json.Value) ![]ProviderModel {
+fn parseProviderModels(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    provider_name: []const u8,
+    value: std.json.Value,
+    diagnostics: *std.ArrayList(Diagnostic),
+) ![]ProviderModel {
     var models: std.ArrayList(ProviderModel) = .empty;
     errdefer {
         for (models.items) |*model| model.deinit(gpa);
@@ -1364,7 +1420,13 @@ fn parseProviderModels(gpa: std.mem.Allocator, provider_name: []const u8, value:
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const val = entry.value_ptr.*;
-        const overrides = if (val.object.get("responsePolicy")) |policy| try parseResponsePolicy(policy) else response_policy.Overrides{};
+        const overrides = if (val.object.get("responsePolicy")) |policy|
+            parseResponsePolicy(policy) catch blk: {
+                try appendConfigError(gpa, diagnostics, path, "provider '{s}' model '{s}' has invalid responsePolicy; using default", .{ provider_name, entry.key_ptr.* });
+                break :blk response_policy.Overrides{};
+            }
+        else
+            response_policy.Overrides{};
         var model: ProviderModel = .{
             .id = try gpa.dupe(u8, entry.key_ptr.*),
             .response_policy = overrides,
@@ -1614,8 +1676,20 @@ fn writeConfigFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, config:
     errdefer std.Io.Dir.deleteFile(.cwd(), io, tmp_path) catch {};
 
     {
-        var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{ .truncate = true });
+        // config.json can store databaseAuthToken / database.authToken in
+        // cleartext; write owner-only on POSIX so local users cannot read it,
+        // and narrow any pre-existing wider mode on overwrite.
+        const is_windows = @import("builtin").os.tag == .windows;
+        const file_permissions: std.Io.File.Permissions = if (is_windows)
+            .default_file
+        else
+            .fromMode(0o600);
+        var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{
+            .truncate = true,
+            .permissions = file_permissions,
+        });
         defer file.close(io);
+        if (!is_windows) try file.setPermissions(io, file_permissions);
         var buffer: [4096]u8 = undefined;
         var writer = file.writer(io, &buffer);
         try writer.interface.writeAll(payload.written());
@@ -2671,16 +2745,16 @@ test "parseObject: invalid JSON records diagnostic" {
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
 }
 
-test "parseMcpServers rejects a server config missing a transport" {
-    // A server with neither `command` nor `url` is rejected at parse time:
-    // the transport union makes the misconfiguration unrepresentable in the
-    // struct form, so the manager never needs a runtime fallback. The error
-    // propagates up through the public parseFile → parseObject path.
+test "parseMcpServers skips a server config missing a transport with a diagnostic" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
-    defer sink.deinit(gpa);
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
     const config_json =
         \\{
+        \\  "theme": "dark",
         \\  "mcpServers": {
         \\    "broken_server": {
         \\      "env": { "FOO": "bar" }
@@ -2688,10 +2762,11 @@ test "parseMcpServers rejects a server config missing a transport" {
         \\  }
         \\}
     ;
-    try std.testing.expectError(
-        error.InvalidMcpServerConfig,
-        parseFile(gpa, "<test>", config_json, &sink),
-    );
+    var cfg = try parseFile(gpa, "<test>", config_json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("dark", cfg.theme.?);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
 }
 
 test "mergeLayers: later layer overrides earlier" {
@@ -3181,28 +3256,34 @@ test "parseFile parses remote mcp server headers (kept raw)" {
     }
 }
 
-test "parseFile rejects mcp server configuring both transports" {
+test "parseFile skips mcp server configuring both transports with a diagnostic" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
-    defer sink.deinit(gpa);
-    // command + url is ambiguous — the transport union allows exactly one,
-    // matching schema/config.schema.json's MCPServerConfig oneOf.
-    const json = "{\"mcp_servers\":{\"bad\":{\"command\":\"npx\",\"url\":\"https://mcp.example.com/mcp\"}}}";
-    try std.testing.expectError(
-        error.InvalidMcpServerConfig,
-        parseFile(gpa, "<test>", json, &sink),
-    );
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const json = "{\"theme\":\"light\",\"mcp_servers\":{\"bad\":{\"command\":\"npx\",\"url\":\"https://mcp.example.com/mcp\"}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("light", cfg.theme.?);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
 }
 
-test "parseFile rejects mcp server with neither command nor url" {
+test "parseFile skips mcp server with neither command nor url with a diagnostic" {
     const gpa = std.testing.allocator;
     var sink: std.ArrayList(Diagnostic) = .empty;
-    defer sink.deinit(gpa);
-    const json = "{\"mcp_servers\":{\"bad\":{\"enabled\":true}}}";
-    try std.testing.expectError(
-        error.InvalidMcpServerConfig,
-        parseFile(gpa, "<test>", json, &sink),
-    );
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const json = "{\"theme\":\"light\",\"mcp_servers\":{\"bad\":{\"enabled\":true}}}";
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("light", cfg.theme.?);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
 }
 
 test "parseFile keeps {env:VAR} placeholders raw in mcp url" {
@@ -5249,4 +5330,87 @@ test "applyProviderModelsOverlay updates reasoning options without memory leak" 
     try std.testing.expectEqual(@as(usize, 2), target.models[0].reasoning_options.len);
     try std.testing.expectEqual(ReasoningEffort.high, target.models[0].reasoning_options[0]);
     try std.testing.expectEqual(ReasoningEffort.max, target.models[0].reasoning_options[1]);
+}
+
+test "parseFile skips MCP SSE headers with CR/LF in name or value (#405)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const json =
+        \\{
+        \\  "mcpServers": {
+        \\    "srv": {
+        \\      "url": "https://example.com/mcp",
+        \\      "headers": {
+        \\        "X-Good": "ok",
+        \\        "X-BadVal": "abc\r\nX-Injected: yes",
+        \\        "X-Bad\r\nName": "val"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    const headers = cfg.mcp_servers[0].transport.sse.headers;
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings("X-Good", headers[0].name);
+    try std.testing.expectEqualStrings("ok", headers[0].value);
+    try std.testing.expectEqual(@as(usize, 2), sink.items.len);
+}
+
+test "writeConfigFile writes owner-only 0600 permissions on POSIX (#406)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(dir_path);
+    const cfg_path = try std.fs.path.join(gpa, &.{ dir_path, "config.json" });
+    defer gpa.free(cfg_path);
+
+    var cfg: Config = .{};
+    cfg.database_auth_token = try gpa.dupe(u8, "secret-token");
+    defer cfg.deinit(gpa);
+
+    try writeConfigFile(gpa, io, cfg_path, cfg);
+
+    var file = try std.Io.Dir.openFile(.cwd(), io, cfg_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+}
+
+test "parseFile preserves valid settings on bad responsePolicy, wrong-typed section, and camelCase fallback (#407)" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    const json =
+        \\{
+        \\  "theme": "nord",
+        \\  "baseURL": 123,
+        \\  "base_url": "https://fallback.example/v1",
+        \\  "mcpServers": [],
+        \\  "providers": {
+        \\    "openai": {
+        \\      "responsePolicy": { "thinking": "invalid_kind" }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try parseFile(gpa, "<test>", json, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqualStrings("nord", cfg.theme.?);
+    try std.testing.expectEqualStrings("https://fallback.example/v1", cfg.base_url.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqual(@as(usize, 2), sink.items.len);
 }
