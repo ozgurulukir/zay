@@ -1527,9 +1527,6 @@ test "RunOptions.stdin bypasses shell interpretation" {
 
 test "searchFiles clamps a negative max_results without panicking" {
     const sandbox = @import("sandbox.zig");
-    // Hermetic root: without a dispatch cwd the search would walk the
-    // whole process CWD (the repo during suite runs) and the wall-clock
-    // budget could expire under load before the clamp path is exercised.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "note.txt", .data = "needle here\nplain line\n" });
