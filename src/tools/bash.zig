@@ -40,6 +40,29 @@ pub const Backend = struct {
         \\
     ;
 
+    /// Reject `builtin`/`command`-prefixed `cd`/`pushd`/`popd` in contained
+    /// workspaces: Bash resolves builtins directly when prefixed, bypassing the
+    /// `cd()`/`pushd()`/`popd()` shell functions (#418).
+    pub fn hasCdGuardBypass(command: []const u8) bool {
+        var it = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()");
+        while (it.next()) |tok| {
+            if (!std.mem.eql(u8, tok, "builtin") and !std.mem.eql(u8, tok, "command")) continue;
+            var next = it.next() orelse break;
+            if (std.mem.eql(u8, tok, "command")) {
+                while (next.len > 0 and next[0] == '-') {
+                    next = it.next() orelse break;
+                }
+            }
+            if (std.mem.eql(u8, next, "cd") or
+                std.mem.eql(u8, next, "pushd") or
+                std.mem.eql(u8, next, "popd"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Prefix `command` with `_zay_root` (the literal, shell-escaped project root)
     /// and the `cd`/`pushd`/`popd` guard functions. `_zay_root` anchors on the
     /// project root — not the shell's start cwd — so a `cwd` subdir argument does
@@ -514,4 +537,26 @@ test "contained bash still validates a cwd argument escaping the root" {
 
     try std.testing.expect(output.code != 0);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "escapes the project root") != null);
+}
+
+test "contained bash rejects builtin cd and command cd (#418)" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    for ([_][]const u8{
+        "{\"command\":\"builtin cd /tmp && pwd\",\"description\":\"bypass\"}",
+        "{\"command\":\"command cd /tmp && pwd\",\"description\":\"bypass\"}",
+        "{\"command\":\"command -p cd /tmp && pwd\",\"description\":\"bypass\"}",
+    }) |args| {
+        var output = try runContained(gpa, std.testing.io, root_abs, args, null, bash_safety.mintClassified("containment-fixture"));
+        defer output.deinit(gpa);
+        try std.testing.expect(output.code != 0);
+        try std.testing.expect(std.mem.indexOf(u8, output.stderr, "bypassing cd guard") != null);
+    }
 }

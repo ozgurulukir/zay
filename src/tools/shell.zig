@@ -216,6 +216,9 @@ pub fn Impl(comptime B: type) type {
             if (!B.validateCwd(gpa, io, cwd, resolved_cwd)) {
                 return common.failFmt(gpa, 1, B.name ++ ": cwd '{s}' escapes the project root\n", .{resolved_cwd});
             }
+            if (opts.contained and B.hasCdGuardBypass(args.command)) {
+                return common.fail(gpa, B.name ++ ": bypassing cd guard via builtin/command/module-qualified call is not allowed in this workspace\n", 1);
+            }
 
             var env_map = try currentEnvMap(gpa, io);
             defer env_map.deinit();

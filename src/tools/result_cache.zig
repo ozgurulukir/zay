@@ -192,7 +192,7 @@ pub const ResultCache = struct {
             self.clear();
             return .bypass;
         }
-        if (self.map.get(parsed.command)) |index| {
+        if (self.map.get(parsed.cache_key)) |index| {
             const entry = &self.entries.items[index];
             var dup = dupeOutput(self.gpa, &entry.output) catch return .miss;
             markCached(self.gpa, &dup) catch {
@@ -213,9 +213,9 @@ pub const ResultCache = struct {
         var parsed = parseShellArgs(self.gpa, arguments_json) catch return;
         defer parsed.deinit(self.gpa);
         if (parsed.background or !isReadOnlyShellCommand(parsed.command)) return;
-        if (self.map.contains(parsed.command)) return;
+        if (self.map.contains(parsed.cache_key)) return;
 
-        const key = self.gpa.dupe(u8, parsed.command) catch return;
+        const key = self.gpa.dupe(u8, parsed.cache_key) catch return;
         const dup = dupeOutput(self.gpa, output) catch {
             self.gpa.free(key);
             return;
@@ -259,19 +259,23 @@ pub const ResultCache = struct {
     }
 };
 
-/// Parsed shell-tool arguments. Owns the command copy (the parsed JSON it
-/// came from is freed inside `parseShellArgs`).
+/// Parsed shell-tool arguments. Owns `command` and the canonical `cache_key`
+/// encoding `(command, cwd, sorted env)` (#420).
 const ShellArgs = struct {
     command: []u8,
+    cache_key: []u8,
     background: bool,
 
     fn deinit(self: *ShellArgs, gpa: std.mem.Allocator) void {
         gpa.free(self.command);
+        gpa.free(self.cache_key);
     }
 };
 
 const ShellArgsJson = struct {
     command: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    env: ?std.json.Value = null,
     run_in_background: ?bool = null,
 };
 
@@ -282,7 +286,45 @@ fn parseShellArgs(gpa: std.mem.Allocator, arguments_json: []const u8) !ShellArgs
     defer parsed.deinit();
     const command = parsed.value.command orelse return error.InvalidToolArguments;
     if (command.len == 0) return error.InvalidToolArguments;
-    return .{ .command = try gpa.dupe(u8, command), .background = parsed.value.run_in_background orelse false };
+
+    var key_writer: std.Io.Writer.Allocating = .init(gpa);
+    defer key_writer.deinit();
+    try key_writer.writer.writeAll(command);
+    try key_writer.writer.writeByte(0);
+    if (parsed.value.cwd) |cwd| {
+        try key_writer.writer.writeAll(cwd);
+    }
+    try key_writer.writer.writeByte(0);
+    if (parsed.value.env) |env_val| {
+        if (env_val != .object) return error.InvalidToolArguments;
+        var pairs: std.ArrayList(struct { k: []const u8, v: []const u8 }) = .empty;
+        defer pairs.deinit(gpa);
+        var it = env_val.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .string) return error.InvalidToolArguments;
+            try pairs.append(gpa, .{ .k = entry.key_ptr.*, .v = entry.value_ptr.string });
+        }
+        std.mem.sort(@TypeOf(pairs.items[0]), pairs.items, {}, struct {
+            fn lessThan(_: void, a: @TypeOf(pairs.items[0]), b: @TypeOf(pairs.items[0])) bool {
+                return std.mem.order(u8, a.k, b.k) == .lt;
+            }
+        }.lessThan);
+        for (pairs.items) |p| {
+            try key_writer.writer.writeAll(p.k);
+            try key_writer.writer.writeByte('=');
+            try key_writer.writer.writeAll(p.v);
+            try key_writer.writer.writeByte(0);
+        }
+    }
+
+    const owned_cmd = try gpa.dupe(u8, command);
+    errdefer gpa.free(owned_cmd);
+    const cache_key = try key_writer.toOwnedSlice();
+    return .{
+        .command = owned_cmd,
+        .cache_key = cache_key,
+        .background = parsed.value.run_in_background orelse false,
+    };
 }
 
 /// Deep-copy an `Output` so cache entries and hits own independent storage.
@@ -558,4 +600,39 @@ test "dupeOutput deep-copies display and observation" {
     try std.testing.expectEqualStrings("out", dup.stdout);
     try std.testing.expectEqualStrings("display", dup.display.text);
     try std.testing.expectEqualStrings("obs", dup.observation.?.complete);
+}
+
+test "ResultCache separates entries by cwd and env (#420)" {
+    const gpa = std.testing.allocator;
+    var cache = ResultCache.init(gpa);
+    defer cache.deinit();
+
+    const root_out: common.Output = .{ .stdout = @constCast("root"), .stderr = &.{}, .code = 0 };
+    const sub_out: common.Output = .{ .stdout = @constCast("sub"), .stderr = &.{}, .code = 0 };
+    const env_out: common.Output = .{ .stdout = @constCast("env"), .stderr = &.{}, .code = 0 };
+
+    cache.storeShell("{\"command\":\"cat config.json\"}", &root_out);
+    try std.testing.expectEqual(ResultCache.ShellLookup.miss, cache.lookupShell("{\"command\":\"cat config.json\",\"cwd\":\"subdir\"}"));
+    try std.testing.expectEqual(ResultCache.ShellLookup.miss, cache.lookupShell("{\"command\":\"cat config.json\",\"env\":{\"FOO\":\"1\"}}"));
+
+    cache.storeShell("{\"command\":\"cat config.json\",\"cwd\":\"subdir\"}", &sub_out);
+    cache.storeShell("{\"command\":\"cat config.json\",\"env\":{\"FOO\":\"1\",\"BAR\":\"2\"}}", &env_out);
+
+    switch (cache.lookupShell("{\"command\":\"cat config.json\",\"cwd\":\"subdir\"}")) {
+        .hit => |hit| {
+            var mut = hit;
+            defer mut.deinit(gpa);
+            try std.testing.expect(std.mem.endsWith(u8, hit.stdout, "sub"));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Env map key order must not cause spurious misses.
+    switch (cache.lookupShell("{\"command\":\"cat config.json\",\"env\":{\"BAR\":\"2\",\"FOO\":\"1\"}}")) {
+        .hit => |hit| {
+            var mut = hit;
+            defer mut.deinit(gpa);
+            try std.testing.expect(std.mem.endsWith(u8, hit.stdout, "env"));
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
