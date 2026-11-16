@@ -37,8 +37,8 @@ pub const ToolContext = struct {
     /// tools report that no live manager exists (never invoke a freed one).
     plugin_manager: ?*plugin_manager_mod.PluginManager = null,
     /// Shell-safety classifier URL for plugin `zay.run_bash` shells; also the
-    /// source of the derived `bash_classifier_url_slot` binding. Null keeps
-    /// the always-armed local matcher.
+    /// source of the plugin dispatch context's `classifier_url` binding. Null
+    /// keeps the always-armed local matcher.
     bash_classifier_url: ?[]const u8 = null,
     /// Proof-of-classification for a skill command run (#295): the executor's
     /// approval gate mints one for a skill command call it approved, and the

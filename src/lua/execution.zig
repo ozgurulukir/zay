@@ -4,7 +4,6 @@
 const std = @import("std");
 const c = @import("c");
 const platform = @import("platform");
-const bridge = @import("bridge.zig");
 
 pub const StopReason = enum {
     none,
@@ -24,6 +23,17 @@ pub const StopReason = enum {
     }
 };
 
+/// Typed dispatch context for one plugin dispatch window (tool call or
+/// event delivery): the executor-owned values the Lua bridges used to read
+/// from threadlocal slots in bridge.zig. Null fields mean "outside a batch
+/// window" (init.lua load, state save/restore) and keep the degraded
+/// fallbacks: process cwd, no cancellation check, built-in shell matcher.
+pub const DispatchCtx = struct {
+    cwd: ?[]const u8 = null,
+    cancel: ?*const std.atomic.Value(bool) = null,
+    classifier_url: ?[]const u8 = null,
+};
+
 pub const Budget = struct {
     instruction_limit: u32,
     instruction_count: u32,
@@ -33,7 +43,18 @@ pub const Budget = struct {
     deadline_ns: i64 = 0,
     io: ?std.Io = null,
     stop_reason: StopReason = .none,
+    ctx: DispatchCtx = .{},
 };
+
+/// The dispatch context of the budget attached to `L` (a zero context when
+/// no budget is installed, e.g. raw bridge unit-test states).
+pub fn dispatchCtx(L: *c.lua_State) DispatchCtx {
+    return (budget(L) orelse return .{}).ctx;
+}
+
+pub fn setDispatchCtx(L: *c.lua_State, ctx: DispatchCtx) void {
+    if (budget(L)) |data| data.ctx = ctx;
+}
 
 pub fn budget(L: *c.lua_State) ?*Budget {
     return @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L)))).*;
@@ -42,7 +63,7 @@ pub fn budget(L: *c.lua_State) ?*Budget {
 pub fn check(L: *c.lua_State) void {
     const data = budget(L) orelse return;
     if (data.stop_reason != .none) return;
-    if (bridge.cancel_requested_slot) |flag| {
+    if (data.ctx.cancel) |flag| {
         if (flag.load(.acquire)) {
             data.stop_reason = .canceled;
             return;
@@ -202,12 +223,11 @@ test "execution: check handles timeout and atomic cancellation" {
     check(L.handle);
     try testing.expectEqual(StopReason.timeout, b.stop_reason);
 
-    // Reset stop reason & test atomic cancellation flag slot
+    // Reset stop reason & test the budget's cancellation flag binding
     b.stop_reason = .none;
     b.deadline_ns = 0;
     var flag = std.atomic.Value(bool).init(true);
-    bridge.cancel_requested_slot = &flag;
-    defer bridge.cancel_requested_slot = null;
+    b.ctx = .{ .cancel = &flag };
 
     check(L.handle);
     try testing.expectEqual(StopReason.canceled, b.stop_reason);
@@ -595,7 +615,7 @@ test "preservesStopReason_whenAlreadyStopped" {
     try std.testing.expectEqual(StopReason.memory_limit, b.stop_reason);
 }
 
-test "setsCanceled_whenCancelRequestedSlotIsTrue" {
+test "setsCanceled_whenDispatchCtxCancelIsTrue" {
     var L = try State.init();
     defer L.deinit();
 
@@ -608,14 +628,13 @@ test "setsCanceled_whenCancelRequestedSlotIsTrue" {
     @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
 
     var cancel_flag = std.atomic.Value(bool).init(true);
-    bridge.cancel_requested_slot = &cancel_flag;
-    defer bridge.cancel_requested_slot = null;
+    setDispatchCtx(L.handle, .{ .cancel = &cancel_flag });
 
     check(L.handle);
     try std.testing.expectEqual(StopReason.canceled, b.stop_reason);
 }
 
-test "preservesNone_whenCancelRequestedSlotIsFalse" {
+test "preservesNone_whenDispatchCtxCancelIsFalse" {
     var L = try State.init();
     defer L.deinit();
 
@@ -628,8 +647,7 @@ test "preservesNone_whenCancelRequestedSlotIsFalse" {
     @as(*?*Budget, @ptrCast(@alignCast(c.lua_getextraspace(L.handle)))).* = &b;
 
     var cancel_flag = std.atomic.Value(bool).init(false);
-    bridge.cancel_requested_slot = &cancel_flag;
-    defer bridge.cancel_requested_slot = null;
+    setDispatchCtx(L.handle, .{ .cancel = &cancel_flag });
 
     check(L.handle);
     try std.testing.expectEqual(StopReason.none, b.stop_reason);

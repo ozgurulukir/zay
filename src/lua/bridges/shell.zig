@@ -43,7 +43,9 @@ fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
 }
 
 /// Sanitize a path: resolve `..` and `.` segments, reject traversal.
-pub fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
+/// `ctx_cwd` is the dispatch context's cwd (borrowed); null falls back to the
+/// process cwd.
+pub fn sanitizePath(io: std.Io, path: []const u8, ctx_cwd: ?[]const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
     // Reject C0 control bytes: NT returns OBJECT_NAME_INVALID for them and
     // std's Io layer panics on that status in Debug, so a plugin-supplied
@@ -53,7 +55,7 @@ pub fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
         if (byte < 0x20) return error.InvalidPath;
     }
 
-    var resolved_cwd = bridge.resolvePluginCwd(io) orelse return error.OutOfMemory;
+    var resolved_cwd = bridge.resolvePluginCwd(io, ctx_cwd) orelse return error.OutOfMemory;
     defer resolved_cwd.deinit();
     const raw_cwd = resolved_cwd.path;
 
@@ -144,7 +146,7 @@ fn spawnClassifiedShell(
     stdin_bytes: ?[]const u8,
     timeout_seconds: u32,
 ) !bash_exec.Result {
-    const verdict = bash_safety.classify(std.heap.page_allocator, io, bridge.bash_classifier_url_slot, resolved_cwd, cmd);
+    const verdict = bash_safety.classify(std.heap.page_allocator, io, execution.dispatchCtx(L_ptr).classifier_url, resolved_cwd, cmd);
     if (verdict == .unsafe) {
         const backend_name = if (backend == .pwsh) "pwsh" else "bash";
         // Warn→toast copy: the sink pushes this line verbatim in TUI mode, so
@@ -160,19 +162,20 @@ fn spawnClassifiedShell(
     execution.check(L_ptr);
     if (execution.stopped(L_ptr)) return error.PluginExecutionStopped;
 
+    const cancel = execution.dispatchCtx(L_ptr).cancel;
     return switch (backend) {
         .bash => bash_exec.runWithOptions(std.heap.page_allocator, io, .{
             .cwd = resolved_cwd,
             .command = cmd,
             .stdin = stdin_bytes,
-            .cancel_requested = bridge.cancel_requested_slot,
+            .cancel_requested = cancel,
             .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
         }),
         .pwsh => pwsh_exec.runWithOptions(std.heap.page_allocator, io, .{
             .cwd = resolved_cwd,
             .command = cmd,
             .stdin = stdin_bytes,
-            .cancel_requested = bridge.cancel_requested_slot,
+            .cancel_requested = cancel,
             .timeout = execution.ioTimeout(L_ptr, timeout_seconds),
         }),
     };
@@ -205,14 +208,15 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
         if (bridge.getTableInteger(&state, 2, "timeout")) |v| timeout_seconds = @min(@max(@as(u32, @intCast(@max(v, 1))), 1), bash_exec.timeout_seconds_max);
     }
 
+    const ctx_cwd = execution.dispatchCtx(L_ptr).cwd;
     const resolved_cwd = if (cwd) |path| blk: {
-        break :blk sanitizePath(io, path) catch {
+        break :blk sanitizePath(io, path, ctx_cwd) catch {
             state.pushNil();
             state.pushString("invalid cwd path");
             return 2;
         };
     } else blk: {
-        var resolved = bridge.resolvePluginCwd(io) orelse {
+        var resolved = bridge.resolvePluginCwd(io, ctx_cwd) orelse {
             state.pushNil();
             state.pushString("could not resolve cwd");
             return 2;
@@ -298,7 +302,7 @@ pub fn getCwd(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
@@ -313,15 +317,16 @@ pub fn getProjectRoot(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
+    const ctx_cwd = execution.dispatchCtx(L_ptr).cwd;
 
-    var resolved = bridge.resolvePluginCwd(io) orelse {
+    var resolved = bridge.resolvePluginCwd(io, ctx_cwd) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
     defer resolved.deinit();
 
-    const root = git_bridge.findGitRoot(io, resolved.path) catch resolved.path;
+    const root = git_bridge.findGitRoot(io, resolved.path, ctx_cwd) catch resolved.path;
     defer if (root.ptr != resolved.path.ptr) std.heap.page_allocator.free(root);
 
     state.pushString(root);
@@ -330,11 +335,11 @@ pub fn getProjectRoot(L: ?*c.lua_State) callconv(.c) c_int {
 
 test "sanitizePath rejects control characters before any resolution" {
     const io = std.testing.io;
-    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\tfile"));
-    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\nfile"));
-    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "\x07bell"));
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\tfile", null));
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\nfile", null));
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "\x07bell", null));
     // A NUL byte keeps its dedicated check and must not reach the loop below.
-    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\x00file"));
+    try std.testing.expectError(error.InvalidPath, sanitizePath(io, "dir\x00file", null));
 }
 
 test "shellBackendErrorMessage maps only FileNotFound" {
