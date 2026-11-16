@@ -8,6 +8,7 @@ const std = @import("std");
 const c = @import("c");
 const State = @import("../state.zig").State;
 const bridge = @import("../bridge.zig");
+const execution = @import("../execution.zig");
 const shell_bridge = @import("shell.zig");
 pub const fs_ops = @import("fs_ops.zig");
 
@@ -53,7 +54,7 @@ pub fn readFile(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -127,7 +128,7 @@ pub fn writeFile(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -169,7 +170,7 @@ pub fn editFile(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -201,7 +202,7 @@ pub fn listDir(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -265,7 +266,7 @@ pub fn mkdir(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -300,13 +301,13 @@ pub fn copyPath(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_src = sanitizePath(io, src) catch |err| {
+    const clean_src = sanitizePath(io, src, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
     };
     defer std.heap.page_allocator.free(clean_src);
-    const clean_dst = sanitizePath(io, dst) catch |err| {
+    const clean_dst = sanitizePath(io, dst, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -341,13 +342,13 @@ pub fn movePath(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_src = sanitizePath(io, src) catch |err| {
+    const clean_src = sanitizePath(io, src, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
     };
     defer std.heap.page_allocator.free(clean_src);
-    const clean_dst = sanitizePath(io, dst) catch |err| {
+    const clean_dst = sanitizePath(io, dst, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -381,14 +382,14 @@ pub fn deletePath(L: ?*c.lua_State) callconv(.c) c_int {
         if (bridge.getTableBoolean(&state, 2, "recursive")) |v| recursive = v;
     }
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
     };
     defer std.heap.page_allocator.free(clean_path);
 
-    var resolved_cwd = bridge.resolvePluginCwd(io);
+    var resolved_cwd = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd);
     defer if (resolved_cwd) |*r| r.deinit();
     const cwd: []const u8 = if (resolved_cwd) |r| r.path else "";
     if (cwd.len > 0 and std.mem.eql(u8, clean_path, cwd)) {
@@ -454,7 +455,7 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    const clean_path = sanitizePath(io, path) catch |err| {
+    const clean_path = sanitizePath(io, path, execution.dispatchCtx(L_ptr).cwd) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;

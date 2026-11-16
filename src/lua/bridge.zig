@@ -7,31 +7,8 @@ const std = @import("std");
 const c = @import("c");
 const State = @import("state.zig").State;
 
-/// Thread-local override for the working directory a plugin tool runs in.
-/// A DERIVED binding of `ExecutorService.cwd` (= `Agent.effectiveCwd()`,
-/// lane worktree OR `/resume` session cwd): written
-/// only by `ExecutorService.runAll` entry (covers observer-driven plugin
-/// event callbacks, which fire outside the dispatch window) and refreshed by
-/// `rerootFromRequester` on mid-batch lane ops. Outside these windows (e.g.
-/// `init.lua` load) callers fall back to the process cwd via
-/// `resolvePluginCwd`. Lives here (not `registry_bridge.zig`) because
-/// `plugin_api.zig` imports this leaf module — placing it here avoids an
-/// import cycle.
-pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
-
-/// Derived from the executor's turn cancellation flag, including events.
-pub threadlocal var cancel_requested_slot: ?*const std.atomic.Value(bool) = null;
-
-/// Thread-local carrying the remote shell-safety classifier URL to the Lua C
-/// boundary, so `zay.run_bash`/`zay.run_shell` gate plugin shell execution
-/// through the same classifier as the builtin tool (`bash_safety.classify`).
-/// A DERIVED binding of `ToolContext.bash_classifier_url`: written only by
-/// `ExecutorService.runAll` entry, for the same observer-window reason as
-/// `plugin_cwd_slot`. Lives here beside it for the same import-cycle reason.
-pub threadlocal var bash_classifier_url_slot: ?[]const u8 = null;
-
-/// Resolved working directory for a plugin bridge: either a borrow of
-/// `plugin_cwd_slot` (no free needed), or an owned allocation from
+/// Resolved working directory for a plugin bridge: either a borrow of the
+/// dispatch context's cwd (no free needed), or an owned allocation from
 /// `currentPathAlloc` (must call `deinit`).
 pub const ResolvedCwd = struct {
     path: []const u8,
@@ -51,13 +28,14 @@ pub fn getIo(L: *c.lua_State) std.Io {
 }
 
 /// Resolve the effective working directory for a plugin bridge.
-/// When `plugin_cwd_slot` is set (from Agent.effectiveCwd() — a lane worktree
-/// or a resumed session's cwd), borrows its path. Otherwise falls back to
-/// `std.process.currentPathAlloc` on `std.heap.page_allocator` (the process
-/// cwd, frozen at launch). Returns null on allocation failure.
+/// When `cwd` is set (from `execution.DispatchCtx` — derived from
+/// Agent.effectiveCwd(): a lane worktree or a resumed session's cwd), borrows
+/// its path. Null (outside a dispatch window, e.g. `init.lua` load) falls
+/// back to `std.process.currentPathAlloc` on `std.heap.page_allocator` (the
+/// process cwd, frozen at launch). Returns null on allocation failure.
 /// Callers must call `deinit` on the result.
-pub fn resolvePluginCwd(io: std.Io) ?ResolvedCwd {
-    if (plugin_cwd_slot) |s| {
+pub fn resolvePluginCwd(io: std.Io, cwd: ?[]const u8) ?ResolvedCwd {
+    if (cwd) |s| {
         return .{ .path = s };
     }
     const owned = std.process.currentPathAlloc(io, std.heap.page_allocator) catch return null;
@@ -222,7 +200,7 @@ test "pull from nil returns null" {
     L.pop(1);
 }
 
-test "resolvePluginCwd borrows from plugin_cwd_slot when set" {
+test "resolvePluginCwd borrows the given cwd when set" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
@@ -234,24 +212,17 @@ test "resolvePluginCwd borrows from plugin_cwd_slot when set" {
     const abs_fake = try std.fs.path.resolve(gpa, &.{fake});
     defer gpa.free(abs_fake);
 
-    plugin_cwd_slot = abs_fake;
-    defer plugin_cwd_slot = null;
-
-    var resolved = resolvePluginCwd(io) orelse return error.TestFailed;
+    var resolved = resolvePluginCwd(io, abs_fake) orelse return error.TestFailed;
     defer resolved.deinit();
 
     try std.testing.expect(resolved.owned == null);
     try std.testing.expectEqualStrings(abs_fake, resolved.path);
 }
 
-test "resolvePluginCwd falls back to process currentPathAlloc when slot is null" {
+test "resolvePluginCwd falls back to process currentPathAlloc when cwd is null" {
     const io = std.testing.io;
 
-    const prev = plugin_cwd_slot;
-    plugin_cwd_slot = null;
-    defer plugin_cwd_slot = prev;
-
-    var resolved = resolvePluginCwd(io) orelse return error.TestFailed;
+    var resolved = resolvePluginCwd(io, null) orelse return error.TestFailed;
     defer resolved.deinit();
 
     try std.testing.expect(resolved.owned != null);
