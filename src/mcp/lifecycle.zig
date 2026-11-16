@@ -151,6 +151,8 @@ pub fn cloneForConnect(self: *const McpClient, io: std.Io) !McpClient {
     if (self.transport == .sse) {
         clone.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, self.transport.sse.headers);
     }
+    clone.read_timeout_ms = self.read_timeout_ms;
+    clone.generation = self.generation;
     markConnecting(&clone, io);
     assert(clone.discovery.tools.items.len == 0);
     assert(!clone.discovery.pending_refresh.load(.acquire));
