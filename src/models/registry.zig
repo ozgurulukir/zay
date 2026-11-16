@@ -599,13 +599,14 @@ pub fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
                 if (r == .bool) break :blk r.bool;
                 break :blk false;
             };
-            const context_window = blk: {
+            const context_window: u32 = blk: {
                 const limit_field = mkv.value_ptr.object.get("limit") orelse break :blk 0;
                 if (limit_field != .object) break :blk 0;
                 const ctx = limit_field.object.get("context") orelse break :blk 0;
                 if (ctx != .integer) break :blk 0;
                 if (ctx.integer < 0) break :blk 0;
-                break :blk @as(u32, @intCast(ctx.integer));
+                if (ctx.integer > std.math.maxInt(u32)) break :blk std.math.maxInt(u32);
+                break :blk @intCast(ctx.integer);
             };
             try unresolved_models.append(gpa, .{
                 .id = try appendString(gpa, &strings, mkv.key_ptr.*),
@@ -994,4 +995,23 @@ test "returnsNull_whenRegistryIsEmpty" {
 
     try std.testing.expect(registry.lookup("openai") == null);
     try std.testing.expect(registry.lookup("") == null);
+}
+
+test "parseModelsDevJson clamps context > maxInt(u32) (#423)" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{
+        \\  "custom": {
+        \\    "api": "https://api.example.com/v1",
+        \\    "name": "Custom",
+        \\    "models": {
+        \\      "huge": { "limit": { "context": 5000000000 } }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var registry = try parseModelsDevJson(gpa, json);
+    defer registry.deinit(gpa);
+    const m = registry.lookupModel("huge").?;
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), m.context_window);
 }
