@@ -6,6 +6,15 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-11-16
+
+### Changed
+- Lua: replace the threadlocal dispatch slots with a typed `DispatchCtx` plumbed to the bridge (#404).
+- Agent: drop tool-batch binding reflection in favor of explicit assertions (#403).
+
+### Fixed
+- Executor/agent/TUI: prevent stalls in tool execution and task continuation — concurrent worker races on the tool-batch produce path, `ResultFooterTooLarge` aborts on oversized preview footers, partial-allocation double-free in `emitToolCallFinished`, a missing assistant message when continuing on length cuts with no wire prose, and lane await now resurfaces stall warnings on subsequent stall windows (#402).
+
 ## [0.11.11] - 2026-11-15
 
 ### Changed
@@ -162,7 +171,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.11...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.12...HEAD
+[0.11.12]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.12
 [0.11.11]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.11
 [0.11.10]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.10
 [0.11.9]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.9
