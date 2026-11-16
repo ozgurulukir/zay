@@ -79,7 +79,7 @@ pub const Source = struct {
     /// `[DONE]` sentinel or end of stream. Skips non-data and keep-alive lines
     /// and enforces the stream bounds.
     pub fn next(self: *Source, gpa: std.mem.Allocator) !?[]u8 {
-        while (try readLine(gpa, self.reader)) |line| {
+        while (try readLine(gpa, self.reader, bytes_max -| self.bytes_read)) |line| {
             defer gpa.free(line);
             self.chunk_count += 1;
             self.bytes_read += line.len;
@@ -95,12 +95,14 @@ pub const Source = struct {
     }
 };
 
-/// Read one `\n`-terminated line (delimiter stripped). Returns null at end of
-/// stream when no trailing bytes remain.
-fn readLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+/// Read one `\n`-terminated line (delimiter stripped), bounded by `max_bytes`
+/// during the read so an unterminated line cannot exhaust memory (#422).
+/// Returns null at end of stream when no trailing bytes remain.
+fn readLine(gpa: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) !?[]u8 {
     var line_writer: std.Io.Writer.Allocating = .init(gpa);
     errdefer line_writer.deinit();
-    _ = reader.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
+    _ = reader.streamDelimiterLimit(&line_writer.writer, '\n', .limited(max_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return error.StreamTooLarge,
         error.ReadFailed => return error.ReadFailed,
         error.WriteFailed => return error.OutOfMemory,
     };
@@ -228,4 +230,10 @@ test "Source.next enforces chunk_count_max with StreamTooManyChunks error" {
 
     const result = source.next(gpa);
     try std.testing.expectError(error.StreamTooManyChunks, result);
+}
+
+test "readLine aborts during read when line exceeds max_bytes (#422)" {
+    const gpa = std.testing.allocator;
+    var reader = std.Io.Reader.fixed("data: " ++ ("x" ** 64));
+    try std.testing.expectError(error.StreamTooLarge, readLine(gpa, &reader, 32));
 }
