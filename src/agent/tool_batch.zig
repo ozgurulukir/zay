@@ -22,6 +22,7 @@ const std = @import("std");
 
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
+const background = @import("../background.zig");
 const executor_mod = @import("../executor.zig");
 const session_mod = @import("../session.zig");
 const skill_mod = @import("../skill.zig");
@@ -36,8 +37,7 @@ const StreamContext = stream_context_mod.StreamContext;
 /// takes the workspace scope's mutex, which is fine on the worker but would contend
 /// with the UI-thread lock users if this were constructed from the main
 /// thread. Every field is either a direct Agent mirror or derived exactly
-/// as the batch path needs — `toolExecutor bindings mirror the Agent
-/// fields they read` and the runtime parity test guard that wiring.
+/// as the batch path needs — the runtime parity test guards that wiring.
 pub fn toolExecutor(self: *Agent, turn_allocator: std.mem.Allocator) executor_mod.ExecutorService {
     return executor_mod.ExecutorService.init(.{
         .gpa = self.gpa,
@@ -257,90 +257,6 @@ fn ExecutorBridge(comptime L: type) type {
     };
 }
 
-/// InitOptions field name → Agent field path for every `toolExecutor`
-/// binding taken straight from an Agent field. Derived bindings (cwd via
-/// `effectiveCwd`, scratch_allocator from the turn, the session_writer
-/// triple, the null background path, lane_requester = the Agent itself,
-/// result_cache = an address-of) are covered by the runtime parity test
-/// below — it exercises `background_manager == null` only, so a live
-/// manager's `owner_generation` wiring is not asserted there. The record
-/// splits along where ExecutorService stores the value: top-level fields
-/// versus `ctx` (tools.ToolContext).
-const tool_executor_service_bindings = .{
-    .gpa = "gpa",
-    .io = "io",
-    .contained = "contained",
-    .tool_registry = "tool_registry",
-    .tool_output_cap_bytes = "compaction_settings.tool_output_cap_bytes",
-};
-const tool_executor_ctx_bindings = .{
-    .bash_classifier_url = "bash_classifier_url",
-    .mcp_manager = "mcp_manager",
-    .plugin_manager = "plugin_manager",
-    .lane_bridge = "lane_bridge",
-    .skills = "skills",
-    .database_server_url = "database_server_url",
-    .database_auth_token = "database_auth_token",
-    .cancel_requested = "cancel_requested",
-};
-
-/// Resolve a dotted Agent field path ("compaction_settings.tool_output_cap_bytes")
-/// to its field type, for the comptime binding-parity test.
-fn agentFieldTypeAtPath(comptime T: type, comptime path: []const u8) type {
-    comptime {
-        @setEvalBranchQuota(10_000);
-        const head_end = std.mem.indexOfScalar(u8, path, '.') orelse path.len;
-        var found: ?type = null;
-        for (std.meta.fields(T)) |field| {
-            if (std.mem.eql(u8, field.name, path[0..head_end])) {
-                found = field.type;
-                break;
-            }
-        }
-        if (head_end == path.len) return found.?;
-        return agentFieldTypeAtPath(found.?, path[head_end + 1 ..]);
-    }
-}
-
-/// Resolve a dotted Agent field path to its runtime value. Accepts the Agent
-/// by pointer or value; `@field` auto-dereferences either way.
-fn agentFieldValueAtPath(obj: anytype, comptime path: []const u8) agentFieldTypeAtPath(
-    switch (@typeInfo(@TypeOf(obj))) {
-        .pointer => |pointer| pointer.child,
-        else => @TypeOf(obj),
-    },
-    path,
-) {
-    if (comptime std.mem.indexOfScalar(u8, path, '.')) |dot| {
-        return agentFieldValueAtPath(@field(obj, path[0..dot]), path[dot + 1 ..]);
-    }
-    return @field(obj, path);
-}
-
-test "toolExecutor bindings mirror the Agent fields they read" {
-    // Compile-time parity: every binding-record entry must name an
-    // InitOptions field and an Agent field path of the same type, so the
-    // hand-built literal and the Agent fields it reads cannot drift apart.
-    // No runtime assertions — compiling IS the assertion.
-    inline for (.{ tool_executor_service_bindings, tool_executor_ctx_bindings }) |bindings| {
-        inline for (std.meta.fields(@TypeOf(bindings))) |binding| {
-            const path = @field(bindings, binding.name);
-            const option_type = comptime blk: {
-                for (std.meta.fields(executor_mod.ExecutorService.InitOptions)) |option_field| {
-                    if (std.mem.eql(u8, option_field.name, binding.name)) {
-                        break :blk option_field.type;
-                    }
-                }
-                @compileError("toolExecutor binding." ++ binding.name ++ " is not an InitOptions field");
-            };
-            if (option_type != agentFieldTypeAtPath(Agent, path)) {
-                @compileError("Agent." ++ path ++
-                    " type diverged from InitOptions." ++ binding.name);
-            }
-        }
-    }
-}
-
 test "toolExecutor projected fields match the hand-built InitOptions wiring" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -373,6 +289,9 @@ test "toolExecutor projected fields match the hand-built InitOptions wiring" {
     agent.skills = &.{fixture};
     var cancel_flag: std.atomic.Value(bool) = .init(false);
     agent.cancel_requested = &cancel_flag;
+    var bg_manager = background.BackgroundManager.init(std.testing.io, gpa);
+    defer bg_manager.shutdownAll();
+    agent.background_manager = &bg_manager;
 
     const options = toolExecutor(&agent, gpa);
 
@@ -385,22 +304,28 @@ test "toolExecutor projected fields match the hand-built InitOptions wiring" {
     try std.testing.expectEqualStrings(sw.session.id.slice(), options.ctx.session_id.?);
     try std.testing.expectEqual(sw, options.session_writer.?);
     try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&agent)), options.ctx.lane_requester);
-    try std.testing.expect(agent.background_manager == null and options.ctx.background_manager == null);
+    // Live background manager: the whole-batch wiring (manager pointer and
+    // the lane generation as owner_generation) — not just the null branch.
+    try std.testing.expectEqual(agent.background_manager.?, options.ctx.background_manager.?);
+    try std.testing.expectEqual(agent.lane_generation, options.ctx.owner_generation);
     try std.testing.expectEqual(&agent.result_cache, options.result_cache.?);
 
-    // Direct mirrors, driven by the shared binding records.
-    inline for (std.meta.fields(@TypeOf(tool_executor_service_bindings))) |binding| {
-        try std.testing.expectEqual(
-            agentFieldValueAtPath(&agent, @field(tool_executor_service_bindings, binding.name)),
-            @field(options, binding.name),
-        );
-    }
-    inline for (std.meta.fields(@TypeOf(tool_executor_ctx_bindings))) |binding| {
-        try std.testing.expectEqual(
-            agentFieldValueAtPath(&agent, @field(tool_executor_ctx_bindings, binding.name)),
-            @field(options.ctx, binding.name),
-        );
-    }
+    // Direct mirrors: an explicit list. expectEqual enforces both value and
+    // type parity — an InitOptions field type change breaks this test's
+    // compile, same guard the former comptime binding tables provided.
+    try std.testing.expectEqual(agent.gpa, options.gpa);
+    try std.testing.expectEqual(agent.io, options.io);
+    try std.testing.expectEqual(agent.contained, options.contained);
+    try std.testing.expectEqual(agent.tool_registry, options.tool_registry);
+    try std.testing.expectEqual(agent.compaction_settings.tool_output_cap_bytes, options.tool_output_cap_bytes);
+    try std.testing.expectEqual(agent.bash_classifier_url, options.ctx.bash_classifier_url);
+    try std.testing.expectEqual(agent.mcp_manager, options.ctx.mcp_manager);
+    try std.testing.expectEqual(agent.plugin_manager, options.ctx.plugin_manager);
+    try std.testing.expectEqual(agent.lane_bridge, options.ctx.lane_bridge);
+    try std.testing.expectEqual(agent.skills, options.ctx.skills);
+    try std.testing.expectEqual(agent.database_server_url, options.ctx.database_server_url);
+    try std.testing.expectEqual(agent.database_auth_token, options.ctx.database_auth_token);
+    try std.testing.expectEqual(agent.cancel_requested, options.ctx.cancel_requested);
 }
 
 test "snapshotAfterBatch: disabled snapshots return without touching git" {
