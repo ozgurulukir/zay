@@ -66,15 +66,12 @@ pub fn runMcpTool(
     };
     defer gpa.free(server_args);
 
-    const result_text = blk: {
-        for (manager.clients.items) |client| {
-            if (client.status() != .connected) continue;
-            if (!std.mem.eql(u8, client.name, key.server_name)) continue;
-            break :blk client.callTool(io, key.tool_name, server_args) catch |err| {
-                return tools_common.failFmt(gpa, 1, "MCP tool '{s}' failed: {s}", .{ key.tool_name, @errorName(err) });
-            };
-        }
+    const client = manager.acquireConnectedClient(io, key.server_name) orelse
         return tools_common.fail(gpa, "MCP server not found", 1);
+    defer @import("manager.zig").McpManager.releaseClient(client);
+
+    const result_text = client.callTool(io, key.tool_name, server_args) catch |err| {
+        return tools_common.failFmt(gpa, 1, "MCP tool '{s}' failed: {s}", .{ key.tool_name, @errorName(err) });
     };
 
     // Single ownership: `stdout` owns the final text from here on — the

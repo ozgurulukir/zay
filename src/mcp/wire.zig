@@ -148,10 +148,13 @@ pub fn sendRequestStdio(client: *McpClient, io: std.Io, method: []const u8, para
             }
         }
 
-        // Read one line from stdout (newline-delimited JSON-RPC).
+        // Read one line from stdout (newline-delimited JSON-RPC), bounded so a
+        // misbehaving server cannot exhaust memory on an unterminated line.
+        const stdio_line_bytes_max: usize = 64 * 1024 * 1024;
         var line_writer: std.Io.Writer.Allocating = .init(client.gpa);
         errdefer line_writer.deinit();
-        _ = reader.interface.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
+        _ = reader.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(stdio_line_bytes_max)) catch |err| switch (err) {
+            error.StreamTooLong => return error.McpStreamTooLarge,
             error.ReadFailed => return error.McpServerCrashed,
             error.WriteFailed => return error.OutOfMemory,
         };
@@ -392,7 +395,10 @@ fn sendRequestHttpUnbounded(client: *McpClient, io: std.Io, method: []const u8, 
     var redirect_buffer: [http_redirect_buffer_bytes]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
     const status_code: u16 = @intFromEnum(response.head.status);
-    if (status_code == 404) return error.McpSessionExpired;
+    if (status_code == 404) {
+        clearSessionId(client, io);
+        return error.McpSessionExpired;
+    }
     if (status_code == 401 or status_code == 403) return error.McpUnauthorized;
     if (!http.isSuccess(status_code)) return error.McpHttpRequestFailed;
 
@@ -461,7 +467,10 @@ fn sendNotificationHttpUnbounded(client: *McpClient, io: std.Io, method: []const
     const response = try req.receiveHead(&redirect_buffer);
     try captureSessionId(client, io, response.head);
     const status_code: u16 = @intFromEnum(response.head.status);
-    if (status_code == 404) return error.McpSessionExpired;
+    if (status_code == 404) {
+        clearSessionId(client, io);
+        return error.McpSessionExpired;
+    }
     if (status_code >= 400) return error.McpHttpRequestFailed;
 }
 
@@ -537,6 +546,17 @@ pub fn captureSessionId(client: *McpClient, io: std.Io, head: std.http.Client.Re
         if (client.session_id) |old| client.gpa.free(old);
         client.session_id = fresh;
         return;
+    }
+}
+
+/// Clear `session_id` under `transport_mutex` when the server rejects a stale
+/// session with 404 so subsequent calls do not keep sending the expired id.
+pub fn clearSessionId(client: *McpClient, io: std.Io) void {
+    client.transport_mutex.lockUncancelable(io);
+    defer client.transport_mutex.unlock(io);
+    if (client.session_id) |old| {
+        client.gpa.free(old);
+        client.session_id = null;
     }
 }
 
