@@ -501,7 +501,7 @@ fn pruneProject(backend: *SessionBackend, io: std.Io, project_key: []const u8) !
     defer result.deinit();
     if (result.rows.len <= project_result_limit) {
         var total_bytes: i64 = 0;
-        for (result.rows) |row| total_bytes += try integer(row[2]);
+        for (result.rows) |row| total_bytes += try integer(row[3]);
         if (total_bytes <= project_bytes_limit) return;
     }
 

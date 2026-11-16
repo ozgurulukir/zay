@@ -54,6 +54,7 @@ pub fn downscaleWith(
     const is_png = std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n");
     const is_jpeg = std.mem.startsWith(u8, bytes, "\xff\xd8\xff");
     if (!is_png and !is_jpeg) return .unchanged;
+    if (!dimensionsWithinLimit(bytes, is_png)) return .unchanged;
 
     var img = zigimg.Image.fromMemory(gpa, bytes) catch return .unchanged;
     defer img.deinit(gpa);
@@ -306,4 +307,55 @@ test "compositeResize averages boxes and composites alpha over white" {
     try std.testing.expectEqual(@as(u8, 7), identity_dst[0].r);
     try std.testing.expectEqual(@as(u8, 8), identity_dst[0].g);
     try std.testing.expectEqual(@as(u8, 9), identity_dst[0].b);
+}
+
+const max_decode_pixels: u64 = 100_000_000;
+
+/// Validate PNG IHDR or JPEG SOF dimensions in `u64` before calling zigimg,
+/// whose `u32` width*height arithmetic overflows on crafted headers (#428).
+fn dimensionsWithinLimit(bytes: []const u8, is_png: bool) bool {
+    if (is_png) {
+        if (bytes.len < 24) return false;
+        if (!std.mem.eql(u8, bytes[12..16], "IHDR")) return false;
+        const w = std.mem.readInt(u32, bytes[16..20], .big);
+        const h = std.mem.readInt(u32, bytes[20..24], .big);
+        if (w == 0 or h == 0) return false;
+        return @as(u64, w) * @as(u64, h) <= max_decode_pixels;
+    }
+    var i: usize = 2;
+    while (i + 3 < bytes.len) {
+        if (bytes[i] != 0xFF) return false;
+        while (i < bytes.len and bytes[i] == 0xFF) i += 1;
+        if (i >= bytes.len) return false;
+        const marker = bytes[i];
+        i += 1;
+        if (marker == 0xD8 or marker == 0xD9 or marker == 0x00 or (marker >= 0xD0 and marker <= 0xD7)) continue;
+        if (i + 2 > bytes.len) return false;
+        const seg_len = std.mem.readInt(u16, bytes[i..][0..2], .big);
+        if (seg_len < 2 or i + seg_len > bytes.len) return false;
+        const is_sof = (marker >= 0xC0 and marker <= 0xCF) and
+            marker != 0xC4 and marker != 0xC8 and marker != 0xCC;
+        if (is_sof) {
+            if (seg_len < 7) return false;
+            const h = std.mem.readInt(u16, bytes[i + 3 ..][0..2], .big);
+            const w = std.mem.readInt(u16, bytes[i + 5 ..][0..2], .big);
+            if (w == 0 or h == 0) return false;
+            return @as(u64, w) * @as(u64, h) <= max_decode_pixels;
+        }
+        i += seg_len;
+    }
+    return false;
+}
+
+test "downscaleWith rejects oversized PNG IHDR before zigimg decode (#428)" {
+    const gpa = std.testing.allocator;
+    var crafted: [64]u8 = undefined;
+    @memset(&crafted, 0);
+    @memcpy(crafted[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(crafted[12..16], "IHDR");
+    std.mem.writeInt(u32, crafted[16..20], 0x7fff_ffff, .big);
+    std.mem.writeInt(u32, crafted[20..24], 3, .big);
+
+    const res = try downscaleWith(gpa, &crafted, 16, 1024);
+    try std.testing.expectEqual(Downscale.unchanged, res);
 }
