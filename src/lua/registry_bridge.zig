@@ -16,6 +16,7 @@ const std = @import("std");
 const lua_mod = @import("root.zig");
 const PluginManager = lua_mod.PluginManager;
 const PluginInstance = lua_mod.PluginInstance;
+const execution = @import("execution.zig");
 const tools_mod = @import("../tools.zig");
 const tools_common = @import("../tools/common.zig");
 const Tool = tools_common.Tool;
@@ -81,15 +82,22 @@ pub fn runPluginTool(
     args: []const u8,
     env: tools_common.Env,
 ) tools_common.Error!tools_common.Output {
-    _ = cwd;
     _ = io;
     const key: *PluginToolKey = @ptrCast(@alignCast(env.userdata));
     const manager = env.ctx.plugin_manager orelse
         return tools_common.fail(gpa, "plugin dispatcher: no live plugin manager"[0..], 1);
+    // Arm the dispatch window with the executor-owned values the Lua
+    // bridges used to read from threadlocal slots: the dispatch cwd plus
+    // the ToolContext cancel/classifier bindings.
     var result = manager.callTool(
         key.plugin_name[0..],
         key.tool_name[0..],
         args,
+        .{
+            .cwd = cwd,
+            .cancel = env.ctx.cancel_requested,
+            .classifier_url = env.ctx.bash_classifier_url,
+        },
     ) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         return tools_common.failFmt(

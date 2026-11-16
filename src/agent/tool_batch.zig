@@ -27,6 +27,7 @@ const executor_mod = @import("../executor.zig");
 const session_mod = @import("../session.zig");
 const skill_mod = @import("../skill.zig");
 const tools = @import("../tools.zig");
+const lua_execution = @import("../lua/execution.zig");
 const stream_context_mod = @import("stream_context.zig");
 
 const Agent = agent_mod.Agent;
@@ -78,12 +79,13 @@ pub fn runToolBatch(
     listener: L,
     turn_allocator: std.mem.Allocator,
 ) !bool {
+    var executor = toolExecutor(self, turn_allocator);
     var bridge: ExecutorBridge(L) = .{
         .agent = self,
         .listener = listener,
         .stream_context = stream_context,
+        .executor = &executor,
     };
-    var executor = toolExecutor(self, turn_allocator);
     const results = executor.runAll(tool_calls, bridge.observer()) catch |err| {
         if (err == error.Canceled) {
             if (self.cancel_requested) |flag| {
@@ -189,12 +191,27 @@ pub fn emitToolCallFinished(
 /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
 /// agent's Event stream. Tracks tool_index across the batch so the
 /// events line up with the tool_indexes the TUI saw during deltas.
+/// The `executor` back-pointer arms each plugin event dispatch with the
+/// executor-owned dispatch context (cwd / cancellation / classifier URL) —
+/// read live per callback so a mid-batch `rerootFromRequester` (lane
+/// enter/leave) is reflected in the remaining event windows.
 fn ExecutorBridge(comptime L: type) type {
     return struct {
         agent: *Agent,
         listener: L,
         stream_context: *const StreamContext(L),
+        executor: *executor_mod.ExecutorService,
         tool_index: u32 = 0,
+
+        /// The executor-owned dispatch context for plugin event delivery,
+        /// built from the live executor state at callback time.
+        fn dispatchCtx(ctx: *@This()) lua_execution.DispatchCtx {
+            return .{
+                .cwd = ctx.executor.cwd,
+                .cancel = ctx.executor.ctx.cancel_requested,
+                .classifier_url = ctx.executor.ctx.bash_classifier_url,
+            };
+        }
 
         fn onStarted(ctx: *@This(), call: ai.ToolCall) anyerror!void {
             // Synthesise a tool_delta for the TUI if the LM did not stream
@@ -208,7 +225,7 @@ fn ExecutorBridge(comptime L: type) type {
             // plugin's own handler has not been entered yet on this thread.
             if (ctx.agent.plugin_manager) |pm| pm.emitEvent(.{
                 .tool_call_started = .{ .name = call.name, .call_id = call.call_id.slice() },
-            });
+            }, ctx.dispatchCtx());
         }
 
         fn onFinished(ctx: *@This(), result: *const executor_mod.ToolResult) anyerror!void {
@@ -219,7 +236,7 @@ fn ExecutorBridge(comptime L: type) type {
                     .call_id = result.call_id.slice(),
                     .success = !result.failed,
                 },
-            });
+            }, ctx.dispatchCtx());
             try emitToolCallFinished(
                 L,
                 ctx.agent,

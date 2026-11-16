@@ -3,7 +3,6 @@ const std = @import("std");
 const c = @import("c");
 const manager_mod = @import("manager.zig");
 const registry_bridge = @import("registry_bridge.zig");
-const bridge = @import("bridge.zig");
 const sandbox = @import("sandbox.zig");
 const execution = @import("execution.zig");
 const snapshot_mod = @import("tool_snapshot.zig");
@@ -97,10 +96,8 @@ const Call = struct {
     result: ?@import("plugin_api.zig").ToolHandlerResult = null,
 
     fn run(self: *Call) void {
-        bridge.cancel_requested_slot = self.flag;
-        defer bridge.cancel_requested_slot = null;
         self.started.set(testing.io);
-        self.result = self.manager.callTool(self.plugin_name, "test", self.params) catch |err| blk: {
+        self.result = self.manager.callTool(self.plugin_name, "test", self.params, .{ .cancel = self.flag }) catch |err| blk: {
             self.err = err;
             break :blk null;
         };
@@ -184,10 +181,10 @@ test "Lua concurrency: handlers serialize, snapshots stay independent, and cance
     task.await(testing.io);
     other_task.await(testing.io);
     try testing.expectEqual(top, instance.state.getTop());
-    var result = try manager.callTool("concurrent", "late", "{}");
+    var result = try manager.callTool("concurrent", "late", "{}", .{});
     defer result.deinit(gpa);
     try testing.expectEqualStrings("tools may only be registered during plugin initialization", result.text);
-    try testing.expectError(error.ToolNotFound, manager.callTool("concurrent", "extra", "{}"));
+    try testing.expectError(error.ToolNotFound, manager.callTool("concurrent", "extra", "{}", .{}));
     // An SDK turn lease rejects mutation even between tool calls.
     try manager.beginUse();
     try testing.expectError(error.InFlightTurn, manager.unload("concurrent"));
@@ -298,7 +295,7 @@ test "Lua concurrency: failures, timeout, reload failure and allocation errors l
     const instance = try manager.loadOne(path, false);
     const top = instance.state.getTop();
     for ([_][]const u8{ "fail", "loop", "test" }) |name| {
-        var result = try manager.callTool("concurrent", name, "{}");
+        var result = try manager.callTool("concurrent", name, "{}", .{});
         defer result.deinit(gpa);
         try testing.expectEqual(@as(u8, if (std.mem.eql(u8, name, "test")) 0 else 1), result.code);
         try testing.expectEqual(top, instance.state.getTop());
@@ -310,10 +307,10 @@ test "Lua concurrency: failures, timeout, reload failure and allocation errors l
     {
         manager.allocator = failed.allocator();
         defer manager.allocator = gpa;
-        try testing.expectError(error.OutOfMemory, manager.callTool("concurrent", "test", "{}"));
+        try testing.expectError(error.OutOfMemory, manager.callTool("concurrent", "test", "{}", .{}));
     }
     try testing.expectEqual(top, instance.state.getTop());
-    var result = try manager.callTool("concurrent", "test", "{}");
+    var result = try manager.callTool("concurrent", "test", "{}", .{});
     defer result.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), result.code);
 }
@@ -383,7 +380,7 @@ test "Lua concurrency: independent plugins run while another state is blocked an
     try testing.expectEqual(error.Canceled, first.err.?);
     try testing.expect(first.result == null);
     try testing.expectEqual(@as(c_int, 0), instance.state.getTop());
-    var next = try manager.callTool("concurrent", "test", "{}");
+    var next = try manager.callTool("concurrent", "test", "{}", .{});
     defer next.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), next.code);
     other_task.await(testing.io);
@@ -411,7 +408,7 @@ test "Lua concurrency: wall-clock timeout resets and leaves the execution mutex 
     // silent slow-down (the 5s manifest budget still times the loop out
     // with identical assertions).
     try testing.expectEqual(@as(u32, 1), execution.budget(instance.state.handle).?.timeout_ms);
-    var timeout = try manager.callTool("concurrent", "loop", "{}");
+    var timeout = try manager.callTool("concurrent", "loop", "{}", .{});
     defer timeout.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), timeout.code);
     try testing.expect(std.mem.indexOf(u8, timeout.text, "timeout exceeded") != null);
@@ -420,7 +417,7 @@ test "Lua concurrency: wall-clock timeout resets and leaves the execution mutex 
     // longer than 1ms must not flake a trivial call. A wedged mutex or an
     // uncleared stop_reason would fail this call at any budget size.
     sandbox.setWallClockTimeoutMs(instance.state.handle, 5000);
-    var next = try manager.callTool("concurrent", "test", "{}");
+    var next = try manager.callTool("concurrent", "test", "{}", .{});
     defer next.deinit(gpa);
     try testing.expectEqual(@as(u8, 0), next.code);
 }
@@ -497,7 +494,7 @@ const SpinningCall = struct {
     }
 
     fn run(self: *SpinningCall) void {
-        self.result = self.manager.callTool("concurrent", "spin", "{}") catch |err| blk: {
+        self.result = self.manager.callTool("concurrent", "spin", "{}", .{}) catch |err| blk: {
             self.err = err;
             break :blk null;
         };
@@ -534,7 +531,7 @@ test "lock architecture: Io cancellation escapes a spinning protected handler an
     try testing.expectEqual(error.Canceled, call.err.?);
     try testing.expect(call.result == null);
     try testing.expectEqual(@as(c_int, 0), instance.state.getTop());
-    var next = try manager.callTool("concurrent", "test", "{}");
+    var next = try manager.callTool("concurrent", "test", "{}", .{});
     defer next.deinit(gpa);
     try testing.expectEqualStrings("usable", next.text);
 }
@@ -560,24 +557,22 @@ test "lock architecture: busy tools time out, unrelated events skip Lua, and sub
     defer gate.release.set(testing.io);
     try wait(&gate.entered);
     const start = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
-    try testing.expectError(error.PluginBusy, manager.callTool("concurrent", "test", "{}"));
+    try testing.expectError(error.PluginBusy, manager.callTool("concurrent", "test", "{}", .{}));
     const elapsed = std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start;
     try testing.expect(elapsed >= 20 * std.time.ns_per_ms);
     try testing.expect(elapsed < std.time.ns_per_s);
     // A zero delivery budget still allows an immediate lookup-free skip.
     manager.execution_policy.event_budget_ms = 0;
-    manager.emitEvent(.{ .response_received = {} });
+    manager.emitEvent(.{ .response_received = {} }, .{});
     manager.execution_policy.event_budget_ms = 20;
-    manager.emitEvent(.{ .tool_call_started = .{ .name = "builtin", .call_id = "other" } });
+    manager.emitEvent(.{ .tool_call_started = .{ .name = "builtin", .call_id = "other" } }, .{});
     try testing.expectEqual(@as(u32, 0), gate.callbacks.load(.acquire));
     try testing.expect(!first.done.isSet());
     gate.release.set(testing.io);
     task.await(testing.io);
     try testing.expect(first.err == null);
-    const previous_cwd = bridge.plugin_cwd_slot;
-    bridge.plugin_cwd_slot = path;
-    defer bridge.plugin_cwd_slot = previous_cwd;
-    manager.emitEvent(.{ .tool_call_started = .{ .name = "builtin", .call_id = "after" } });
+    // The dispatch ctx (here the plugin dir) replaces the old threadlocal cwd slot.
+    manager.emitEvent(.{ .tool_call_started = .{ .name = "builtin", .call_id = "after" } }, .{ .cwd = path });
     try testing.expectEqual(@as(u32, 1), gate.callbacks.load(.acquire));
 }
 
@@ -597,11 +592,11 @@ test "lock architecture: runtime event registration updates the host subscriptio
     const instance = try manager.loadOne(path, false);
     var gate: Gate = .{ .io = testing.io };
     gate.install(instance);
-    manager.emitEvent(.{ .response_received = {} });
+    manager.emitEvent(.{ .response_received = {} }, .{});
     try testing.expectEqual(@as(u32, 0), gate.callbacks.load(.acquire));
-    var result = try manager.callTool("concurrent", "subscribe", "{}");
+    var result = try manager.callTool("concurrent", "subscribe", "{}", .{});
     defer result.deinit(gpa);
-    manager.emitEvent(.{ .response_received = {} });
+    manager.emitEvent(.{ .response_received = {} }, .{});
     try testing.expectEqual(@as(u32, 1), gate.callbacks.load(.acquire));
 }
 
@@ -621,13 +616,13 @@ test "lock architecture: slow shell and permitted os.execute share the Lua deadl
         defer manager.deinit();
         const instance = try manager.loadOne(path, false);
         const start = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
-        var result = try manager.callTool("concurrent", "slow", "{}");
+        var result = try manager.callTool("concurrent", "slow", "{}", .{});
         defer result.deinit(gpa);
         try testing.expectEqual(@as(u8, 1), result.code);
         try testing.expect(std.mem.indexOf(u8, result.text, "timeout exceeded") != null);
         try testing.expect(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start < 3 * std.time.ns_per_s);
         try testing.expectEqual(@as(c_int, 0), instance.state.getTop());
-        var next = try manager.callTool("concurrent", "test", "{}");
+        var next = try manager.callTool("concurrent", "test", "{}", .{});
         defer next.deinit(gpa);
         try testing.expectEqualStrings("usable", next.text);
     }
@@ -650,11 +645,11 @@ test "lock architecture: one event budget stops protected callbacks and the next
     manager.execution_policy.event_budget_ms = 20;
     const instance = try manager.loadOne(path, false);
     const start = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
-    manager.emitEvent(.{ .response_received = {} });
+    manager.emitEvent(.{ .response_received = {} }, .{});
     try testing.expect(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start < std.time.ns_per_s);
     try testing.expectEqual(@as(c_int, 0), instance.state.getTop());
     try testing.expect(@import("execution.zig").budget(instance.state.handle).?.stop_reason == .timeout);
-    var next = try manager.callTool("concurrent", "test", "{}");
+    var next = try manager.callTool("concurrent", "test", "{}", .{});
     defer next.deinit(gpa);
     try testing.expectEqualStrings("usable", next.text);
 }

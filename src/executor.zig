@@ -310,30 +310,6 @@ pub const ExecutorService = struct {
         calls: []const ai.ToolCall,
         observer: anytype,
     ) ![]ToolResult {
-        const prev_cancel_slot = lua_mod.bridge.cancel_requested_slot;
-        lua_mod.bridge.cancel_requested_slot = self.ctx.cancel_requested;
-        defer lua_mod.bridge.cancel_requested_slot = prev_cancel_slot;
-
-        // Shell-safety classifier URL for plugin `zay.run_bash`/`run_shell`
-        // calls: set for the WHOLE batch, not just `produceOutput` — the
-        // observers below fire plugin event callbacks (emitEvent → Lua) after
-        // produceOutput's dispatch window, and a handler shelling out there
-        // must classify with the same remote classifier as the builtin tool.
-        // Null (headless/tests) keeps the always-armed local matcher.
-        const prev_classifier_url = lua_mod.bridge.bash_classifier_url_slot;
-        lua_mod.bridge.bash_classifier_url_slot = self.ctx.bash_classifier_url;
-        defer lua_mod.bridge.bash_classifier_url_slot = prev_classifier_url;
-
-        // Plugin cwd slot for the whole batch: observer-driven event callbacks
-        // (on_started/on_finished → emitEvent → drainEventCallbacks) fire
-        // outside produceOutput's dispatch window, but still inside runAll on
-        // the same thread. Setting it here ensures all plugin bridges see the
-        // correct effective cwd (lane worktree OR resumed session) even from
-        // event handlers. Refreshed by rerootFromRequester on mid-batch lane ops.
-        const prev_cwd_slot = lua_mod.bridge.plugin_cwd_slot;
-        lua_mod.bridge.plugin_cwd_slot = self.cwd;
-        defer lua_mod.bridge.plugin_cwd_slot = prev_cwd_slot;
-
         const results = try self.gpa.alloc(ToolResult, calls.len);
         var initialized: usize = 0;
         errdefer {
@@ -369,9 +345,6 @@ pub const ExecutorService = struct {
         const ptr = self.ctx.lane_requester orelse return;
         const agent: *agent_mod.Agent = @ptrCast(@alignCast(ptr));
         self.cwd = agent.effectiveCwd();
-        // The Lua bridge binding is the derived per-batch window set by
-        // runAll — refresh it along with the cwd.
-        lua_mod.bridge.plugin_cwd_slot = self.cwd;
     }
 
     fn shouldRejectUnsafeShell(self: *ExecutorService, call: ai.ToolCall, observer: anytype) !executor_safety.Outcome {
@@ -1879,7 +1852,7 @@ test "valid MCP tool call reaches the registry bridge, not unknown-tool" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "MCP tool 'search' failed") != null);
 }
 
-test "ExecutorService.runAll sets plugin_cwd_slot around observer callbacks" {
+test "ExecutorService.runAll keeps the batch cwd visible to observer callbacks" {
     // POSIX-gated: uses tmpDir for a temp dir whose path differs from the
     // process cwd, simulating the lane/resume differential.
     if (os.is_windows) return error.SkipZigTest;
@@ -1892,25 +1865,34 @@ test "ExecutorService.runAll sets plugin_cwd_slot around observer callbacks" {
     const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(fake_cwd);
 
-    // Recording observer captures plugin_cwd_slot at on_started and on_finished.
+    // Recording observer captures the executor state the ExecutorBridge's
+    // dispatch ctx is derived from (cwd + cancel + classifier URL) at
+    // on_started and on_finished — the values a plugin event dispatch now
+    // receives instead of the old threadlocal plugin_cwd_slot.
     const Recording = struct {
-        started_slot: ?[]const u8 = null,
-        finished_slot: ?[]const u8 = null,
+        executor: *ExecutorService,
+        started_cwd: ?[]const u8 = null,
+        finished_cwd: ?[]const u8 = null,
+        started_cancel: ?*const std.atomic.Value(bool) = null,
+        started_classifier_url: ?[]const u8 = null,
     };
-    var rec = Recording{};
+    var rec: Recording = undefined;
 
     const Obs = struct {
         pub fn onStarted(ctx: *Recording, _: ai.ToolCall) anyerror!void {
-            ctx.started_slot = lua_mod.bridge.plugin_cwd_slot;
+            ctx.started_cwd = ctx.executor.cwd;
+            ctx.started_cancel = ctx.executor.ctx.cancel_requested;
+            ctx.started_classifier_url = ctx.executor.ctx.bash_classifier_url;
         }
         pub fn onFinished(ctx: *Recording, _: *const ToolResult) anyerror!void {
-            ctx.finished_slot = lua_mod.bridge.plugin_cwd_slot;
+            ctx.finished_cwd = ctx.executor.cwd;
         }
         pub fn approve(_: *Recording, _: ai.ToolCall, _: []const u8) anyerror!bool {
             return true;
         }
     };
 
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
     var executor = ExecutorService.init(.{
         .gpa = gpa,
         .io = std.testing.io,
@@ -1919,7 +1901,10 @@ test "ExecutorService.runAll sets plugin_cwd_slot around observer callbacks" {
         .mcp_manager = null,
         .lane_bridge = null,
         .lane_requester = null,
+        .cancel_requested = &cancel_flag,
+        .bash_classifier_url = "http://127.0.0.1:9/classify",
     });
+    rec = .{ .executor = &executor };
 
     // Use a non-empty call list so observer fires. We use a call with an
     // unknown tool name that will produce a failure result quickly.
@@ -1944,10 +1929,12 @@ test "ExecutorService.runAll sets plugin_cwd_slot around observer callbacks" {
         gpa.free(results);
     }
 
-    try std.testing.expectEqualStrings(fake_cwd, rec.started_slot orelse "");
-    try std.testing.expectEqualStrings(fake_cwd, rec.finished_slot orelse "");
-    // Verify slot is restored after runAll
-    try std.testing.expect(lua_mod.bridge.plugin_cwd_slot == null);
+    // The dispatch ctx the bridge would hand emitEvent carries the executor's
+    // cwd, cancel flag, and classifier URL during both observer callbacks.
+    try std.testing.expectEqualStrings(fake_cwd, rec.started_cwd orelse "");
+    try std.testing.expectEqualStrings(fake_cwd, rec.finished_cwd orelse "");
+    try std.testing.expectEqual(&cancel_flag, rec.started_cancel.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/classify", rec.started_classifier_url orelse "");
 }
 
 test "executor rejects MCP tool call with wrong type" {
@@ -2009,8 +1996,12 @@ test "executor rejects MCP tool call with invalid JSON" {
 const RerootOutcome = struct {
     results: []ToolResult = &.{},
     err: ?anyerror = null,
-    /// Captured plugin_cwd_slot value at on_started of the post-enter call.
-    captured_slot: ?[]const u8 = null,
+    /// Executor owning the batch; the reroot assertion reads its live cwd.
+    executor: ?*ExecutorService = null,
+    /// Captured executor cwd at on_started of the post-enter call — the
+    /// value the ExecutorBridge's dispatch ctx (and thus plugin event
+    /// dispatches) would carry after the mid-batch reroot.
+    captured_cwd: ?[]const u8 = null,
 };
 
 /// Spin until the bridge has a pending request, then service until `done` —
@@ -2056,7 +2047,7 @@ test "executor re-roots mid-batch after lane enter" {
 
     const SlotObserver = struct {
         pub fn on_started(ctx: *RerootOutcome, _: ai.ToolCall) !void {
-            ctx.captured_slot = lua_mod.bridge.plugin_cwd_slot;
+            ctx.captured_cwd = ctx.executor.?.cwd;
         }
         pub fn on_finished(_: *RerootOutcome, _: *const ToolResult) !void {}
         pub fn approve_unsafe_bash(_: *RerootOutcome, _: ai.ToolCall, _: []const u8) anyerror!bool {
@@ -2103,7 +2094,7 @@ test "executor re-roots mid-batch after lane enter" {
         }
     };
 
-    var outcome = RerootOutcome{};
+    var outcome = RerootOutcome{ .executor = &executor };
     var done: std.atomic.Value(bool) = .init(false);
     const thread = try std.Thread.spawn(.{}, Worker.run, .{ &executor, &calls, &outcome, &done });
     const lane_ctx: *anyopaque = @ptrCast(@constCast(&lane_path));
@@ -2119,8 +2110,9 @@ test "executor re-roots mid-batch after lane enter" {
     try std.testing.expect(!outcome.results[1].failed);
     // The native shell call after `enter` ran in the lane worktree, not the batch-start root.
     try std.testing.expect(std.mem.indexOf(u8, outcome.results[1].content, lane_path) != null);
-    // Verify plugin_cwd_slot was refreshed to the lane path for the post-enter call.
-    try std.testing.expectEqualStrings(lane_path, outcome.captured_slot orelse "");
+    // Verify the executor cwd (the dispatch ctx source) was refreshed to the
+    // lane path for the post-enter call.
+    try std.testing.expectEqualStrings(lane_path, outcome.captured_cwd orelse "");
 }
 
 test "executor re-roots back on lane leave" {
