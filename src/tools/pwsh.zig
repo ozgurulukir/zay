@@ -46,11 +46,23 @@ pub const Backend = struct {
         \\    $abs = [System.IO.Path]::GetFullPath($abs)
         \\    $root = $_zay_root.TrimEnd('\', '/')
         \\    if ($abs -ne $_zay_root -and $abs -ne $root -and $abs -notlike "$root\*") { throw "cd: $abs escapes the workspace root" }
-        \\    Microsoft.PowerShell.Core\Set-Location @Path }
+        \\    Microsoft.PowerShell.Management\Set-Location @Path }
         \\function Push-Location { throw "pushd: not allowed in this workspace" }
         \\function Pop-Location  { throw "popd: not allowed in this workspace" }
         \\
     ;
+
+    pub fn hasCdGuardBypass(command: []const u8) bool {
+        const blocked = [_][]const u8{
+            "Microsoft.PowerShell.Management\\Set-Location",
+            "Microsoft.PowerShell.Management\\Push-Location",
+            "Microsoft.PowerShell.Management\\Pop-Location",
+        };
+        for (blocked) |item| {
+            if (std.ascii.indexOfIgnoreCase(command, item) != null) return true;
+        }
+        return false;
+    }
 
     /// Prefix `command` with `_zay_root` (the canonicalized project root via
     /// `[System.IO.Path]::GetFullPath`, single-quoted and quote-doubled for PowerShell)
@@ -210,11 +222,15 @@ test "contained pwsh allows Set-Location within the workspace root" {
     defer gpa.free(test_cwd);
     const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(root_abs);
-    // A workspace-relative subdir inside the root is allowed.
-    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Set-Location .; Write-Output ok\",\"description\":\"read\"}", null, bash_safety.mintClassified("containment-fixture"));
+    // A workspace-relative subdir inside the root is allowed and must actually change location.
+    const sub_dir = try std.fs.path.join(gpa, &.{ root_abs, "sub" });
+    defer gpa.free(sub_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, sub_dir);
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Set-Location sub; Write-Output (Get-Location).Path\",\"description\":\"read\"}", null, bash_safety.mintClassified("containment-fixture"));
     defer output.deinit(gpa);
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "sub") != null);
 }
 
 test "pwsh observation echoes the invoked command" {
