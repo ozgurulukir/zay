@@ -362,24 +362,7 @@ fn tryAttachOpenAiCompatibleFromConfig(
     resolveModelContextFallbacks(self, ms);
     var loaded_key: ?[]u8 = null;
     defer if (loaded_key) |k| self.gpa.free(k);
-    const api_key = blk: {
-        if (ms.apiKey()) |key| {
-            if (key.len > 0) break :blk key;
-        }
-        // Auth lookup uses provider_name (the config map key / defaultModel
-        // prefix) so custom providers like "qwen-cloud" resolve their own
-        // stored key from auth.json.
-        if (self.home_dir.len > 0) {
-            loaded_key = auth_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, ms.providerName()) catch null;
-            if (loaded_key) |k| break :blk k;
-        }
-        // No stored key — log for diagnostics when the provider requires
-        // one, so a 402/401 on the first turn is traceable.
-        if (provider.requiresApiKey()) {
-            log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{ms.providerName()});
-        }
-        break :blk provider.anonymousApiKey() orelse "";
-    };
+    const api_key = resolveApiKeyForAttach(self, provider, ms.providerName(), ms.apiKey(), &loaded_key);
     const model_id_to_attach = switch (ms) {
         .builtin => |b| b.model.id,
         .custom => |c| c.model.id,
@@ -408,7 +391,32 @@ fn tryAttachOpenAiResponsesFromConfig(
         .effort = ms.model().reasoning.resolve(),
         .summary = .auto,
     };
-    try attachOpenAiResponsesClient(self, ms.providerName(), base_url, ms.apiKey() orelse "", ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
+    var loaded_key: ?[]u8 = null;
+    defer if (loaded_key) |k| self.gpa.free(k);
+    const api_key = resolveApiKeyForAttach(self, provider, ms.providerName(), ms.apiKey(), &loaded_key);
+    try attachOpenAiResponsesClient(self, ms.providerName(), base_url, api_key, ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
+}
+
+/// Resolve the API key for an attach path: inline key, then `auth.json`, then
+/// the provider's anonymous key (emitting `auth.missing_key` when required).
+fn resolveApiKeyForAttach(
+    self: *AgentRuntime,
+    provider: config_mod.Provider,
+    provider_name: []const u8,
+    inline_key: ?[]const u8,
+    loaded_key: *?[]u8,
+) []const u8 {
+    if (inline_key) |key| {
+        if (key.len > 0) return key;
+    }
+    if (self.home_dir.len > 0) {
+        loaded_key.* = auth_mod.loadProviderApiKey(self.gpa, self.io, self.home_dir, provider_name) catch null;
+        if (loaded_key.*) |k| return k;
+    }
+    if (provider.requiresApiKey()) {
+        log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{provider_name});
+    }
+    return provider.anonymousApiKey() orelse "";
 }
 
 /// Per-model context_window and max_output_tokens from the providers map
@@ -1156,4 +1164,25 @@ test "runtime keeps codex adapter for openai provider" {
         config_mod.AdapterKind.codex_responses,
         adapterForConfig(.openai, config).?,
     );
+}
+
+test "resolveApiKeyForAttach loads stored API key from auth.json (#427)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home);
+    try auth_mod.saveProviderApiKey(gpa, io, home, "custom-resp", "sk-stored-responses");
+
+    var rt: AgentRuntime = undefined;
+    rt.gpa = gpa;
+    rt.io = io;
+    rt.home_dir = home;
+
+    var loaded_key: ?[]u8 = null;
+    defer if (loaded_key) |k| gpa.free(k);
+    const api_key = resolveApiKeyForAttach(&rt, .openai_compatible, "custom-resp", "", &loaded_key);
+    try std.testing.expectEqualStrings("sk-stored-responses", api_key);
 }

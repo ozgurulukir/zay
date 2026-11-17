@@ -189,6 +189,7 @@ pub fn pruneOrphanKeys(
         }
         if (keys.fetchOrderedRemove(name)) |old| {
             gpa.free(old.key);
+            @memset(old.value, 0);
             gpa.free(old.value);
         }
     }
