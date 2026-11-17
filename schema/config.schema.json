@@ -284,6 +284,20 @@
           "default": 300,
           "description": "Socket read timeout in seconds for streaming responses. Prevents indefinite hangs when the server stops mid-stream."
         },
+        "maxRetries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 2,
+          "description": "Maximum number of retries for transient HTTP head errors (429 rate limits and 5xx server failures). 0 disables retries. Out-of-range values are dropped and the default is used."
+        },
+        "retryBaseDelayMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8000,
+          "default": 500,
+          "description": "Base delay in milliseconds for exponential retry backoff (base * 2^attempt, capped at 8000 ms). A server Retry-After header takes precedence. Out-of-range values are dropped and the default is used."
+        },
         "maxConcurrentRequests": {
           "type": "integer",
           "minimum": 1,

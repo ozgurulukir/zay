@@ -141,6 +141,13 @@ pub const WireDialect = enum {
 /// field defaults below.
 pub const default_request_timeout_seconds: u32 = 300;
 pub const default_max_parallel_tool_calls: u32 = 16;
+/// Default retry budget for transient HTTP head errors (429 rate limits and
+/// 5xx server failures). Two retries handle brief cloud-provider hiccups in
+/// interactive coding sessions without stalling the turn for minutes.
+pub const default_max_retries: u32 = 2;
+/// Default initial backoff delay in milliseconds for transient HTTP retries.
+/// Doubles per attempt up to `http.retry_max_delay_ms` (8000 ms).
+pub const default_retry_base_delay_ms: u64 = 500;
 /// The wire-level system prompt when a caller supplies none. Chat clients
 /// leave this in place (the agent prompt lives in history); the runtime's
 /// attach plan overrides it for adapters that carry the agent prompt on the
@@ -204,11 +211,11 @@ pub const Config = struct {
     /// 0 disables retries entirely (single attempt — the legacy behavior).
     /// Only head-phase statuses are retried; once the response body streams,
     /// an error is never retried (partial deltas may already be visible).
-    max_retries: u32 = 2,
+    max_retries: u32 = default_max_retries,
     /// Base delay for exponential retry backoff, in milliseconds. The actual
     /// delay is `base * 2^attempt`, capped; a server-sent `Retry-After` header
     /// (integer seconds) takes precedence over the backoff.
-    retry_base_delay_ms: u64 = 500,
+    retry_base_delay_ms: u64 = default_retry_base_delay_ms,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
     /// Resolved provider headers for this client: provider-required auto

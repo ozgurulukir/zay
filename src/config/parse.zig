@@ -66,6 +66,12 @@ const context_window_floor_tokens: u32 = 1024;
 /// dropped (the field stays null → default), matching sibling knobs.
 const tool_call_limit_min: u32 = 1;
 const tool_call_limit_max: u32 = 1000;
+/// Accepted ceiling for `maxRetries` (0 disables retries; 10 prevents
+/// runaway retry loops). Out-of-band values are dropped to null → default.
+const max_retries_max: u32 = 10;
+/// Accepted ceiling for `retryBaseDelayMs` (matches `http.retry_max_delay_ms`).
+/// Out-of-band values are dropped to null → default.
+const retry_base_delay_ms_max: u32 = 8000;
 /// Accepted band for `minSplitWidth`; out-of-band values are dropped (the
 /// field keeps its default), matching the toast-setting convention.
 const min_split_width_min: u16 = 80;
@@ -335,6 +341,8 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.max_output_tokens != null) target.max_output_tokens = updates.max_output_tokens;
     if (updates.max_parallel_tool_calls != null) target.max_parallel_tool_calls = updates.max_parallel_tool_calls;
     if (updates.request_timeout_seconds != null) target.request_timeout_seconds = updates.request_timeout_seconds;
+    if (updates.max_retries != null) target.max_retries = updates.max_retries;
+    if (updates.retry_base_delay_ms != null) target.retry_base_delay_ms = updates.retry_base_delay_ms;
     if (updates.max_concurrent_requests != null) target.max_concurrent_requests = updates.max_concurrent_requests;
     if (updates.disable_prompt_cache != null) target.disable_prompt_cache = updates.disable_prompt_cache;
     if (updates.tool_call_limit_per_turn != null) target.tool_call_limit_per_turn = updates.tool_call_limit_per_turn;
@@ -966,6 +974,12 @@ fn parseContext(value: std.json.Value) ContextSettings {
     }
     if (u32field(value, "requestTimeoutSeconds")) |v| {
         if (v >= 1) ctx.request_timeout_seconds = v;
+    }
+    if (u32fieldCompat(value, "maxRetries", "max_retries")) |v| {
+        if (v <= max_retries_max) ctx.max_retries = v;
+    }
+    if (u32fieldCompat(value, "retryBaseDelayMs", "retry_base_delay_ms")) |v| {
+        if (v <= retry_base_delay_ms_max) ctx.retry_base_delay_ms = v;
     }
     if (u32field(value, "maxConcurrentRequests")) |v| {
         if (v >= 1) ctx.max_concurrent_requests = v;
@@ -2115,6 +2129,8 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.max_output_tokens != null) return true;
     if (ctx.max_parallel_tool_calls != null) return true;
     if (ctx.request_timeout_seconds != null) return true;
+    if (ctx.max_retries != null) return true;
+    if (ctx.retry_base_delay_ms != null) return true;
     if (ctx.max_concurrent_requests != null) return true;
     if (ctx.disable_prompt_cache != null) return true;
     if (ctx.tool_call_limit_per_turn != null) return true;
@@ -2147,6 +2163,14 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     }
     if (ctx.request_timeout_seconds) |v| {
         try writeKeyNoIndent(writer, "requestTimeoutSeconds", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.max_retries) |v| {
+        try writeKeyNoIndent(writer, "maxRetries", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.retry_base_delay_ms) |v| {
+        try writeKeyNoIndent(writer, "retryBaseDelayMs", &wrote_any);
         try writer.print("{d}", .{v});
     }
     if (ctx.max_concurrent_requests) |v| {
@@ -2574,6 +2598,45 @@ test "parseContext drops integer fields outside u32 range instead of truncating"
     try std.testing.expectEqual(@as(?u32, null), ctx.request_timeout_seconds);
     // An in-range value is still applied.
     try std.testing.expectEqual(@as(?u32, 8), ctx.max_parallel_tool_calls);
+}
+
+test "parseContext accepts retry policy keys in bounds and drops out-of-range" {
+    const json =
+        \\{"maxRetries":4,"retryBaseDelayMs":1200}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const ctx = parseContext(parsed.value);
+    try std.testing.expectEqual(@as(?u32, 4), ctx.max_retries);
+    try std.testing.expectEqual(@as(?u32, 1200), ctx.retry_base_delay_ms);
+
+    // Zero is valid (0 retries disables retries; 0 ms base delay retries immediately).
+    const zero_json =
+        \\{"max_retries":0,"retry_base_delay_ms":0}
+    ;
+    const zero_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, zero_json, .{});
+    defer zero_parsed.deinit();
+    const zero_ctx = parseContext(zero_parsed.value);
+    try std.testing.expectEqual(@as(?u32, 0), zero_ctx.max_retries);
+    try std.testing.expectEqual(@as(?u32, 0), zero_ctx.retry_base_delay_ms);
+
+    // Out-of-band values are dropped to null (default), never clamped.
+    const bad_json =
+        \\{"maxRetries":11,"retryBaseDelayMs":8001}
+    ;
+    const bad_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bad_json, .{});
+    defer bad_parsed.deinit();
+    const bad_ctx = parseContext(bad_parsed.value);
+    try std.testing.expectEqual(@as(?u32, null), bad_ctx.max_retries);
+    try std.testing.expectEqual(@as(?u32, null), bad_ctx.retry_base_delay_ms);
+
+    // Roundtrip serialization preserves explicit retry policy values.
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
+    try std.testing.expect(hasNonDefaultContext(ctx));
+    try writeContext(&buf.writer, ctx);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"maxRetries\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"retryBaseDelayMs\":1200") != null);
 }
 
 test "parseContext accepts tool budget keys in both cases, drops out-of-range" {

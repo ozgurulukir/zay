@@ -86,6 +86,14 @@ pub const default_max_concurrent_requests: u32 = 2;
 /// knob is unset.
 pub const default_tool_call_limit_per_turn: u32 = 100;
 
+/// Default retry budget for transient HTTP head errors (429 + 5xx) when
+/// `context.maxRetries` is unset. Mirrors `ai.default_max_retries`.
+pub const default_max_retries: u32 = 2;
+
+/// Default exponential-backoff base delay in milliseconds when
+/// `context.retryBaseDelayMs` is unset. Mirrors `ai.default_retry_base_delay_ms`.
+pub const default_retry_base_delay_ms: u32 = 500;
+
 /// Context window management and automatic compaction policy.
 /// Serialized as `"context"` in JSON (camelCase keys inside).
 pub const ContextSettings = struct {
@@ -100,6 +108,14 @@ pub const ContextSettings = struct {
     /// Socket read timeout in seconds for streaming responses.
     /// Prevents indefinite hangs when the server stops mid-stream.
     request_timeout_seconds: ?u32 = null,
+    /// Maximum retries for transient HTTP head errors (429 rate limits and
+    /// 5xx server failures). Null = `default_max_retries` (2). 0 disables
+    /// retries; parse accepts 0–10 and drops out-of-range values.
+    max_retries: ?u32 = null,
+    /// Base delay in milliseconds for exponential retry backoff. Null =
+    /// `default_retry_base_delay_ms` (500 ms). Parse accepts 0–8000 (the
+    /// `http.retry_max_delay_ms` ceiling) and drops out-of-range values.
+    retry_base_delay_ms: ?u32 = null,
     /// Maximum number of LLM requests in flight across ALL lanes at once.
     /// Lanes each run their own worker + HTTP client, so without this cap N
     /// active lanes fire N independent requests at the provider, which
