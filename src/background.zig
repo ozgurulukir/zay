@@ -167,7 +167,6 @@ pub const BackgroundManager = struct {
         killed: std.atomic.Value(bool) = .init(false),
         exit_code: u8 = 0,
         completion_message: ?[]u8 = null,
-        reported: bool = false,
         bytes_written: u64 = 0,
         truncated: bool = false,
     };
@@ -573,7 +572,7 @@ pub const BackgroundManager = struct {
         }
     }
 
-    /// Take every finished-but-unreported job, transferring ownership to the
+    /// Take every finished job, transferring ownership to the
     /// caller (the UI), which shows the notice and — for non-killed jobs —
     /// delivers `completion_message` to the owning agent. Free each with `deinit`.
     pub fn takeFinished(self: *BackgroundManager, gpa: std.mem.Allocator) ![]Finished {
@@ -589,7 +588,7 @@ pub const BackgroundManager = struct {
 
         var write_idx: usize = 0;
         for (self.jobs.items) |job| {
-            if (!job.reported and job.state.load(.acquire) == .finished) {
+            if (job.state.load(.acquire) == .finished) {
                 if (job.thread) |t| {
                     t.join();
                     job.thread = null;
@@ -600,7 +599,6 @@ pub const BackgroundManager = struct {
                     continue;
                 } else |_| {
                     // Leave the job in place to retry on next tick.
-                    job.reported = false;
                 }
             }
             self.jobs.items[write_idx] = job;
