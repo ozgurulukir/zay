@@ -215,7 +215,7 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     const io = getIo(L_ptr);
 
     var n: u32 = 10;
-    if (bridge.pullValue(&state, i64, 1)) |v| n = @intCast(@max(v, 1));
+    if (bridge.pullValue(&state, i64, 1)) |v| n = @intCast(std.math.clamp(v, 1, std.math.maxInt(u32)));
 
     var resolved = bridge.resolvePluginCwd(io, execution.dispatchCtx(L_ptr).cwd) orelse {
         state.pushNil();

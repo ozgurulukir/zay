@@ -116,7 +116,7 @@ pub fn findFiles(L: ?*c.lua_State) callconv(.c) c_int {
     var max_results: u32 = find_files_default_max_results;
     if (state.getTop() >= 3 and state.isTable(3)) {
         if (bridge.getTableInteger(&state, 3, "max_results")) |v| {
-            max_results = @min(@as(u32, @intCast(@max(v, 1))), max_search_results);
+            max_results = @intCast(std.math.clamp(v, 1, @as(i64, max_search_results)));
         }
     }
 
