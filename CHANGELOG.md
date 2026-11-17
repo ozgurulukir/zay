@@ -6,6 +6,21 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.13] - 2026-11-17
+
+### Added
+- Config: `database.timeoutSeconds` (default 30s, accepted 1..300s) lets remote session stores (`zay_service`, `turso_http`, `d1_http`) use a configurable request timeout for startup migrations and session operations instead of a fixed one.
+- Config: `context.maxRetries` (0..10) and `context.retryBaseDelayMs` (0..8000) expose the transient 429/5xx retry policy, and `request_timeout_seconds` / `max_retries` / `retry_base_delay_ms` now reach every adapter (`.chat`, `.responses`, `.codex`), so Responses and Codex honor `ContextSettings` like the chat path.
+
+### Fixed
+- Config: MCP SSE header names and values are validated, `{env:VAR}` expansions included, rejecting CR/LF header injection (#405); `config.json` is written `0600` so plaintext `database.authToken` values are not world-readable (#406); malformed MCP transports, `responsePolicy` blocks, and wrong-typed section keys become per-entry diagnostics instead of discarding the whole config layer (#407).
+- DB: authenticated GETs no longer follow redirects, so `Authorization: Bearer ...` cannot leak to cross-domain or downgraded targets (#408); the loopback check parses IPv4, so `127.<attacker-domain>` no longer passes as loopback and sends the token in cleartext (#409).
+- MCP: client-list access is synchronized and in-flight requests are counted under lock, closing a retire use-after-free (#410); SSE and stdio line buffers are bounded, failing with `McpStreamTooLarge` (#412); crashed or expired sessions transition to `failed` and re-`initialize` once instead of staying wedged as connected (#411); a transport or timeout edit retires and recreates the client, correlated by a generation counter so a stale connect cannot install into a recreated client (#413); an image `mimeType` that overflows its label buffer falls back to `[Image content]` instead of aborting the tool call (#414).
+- Lua/Skills: `sanitizePath` walks up to the deepest existing ancestor, so a symlink escape cannot be reached through a nonexistent leaf (#415); Lua-supplied `i64` values are clamped to `u32` before `@intCast` in the file, git, shell, and search bridges (#416); `plugin.get_config`, `os.remove`, and `os.rename` register as guarded functions, and skill recursion is bounded by depth (#417).
+- Tools: `builtin`/`command`-prefixed `cd`/`pushd`/`popd` and module-qualified PowerShell `Set-Location`/`Push-Location`/`Pop-Location` are rejected at the containment boundary (#418, #421); the bash safety classifier unescapes backslashes, matches `rm` force flags case-insensitively, and stream-scans instead of truncating at 4096 bytes (#419); the shell result cache key includes `cwd` and canonicalized `env`, so identical commands in different directories no longer collide (#420).
+- AI/Auth/Models: the SSE line reader is bounded during reads instead of after buffering an unterminated line (#422); pruned API key bytes are zeroed before free, `limit.context` is clamped before `@intCast`, and OpenRouter `effort` resolves through the shared effort-label map (#423); Responses-endpoint attach resolves the stored `auth.json` key like the chat path (#427).
+- Runtime/TUI: the tool-result quota fast path sums `byte_length` instead of `created_at_ms`, so pruning stays under quota (#424); `emitToolDelta` frees owned name and arguments on OOM without a double-free, and the dead `Job.reported` flag is gone (#425); lane context capture is deferred to the paths that need it, ending duplicate transcript churn on async-worktree poll ticks (#426); PNG and JPEG dimensions are validated in `u64` against a 100 MP cap (#428); `RequestLimiter` wakes newly available waiters when permits increase (#429); the release workflow passes `github.ref_name` through an env var and pins all actions to commit SHAs (#429).
+
 ## [0.11.12] - 2026-11-16
 
 ### Changed
@@ -171,7 +186,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.12...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.13...HEAD
+[0.11.13]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.13
 [0.11.12]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.12
 [0.11.11]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.11
 [0.11.10]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.10
