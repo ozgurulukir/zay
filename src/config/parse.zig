@@ -1632,12 +1632,6 @@ fn floatField(value: std.json.Value, name: []const u8) ?f64 {
     };
 }
 
-/// Look up a JSON key trying camelCase first, then snake_case fallback.
-/// Returns the value from whichever key exists (camelCase wins).
-fn fieldCompat(object: std.json.ObjectMap, camel: []const u8, snake: []const u8) ?std.json.Value {
-    return object.get(camel) orelse object.get(snake);
-}
-
 /// Process-wide counter giving every config write a distinct temp name,
 /// even two writes in the same clock tick or two threads racing on one file.
 var write_serial: std.atomic.Value(u64) = .init(0);
