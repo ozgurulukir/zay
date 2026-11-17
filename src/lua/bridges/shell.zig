@@ -69,7 +69,7 @@ pub fn sanitizePath(io: std.Io, path: []const u8, ctx_cwd: ?[]const u8) ![]u8 {
     if (resolved.len > cwd.len and resolved[cwd.len] != std.fs.path.sep) return error.PathTraversal;
 
     if (!os.is_windows) {
-        const cwd_z = std.heap.page_allocator.dupeZ(u8, cwd) catch return resolved;
+        const cwd_z = try std.heap.page_allocator.dupeZ(u8, cwd);
         defer std.heap.page_allocator.free(cwd_z);
         var real_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const rcwd_ptr = std.c.realpath(cwd_z.ptr, &real_cwd_buf);
@@ -79,7 +79,7 @@ pub fn sanitizePath(io: std.Io, path: []const u8, ctx_cwd: ?[]const u8) ![]u8 {
         // workspace cannot be bypassed by targeting a nonexistent leaf (#415).
         var probe: []const u8 = resolved;
         while (true) {
-            const probe_z = std.heap.page_allocator.dupeZ(u8, probe) catch return resolved;
+            const probe_z = try std.heap.page_allocator.dupeZ(u8, probe);
             defer std.heap.page_allocator.free(probe_z);
             var real_buf: [std.fs.max_path_bytes]u8 = undefined;
             if (std.c.realpath(probe_z.ptr, &real_buf)) |rp| {
