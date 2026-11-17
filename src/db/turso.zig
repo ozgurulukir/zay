@@ -92,7 +92,8 @@ pub fn pipelineUrl(allocator: std.mem.Allocator, raw_url: []const u8) ![]u8 {
 fn isLoopbackHost(host: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
     if (std.ascii.eqlIgnoreCase(host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
-    return std.ascii.startsWithIgnoreCase(host, "127.");
+    const ip4 = std.Io.net.Ip4Address.parse(host, 0) catch return false;
+    return ip4.bytes[0] == 127;
 }
 
 pub const Client = struct {
@@ -1084,4 +1085,14 @@ test "schema fetches multiple table schemas in a single batched pipeline request
     try std.testing.expectEqual(@as(usize, 2), res.tables[1].columns.len);
     try std.testing.expectEqualStrings("id", res.tables[1].columns[0].name);
     try std.testing.expectEqualStrings("title", res.tables[1].columns[1].name);
+}
+
+test "pipelineUrl rejects 127.* domain names over plain http (#409)" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedScheme, pipelineUrl(gpa, "http://127.evil.com"));
+    try std.testing.expectError(error.UnsupportedScheme, pipelineUrl(gpa, "http://127.0.0.1.evil.com"));
+
+    const ok_url = try pipelineUrl(gpa, "http://127.0.1.1:8080");
+    defer gpa.free(ok_url);
+    try std.testing.expectEqualStrings("http://127.0.1.1:8080/v2/pipeline", ok_url);
 }
