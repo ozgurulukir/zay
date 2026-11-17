@@ -303,7 +303,8 @@ pub fn writePayload(
     // nothing so we don't override the model's own reasoning behaviour. `auto`
     // summary = model default, treated like `default` effort — not sent.
     if (dialect == .openrouter) {
-        const has_effort = effort != null and effort.? != .default;
+        const resolved_effort = if (effort) |e| model_compat.resolveEffortLabel(model, dialect, e) else null;
+        const has_effort = resolved_effort != null;
         const has_summary = summary != null and summary.? != .auto;
         if (!has_effort and !has_summary) {
             try out.writeByte('}');
@@ -311,9 +312,9 @@ pub fn writePayload(
         }
         try out.writeAll(",\"reasoning\":{");
         var wrote = false;
-        if (has_effort) {
+        if (resolved_effort) |label| {
             try out.writeAll("\"effort\":\"");
-            try out.writeAll(effort.?.label());
+            try out.writeAll(label);
             try out.writeByte('"');
             wrote = true;
         }
@@ -824,4 +825,18 @@ test "writePayload emits parallel_tool_calls when configured" {
     }, &.{}, "[{\"type\":\"function\"}]");
 
     try std.testing.expect(std.mem.indexOf(u8, payload_true.written(), ",\"parallel_tool_calls\":true") != null);
+}
+
+test "writePayload clips Qwen reasoning effort on OpenRouter dialect (#423)" {
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+
+    try writePayload(gpa, &payload.writer, .{
+        .model = "qwen/qwen3-32b",
+        .dialect = .openrouter,
+        .reasoning = .{ .effort = .high, .summary = .auto },
+    }, &.{}, "[]");
+
+    try std.testing.expect(std.mem.indexOf(u8, payload.written(), "\"effort\":\"medium\"") != null);
 }
