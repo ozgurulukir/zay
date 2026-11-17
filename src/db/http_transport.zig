@@ -10,7 +10,13 @@ const os = @import("../os.zig");
 
 const assert = std.debug.assert;
 
+/// Default per-request HTTP timeout for remote database backends (Zay service,
+/// Turso, Cloudflare D1). 30s covers normal query/migration round-trips while
+/// failing fast enough for startup local-SQLite fallback to feel responsive.
 pub const timeout_seconds_default: u32 = 30;
+/// Upper bound for configurable remote database timeouts (5 minutes) so a
+/// config typo cannot hang session startup or sync indefinitely.
+pub const timeout_seconds_max: u32 = 300;
 pub const response_max_bytes_default: usize = 16 * 1024 * 1024;
 
 pub const Options = struct {

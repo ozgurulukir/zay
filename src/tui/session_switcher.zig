@@ -125,7 +125,7 @@ pub fn currentSessionStore(app: *const App) session_mod.SessionStore {
         cfg.effectiveDatabaseUrl(),
         cfg.effectiveDatabaseAuthToken(),
         cfg.effectiveDatabasePath(),
-    );
+    ).withTimeout(cfg.effectiveDatabaseTimeoutSeconds());
 }
 
 fn hostIdOf(app: *const App) []const u8 {

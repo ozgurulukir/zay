@@ -278,6 +278,7 @@ fn applyDatabaseOverlay(gpa: std.mem.Allocator, target: *DatabaseConfig, updates
     try applyTextOverlay(gpa, &target.url, updates.url);
     try applyTextOverlay(gpa, &target.auth_token, updates.auth_token);
     try applyTextOverlay(gpa, &target.path, updates.path);
+    if (updates.timeout_seconds != null) target.timeout_seconds = updates.timeout_seconds;
 }
 
 /// Overlay semantics for user-clearable text fields (`system_prompt`,
@@ -1040,6 +1041,10 @@ const toast_duration_min: u32 = 500;
 const toast_duration_max: u32 = 30_000;
 const toast_max_visible_min: u8 = 1;
 const toast_max_visible_max: u8 = 5;
+/// Accepted band for `database.timeoutSeconds`. Out-of-band values are
+/// dropped to null → default (`default_database_timeout_seconds`, 30s).
+const database_timeout_seconds_min: u32 = 1;
+const database_timeout_seconds_max: u32 = 300;
 
 fn parseDatabase(
     gpa: std.mem.Allocator,
@@ -1064,6 +1069,11 @@ fn parseDatabase(
     }
     if (stringFieldCompat(value, "path", "path")) |s| {
         if (s.len > 0) db_cfg.path = try gpa.dupe(u8, s);
+    }
+    if (u32fieldCompat(value, "timeoutSeconds", "timeout_seconds")) |v| {
+        if (v >= database_timeout_seconds_min and v <= database_timeout_seconds_max) {
+            db_cfg.timeout_seconds = v;
+        }
     }
     return db_cfg;
 }
@@ -1987,6 +1997,7 @@ fn hasNonDefaultDatabase(db_cfg: DatabaseConfig) bool {
     if (db_cfg.url != null and db_cfg.url.?.len > 0) return true;
     if (db_cfg.auth_token != null and db_cfg.auth_token.?.len > 0) return true;
     if (db_cfg.path != null and db_cfg.path.?.len > 0) return true;
+    if (db_cfg.timeout_seconds != null) return true;
     return false;
 }
 
@@ -2014,6 +2025,10 @@ fn writeDatabase(writer: *std.Io.Writer, db_cfg: DatabaseConfig) !void {
             try writeKeyNoIndent(writer, "path", &wrote_any);
             try std.json.Stringify.value(p, .{}, writer);
         }
+    }
+    if (db_cfg.timeout_seconds) |v| {
+        try writeKeyNoIndent(writer, "timeoutSeconds", &wrote_any);
+        try writer.print("{d}", .{v});
     }
     try writer.writeByte('}');
 }
@@ -3641,7 +3656,7 @@ test "parseObject accepts modular database configuration" {
     var sink: std.ArrayList(Diagnostic) = .empty;
     defer sink.deinit(gpa);
     const json =
-        \\{"defaultModel":"openai/gpt-5.5","database":{"backend":"turso_http","url":"https://zay-db.turso.io","authToken":"turso-secret","path":"/custom/path.db"}}
+        \\{"defaultModel":"openai/gpt-5.5","database":{"backend":"turso_http","url":"https://zay-db.turso.io","authToken":"turso-secret","path":"/custom/path.db","timeoutSeconds":90}}
     ;
     var cfg = try parseFile(gpa, "<test>", json, &sink);
     defer cfg.deinit(gpa);
@@ -3649,11 +3664,29 @@ test "parseObject accepts modular database configuration" {
     try std.testing.expectEqualStrings("https://zay-db.turso.io", cfg.database.url.?);
     try std.testing.expectEqualStrings("turso-secret", cfg.database.auth_token.?);
     try std.testing.expectEqualStrings("/custom/path.db", cfg.database.path.?);
+    try std.testing.expectEqual(@as(?u32, 90), cfg.database.timeout_seconds);
     try std.testing.expectEqual(DatabaseBackendKind.turso_http, cfg.effectiveDatabaseBackend());
     try std.testing.expectEqualStrings("https://zay-db.turso.io", cfg.effectiveDatabaseUrl().?);
     try std.testing.expectEqualStrings("turso-secret", cfg.effectiveDatabaseAuthToken().?);
     try std.testing.expectEqualStrings("/custom/path.db", cfg.effectiveDatabasePath().?);
+    try std.testing.expectEqual(@as(?u32, 90), cfg.effectiveDatabaseTimeoutSeconds());
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+
+    // Out-of-range timeoutSeconds is dropped (left null → default 30s).
+    var bad = try parseFile(gpa, "<test>", "{\"database\":{\"timeoutSeconds\":0}}", &sink);
+    defer bad.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, null), bad.database.timeout_seconds);
+
+    var too_high = try parseFile(gpa, "<test>", "{\"database\":{\"timeoutSeconds\":301}}", &sink);
+    defer too_high.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, null), too_high.database.timeout_seconds);
+
+    // Roundtrip serialization preserves timeoutSeconds.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try std.testing.expect(hasNonDefaultDatabase(cfg.database));
+    try writeDatabase(&buf.writer, cfg.database);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"timeoutSeconds\":90") != null);
 }
 
 test "parseObject accepts Cloudflare D1 database configuration" {

@@ -505,6 +505,13 @@
         "path": {
           "type": "string",
           "description": "Filesystem path for local SQLite database file, including when a remote service falls back to local storage (overrides the platform config directory's sessions.sqlite)."
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 30,
+          "description": "Per-request HTTP timeout in seconds for remote database backends (zay_service, turso_http, d1_http). Out-of-range values are dropped and the 30s default is used."
         }
       },
       "additionalProperties": false
