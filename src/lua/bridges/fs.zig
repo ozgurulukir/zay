@@ -66,8 +66,8 @@ pub fn readFile(L: ?*c.lua_State) callconv(.c) c_int {
     var max_size: usize = max_read_size;
 
     if (state.getTop() >= 2 and state.isTable(2)) {
-        if (bridge.getTableInteger(&state, 2, "start_line")) |v| start_line = @intCast(@max(v, 1));
-        if (bridge.getTableInteger(&state, 2, "end_line")) |v| end_line = @intCast(@max(v, 1));
+        if (bridge.getTableInteger(&state, 2, "start_line")) |v| start_line = @intCast(std.math.clamp(v, 1, std.math.maxInt(u32)));
+        if (bridge.getTableInteger(&state, 2, "end_line")) |v| end_line = @intCast(std.math.clamp(v, 1, std.math.maxInt(u32)));
         // Clamp on the i64 before the usize cast so a negative max_size can't
         // panic (safe builds) or wrap to ~2^64 (ReleaseFast).
         if (bridge.getTableInteger(&state, 2, "max_size")) |v| max_size = @min(@as(usize, @intCast(@max(v, 0))), max_read_size);
