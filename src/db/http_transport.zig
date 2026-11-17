@@ -128,7 +128,11 @@ fn fetchUnbounded(
         options.method,
         std.Uri.parse(options.url) catch return error.InvalidEndpoint,
         .{
-            .redirect_behavior = if (options.payload == null) @enumFromInt(3) else .unhandled,
+            // Never follow redirects when an Authorization bearer token is
+            // attached: std.http only strips privileged_headers on cross-domain
+            // redirects, not headers.authorization, which would leak the DB
+            // token to redirect targets.
+            .redirect_behavior = if (options.payload == null and options.auth_token == null) @enumFromInt(3) else .unhandled,
             .headers = .{
                 .content_type = if (options.payload != null) .{ .override = http.content_type_json } else .default,
                 .authorization = if (auth_header) |header| .{ .override = header } else .omit,
@@ -407,4 +411,33 @@ test "returnsConnectionRefused_whenServerNotListening" {
         // mapError runs (#287).
         try std.testing.expectEqual(error.ConnectionRefused, err);
     }
+}
+
+test "does not follow redirects when auth_token is set (#408)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const redirect_headers = [_]std.http.Header{
+        .{ .name = "Location", .value = "http://127.0.0.1:1/exfil" },
+    };
+    const responses = [_]mock_http_server.Response{
+        .{ .status = .found, .extra_headers = &redirect_headers, .body = "" },
+    };
+    var server = try mock_http_server.MockHttpServer.init(io, &responses);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, mock_http_server.MockHttpServer.serve, .{&server});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/health", .{server.port()});
+    defer gpa.free(endpoint);
+
+    const options = Options{
+        .method = .GET,
+        .url = endpoint,
+        .auth_token = "secret-db-token",
+    };
+
+    const res = try fetch(gpa, io, &options);
+    defer gpa.free(res.body);
+    try std.testing.expectEqual(@as(u16, 302), res.status);
 }
