@@ -120,6 +120,9 @@ pub const McpClient = struct {
     pending_close: ?struct { stdin: ?std.Io.File = null, stdout: ?std.Io.File = null } = null,
     /// Timeout for one stdio poll or complete HTTP request, in milliseconds.
     read_timeout_ms: u32 = 30_000,
+    /// Monotonic slot generation assigned by `McpManager` so async connect
+    /// jobs never install into a removed-and-readded client of the same name.
+    generation: u64 = 0,
     /// Server-assigned `Mcp-Session-Id` for the Streamable HTTP transport.
     /// null until the initialize response provides one. Owned; freed in deinit.
     session_id: ?[]u8 = null,
@@ -162,6 +165,13 @@ pub const McpClient = struct {
     /// Unchanged-signature delegate: the body moved to `lifecycle.zig`
     /// (`statusOf`) in issue #367 slice 11.
     pub fn status(self: *const McpClient) ServerStatus {
+        return lifecycle.statusOf(self);
+    }
+
+    /// Thread-safe status read under `transport_mutex` for worker threads.
+    pub fn statusSync(self: *McpClient, io: std.Io) ServerStatus {
+        self.transport_mutex.lockUncancelable(io);
+        defer self.transport_mutex.unlock(io);
         return lifecycle.statusOf(self);
     }
 

@@ -17,6 +17,13 @@ pub const McpManager = struct {
     /// `installConnectResult`'s slot overwrite. The manager owns every slot;
     /// removal/replacement goes through `retireClient`.
     clients: std.ArrayList(*client_mod.McpClient) = .empty,
+    /// Guards `clients` slice mutations against worker threads calling
+    /// `acquireConnectedClient` (#410). Short critical sections only.
+    clients_mutex: std.Io.Mutex = .init,
+    /// Monotonic generation counter assigned to each newly-created client slot
+    /// so async `ConnectJob`s cannot install into a removed-and-readded client
+    /// of the same name (#413).
+    next_client_generation: u64 = 1,
     /// In-flight async connect jobs. Touched only from the main thread; each
     /// job's worker mutates only the job's private clone, never the live list.
     pending_connects: std.ArrayList(*ConnectJob) = .empty,
@@ -74,7 +81,70 @@ pub const McpManager = struct {
         const slot = try self.gpa.create(client_mod.McpClient);
         errdefer self.gpa.destroy(slot);
         slot.* = client;
+        slot.generation = self.next_client_generation;
+        self.next_client_generation += 1;
         try self.clients.append(self.gpa, slot);
+    }
+
+    fn addClientLocked(self: *McpManager, io: std.Io, client: client_mod.McpClient) !void {
+        const slot = try self.gpa.create(client_mod.McpClient);
+        errdefer self.gpa.destroy(slot);
+        slot.* = client;
+        slot.generation = self.next_client_generation;
+        self.next_client_generation += 1;
+        self.clients_mutex.lockUncancelable(io);
+        defer self.clients_mutex.unlock(io);
+        try self.clients.append(self.gpa, slot);
+    }
+
+    /// Look up a connected client by name under `clients_mutex` and retain it
+    /// via `in_flight_requests` before releasing the lock, preventing
+    /// `retireClient` from destroying it before `callTool` begins (#410).
+    /// Caller MUST pair a non-null return with `McpManager.releaseClient`.
+    pub fn acquireConnectedClient(self: *McpManager, io: std.Io, name: []const u8) ?*client_mod.McpClient {
+        self.clients_mutex.lockUncancelable(io);
+        defer self.clients_mutex.unlock(io);
+        for (self.clients.items) |client| {
+            if (!std.mem.eql(u8, client.name, name)) continue;
+            if (client.statusSync(io) != .connected) continue;
+            _ = client.in_flight_requests.fetchAdd(1, .acq_rel);
+            return client;
+        }
+        return null;
+    }
+
+    pub fn releaseClient(client: *client_mod.McpClient) void {
+        _ = client.in_flight_requests.fetchSub(1, .acq_rel);
+    }
+
+    fn transportMatches(c: *const client_mod.McpClient, expanded: config_mod.McpServerConfig) bool {
+        const expected_timeout_ms: u32 = if (expanded.request_timeout_ms) |ms| @max(ms, 1) else 30_000;
+        if (c.read_timeout_ms != expected_timeout_ms) return false;
+        return switch (c.transport) {
+            .stdio => |ct| switch (expanded.transport) {
+                .stdio => |et| blk: {
+                    if (!std.mem.eql(u8, ct.command, et.command)) break :blk false;
+                    if (ct.args.len != et.args.len) break :blk false;
+                    for (ct.args, et.args) |ca, ea| {
+                        if (!std.mem.eql(u8, ca, ea)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .sse => false,
+            },
+            .sse => |ct| switch (expanded.transport) {
+                .sse => |et| blk: {
+                    if (!std.mem.eql(u8, ct.url, et.url)) break :blk false;
+                    if (ct.headers.len != et.headers.len) break :blk false;
+                    for (ct.headers, et.headers) |ch, eh| {
+                        if (!std.mem.eql(u8, ch.name, eh.name)) break :blk false;
+                        if (!std.mem.eql(u8, ch.value, eh.value)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .stdio => false,
+            },
+        };
     }
 
     /// Reconcile client list against config: remove stale, add new, update status.
@@ -126,21 +196,32 @@ pub const McpManager = struct {
                 .sse => |t| t.url,
             };
 
-            if (self.findClient(server_cfg.name)) |c| {
-                if (server_cfg.enabled) {
-                    if (c.status() != .connected) c.markConnecting(io);
+            var existing_handled = false;
+            if (self.findClientIdx(server_cfg.name)) |idx| {
+                const c = self.clients.items[idx];
+                if (transportMatches(c, expanded)) {
+                    if (server_cfg.enabled) {
+                        if (c.status() != .connected) c.markConnecting(io);
+                    } else {
+                        // Mirrors `disconnectClient` (#384 bug 4): the raw
+                        // `.disabled` write this replaced dropped the lifecycle
+                        // union on a possibly-connected client — orphaning the
+                        // stdio child and leaving the discovery cache populated,
+                        // which then wedged the next re-enable in CONNECTING.
+                        // `stop` sets the `.disabled` lifecycle itself.
+                        c.stop(io);
+                        c.clearTools();
+                        c.latency_ms = 0;
+                    }
+                    existing_handled = true;
                 } else {
-                    // Mirrors `disconnectClient` (#384 bug 4): the raw
-                    // `.disabled` write this replaced dropped the lifecycle
-                    // union on a possibly-connected client — orphaning the
-                    // stdio child and leaving the discovery cache populated,
-                    // which then wedged the next re-enable in CONNECTING.
-                    // `stop` sets the `.disabled` lifecycle itself.
-                    c.stop(io);
-                    c.clearTools();
-                    c.latency_ms = 0;
+                    self.clients_mutex.lockUncancelable(io);
+                    _ = self.clients.orderedRemove(idx);
+                    self.clients_mutex.unlock(io);
+                    self.retireClient(io, c);
                 }
-            } else {
+            }
+            if (!existing_handled) {
                 var c = try client_mod.McpClient.init(
                     self.gpa,
                     server_cfg.name,
@@ -154,7 +235,7 @@ pub const McpManager = struct {
                     c.transport.sse.headers = try config_mod.cloneHeaders(self.gpa, expanded.transport.sse.headers);
                 }
                 if (server_cfg.enabled) c.markConnecting(io);
-                try self.addClient(c);
+                try self.addClientLocked(io, c);
             }
         }
     }
@@ -179,7 +260,7 @@ pub const McpManager = struct {
         for (self.clients.items) |c| {
             if (c.status() != .connecting) continue;
             if (c.discovery.tools.items.len > 0) continue;
-            if (self.hasPendingConnect(c.name)) continue;
+            if (self.hasPendingConnect(c.name, c.generation)) continue;
             self.launchConnect(io, c.name);
         }
     }
@@ -323,9 +404,9 @@ pub const McpManager = struct {
         return self.pending_connects.items.len > 0;
     }
 
-    fn hasPendingConnect(self: *const McpManager, name: []const u8) bool {
+    fn hasPendingConnect(self: *const McpManager, name: []const u8, generation: u64) bool {
         for (self.pending_connects.items) |job| {
-            if (std.mem.eql(u8, job.client_name, name)) return true;
+            if (job.client_generation == generation and std.mem.eql(u8, job.client_name, name)) return true;
         }
         return false;
     }
@@ -335,8 +416,8 @@ pub const McpManager = struct {
     /// discovered tools. The worker owns `job.clone`; the main thread installs
     /// it via `drainConnects`.
     fn launchConnect(self: *McpManager, io: std.Io, name: []const u8) void {
-        if (self.hasPendingConnect(name)) return;
         const client = self.findClient(name) orelse return;
+        if (self.hasPendingConnect(name, client.generation)) return;
         if (client.status() != .connecting) return;
         if (client.discovery.tools.items.len > 0) return;
 
@@ -352,6 +433,7 @@ pub const McpManager = struct {
             .gpa = self.gpa,
             .io = io,
             .client_name = undefined,
+            .client_generation = client.generation,
             .clone = undefined,
             .future = undefined,
         };
@@ -389,6 +471,13 @@ pub const McpManager = struct {
             return;
         };
         const target = self.clients.items[idx];
+        if (target.generation != job.client_generation) {
+            // Client was removed and re-added with the same name while the
+            // old connect was in flight (#413).
+            job.clone.deinit(io);
+            if (job.failed_message) |msg| self.gpa.free(msg);
+            return;
+        }
         switch (result) {
             .ok => {
                 // Install only if the target is still connecting — the user may
@@ -408,8 +497,11 @@ pub const McpManager = struct {
                     return;
                 };
                 moved.* = job.clone;
-                self.retireClient(io, target);
+                moved.generation = target.generation;
+                self.clients_mutex.lockUncancelable(io);
                 self.clients.items[idx] = moved;
+                self.clients_mutex.unlock(io);
+                self.retireClient(io, target);
             },
             .failed => {
                 const msg = job.failed_message orelse (self.gpa.dupe(u8, "connect failed") catch return);
@@ -477,8 +569,10 @@ pub const McpManager = struct {
                 }
             }
             if (!found) {
-                self.retireClient(io, client);
+                self.clients_mutex.lockUncancelable(io);
                 _ = self.clients.orderedRemove(i);
+                self.clients_mutex.unlock(io);
+                self.retireClient(io, client);
             }
         }
     }
@@ -789,6 +883,8 @@ const ConnectJob = struct {
     /// Name of the live client this connect belongs to — stable across list
     /// churn, so the install looks the client up by name, not index.
     client_name: []u8,
+    /// Generation of the target client slot at launch time (#413).
+    client_generation: u64,
     /// Private transport copy the worker spawns/handshakes on.
     clone: client_mod.McpClient,
     future: std.Io.Future(ConnectResult),
@@ -1839,4 +1935,54 @@ test "launchToolRefresh re-arms the refresh flag on the dedup early-return" {
     try std.testing.expect(manager.clients.items[0].discovery.pending_refresh.load(.acquire));
 
     try drainUntilRefreshed(&manager, io);
+}
+
+test "McpManager acquireConnectedClient pins client against retireClient until release (#410)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var client = try client_mod.initMockClient(gpa, "srv", "default");
+    try client.startStdio(io);
+    try client.initialize(io);
+    try manager.addClient(client);
+
+    const acquired = manager.acquireConnectedClient(io, "srv").?;
+    try std.testing.expectEqual(@as(u32, 1), acquired.in_flight_requests.load(.acquire));
+
+    // Removing the client while acquired parks it in pending_destroys instead of UAF.
+    const empty_cfg: config_mod.Config = .{};
+    try manager.syncFromConfig(io, &empty_cfg);
+    try std.testing.expectEqual(@as(usize, 0), manager.clients.items.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.pending_destroys.items.len);
+
+    McpManager.releaseClient(acquired);
+    manager.drainPendingDestroys(io);
+    try std.testing.expectEqual(@as(usize, 0), manager.pending_destroys.items.len);
+}
+
+test "McpManager syncFromConfig replaces client when transport config changes (#413)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var servers = try arena.alloc(config_mod.McpServerConfig, 1);
+    servers[0] = try mockStdioConfig(arena, "editable", "default");
+    var cfg: config_mod.Config = .{ .mcp_servers = servers };
+    try manager.syncFromConfig(io, &cfg);
+    const gen1 = manager.clients.items[0].generation;
+
+    // Change transport to SSE URL; syncFromConfig must replace the client.
+    servers[0] = try config_mod.mcpServerFromUrl(arena, "editable", "https://example.com/mcp");
+    try manager.syncFromConfig(io, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), manager.clients.items.len);
+    try std.testing.expect(manager.clients.items[0].generation != gen1);
+    try std.testing.expect(manager.clients.items[0].transport == .sse);
+    try std.testing.expectEqualStrings("https://example.com/mcp", manager.clients.items[0].transport.sse.url);
 }
