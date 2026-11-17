@@ -179,8 +179,12 @@ pub fn emitToolDelta(
     name: []const u8,
     arguments: []const u8,
 ) !void {
+    var transferred = false;
     const owned_name = try gpa.dupe(u8, name);
+    errdefer if (!transferred) gpa.free(owned_name);
     const owned_arguments = try gpa.dupe(u8, arguments);
+    errdefer if (!transferred) gpa.free(owned_arguments);
+    transferred = true;
     try listener.emit(.{
         .tool_delta = .{
             .index = tool_index,

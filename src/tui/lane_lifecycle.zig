@@ -782,44 +782,36 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 
     // H2: the naming context comes from the SPAWNER lane, not whatever lane
     // the user is currently viewing. Scope-swap app.thread for the capture.
-    // Captured once up front; the req.lane branch passes it to `wakeIdleLane`
-    // (which adopts it), the fresh-worktree branch passes it to `Thread.initLive`
-    // (which adopts it). Every failure path below returns a `Resp` (never an
-    // error), so cleanup is explicit at each site — an `errdefer` would never
-    // fire here. `context` is freed by the caller on each pre-adoption failure.
+    // Captured lazily at adoption time so async-worktree poll ticks do not
+    // heap-duplicate transcript messages only to discard them (#426).
     const spawner = requester_lane orelse return failResp(app.gpa, "lane: no spawner lane\n", .{});
-    const context = captureLaneContext(app, spawner, tui.lane_naming_context_max) catch @as([][]u8, &.{});
 
     // H1: if req.lane targets an existing idle lane, reuse its worktree+
     // branch and wake it as a worker (TD-3/TD-4). Null or unresolvable
     // req.lane falls through to the fresh-worktree path (current behavior).
     if (req.lane) |target_id| {
         if (isPrimaryId(target_id)) {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: [0] is the primary driver lane — spawn creates a worker in an isolated worktree.\n", .{});
         }
         const target = resolveLane(app, target_id) orelse {
-            freeLaneContext(app.gpa, context);
             return failUnknownWorkerLane(app, target_id);
         };
         // TD-6: refuse on the primary (no worktree to reuse).
         if (lanes_util.workingLaneOf(target) == null) {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: [0] is the primary driver lane — spawn creates a worker in an isolated worktree.\n", .{});
         }
         // TD-6: refuse on a running/live lane (would race on the worktree).
         if (target.engine != .idle) {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: lane {s} is already running — spawn targets an idle lane\n", .{target_id});
         }
         if (target.turn.isActive()) {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: lane {s} is still running — wait or cancel before re-tasking\n", .{target_id});
         }
         // The cap counts the driver too; reusing an idle lane does NOT
         // add a new Thread, so the cap check is skipped here (the lane
         // is already in the grid).
 
+        const context = captureLaneContext(app, spawner, tui.lane_naming_context_max) catch @as([][]u8, &.{});
         wakeIdleLane(app, target, repo, context, null) catch |err| {
             // `context` is still caller-owned on failure — `wakeIdleLane`
             // only adopts it on success.
@@ -868,7 +860,6 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     // (the primary), so >= max_threads means "driver + 3 lanes" — a 4th lane
     // would need a 5th pane in the 2×2 grid.
     if (app.threads.len() >= max_threads) {
-        freeLaneContext(app.gpa, context);
         return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
     }
 
@@ -879,7 +870,6 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
 
     if (app.async_worktree_job) |job| {
         if (!job.done.load(.acquire)) {
-            freeLaneContext(app.gpa, context);
             return null; // Keep request in pending, UI thread continues ticking smoothly
         }
         defer {
@@ -887,21 +877,17 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
             app.async_worktree_job = null;
         }
         if (job.err) |err| {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
         }
         wt_dest_owned = app.gpa.dupe(u8, job.dest) catch {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         wt_branch_owned = app.gpa.dupe(u8, job.branch) catch {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
     } else {
         // `home` is only needed for creating a new worktree; compute it here.
         const home = (app.templateRuntime() orelse {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: no active runtime\n", .{});
         }).home_dir;
 
@@ -910,7 +896,6 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         const id = std.fmt.bytesToHex(raw, .lower);
 
         const branch = app.gpa.alloc(u8, "zay/".len + id.len) catch {
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         errdefer app.gpa.free(branch);
@@ -918,14 +903,12 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         @memcpy(branch["zay/".len..], &id);
         const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
             app.gpa.free(branch);
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         defer app.gpa.free(parent);
         std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
         const dest = std.fs.path.join(app.gpa, &.{ parent, id[0..] }) catch {
             app.gpa.free(branch);
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         errdefer app.gpa.free(dest);
@@ -933,13 +916,11 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         const job = WorktreeJob.start(app.gpa, app.io, repo, dest, branch) catch |err| {
             app.gpa.free(branch);
             app.gpa.free(dest);
-            freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
         };
         app.gpa.free(branch);
         app.gpa.free(dest);
         app.async_worktree_job = job;
-        freeLaneContext(app.gpa, context);
         return null; // Return null so request stays in pending list and UI tick runs without blocking!
     }
 
@@ -948,6 +929,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     wt_dest_owned = null;
     wt_branch_owned = null;
 
+    const context = captureLaneContext(app, spawner, tui.lane_naming_context_max) catch @as([][]u8, &.{});
     const runtime = app.createRuntime(wt_dest, repo, null) catch |err| {
         freeLaneContext(app.gpa, context);
         rollbackLaneWorktree(app, repo, wt_dest, wt_branch);

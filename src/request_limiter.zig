@@ -61,8 +61,14 @@ pub const RequestLimiter = struct {
     pub fn setPermits(self: *RequestLimiter, io: std.Io, n: u32) void {
         self.mutex.lock(io) catch return;
         defer self.mutex.unlock(io);
+        const prev = self.permits;
         self.permits = @max(1, n);
-        self.condition.signal(io);
+        if (self.permits > prev) {
+            var i: u32 = 0;
+            while (i < self.permits - prev) : (i += 1) {
+                self.condition.signal(io);
+            }
+        }
     }
 };
 
@@ -197,4 +203,31 @@ test "a cancelled acquire reports TurnCancelled (interrupt/teardown path)" {
     // The main slot is still held — only the cancelled waiter was unwound.
     try std.testing.expectEqual(@as(u32, 1), inFlightCount(&limiter));
     limiter.release(std.testing.io);
+}
+
+test "setPermits wakes multiple parked waiters when capacity increases (#429)" {
+    const io = std.testing.io;
+    var limiter: RequestLimiter = .{ .permits = 1 };
+    try limiter.acquire(io);
+
+    var acquired_count: std.atomic.Value(u32) = .init(0);
+    const Worker = struct {
+        fn run(l: *RequestLimiter, count: *std.atomic.Value(u32)) void {
+            l.acquire(std.testing.io) catch return;
+            _ = count.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var f1 = try io.concurrent(Worker.run, .{ &limiter, &acquired_count });
+    var f2 = try io.concurrent(Worker.run, .{ &limiter, &acquired_count });
+    io.sleep(.fromMilliseconds(15), .awake) catch {};
+
+    limiter.setPermits(io, 3);
+    _ = f1.await(io);
+    _ = f2.await(io);
+    try std.testing.expectEqual(@as(u32, 2), acquired_count.load(.acquire));
+
+    limiter.release(io);
+    limiter.release(io);
+    limiter.release(io);
 }
