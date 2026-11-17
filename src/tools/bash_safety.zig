@@ -235,58 +235,58 @@ fn isPrivilegedPmPhrase(command: []const u8) bool {
 /// split sees `apt;install` / `/usr/bin/apt` / `apt\ninstall` / `pip  install`
 /// (double space) as the same tokens as `apt install`. Returns a slice of `buf`
 /// (caller owns buf).
-fn normalizeShell(command: []const u8, buf: []u8) []u8 {
-    var n: usize = 0;
-    var prev_space = false;
-    for (command) |ch| {
-        const is_sep = ch == '\n' or ch == '\t' or ch == ';' or ch == '|' or ch == '&' or
-            ch == '(' or ch == ')' or ch == '<' or ch == '>' or ch == '/' or
-            ch == '.' or ch == '\'' or ch == '"' or ch == '`';
-        const space = is_sep or ch == ' ';
-        // Collapse separators/whitespace runs into a single space.
-        if (space and prev_space) continue;
-        const out: u8 = if (space) ' ' else ch;
-        if (n < buf.len) buf[n] = out;
-        n += 1;
-        prev_space = space;
+fn isNormalizedSep(ch: u8) bool {
+    return ch == ' ' or ch == '\n' or ch == '\t' or ch == ';' or ch == '|' or ch == '&' or
+        ch == '(' or ch == ')' or ch == '<' or ch == '>' or ch == '/' or
+        ch == '.' or ch == '\'' or ch == '"' or ch == '`';
+}
+
+/// Stream-scan normalized tokens without a fixed 4096-byte buffer (#419).
+fn nextNormalizedToken(command: []const u8, pos: *usize) ?[]const u8 {
+    var i = pos.*;
+    while (i < command.len and isNormalizedSep(command[i])) i += 1;
+    if (i >= command.len) {
+        pos.* = i;
+        return null;
     }
-    const len = if (n > buf.len) buf.len else n;
-    return buf[0..len];
+    const start = i;
+    while (i < command.len and !isNormalizedSep(command[i])) i += 1;
+    pos.* = i;
+    return command[start..i];
 }
 
 fn tokenContains(command: []const u8, needle: []const u8) bool {
-    // Normalize shell metacharacters to spaces so `apt\ninstall` and
-    // `pip\tinstall` split into the same tokens as `apt install`.
-    var buf: [4096]u8 = undefined;
-    const normalized = normalizeShell(command, &buf);
-    var it = std.mem.tokenizeScalar(u8, normalized, ' ');
-    while (it.next()) |tok| {
+    var pos: usize = 0;
+    while (nextNormalizedToken(command, &pos)) |tok| {
         if (std.ascii.eqlIgnoreCase(tok, needle)) return true;
     }
     return false;
 }
 
-/// Case-insensitive match of `phrase` (may contain spaces, expected lowercase)
-/// only when bounded by word boundaries (string edges or any shell
-/// metacharacter/whitespace), so `pip install` inside `pip install --user x`
-/// matches but `equip installation` does not. Case-folds the normalized text
-/// so `PIP INSTALL` classifies the same as the token matcher's
-/// case-insensitive compare. Advances past the match to avoid infinite loops
-/// on overlap.
+/// Case-insensitive match of `phrase` (space-separated lowercase words)
+/// against consecutive normalized tokens without a fixed 4096-byte buffer
+/// (#419), so `apt\ninstall` and `PIP INSTALL` match at any offset.
 fn phraseAtBoundary(command: []const u8, phrase: []const u8) bool {
-    // Normalize so `apt\ninstall` still trips the `apt install` phrase.
-    var buf: [4096]u8 = undefined;
-    const normalized = normalizeShell(command, &buf);
-    for (normalized) |*c| c.* = std.ascii.toLower(c.*);
-    var idx: usize = 0;
-    while (idx < normalized.len) {
-        const at = std.mem.indexOf(u8, normalized[idx..], phrase) orelse return false;
-        const abs = idx + at;
-        const before_ok = abs == 0 or isBoundary(normalized[abs - 1]);
-        const after_pos = abs + phrase.len;
-        const after_ok = after_pos >= normalized.len or isBoundary(normalized[after_pos]);
-        if (before_ok and after_ok) return true;
-        idx = after_pos + 1;
+    var first_it = std.mem.tokenizeScalar(u8, phrase, ' ');
+    const first_word = first_it.next() orelse return false;
+
+    var pos: usize = 0;
+    while (nextNormalizedToken(command, &pos)) |tok| {
+        if (!std.ascii.eqlIgnoreCase(tok, first_word)) continue;
+        var look_pos = pos;
+        var rest_it = first_it;
+        var matched = true;
+        while (rest_it.next()) |word| {
+            const next_tok = nextNormalizedToken(command, &look_pos) orelse {
+                matched = false;
+                break;
+            };
+            if (!std.ascii.eqlIgnoreCase(next_tok, word)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
     }
     return false;
 }
@@ -497,11 +497,12 @@ fn isDangerousRm(command: []const u8) bool {
         if (rm_idx > 0 and !isCommandWordBoundary(command[rm_idx - 1])) continue;
 
         const rest = command[rm_idx + 2 ..];
-        // Look for `-rf` or `-fr` flags.
-        const has_recursive = std.mem.indexOf(u8, rest, "-rf") != null or
-            std.mem.indexOf(u8, rest, "-fr") != null or
-            std.mem.indexOf(u8, rest, "-r -f") != null or
-            std.mem.indexOf(u8, rest, "-f -r") != null;
+        // Look for `-rf`, `-fr`, `-r -f`, `-f -r` (including uppercase `-R`
+        // synonym for recursive, #419).
+        const has_recursive = std.ascii.indexOfIgnoreCase(rest, "-rf") != null or
+            std.ascii.indexOfIgnoreCase(rest, "-fr") != null or
+            std.ascii.indexOfIgnoreCase(rest, "-r -f") != null or
+            std.ascii.indexOfIgnoreCase(rest, "-f -r") != null;
         if (!has_recursive) continue;
 
         // Target being root (`/`, `/*`, `"/"`) — not just any absolute path.
@@ -583,11 +584,28 @@ fn isDangerousBashRedirect(command: []const u8) bool {
         while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
         if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
         for (dangerous_targets) |target| {
-            if (std.mem.startsWith(u8, command[after..], target)) return true;
+            if (unescapedStartsWith(command[after..], target)) return true;
         }
         idx = gt + 1;
     }
     return false;
+}
+
+/// Compare `haystack` against `prefix` while unescaping bash backslash escapes
+/// (`\X` -> `X`), so `> /etc\/passwd` matches `/etc/` (#419).
+fn unescapedStartsWith(haystack: []const u8, prefix: []const u8) bool {
+    var hi: usize = 0;
+    var pi: usize = 0;
+    while (pi < prefix.len) : (pi += 1) {
+        if (hi >= haystack.len) return false;
+        if (haystack[hi] == '\\') {
+            hi += 1;
+            if (hi >= haystack.len) return false;
+        }
+        if (haystack[hi] != prefix[pi]) return false;
+        hi += 1;
+    }
+    return true;
 }
 
 /// PowerShell redirect (`>`) into a Windows system root. Case-insensitive on the
@@ -1470,4 +1488,14 @@ test "client classifier body read is bounded by the socket timeout" {
     const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start;
     try std.testing.expect(outcome == error.Timeout or outcome == error.ReadFailed);
     try std.testing.expect(elapsed < 10 * std.time.ns_per_s);
+}
+
+test "bash safety classifier catches backslash redirect, uppercase rm -Rf, and >4096B commands (#419)" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > /etc\\/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > \"/dev\\/sda\""));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -Rf /"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("rm -R -f /"));
+
+    const long_cmd = "echo " ++ ("a" ** 5000) ++ "; sudo apt install malware";
+    try std.testing.expectEqual(Verdict.unsafe, localClassify(long_cmd));
 }
