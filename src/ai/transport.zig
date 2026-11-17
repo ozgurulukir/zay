@@ -107,8 +107,8 @@ pub const Transport = struct {
 
     // ── Policy (from the client's ai.Config). ──
     request_timeout_seconds: u32 = 0,
-    retry_base_delay_ms: u64 = 500,
-    max_retries: u32 = 2,
+    retry_base_delay_ms: u64 = ai.default_retry_base_delay_ms,
+    max_retries: u32 = ai.default_max_retries,
     /// C1 seed: the user's `disable_prompt_cache` flag. The C2 downgrade may
     /// flip the per-request value on top; the seed itself never changes.
     disable_cache_seed: bool = false,

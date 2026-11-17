@@ -478,6 +478,9 @@ fn attachBaseConfig(
         .disable_prompt_cache = self.disable_prompt_cache,
         .session_id = self.session_writer.session.id.slice(),
         .system_prompt = plan.main_system_prompt orelse ai.default_system_prompt,
+        .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
+        .max_retries = self.context_settings.max_retries orelse ai.default_max_retries,
+        .retry_base_delay_ms = if (self.context_settings.retry_base_delay_ms) |ms| @as(u64, ms) else ai.default_retry_base_delay_ms,
         .headers = provider_specs,
     };
     switch (plan.adapter) {
@@ -486,7 +489,6 @@ fn attachBaseConfig(
             cfg.is_reasoning_model = compaction.isReasoningModel(model_info);
             cfg.max_output_tokens = self.context_settings.max_output_tokens;
             cfg.max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse ai.default_max_parallel_tool_calls;
-            cfg.request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds;
         },
         .codex => cfg.account_id = plan.account_id,
         .responses => {},
@@ -1004,10 +1006,12 @@ test "attach parity: every role inherits plan fields across all adapters" {
         });
         defer runtime.deinit();
 
-        // Re-attach with a non-default timeout so the parity check reads a
-        // plan value no default could mask.
+        // Re-attach with a non-default timeout and retry policy so the parity
+        // check reads plan values no default could mask.
         runtime.wire_dialect = .dashscope;
         runtime.context_settings.request_timeout_seconds = 777;
+        runtime.context_settings.max_retries = 4;
+        runtime.context_settings.retry_base_delay_ms = 250;
         try runtime.attachOpenAiCompatibleClient(
             "dashscope",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -1024,6 +1028,8 @@ test "attach parity: every role inherits plan fields across all adapters" {
         for (roles) |client| {
             try std.testing.expectEqual(ai.WireDialect.dashscope, client.config.wire_dialect);
             try std.testing.expectEqual(@as(u32, 777), client.config.request_timeout_seconds);
+            try std.testing.expectEqual(@as(u32, 4), client.config.max_retries);
+            try std.testing.expectEqual(@as(u64, 250), client.config.retry_base_delay_ms);
             try std.testing.expectEqualStrings(main_client.config.session_id, client.config.session_id);
             try std.testing.expectEqual(runtime.disable_prompt_cache, client.config.disable_prompt_cache);
         }
@@ -1039,6 +1045,8 @@ test "attach parity: every role inherits plan fields across all adapters" {
         try std.testing.expectEqualStrings(ai.default_system_prompt, main_client.config.system_prompt);
         try std.testing.expectEqualStrings(ai.default_system_prompt, naming_client.config.system_prompt);
         try std.testing.expectEqualStrings(compaction.summarizer_system_prompt, comp_client.config.system_prompt);
+        try std.testing.expectEqual(config_mod.default_max_retries, ai.default_max_retries);
+        try std.testing.expectEqual(@as(u64, config_mod.default_retry_base_delay_ms), ai.default_retry_base_delay_ms);
     }
 
     // ── responses: prompt roles + per-model context fallbacks on attach ──
@@ -1086,6 +1094,9 @@ test "attach parity: every role inherits plan fields across all adapters" {
         const roles = [_]*const ai.responses_core.Client{ main_client, comp_client, naming_client };
         for (roles) |client| {
             try std.testing.expectEqualStrings(main_client.config.session_id, client.config.session_id);
+            try std.testing.expectEqual(ai.default_request_timeout_seconds, client.transport.request_timeout_seconds);
+            try std.testing.expectEqual(ai.default_max_retries, client.transport.max_retries);
+            try std.testing.expectEqual(ai.default_retry_base_delay_ms, client.transport.retry_base_delay_ms);
         }
         // Naming carries the main client's (assembled) system prompt; the
         // runtime prompt is assembled, so assert the pairing, not a literal.
