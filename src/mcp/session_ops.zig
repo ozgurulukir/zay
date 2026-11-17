@@ -170,6 +170,37 @@ pub fn listToolsFresh(self: *McpClient, io: std.Io) !std.ArrayList(discovery_mod
     return fresh;
 }
 
+/// Send a JSON-RPC request with lifecycle recovery for live tool calls:
+/// - `McpServerCrashed` transitions the client to `.failed` (clearing tools)
+///   so it is not left wedged as `.connected`.
+/// - `McpSessionExpired` (HTTP 404, `session_id` already cleared by wire.zig)
+///   re-runs `initialize` once and retries the request; if recovery fails,
+///   transitions the client to `.failed`.
+fn sendRequestWithRecovery(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
+    return self.sendRequest(io, method, params_json) catch |err| switch (err) {
+        error.McpServerCrashed => {
+            self.setError(io, "MCP server crashed", .{});
+            return error.McpServerCrashed;
+        },
+        error.McpSessionExpired => {
+            initialize(self, io) catch |init_err| {
+                self.setError(io, "MCP session expired and re-initialize failed: {s}", .{@errorName(init_err)});
+                return init_err;
+            };
+            return self.sendRequest(io, method, params_json) catch |retry_err| {
+                switch (retry_err) {
+                    error.McpServerCrashed, error.McpSessionExpired => {
+                        self.setError(io, "MCP request failed after session refresh: {s}", .{@errorName(retry_err)});
+                    },
+                    else => {},
+                }
+                return retry_err;
+            };
+        },
+        else => return err,
+    };
+}
+
 /// Call a tool via `tools/call` JSON-RPC.
 /// Returns the text content from the tool response (owned, caller must free).
 /// JSON-RPC errors and `isError: true` both return the server's message
@@ -186,7 +217,7 @@ pub fn callTool(self: *McpClient, io: std.Io, tool_name: []const u8, arguments_j
     const params = try pw.toOwnedSlice();
     defer self.gpa.free(params);
 
-    const response = try self.sendRequest(io, "tools/call", params);
+    const response = try sendRequestWithRecovery(self, io, "tools/call", params);
     defer self.gpa.free(response);
 
     // Parse response inline to handle JSON-RPC errors with full context

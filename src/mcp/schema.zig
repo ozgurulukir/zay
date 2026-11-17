@@ -72,7 +72,7 @@ pub fn extractContentText(gpa: std.mem.Allocator, result: std.json.Value) ![]u8 
             else
                 "unknown";
             var buf: [128]u8 = undefined;
-            const label = try std.fmt.bufPrint(&buf, "[Image content ({s})]", .{mime});
+            const label = std.fmt.bufPrint(&buf, "[Image content ({s})]", .{mime}) catch "[Image content]";
             try text.appendSlice(gpa, label);
         } else {
             var buf: [128]u8 = undefined;
@@ -1177,4 +1177,22 @@ test "extractContentText returns empty string for missing content" {
     const text = try extractContentText(gpa, parsed.value);
     defer gpa.free(text);
     try std.testing.expectEqualStrings("", text);
+}
+
+test "extractContentText gracefully handles long image mimeType (#414)" {
+    const gpa = std.testing.allocator;
+    const long_mime = "image/" ++ ("x" ** 150);
+    const result_json =
+        \\{"content":[
+        \\  {"type":"image","mimeType":"
+    ++ long_mime ++
+        \\"},
+        \\  {"type":"text","text":"preserved"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result_json, .{});
+    defer parsed.deinit();
+    const text = try extractContentText(gpa, parsed.value);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("[Image content]\npreserved", text);
 }

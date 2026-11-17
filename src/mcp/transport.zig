@@ -127,12 +127,15 @@ pub fn classifySseLine(line: []const u8) SseLine {
     return .other;
 }
 
-/// Read one `\n`-terminated SSE line (delimiter stripped). Returns null at end
-/// of stream when no trailing bytes remain.
-fn readSseLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+const sse_event_type_max: usize = 4096;
+
+/// Read one `\n`-terminated SSE line (delimiter stripped), bounded by `max_bytes`.
+/// Returns null at end of stream when no trailing bytes remain.
+fn readSseLine(gpa: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) !?[]u8 {
     var line: std.Io.Writer.Allocating = .init(gpa);
     errdefer line.deinit();
-    _ = reader.streamDelimiterEnding(&line.writer, '\n') catch |err| switch (err) {
+    _ = reader.streamDelimiterLimit(&line.writer, '\n', .limited(max_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return error.McpStreamTooLarge,
         error.ReadFailed => return error.ReadFailed,
         error.WriteFailed => return error.OutOfMemory,
     };
@@ -199,10 +202,13 @@ pub fn readSseResponse(
 
     var events_seen: u32 = 0;
     while (events_seen < sse_event_max) {
-        const line = (try readSseLine(gpa, reader)) orelse return error.McpStreamEndedEarly;
+        const line = (try readSseLine(gpa, reader, sse_data_bytes_max)) orelse return error.McpStreamEndedEarly;
         defer gpa.free(line);
         switch (classifySseLine(line)) {
-            .event => |e| try event_type.appendSlice(gpa, e),
+            .event => |e| {
+                if (event_type.items.len + e.len > sse_event_type_max) return error.McpStreamTooLarge;
+                try event_type.appendSlice(gpa, e);
+            },
             .data => |d| {
                 if (data.items.len > 0) try data.append(gpa, '\n');
                 try data.appendSlice(gpa, d);
@@ -526,4 +532,23 @@ test "readSseResponse treats a default (no event:) event as a message" {
     const response = try readSseResponse(gpa, &reader, 5, &notifications);
     defer gpa.free(response);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}", response);
+}
+
+test "readSseLine aborts with McpStreamTooLarge on oversized line (#412)" {
+    const gpa = std.testing.allocator;
+    const payload = "data: " ++ ("x" ** 64);
+    var reader: std.Io.Reader = .fixed(payload);
+    try std.testing.expectError(error.McpStreamTooLarge, readSseLine(gpa, &reader, 32));
+}
+
+test "readSseResponse aborts with McpStreamTooLarge on oversized event type (#412)" {
+    const gpa = std.testing.allocator;
+    const huge_event = "event: " ++ ("a" ** (sse_event_type_max + 1)) ++ "\n\n";
+    var reader: std.Io.Reader = .fixed(huge_event);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    try std.testing.expectError(error.McpStreamTooLarge, readSseResponse(gpa, &reader, 1, &notifications));
 }
