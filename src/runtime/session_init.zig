@@ -124,7 +124,7 @@ pub fn initSession(target: *AgentRuntime, genesis: AgentRuntime.Genesis) !void {
         config.effectiveDatabaseUrl(),
         config.effectiveDatabaseAuthToken(),
         config.effectiveDatabasePath(),
-    );
+    ).withTimeout(config.effectiveDatabaseTimeoutSeconds());
 
     if (session_id) |id| {
         // Resume never falls back across stores: an unreachable remote

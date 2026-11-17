@@ -113,6 +113,7 @@ pub const SessionStore = struct {
     url: ?[]const u8 = null,
     token: ?[]const u8 = null,
     path: ?[]const u8 = null,
+    timeout_seconds: ?u32 = null,
 
     /// Build the store spec from a config's resolved database settings — the
     /// single site for the config→`BackendKind` vocabulary (was hand-copied
@@ -130,6 +131,14 @@ pub const SessionStore = struct {
             .token = token,
             .path = path,
         };
+    }
+
+    /// Attach an optional per-request HTTP timeout (in seconds) for remote
+    /// backends (`remote_service`, `turso_http`, `d1_http`).
+    pub fn withTimeout(self: SessionStore, timeout_seconds: ?u32) SessionStore {
+        var copy = self;
+        copy.timeout_seconds = timeout_seconds;
+        return copy;
     }
 };
 
@@ -207,9 +216,14 @@ pub const SessionManager = struct {
     }
 
     pub fn initRemote(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
+        return initRemoteWithTimeout(gpa, io, url, auth_token, host_id, null);
+    }
+
+    pub fn initRemoteWithTimeout(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8, timeout_seconds: ?u32) Error!SessionManager {
         assert(url.len > 0);
         var b = try SessionBackend.openRemote(gpa, url, auth_token, host_id);
         errdefer b.deinit();
+        if (timeout_seconds) |secs| b.setTimeoutSeconds(secs);
         try session_migration.migrateBackend(&b, io);
         const conn = db.Connection.open(":memory:", .{}) catch return error.SystemResources;
         return .{
@@ -222,9 +236,14 @@ pub const SessionManager = struct {
     }
 
     pub fn initTurso(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
+        return initTursoWithTimeout(gpa, io, url, auth_token, host_id, null);
+    }
+
+    pub fn initTursoWithTimeout(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8, timeout_seconds: ?u32) Error!SessionManager {
         assert(url.len > 0);
         var b = try SessionBackend.openTurso(gpa, url, auth_token, host_id);
         errdefer b.deinit();
+        if (timeout_seconds) |secs| b.setTimeoutSeconds(secs);
         try session_migration.migrateBackend(&b, io);
         const conn = db.Connection.open(":memory:", .{}) catch return error.SystemResources;
         return .{
@@ -237,9 +256,14 @@ pub const SessionManager = struct {
     }
 
     pub fn initD1(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8) Error!SessionManager {
+        return initD1WithTimeout(gpa, io, url, auth_token, host_id, null);
+    }
+
+    pub fn initD1WithTimeout(gpa: std.mem.Allocator, io: std.Io, url: []const u8, auth_token: ?[]const u8, host_id: []const u8, timeout_seconds: ?u32) Error!SessionManager {
         assert(url.len > 0);
         var b = try SessionBackend.openD1(gpa, url, auth_token, host_id);
         errdefer b.deinit();
+        if (timeout_seconds) |secs| b.setTimeoutSeconds(secs);
         try session_migration.migrateBackend(&b, io);
         const conn = db.Connection.open(":memory:", .{}) catch return error.SystemResources;
         return .{
@@ -295,7 +319,7 @@ pub const SessionManager = struct {
                     if (!fallback_ok) return error.MissingDatabaseUrl;
                     return initConfiguredLocal(gpa, io, home_dir, host_id, store.path);
                 }
-                if (openRemoteStore(gpa, io, kind, url, store.token, host_id)) |manager| {
+                if (openRemoteStore(gpa, io, kind, url, store.token, host_id, store.timeout_seconds)) |manager| {
                     return manager;
                 } else |err| {
                     if (!fallback_ok) return err;
@@ -314,11 +338,12 @@ pub const SessionManager = struct {
         url: []const u8,
         token: ?[]const u8,
         host_id: []const u8,
+        timeout_seconds: ?u32,
     ) Error!SessionManager {
         return switch (kind) {
-            .remote_service => initRemote(gpa, io, url, token, host_id),
-            .turso_http => initTurso(gpa, io, url, token, host_id),
-            .d1_http => initD1(gpa, io, url, token, host_id),
+            .remote_service => initRemoteWithTimeout(gpa, io, url, token, host_id, timeout_seconds),
+            .turso_http => initTursoWithTimeout(gpa, io, url, token, host_id, timeout_seconds),
+            .d1_http => initD1WithTimeout(gpa, io, url, token, host_id, timeout_seconds),
             else => unreachable,
         };
     }

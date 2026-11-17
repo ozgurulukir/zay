@@ -233,7 +233,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             load_result.config.effectiveDatabaseUrl(),
             load_result.config.effectiveDatabaseAuthToken(),
             load_result.config.effectiveDatabasePath(),
-        );
+        ).withTimeout(load_result.config.effectiveDatabaseTimeoutSeconds());
         var manager = session.SessionManager.initStore(
             runtime_gpa,
             init.io,

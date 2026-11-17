@@ -146,6 +146,13 @@ pub const SessionBackend = struct {
         };
     }
 
+    pub fn setTimeoutSeconds(self: *SessionBackend, timeout_seconds: u32) void {
+        std.debug.assert(timeout_seconds > 0);
+        if (self.remote) |*client| client.timeout_seconds = timeout_seconds;
+        if (self.turso) |*client| client.timeout_seconds = timeout_seconds;
+        if (self.d1) |*client| client.timeout_seconds = timeout_seconds;
+    }
+
     pub fn deinit(self: *SessionBackend) void {
         self.gpa.free(self.host_id);
         if (self.local_path) |path| self.gpa.free(path);
@@ -376,4 +383,19 @@ test "BackendKind vocabulary stays byte-identical to the config leaf" {
         try std.testing.expectEqual(leaf_tag, store_tag.toLeaf());
     }
     try std.testing.expectEqual(@as(?BackendKind, null), BackendKind.fromString("bogus_backend"));
+}
+
+test "SessionBackend setTimeoutSeconds updates remote client timeouts" {
+    const gpa = std.testing.allocator;
+    var turso_backend = try SessionBackend.openTurso(gpa, "https://my-db.turso.io", "secret-token", "test-host");
+    defer turso_backend.deinit();
+    try std.testing.expectEqual(@as(u32, 30), turso_backend.turso.?.timeout_seconds);
+    turso_backend.setTimeoutSeconds(120);
+    try std.testing.expectEqual(@as(u32, 120), turso_backend.turso.?.timeout_seconds);
+
+    var d1_backend = try SessionBackend.openD1(gpa, "d1://my-account/my-db", "secret-token", "test-host");
+    defer d1_backend.deinit();
+    try std.testing.expectEqual(@as(u32, 30), d1_backend.d1.?.timeout_seconds);
+    d1_backend.setTimeoutSeconds(45);
+    try std.testing.expectEqual(@as(u32, 45), d1_backend.d1.?.timeout_seconds);
 }

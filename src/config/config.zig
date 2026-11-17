@@ -254,12 +254,20 @@ pub const TuiSettings = struct {
 /// the schema cannot drift; see database_backend.zig.
 pub const DatabaseBackendKind = database_backend.DatabaseBackendKind;
 
+/// Default per-request HTTP timeout in seconds for remote database backends
+/// (`zay_service`, `turso_http`, `d1_http`). Mirrors `db.http_transport.timeout_seconds_default`.
+pub const default_database_timeout_seconds: u32 = 30;
+
 /// Database backend configuration.
 pub const DatabaseConfig = struct {
     backend: ?DatabaseBackendKind = null,
     url: ?[]u8 = null,
     auth_token: ?[]u8 = null,
     path: ?[]u8 = null,
+    /// Per-request HTTP timeout in seconds for remote database backends.
+    /// Null = `default_database_timeout_seconds` (30s). Parse accepts 1–300
+    /// and drops out-of-range values.
+    timeout_seconds: ?u32 = null,
 
     pub fn deinit(self: *DatabaseConfig, gpa: std.mem.Allocator) void {
         if (self.url) |u| gpa.free(u);
@@ -269,7 +277,10 @@ pub const DatabaseConfig = struct {
     }
 
     pub fn clone(self: DatabaseConfig, gpa: std.mem.Allocator) !DatabaseConfig {
-        var copy: DatabaseConfig = .{ .backend = self.backend };
+        var copy: DatabaseConfig = .{
+            .backend = self.backend,
+            .timeout_seconds = self.timeout_seconds,
+        };
         errdefer copy.deinit(gpa);
         if (self.url) |u| copy.url = try gpa.dupe(u8, u);
         if (self.auth_token) |t| copy.auth_token = try gpa.dupe(u8, t);
@@ -432,6 +443,12 @@ pub const Config = struct {
             if (p.len > 0) return p;
         }
         return null;
+    }
+
+    /// Resolve the configured remote database HTTP timeout in seconds, or null
+    /// to use `default_database_timeout_seconds` (30s).
+    pub fn effectiveDatabaseTimeoutSeconds(self: *const Config) ?u32 {
+        return self.database.timeout_seconds;
     }
 
     pub fn validate(self: *const Config, gpa: std.mem.Allocator) ![]Diagnostic {
