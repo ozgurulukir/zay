@@ -711,7 +711,17 @@ fn makeLargeResultPreview(gpa: std.mem.Allocator, source: []const u8, footer: []
     const footer_block = try std.fmt.allocPrint(gpa, "\n\n{s}", .{footer});
     defer gpa.free(footer_block);
     if (footer_block.len >= cap_bytes) {
-        return tool_common.pruneToolText(gpa, source, cap_bytes);
+        // The footer alone fills (or exceeds) the cap. Dropping it would lose
+        // the full-output pointer the model needs for retrieval, so reserve
+        // room for the `"\n\n"` separator and keep a truncated prefix of the
+        // footer instead (UTF-8 boundary-safe). A cap below separator + one
+        // footer byte cannot hold any footer content — keep the bare prune
+        // there so the result still obeys the cap.
+        if (cap_bytes < 3) return tool_common.pruneToolText(gpa, source, cap_bytes);
+        const footer_budget: usize = cap_bytes - 2;
+        var footer_keep: usize = @min(footer.len, footer_budget);
+        while (footer_keep > 0 and footer_keep < footer.len and (footer[footer_keep] & 0xC0) == 0x80) footer_keep -= 1;
+        return std.fmt.allocPrint(gpa, "\n\n{s}", .{footer[0..footer_keep]});
     }
 
     const excerpt_limit = cap_bytes - @as(u32, @intCast(footer_block.len));
@@ -2410,6 +2420,19 @@ test "makeLargeResultPreview bounds when cap_bytes is smaller than footer withou
     defer gpa.free(preview);
 
     try std.testing.expect(preview.len <= cap_bytes);
+    // #443: the retrieval footer must survive truncation, never be dropped —
+    // the preview is the "\n\n" separator followed by a prefix of the footer,
+    // still within the cap.
+    try std.testing.expect(preview.len >= 2);
+    try std.testing.expectEqualStrings("\n\n", preview[0..2]);
+    try std.testing.expect(preview[2..].len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, footer, preview[2..]));
+
+    // Tiny caps (below separator + one footer byte) cannot hold any footer
+    // content: the bare-prune fallback keeps the ≤cap bound there.
+    const tiny = try makeLargeResultPreview(gpa, source, footer, 2);
+    defer gpa.free(tiny);
+    try std.testing.expect(tiny.len <= 2);
 }
 
 test "ExecutorService produceViaRegistry dispatches via direct lookup without mutating registry scratch" {
