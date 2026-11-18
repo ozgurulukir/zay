@@ -2749,6 +2749,53 @@ test "interrupted turn converges into a scripted queued restart" {
     try std.testing.expectEqual(@as(u32, 0), app.thread.agent.?.message_queue.len());
 }
 
+test "drainAgentEvents frees the rest of the batch when one event fails to apply" {
+    // #444: the queue pops the whole batch before any of it is applied, so a
+    // mid-batch failure must be swallowed per event — propagating it would
+    // leak every sibling the drain loop already owns (they were handed over
+    // by the queue and can only be freed by the per-event defers) and abort
+    // the tick. A failing allocator forces each applyAgentEvent's first
+    // allocation (the `turn_failed` record dupe) to fail.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // A batch of worker events on the primary lane's queue. Payloads are
+    // allocated with the REAL allocator: the events are queue-owned until
+    // the drain pops them, and the per-event frees run through worker.gpa.
+    const worker = &app.thread.worker_context.?;
+    for ([_][]const u8{ "first", "second", "third" }) |text| {
+        const event = try gpa.create(agent_mod.Agent.Event);
+        errdefer gpa.destroy(event);
+        event.* = .{ .turn_failed = try gpa.dupe(u8, text) };
+        errdefer event.deinit(gpa);
+        try worker.queue.push(worker.io, gpa, event);
+    }
+
+    // fail_index 0: the counter never advances past a failure, so every
+    // app.gpa allocation inside the drain fails — one error per event.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    app.gpa = failing.allocator();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+    // The drain must run to completion: returning an error here means a
+    // mid-batch failure aborted the loop and leaked the remaining events.
+    _ = try lifecycle.drainAgentEvents(&root, &ctx);
+
+    // Both turn_failed dupes failed, so no failure reason was recorded; the
+    // leak check on app.deinit (plus the event frees through worker.gpa)
+    // closes the regression — every popped event was freed despite the
+    // mid-batch failures.
+    app.gpa = gpa;
+    try std.testing.expect(app.thread.turn_failed == null);
+}
+
 test "lane commands stay hidden until a second lane exists" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;

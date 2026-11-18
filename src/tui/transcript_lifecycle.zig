@@ -76,10 +76,14 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
 }
 
 pub fn clearConversation(app: *App) !void {
+    // Prior rows are freed in place — the same shape rebuildTranscriptRows
+    // uses. Nothing ever read the retired list (it was append-only and only
+    // freed at exit), so retiring on every /clear, /new, and /resume rebuild
+    // kept every dropped conversation alive for the whole process.
     if (app.thread.transcript.messages.items.len > 0) {
-        try app.retired_transcripts.append(app.gpa, app.thread.transcript);
+        app.thread.transcript.deinit(app.gpa);
+        app.thread.transcript = .{};
     }
-    app.thread.transcript = .{};
     app.thread.transcript_list.scroll = .{};
 }
 
@@ -115,8 +119,7 @@ pub fn rebuildTranscriptFromAgent(app: *App) !void {
 /// Rebuild `lane`'s transcript mirror from the lane's own agent history —
 /// the lane-scoped core shared by the /resume rebuild and the /lanes open
 /// action (a restored lane's mirror is in-memory only and must come back
-/// from the persisted conversation). Prior rows are cleared in place without
-/// retiring them: only the focused /resume path retires.
+/// from the persisted conversation). Prior rows are cleared in place.
 pub fn rebuildTranscriptRows(app: *App, lane: *Thread) !void {
     const agent = lane.agent orelse return;
     if (lane.transcript.messages.items.len > 0) {
@@ -197,4 +200,32 @@ pub fn resumedToolTitleFor(app: *App, agent: *agent_mod.Agent, message: ai.ChatM
         return transcript_mod.toolTitle(app.gpa, id);
     }
     return transcript_mod.toolTitle(app.gpa, "tool");
+}
+
+test "clearConversation empties the transcript in place" {
+    // #444: /clear used to retire the live transcript onto an append-only
+    // list that nothing read back and only exit freed — unbounded growth
+    // across every /clear, /new, and /resume rebuild. The rows must be freed
+    // in place instead; the leak check on `app.deinit` catches a transcript
+    // that was dropped without a deinit.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_helpers = @import("test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    try test_helpers.addIdleFocusedLane(gpa, &app, "cc-clear");
+    _ = try app.thread.transcript.append(gpa, .user, "you", "first prompt");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "first answer");
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+
+    try app.clearConversation();
+
+    try std.testing.expectEqual(@as(usize, 0), app.thread.transcript.messages.items.len);
+    // The cleared transcript accepts new rows again — a fresh value, not a
+    // drained shell.
+    _ = try app.thread.transcript.append(gpa, .user, "you", "second prompt");
+    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
 }

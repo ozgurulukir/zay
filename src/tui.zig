@@ -20,7 +20,6 @@ const tools_mod = @import("tools.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
 const vcs = @import("vcs.zig");
-pub const transcript_mod = @import("transcript.zig");
 pub const agent_worker = @import("tui/agent_worker.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
@@ -226,7 +225,6 @@ pub const App = struct {
     /// runtime. Empty in test harnesses — callers fall back to the session
     /// layer's "default-host" sentinel.
     host_id: []const u8 = "",
-    retired_transcripts: std.ArrayList(transcript_mod.Transcript) = .empty,
     /// Visual feedback state (loading spinner, black-hole intro, diff
     /// cache, git label) lives in MetricsState.
     metrics: app_state.MetricsState = .{},
