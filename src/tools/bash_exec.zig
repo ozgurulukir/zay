@@ -192,6 +192,13 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
             try sink.ingest(gpa, io, chunk);
             reader.tossBuffered();
         }
+        if (!timed_out) {
+            // EOF need not mean exit (#440): a child that closed its pipes but
+            // keeps running must not park `child.wait` past the deadline.
+            // Deadline expiry here maps to the same 124 contract as a
+            // mid-stream timeout.
+            if (!try capture_sink.childExitedBounded(io, &child, deadline, options.cancel_requested)) timed_out = true;
+        }
         if (!timed_out) try multi_reader.checkAnyError();
     }
     const code = if (timed_out) 124 else os.termCode(try child.wait(io));
@@ -250,6 +257,7 @@ const login_env_bytes_limit: usize = 1024 * 1024;
 const login_env_stderr_limit: usize = 64 * 1024;
 const login_env_timeout_seconds: u32 = 10;
 
+var login_env_mutex: std.Io.Mutex = .init;
 var login_env_cache: ?[]const u8 = null;
 var login_env_attempted: bool = false;
 
@@ -257,13 +265,24 @@ var login_env_attempted: bool = false;
 /// `KEY=VALUE` block, captured once and cached for the process lifetime. Returns
 /// null on Windows, or if the capture fails (callers then fall back to the
 /// inherited process env). See the comment above for the rationale.
+///
+/// Mutex-guarded lazy init (mirrors `bashPath`): the tool-call path and the Lua
+/// bridges can reach this concurrently, and the first capture spawns a login
+/// shell (up to 10s) — two racing first callers would each spawn one and race
+/// the cache write (#440). On a lock failure fall back to the cached value
+/// as-is; the capture is an optimization over the inherited env anyway.
 pub fn loginEnvBlock(io: std.Io) ?[]const u8 {
     if (os.is_windows) return null;
-    if (!login_env_attempted) {
-        login_env_attempted = true;
-        login_env_cache = captureLoginEnv(io) catch null;
+    if (login_env_mutex.lock(io)) |_| {
+        defer login_env_mutex.unlock(io);
+        if (!login_env_attempted) {
+            login_env_attempted = true;
+            login_env_cache = captureLoginEnv(io) catch null;
+        }
+        return login_env_cache;
+    } else |_| {
+        return login_env_cache;
     }
-    return login_env_cache;
 }
 
 fn captureLoginEnv(io: std.Io) ![]const u8 {
@@ -281,6 +300,29 @@ fn captureLoginEnv(io: std.Io) ![]const u8 {
     if (os.termCode(result.term) != 0) return error.LoginEnvFailed;
     const marker_at = std.mem.indexOf(u8, result.stdout, login_env_marker) orelse return error.LoginEnvFailed;
     return gpa.dupe(u8, result.stdout[marker_at + login_env_marker.len ..]);
+}
+
+test "loginEnvBlock concurrent callers converge on one cache" {
+    // Regression for #440: the check-then-set was unguarded, so two racing
+    // first callers each spawned a login shell and raced the cache write.
+    // Reset the process-global cache so both callers here race for the real
+    // first capture, then require both to observe the same slice (or null).
+    // Runs before any concurrency, so the direct reset is race-free.
+    if (os.is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    login_env_cache = null;
+    login_env_attempted = false;
+
+    const Caller = struct {
+        fn run(task_io: std.Io) ?[]const u8 {
+            return loginEnvBlock(task_io);
+        }
+    };
+    var first = try io.concurrent(Caller.run, .{io});
+    var second = try io.concurrent(Caller.run, .{io});
+    const first_block = first.await(io);
+    const second_block = second.await(io);
+    try std.testing.expectEqual(first_block, second_block);
 }
 
 // On Windows, `bash` on PATH may resolve to the WSL bash bridge in
@@ -536,6 +578,36 @@ test "capture enforces total runtime even when output keeps flowing" {
     try std.testing.expectEqual(@as(u8, 124), captured.code);
 }
 
+test "capture returns 124 promptly when the child closes both pipes and keeps running" {
+    // Regression for #440: after EOF the capture loop called `child.wait`
+    // unconditionally, so a child that closed both pipe write ends but kept
+    // running parked the worker until the child exited on its own. The
+    // deadline must stop the wait and preserve the 124 timeout contract.
+    // Linux-only: the liveness probe (`os.processExited`) is Linux-only; see
+    // `capture_sink.childExitedBounded` for the platform story.
+    if (os.is_windows or os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    const start = std.Io.Timestamp.now(std.testing.io, .awake);
+    var captured = try capture(gpa, std.testing.io, .{
+        .cwd = cwd,
+        .command = "exec 1>&- 2>&-; sleep 30",
+        .timeout = timeoutFromSeconds(1),
+        .limits = .{
+            .bytes_max = 50 * 1024,
+            .lines_max = 2000,
+            .tail_bytes_max = 100 * 1024,
+            .spill_bytes_max = 10 * 1024 * 1024,
+        },
+    });
+    defer captured.deinit(gpa);
+    const elapsed_ms = start.durationTo(std.Io.Timestamp.now(std.testing.io, .awake)).nanoseconds;
+    try std.testing.expect(captured.timed_out);
+    try std.testing.expectEqual(@as(u8, 124), captured.code);
+    try std.testing.expect(elapsed_ms < 15 * std.time.ns_per_s);
+}
+
 const CaptureOutcome = struct {
     err: ?anyerror = null,
 };
@@ -625,6 +697,29 @@ test "spill stops growing at spill_bytes_max" {
 
     const st = std.Io.Dir.statFile(.cwd(), std.testing.io, sink.spill.?.path, .{}) catch unreachable;
     try std.testing.expect(st.size <= 16);
+}
+
+test "spill file is created owner-only (0600)" {
+    // Regression for #440: the spill file mirrors full command output (which
+    // may hold secrets) and was created with default perms (0644 after umask).
+    // No umask can remove the owner bits from 0600, so the assertion is
+    // umask-independent.
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var sink: Sink = .{ .limits = .{
+        .bytes_max = 4,
+        .lines_max = 100,
+        .tail_bytes_max = 64,
+        .spill_bytes_max = 16,
+    } };
+    defer sink.deinit(gpa, std.testing.io);
+
+    try sink.ingest(gpa, std.testing.io, "aaaa");
+    try sink.ingest(gpa, std.testing.io, "bbbb"); // 8 > 4 → spill trips
+    try std.testing.expect(sink.spill != null);
+
+    const st = try std.Io.Dir.statFile(.cwd(), std.testing.io, sink.spill.?.path, .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
 }
 
 test "pruneTempDir removes only matching stale files" {
