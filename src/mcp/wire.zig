@@ -60,12 +60,122 @@ pub const windows = if (os.is_windows) struct {
     pub const LPVOID = ?*anyopaque;
 };
 
+/// The stdio line-bytes bound (#412): an unterminated line past this fails
+/// the stream instead of growing memory without limit.
+const stdio_line_bytes_max: usize = 64 * 1024 * 1024;
+
+/// Read one newline-delimited JSON-RPC line from the stdio stdout pipe with
+/// the WHOLE line read inside the deadline (#450): the pre-#450 loop only
+/// gated the wait for the FIRST bytes of a line, so once any byte was
+/// available `streamDelimiterLimit` blocked on the pipe with no deadline and
+/// a server that wrote a partial line and stalled wedged the request — and
+/// every request queued behind `request_mutex` — forever. This loop drains
+/// buffered bytes for a newline, otherwise polls/peeks with the remaining
+/// budget, and consumes one bounded OS chunk per ready poll, re-checking the
+/// remaining time per chunk. Deadline expiry maps to `error.Timeout`; a line
+/// past `stdio_line_bytes_max` maps to `error.McpStreamTooLarge` (callers
+/// unchanged). EOF is not an error: an unterminated final line is returned,
+/// matching what `streamDelimiterLimit` did.
+///
+/// The Windows peek breaks on ANY available bytes (the pre-#450 condition
+/// also required a newline or a full 4 KB peek, burning the whole deadline
+/// and reporting error.Timeout on a flowing partial line despite progress).
+fn readStdioLineBounded(client: *McpClient, io: std.Io, reader: *std.Io.Reader, stdout_file: std.Io.File) ![]u8 {
+    const timeout_ns: i96 = @as(i96, client.read_timeout_ms) * std.time.ns_per_ms;
+    const start_time = std.Io.Timestamp.now(io, .awake);
+
+    var line_writer: std.Io.Writer.Allocating = .init(client.gpa);
+    errdefer line_writer.deinit();
+
+    while (true) {
+        // A read can buffer both an interleaved notification and its
+        // response. A complete buffered line needs no blocking call, so it
+        // carries no deadline pressure.
+        const buffered_bytes = reader.buffered();
+        if (std.mem.indexOfScalar(u8, buffered_bytes, '\n')) |newline_index| {
+            if (line_writer.written().len + newline_index > stdio_line_bytes_max) return error.McpStreamTooLarge;
+            line_writer.writer.writeAll(buffered_bytes[0..newline_index]) catch return error.OutOfMemory;
+            reader.toss(newline_index + 1);
+            return try line_writer.toOwnedSlice();
+        }
+        // No newline buffered: everything buffered belongs to this line —
+        // consume it so the pipe keeps flowing.
+        if (line_writer.written().len + buffered_bytes.len > stdio_line_bytes_max) return error.McpStreamTooLarge;
+        line_writer.writer.writeAll(buffered_bytes) catch return error.OutOfMemory;
+        reader.tossBuffered();
+
+        // Wait for data on stdout with the remaining budget so a stalled
+        // server fails the request instead of parking the pipe. Poll in
+        // short slices so cancellation can be observed while connecting or
+        // waiting for an MCP response. HUP alone is not a crash: buffered
+        // bytes still need draining after the child exits.
+        while (true) {
+            if (os.is_windows) {
+                var peek_buffer: [4 * 1024]u8 = undefined;
+                var bytes_read: windows.DWORD = 0;
+                var bytes_avail: windows.DWORD = 0;
+                if (windows.PeekNamedPipe(
+                    stdout_file.handle,
+                    &peek_buffer,
+                    @intCast(peek_buffer.len),
+                    &bytes_read,
+                    &bytes_avail,
+                    null,
+                ) == 0) {
+                    return error.McpServerCrashed;
+                }
+                if (bytes_avail > 0) break;
+            } else {
+                var poll_fds: [1]std.posix.pollfd = .{
+                    .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                };
+                const ready = std.posix.poll(&poll_fds, 0) catch return error.ReadFailed;
+                if (ready > 0) break;
+            }
+
+            const now = std.Io.Timestamp.now(io, .awake);
+            if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
+                return error.Timeout;
+            }
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+
+        // Data is ready: exactly one underlying read so the deadline is
+        // re-checked per chunk. Zero bytes without EOF is not an end — the
+        // next wait re-polls with the remaining budget.
+        reader.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return try line_writer.toOwnedSlice(),
+            error.ReadFailed => return error.McpServerCrashed,
+        };
+    }
+}
+
+/// Best-effort JSON-RPC error reply to a server-initiated request (method +
+/// id) observed while waiting for our response (#450): without a reply a
+/// server waiting on its request can stall its own write side. Runs inside
+/// the caller's capture bracket (request_mutex held) — no new locking — and
+/// callers swallow the error so a write failure never masks the read
+/// outcome.
+fn replyMethodNotFound(client: *McpClient, io: std.Io, stdin_file: std.Io.File, message: std.json.Value) !void {
+    const obj = message.object;
+    const id_val = obj.get("id") orelse return;
+    if (id_val != .integer) return;
+    const method_val = obj.get("method") orelse return;
+    const method_str = if (method_val == .string) method_val.string else "unknown";
+    const reply = try transport.formatErrorResponse(client.gpa, id_val.integer, method_str);
+    defer client.gpa.free(reply);
+    try stdin_file.writeStreamingAll(io, reply);
+}
+
 /// stdio transport: write the request line to the child's stdin and read
 /// one newline-delimited response line from stdout. Blocks up to
-/// `read_timeout_ms`. The server may push notifications (method, no id)
-/// between the request and its response — those are routed to
-/// `handleNotification` and the read continues until the matching
-/// response (id present) arrives.
+/// `read_timeout_ms` — the deadline covers the WHOLE line read (#450), not
+/// just the wait for the first bytes. The server may push notifications
+/// (method, no id) between the request and its response — those are routed
+/// to `handleNotification` and the read continues until the matching
+/// response (our `id`) arrives. Server-initiated requests (method + id) get
+/// a best-effort "method not found" error reply; responses for other ids
+/// (e.g. a late answer to a request that already timed out) are skipped.
 ///
 /// The pipe handles are captured AFTER `request_mutex` and under the
 /// `transport_mutex` bracket (#385): capturing before the lock raced a
@@ -99,79 +209,39 @@ pub fn sendRequestStdio(client: *McpClient, io: std.Io, method: []const u8, para
     var reader = stdout_file.reader(io, &buf);
 
     // Read newline-delimited lines until the response with our `id`
-    // arrives. Server-initiated notifications (method, no id) are
-    // routed to handleNotification and we keep reading.
+    // arrives.
     while (true) {
-        // A read can buffer both an interleaved notification and its
-        // response. Drain a complete buffered line before polling the OS
-        // handle, which may already have no bytes left to report.
-        const has_buffered_line = std.mem.indexOfScalar(u8, reader.interface.buffered(), '\n') != null;
-        if (!has_buffered_line) {
-            // Wait for data on stdout with a timeout to prevent infinite
-            // hangs. Poll in short slices so cancellation can be observed
-            // while connecting or waiting for an MCP response. HUP alone
-            // is not a crash: buffered bytes still need draining after
-            // the child exits.
-            const timeout_ns: i96 = @as(i96, client.read_timeout_ms) * std.time.ns_per_ms;
-            const start_time = std.Io.Timestamp.now(io, .awake);
-            while (true) {
-                if (os.is_windows) {
-                    var peek_buffer: [4 * 1024]u8 = undefined;
-                    var bytes_read: windows.DWORD = 0;
-                    var bytes_avail: windows.DWORD = 0;
-                    if (windows.PeekNamedPipe(
-                        stdout_file.handle,
-                        &peek_buffer,
-                        @intCast(peek_buffer.len),
-                        &bytes_read,
-                        &bytes_avail,
-                        null,
-                    ) == 0) {
-                        return error.McpServerCrashed;
-                    }
-                    if (bytes_avail > 0 and
-                        (std.mem.indexOfScalar(u8, peek_buffer[0..bytes_read], '\n') != null or
-                            bytes_avail > peek_buffer.len)) break;
-                } else {
-                    var poll_fds: [1]std.posix.pollfd = .{
-                        .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
-                    };
-                    const ready = std.posix.poll(&poll_fds, 0) catch return error.ReadFailed;
-                    if (ready > 0) break;
-                }
-
-                const now = std.Io.Timestamp.now(io, .awake);
-                if (start_time.durationTo(now).nanoseconds >= timeout_ns) {
-                    return error.Timeout;
-                }
-                try io.sleep(.fromMilliseconds(10), .awake);
-            }
-        }
-
-        // Read one line from stdout (newline-delimited JSON-RPC), bounded so a
-        // misbehaving server cannot exhaust memory on an unterminated line.
-        const stdio_line_bytes_max: usize = 64 * 1024 * 1024;
-        var line_writer: std.Io.Writer.Allocating = .init(client.gpa);
-        errdefer line_writer.deinit();
-        _ = reader.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(stdio_line_bytes_max)) catch |err| switch (err) {
-            error.StreamTooLong => return error.McpStreamTooLarge,
-            error.ReadFailed => return error.McpServerCrashed,
-            error.WriteFailed => return error.OutOfMemory,
-        };
-        _ = reader.interface.take(1) catch {};
-        const line = try line_writer.toOwnedSlice();
+        const line = try readStdioLineBounded(client, io, &reader.interface, stdout_file);
         errdefer client.gpa.free(line);
 
-        // Classify: notification (method, no id) → handle + continue;
-        // anything else → return for the caller to parse.
+        // Classify (#450):
+        // - notification (method, no id) → route and keep reading;
+        // - server-initiated request (method + id) → best-effort error
+        //   reply, keep reading;
+        // - response for a different id → drop and keep reading;
+        // - anything else → return for the caller to parse.
         const parsed = std.json.parseFromSlice(std.json.Value, client.gpa, line, .{}) catch return line;
         defer parsed.deinit();
         if (parsed.value != .object) return line;
         const obj = parsed.value.object;
-        if (obj.get("method") != null and obj.get("id") == null) {
+        const method_val = obj.get("method");
+        const id_val = obj.get("id");
+        if (method_val != null and id_val == null) {
             // Server-initiated notification — route and keep reading.
-            const method_str = if (obj.get("method").? == .string) obj.get("method").?.string else "";
+            const method_str = if (method_val.? == .string) method_val.?.string else "";
             client.handleNotification(method_str, line);
+            client.gpa.free(line);
+            continue;
+        }
+        if (method_val != null) {
+            // Server-initiated request — decline and keep reading.
+            replyMethodNotFound(client, io, stdin_file, parsed.value) catch {};
+            client.gpa.free(line);
+            continue;
+        }
+        if (id_val != null and id_val.? == .integer and id_val.?.integer != id) {
+            // A response for another request — e.g. a late answer to one
+            // that already timed out — is never ours; keep reading.
             client.gpa.free(line);
             continue;
         }
@@ -421,7 +491,16 @@ fn sendRequestHttpUnbounded(client: *McpClient, io: std.Io, method: []const u8, 
         for (notifications.items) |n| client.handleNotification(n.method, n.payload);
         return response_body;
     }
-    return try readJsonBody(client.gpa, &response);
+    // Single JSON body: defensively verify it answers THIS request's id.
+    // The Streamable HTTP spec routes the POST body to the POST, so a
+    // mismatch means a misbehaving server — a body for another request
+    // (e.g. a late answer) must never masquerade as our response (#450).
+    // Lightweight: one parse, no SSE machinery.
+    const response_body = try readJsonBody(client.gpa, &response);
+    errdefer client.gpa.free(response_body);
+    const body_id = transport.responseId(client.gpa, response_body);
+    if (body_id == null or body_id.? != id) return error.McpInvalidResponse;
+    return response_body;
 }
 
 /// POST a JSON-RPC notification to the remote endpoint. Expects
@@ -714,6 +793,88 @@ test "McpClient sendRequest timeout produces error.Timeout" {
     try std.testing.expectError(error.Timeout, result);
 }
 
+test "McpClient sendRequest times out when the server writes a partial line and stalls (#450)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // partial mode: bytes ARE available on the pipe (`{"jsonrpc":"2.0","id":`)
+    // but the line never completes. The pre-#450 read gated only the wait for
+    // the FIRST bytes, so the deadline never fired and this request — and
+    // every request queued behind request_mutex — wedged forever.
+    var client = try client_mod.initMockClient(gpa, "partial-server", "partial");
+    defer client.deinit(io);
+    client.read_timeout_ms = 200;
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    const result = client.sendRequest(io, "initialize", null);
+    try std.testing.expectError(error.Timeout, result);
+}
+
+test "McpClient sendRequest survives a server that drips a line in chunks (#450)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // drip mode: every response arrives as two chunks with gaps between
+    // them. Flowing data must never time out — the bounded line reader
+    // re-checks the remaining budget per chunk and only the STALL is
+    // billed against the deadline.
+    var client = try client_mod.initMockClient(gpa, "drip-server", "drip");
+    defer client.deinit(io);
+    client.read_timeout_ms = 5_000;
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+    const response = try client.sendRequest(io, "ping", null);
+    defer gpa.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"result\"") != null);
+}
+
+test "McpClient declines a server-initiated request and matches the real response (#450)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // server_request mode: before every response the mock emits a
+    // request-with-id and verifies the client's "method not found" error
+    // reply (id + code) before answering. A client that misclassifies the
+    // server request as a response never answers, so the mock fails and
+    // the handshake with it.
+    var client = try client_mod.initMockClient(gpa, "server-req", "server_request");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+    try client.listTools(io);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("mcp__server-req__greet", client.discovery.tools.items[0].full_name);
+}
+
+test "McpClient skips a late response addressed to an earlier request id (#450)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // late_response mode: every response is preceded by a decoy response
+    // for the PREVIOUS request id. Matching by id skips the decoy; the
+    // pre-#450 match-by-order would misattribute it (the tools/list
+    // response would be swapped for the stale initialize body and the
+    // handshake would see the wrong result).
+    var client = try client_mod.initMockClient(gpa, "late-resp", "late_response");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+
+    try client.initialize(io);
+    try client.listTools(io);
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("greet", client.discovery.tools.items[0].name);
+}
+
 // ---------------------------------------------------------------------------
 // Transport-lifetime races (#385) — stdio wire suite
 // ---------------------------------------------------------------------------
@@ -824,6 +985,38 @@ test "a notification concurrent with an in-flight request does not corrupt stdin
     const result = try request.await(io);
     defer gpa.free(result);
     try std.testing.expectEqualStrings("Hello, World!", result);
+}
+
+/// Concrete wrapper for the worker below: `io.concurrent` needs an
+/// ArgsTuple, which cannot express `setError`'s `anytype` format arguments.
+fn setErrorRaceWorker(client: *McpClient, io: std.Io) void {
+    client.setError(io, "worker failure", .{});
+}
+
+test "setError racing stop never panics and lands in failed or disabled (#450)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var client = try client_mod.initMockClient(gpa, "error-stop-race", "default");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+
+    // setError stops the live transport internally and then overwrites the
+    // lifecycle under `transport_mutex`; racing it against a direct stop
+    // used to read the `.stdio` union tag unsynchronized (pre-#450 stop
+    // snapshot before any lock) and could let both paths kill/reap the same
+    // child — a second wait panics in std's childWaitPosix. Post-fix
+    // exactly one path observes `.stdio`; the loser sees `.disabled`.
+    var worker = try io.concurrent(setErrorRaceWorker, .{ &client, io });
+    try io.sleep(.fromMilliseconds(20), .awake);
+    client.stop(io);
+    worker.await(io);
+
+    switch (client.lifecycle) {
+        .failed, .disabled => {},
+        else => return error.UnexpectedLifecycle,
+    }
 }
 
 test "stop parks the pipes while a capture bracket is open and the bracket's release closes them" {

@@ -133,39 +133,83 @@ pub fn listTools(self: *McpClient, io: std.Io) !void {
     self.discovery.replaceAll(fresh);
 }
 
+/// tools/list pages fetched per discovery: bound on the pagination loop so
+/// a server that always returns a fresh `nextCursor` cannot pin a refresh
+/// worker forever. Hitting the cap fails the fetch like a malformed
+/// response — the caller keeps the previous cache.
+const tools_list_pages_max: usize = 100;
+
 /// tools/list WITHOUT touching the discovery cache: returns freshly-built
 /// owned records for the caller to install via `Discovery.replaceAll` (the
-/// background re-discovery path, #385). A malformed response (no result
-/// object, `tools` not an array) errors instead of returning an empty list
-/// — installing empty would wipe the cache, so failure-keeps-old holds by
-/// construction. Thread-safety: runs on refresh worker threads,
+/// background re-discovery path, #385). Follows `nextCursor` pagination
+/// (#450): the first page is requested with null params (the pre-pagination
+/// shape), each continuation page with `{"cursor":"..."}`, and the page
+/// tools are concatenated — the pre-#450 fetch read only `result.tools` of
+/// the first page, silently dropping every cursor'd page. A malformed
+/// response (no result object, `tools` not an array, the page cap) errors
+/// instead of returning a partial or empty list — installing either would
+/// wipe or truncate the cache, so failure-keeps-old holds by construction:
+/// `fresh` is built across ALL pages before the caller installs anything.
+/// Thread-safety: runs on refresh worker threads,
 /// concurrent with in-flight tool calls (`request_mutex`) and with `stop`
 /// (`transport_mutex` capture bracket); never mutates shared state except
 /// the request-serialized fields and the atomic refresh flag.
 pub fn listToolsFresh(self: *McpClient, io: std.Io) !std.ArrayList(discovery_mod.McpTool) {
-    const response = try self.sendRequest(io, "tools/list", null);
-    defer self.gpa.free(response);
-
-    const parsed = try schema_mod.parseResponse(self.gpa, response) orelse return error.McpInvalidToolsResponse;
-    defer parsed.deinit();
-
-    const result = parsed.value.object.get("result") orelse return error.McpInvalidToolsResponse;
-    if (result != .object) return error.McpInvalidToolsResponse;
-
-    const tools_val = result.object.get("tools") orelse return error.McpInvalidToolsResponse;
-    if (tools_val != .array) return error.McpInvalidToolsResponse;
-
     var fresh: std.ArrayList(discovery_mod.McpTool) = .empty;
     errdefer {
         for (fresh.items) |*tool| tool.deinit(self.gpa);
         fresh.deinit(self.gpa);
     }
-    for (tools_val.array.items) |tool_val| {
-        var record = try discovery_mod.toolRecordFromListEntry(self.gpa, self.name, tool_val) orelse continue;
-        fresh.append(self.gpa, record) catch |err| {
-            record.deinit(self.gpa);
-            return err;
-        };
+
+    // Owned cursor carried across pages: replaced per page (old freed after
+    // the new dupe lands) and freed at the end.
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |c| self.gpa.free(c);
+
+    var page_count: usize = 0;
+    while (true) {
+        page_count += 1;
+        if (page_count > tools_list_pages_max) {
+            log.warn("MCP '{s}': tools/list pagination exceeded {d} pages; failing the fetch so the previous cache survives", .{ self.name, tools_list_pages_max });
+            return error.McpInvalidToolsResponse;
+        }
+
+        // Params: null on the first page, `{"cursor":"..."}` after.
+        var params_json: ?[]u8 = null;
+        defer if (params_json) |p| self.gpa.free(p);
+        if (cursor) |c| {
+            const quoted = try std.json.Stringify.valueAlloc(self.gpa, c, .{});
+            defer self.gpa.free(quoted);
+            params_json = try std.fmt.allocPrint(self.gpa, "{{\"cursor\":{s}}}", .{quoted});
+        }
+
+        const response = try self.sendRequest(io, "tools/list", params_json);
+        defer self.gpa.free(response);
+
+        const parsed = try schema_mod.parseResponse(self.gpa, response) orelse return error.McpInvalidToolsResponse;
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result") orelse return error.McpInvalidToolsResponse;
+        if (result != .object) return error.McpInvalidToolsResponse;
+
+        const tools_val = result.object.get("tools") orelse return error.McpInvalidToolsResponse;
+        if (tools_val != .array) return error.McpInvalidToolsResponse;
+
+        for (tools_val.array.items) |tool_val| {
+            var record = try discovery_mod.toolRecordFromListEntry(self.gpa, self.name, tool_val) orelse continue;
+            fresh.append(self.gpa, record) catch |err| {
+                record.deinit(self.gpa);
+                return err;
+            };
+        }
+
+        // Follow `nextCursor` to the next page; a missing, non-string, or
+        // empty cursor ends the pagination.
+        const next = result.object.get("nextCursor") orelse break;
+        if (next != .string or next.string.len == 0) break;
+        const next_owned = try self.gpa.dupe(u8, next.string);
+        if (cursor) |old| self.gpa.free(old);
+        cursor = next_owned;
     }
     return fresh;
 }
@@ -486,6 +530,55 @@ test "McpClient listToolsFresh errors on a malformed response and keeps the cach
     // identity depends on where parsing rejects the line (SyntaxError from
     // the JSON scanner, McpInvalidToolsResponse from the shape checks) —
     // either keeps the cache intact.
+    if (client.listToolsFresh(io)) |_| return error.ExpectedError else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
+    try std.testing.expectEqualStrings("kept", client.discovery.tools.items[0].name);
+}
+
+// ---------------------------------------------------------------------------
+// tools/list pagination (#450)
+// ---------------------------------------------------------------------------
+
+test "McpClient listToolsFresh follows nextCursor pages and concatenates tools" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // paginated_tools: page 1 is the greet list plus `nextCursor: page-2`;
+    // page 2 (served only when the fetch echoes that cursor back in
+    // `params.cursor`) adds farewell. The pre-#450 fetch read only
+    // result.tools of the first page, silently dropping every cursor'd page.
+    var client = try client_mod.initMockClient(gpa, "paged", "paginated_tools");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+
+    var fresh = try client.listToolsFresh(io);
+    defer {
+        for (fresh.items) |*tool| tool.deinit(gpa);
+        fresh.deinit(gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fresh.items.len);
+    try std.testing.expectEqualStrings("greet", fresh.items[0].name);
+    try std.testing.expectEqualStrings("farewell", fresh.items[1].name);
+}
+
+test "McpClient listToolsFresh keeps the cache when a continuation page is malformed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // paginated_tools_broken: page 1 is valid (with nextCursor), page 2 is
+    // garbage — the fetch must error mid-pagination, never return the
+    // partial page-1-only list, and leave the primed cache fully intact.
+    var client = try client_mod.initMockClient(gpa, "paged-broken", "paginated_tools_broken");
+    defer client.deinit(io);
+
+    try client.startStdio(io);
+    defer client.stop(io);
+    try client.initialize(io);
+    try client.addTool("kept", "Survives the broken page", .{ .properties = &.{} }, null);
+
     if (client.listToolsFresh(io)) |_| return error.ExpectedError else |_| {}
     try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
     try std.testing.expectEqualStrings("kept", client.discovery.tools.items[0].name);

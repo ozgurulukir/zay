@@ -276,38 +276,83 @@ pub fn startStdio(self: *McpClient, io: std.Io) !void {
     };
 }
 
-/// Stop the subprocess and close its pipes. POSIX gets SIGTERM followed by
-/// kill/reap; Windows terminates the Job Object and uses a bounded process
-/// wait so an external MCP server cannot wedge TUI teardown. For the
-/// Streamable HTTP transport, terminates the remote session (best-effort)
-/// and drops the session id.
+/// Grace before SIGKILL escalation in the POSIX stop path (#450): long
+/// enough for graceful-shutdown handlers, short enough that teardown stays
+/// responsive.
+const child_term_grace_ms: u32 = 5_000;
+/// Final wait after SIGKILL: a SIGKILLed process cannot refuse to die, so
+/// this only covers the exit-propagation window.
+const child_kill_grace_ms: u32 = 2_000;
+
+/// Poll interval for the bounded exit probe, mirroring `os.zig`'s
+/// `child_term_poll_ms` cadence (that constant is private there).
+const child_exit_poll_ms: u32 = 10;
+
+/// Stop the subprocess and close its pipes. POSIX escalates SIGTERM →
+/// SIGKILL with bounded waits and reaps only after the exit is observed, so
+/// a server that ignores SIGTERM can no longer wedge TUI teardown forever
+/// (#450); Windows terminates the Job Object and uses a bounded process
+/// wait. For the Streamable HTTP transport, terminates the remote session
+/// (best-effort) and drops the session id.
+///
+/// ONE `transport_mutex` section owns the lifecycle decision (#450): the
+/// tag check, the child/job snapshot, the pipe parking, and the
+/// `.disabled` overwrite. The pre-#450 stop read the `.stdio` tag and
+/// copied the child BEFORE any lock, racing `setError`'s mutex-guarded
+/// lifecycle write from connect/refresh worker threads (unsynchronized
+/// union-tag read) and letting two concurrent stops both copy the same
+/// child and both kill/reap it — a second wait on the reaped pid panics in
+/// std's `childWaitPosix` (ECHILD → errnoBug). Exactly one stop observes
+/// `.stdio` now; the kill/reap of the COPY runs OUTSIDE the mutex, so
+/// capture brackets stay able to fail fast with NotConnected and no
+/// in-flight request can queue behind teardown.
 ///
 /// Pipe close is deferred while requests are in flight (#385): a worker
 /// holding captured handles must never observe them closed (HANDLE/fd
-/// reuse crossfire), so `parkStdioPipes` moves them to `pending_close` and
-/// the last exiting request closes them on its own thread. Process
-/// kill/reap stays immediate — it never touches the pipe handles — so an
-/// in-flight read fails loudly via the existing crash/EOF paths. The
-/// lifecycle flips to `.disabled` synchronously; status() never waits on
-/// the deferred close.
+/// reuse crossfire), so the section parks them in `pending_close` and the
+/// last exiting request closes them on its own thread. Process kill/reap
+/// never touches the pipe handles, so an in-flight read fails loudly via
+/// the existing crash/EOF paths. The lifecycle flips to `.disabled`
+/// synchronously; status() never waits on the deferred close.
 pub fn stop(self: *McpClient, io: std.Io) void {
     log.info("shutdown.mcp.client.begin name={s}", .{self.name});
     defer log.info("shutdown.mcp.client.done name={s}", .{self.name});
-    if (self.lifecycle == .stdio) {
-        var child = self.lifecycle.stdio.process;
-        const job_obj = if (os.is_windows) self.lifecycle.stdio.win32_job_obj else null;
-        // Close stdin so the child sees EOF and can exit gracefully —
-        // parked instead of closed while a request is in flight.
-        parkStdioPipes(self, io);
-        child.stdin = null;
-        child.stdout = null;
-        // SIGTERM first — gives well-behaved servers a chance to clean up.
-        // kill() below sends SIGKILL and reaps the zombie regardless.
-        if (child.id) |pid| {
-            if (!os.is_windows) {
-                std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
-            }
+
+    var child = zeroedChild();
+    var child_live = false;
+    var job_obj: if (os.is_windows) ?wire.windows.HANDLE else void = if (os.is_windows) null else {};
+    {
+        // Parked pipes are closed here ONLY when no request is in flight —
+        // an in-flight request owns its captured handles and closes them in
+        // its release bracket; closing under it would be exactly the
+        // HANDLE/fd-reuse crossfire #385 fixes. A worker wedged past its
+        // join point (no path reaches this; manager deinit joins jobs
+        // first) leaks the parked handles to process exit instead of
+        // racing it. If the lock is canceled we proceed unsynchronized,
+        // matching pre-#385 teardown semantics, rather than blocking
+        // shutdown.
+        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
+        defer if (locked) self.transport_mutex.unlock(io);
+        if (self.lifecycle == .stdio) {
+            child = self.lifecycle.stdio.process;
+            child_live = true;
+            if (os.is_windows) job_obj = self.lifecycle.stdio.win32_job_obj;
+            parkStdioPipesLocked(self, io);
+            // The COPY owns the kill below; the parked handles left the
+            // union, so nothing here can double-close them.
+            child.stdin = null;
+            child.stdout = null;
         }
+        // A failed client may carry an owned reason (set via `setError`, e.g.
+        // by the async connect worker before tearing the clone down). Free it
+        // before the lifecycle is clobbered, or deinit's failed-arm can never
+        // see it and the reason leaks.
+        if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
+        if (self.in_flight_requests.load(.acquire) == 0) closePendingPipesLocked(self, io);
+        self.lifecycle = .disabled;
+    }
+
+    if (child_live) {
         if (os.is_windows) {
             if (job_obj) |h| {
                 _ = os.terminateWin32JobObject(h, 1);
@@ -315,41 +360,17 @@ pub fn stop(self: *McpClient, io: std.Io) void {
             stopChildWindowsBounded(&child);
             if (job_obj) |h| _ = os.closeWin32Handle(h);
         } else {
-            child.kill(io);
+            stopChildPosixBounded(&child, io);
         }
     }
     if (self.transport == .sse) terminateHttpSession(self, io);
-    // A failed client may carry an owned reason (set via `setError`, e.g.
-    // by the async connect worker before tearing the clone down). Free it
-    // before the lifecycle is clobbered, or deinit's failed-arm can never
-    // see it and the reason leaks.
-    if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
-    // Serialize the lifecycle overwrite with any worker's capture bracket
-    // (#385). Parked pipes are closed here ONLY when no request is in
-    // flight — an in-flight request owns its captured handles and closes
-    // them in its release bracket; closing under it would be exactly the
-    // HANDLE/fd-reuse crossfire #385 fixes. A worker wedged past its join
-    // point (no path reaches this; manager deinit joins jobs first)
-    // leaks the parked handles to process exit instead of racing it.
-    // If the lock is canceled we proceed unsynchronized, matching
-    // pre-#385 teardown semantics, rather than blocking shutdown.
-    const locked = if (self.transport_mutex.lock(io)) true else |_| false;
-    defer if (locked) self.transport_mutex.unlock(io);
-    if (self.in_flight_requests.load(.acquire) == 0) closePendingPipesLocked(self, io);
-    self.lifecycle = .disabled;
 }
 
-/// Move the stdio pipe handles out of the child under `transport_mutex`:
-/// closed immediately when no request is in flight (previous behavior),
-/// parked in `pending_close` for the last exiting request to close
-/// otherwise (#385). On lock failure (canceled teardown) the pipes are
-/// left open — stop clobbers the lifecycle union either way; the handles
-/// are closed by the release bracket, stop's tail, or process exit,
-/// rather than blocking on a canceled mutex.
-fn parkStdioPipes(self: *McpClient, io: std.Io) void {
-    self.transport_mutex.lock(io) catch return;
-    defer self.transport_mutex.unlock(io);
-    if (self.lifecycle != .stdio) return;
+/// Move the stdio pipe handles out of the child for a caller already
+/// holding `transport_mutex` (stop's lifecycle section): closed immediately
+/// when no request is in flight (previous behavior), parked in
+/// `pending_close` for the last exiting request to close otherwise (#385).
+fn parkStdioPipesLocked(self: *McpClient, io: std.Io) void {
     const child = &self.lifecycle.stdio.process;
     if (self.in_flight_requests.load(.acquire) > 0) {
         self.pending_close = .{ .stdin = child.stdin, .stdout = child.stdout };
@@ -359,6 +380,68 @@ fn parkStdioPipes(self: *McpClient, io: std.Io) void {
     }
     child.stdin = null;
     child.stdout = null;
+}
+
+/// POSIX stop path, bounded (#450): std's `child.kill` sends SIGTERM and
+/// then blocks in `wait4` with no deadline, so a server that ignores
+/// SIGTERM wedged TUI teardown forever. Signal directly and bound every
+/// wait: SIGTERM → grace poll → SIGKILL → short poll → reap. The reap runs
+/// only after the exit is observed (the zombie is waitable, so `child.wait`
+/// returns immediately) — this stop path is the child's SINGLE reap point
+/// (nothing else in the codebase reaps it) and the exit probe never
+/// consumes, so no double-reap can happen. `child.id == null` guards an
+/// already-reaped child against the ESRCH/errnoBug panic.
+fn stopChildPosixBounded(child: *std.process.Child, io: std.Io) void {
+    if (os.is_windows) unreachable; // POSIX-only: stop branches before calling.
+    const pid = child.id orelse return;
+    assert(pid > 1); // never signal init or the reaper
+
+    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {}; // ESRCH = already dead
+    if (awaitChildExitBounded(io, pid, child_term_grace_ms)) return reapStoppedChild(child, io);
+    std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+    if (awaitChildExitBounded(io, pid, child_kill_grace_ms)) return reapStoppedChild(child, io);
+    if (comptime os.tag == .linux) {
+        // Linux has the zombie-aware probe: reaching here means the probe
+        // could not confirm exit (procfs hiccup). Leave the reap to process
+        // exit rather than hanging the UI thread on a wait4 with no
+        // deadline — a SIGKILLed process WILL die.
+        log.warn("MCP child {d} survived SIGKILL for {d}ms; leaving the reap to process exit", .{ pid, child_kill_grace_ms });
+        return;
+    }
+    // No portable zombie-aware probe on this POSIX target: the SIGKILL has
+    // been delivered and cannot be refused, so the wait returns promptly —
+    // bounded in practice, and strictly safer than the pre-#450 kill
+    // (SIGTERM + unbounded wait4). The reap stays here so no zombie
+    // accumulates per stop.
+    reapStoppedChild(child, io);
+}
+
+/// Bounded exit poll for the stop path: on Linux the zombie-aware
+/// `os.processExited` probe (`waitid(NOHANG | NOWAIT)` — observing only,
+/// never consumes, so the caller's wait stays the single reap point); other
+/// POSIX targets have no portable probe and — mirroring `os.awaitExit` —
+/// assume alive for the full grace and let the SIGKILL settle it.
+fn awaitChildExitBounded(io: std.Io, pid: std.posix.pid_t, grace_ms: u32) bool {
+    if (comptime os.tag != .linux) {
+        io.sleep(.fromMilliseconds(@intCast(grace_ms)), .awake) catch {};
+        return false;
+    }
+    var waited_ms: u32 = 0;
+    while (true) {
+        if (os.processExited(pid)) return true;
+        if (waited_ms >= grace_ms) return false;
+        const step_ms: u32 = @intCast(@min(child_exit_poll_ms, grace_ms - waited_ms));
+        io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
+        waited_ms += step_ms;
+    }
+}
+
+/// The single reap for a stopped stdio MCP server child: called only after
+/// the exit was observed (or, on probe-less POSIX, after SIGKILL), so the
+/// wait returns promptly. A canceled wait leaves the pid unreaped —
+/// process exit cleans it up.
+fn reapStoppedChild(child: *std.process.Child, io: std.Io) void {
+    _ = child.wait(io) catch {};
 }
 
 /// Register as an in-flight stdio request and snapshot the live pipe
@@ -394,8 +477,9 @@ pub fn releaseStdioTransport(self: *McpClient, io: std.Io) void {
 }
 
 /// Close pipes parked by `parkStdioPipes`, if any, for a caller already
-/// holding `transport_mutex` (the release bracket and stop's locked tail).
-fn closePendingPipesLocked(self: *McpClient, io: std.Io) void {
+/// holding `transport_mutex` (the release bracket, stop's lifecycle
+/// section, and the manager's last `releaseClient` — #450).
+pub fn closePendingPipesLocked(self: *McpClient, io: std.Io) void {
     if (self.pending_close) |parked| {
         if (parked.stdin) |*f| f.close(io);
         if (parked.stdout) |*f| f.close(io);
