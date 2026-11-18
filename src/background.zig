@@ -54,6 +54,11 @@ pub const BackgroundManager = struct {
     mutex: std.Io.Mutex = .init,
     next_id: u32 = 1,
     jobs: std.ArrayList(*Job) = .empty,
+    /// Set under the mutex by `shutdownAll` before it drains the list.
+    /// `start` checks it in its publish critical section and refuses, so a
+    /// job can never be appended after teardown has begun (on refusal its
+    /// spawn is killed, joined, and freed on the error path).
+    shutting_down: bool = false,
 
     pub const StartOptions = struct {
         command: []const u8,
@@ -165,6 +170,17 @@ pub const BackgroundManager = struct {
         thread: ?std.Thread = null,
         state: std.atomic.Value(State) = .init(.running),
         killed: std.atomic.Value(bool) = .init(false),
+        /// Pin guarding the cancel/teardown race (#438): `cancel` and
+        /// `terminateJobsInCwd` release the mutex before `terminateTreeSync`
+        /// dereferences this raw pointer, while `takeFinished`/`shutdownAll`
+        /// may concurrently join the reader and destroy the job. A killer
+        /// sets the pin under the mutex before unlocking and clears it after
+        /// `terminateTreeSync` returns (release/acquire, matching
+        /// `killed`/`state`). Reapers honor it: `takeFinished` skips pinned
+        /// jobs (leave in place, retry next tick) and `shutdownAll` waits for
+        /// the pin to clear before join/destroy. At most one killer owns a
+        /// job at a time — `terminateJobsInCwd` skips already-pinned jobs.
+        kill_in_progress: std.atomic.Value(bool) = .init(false),
         exit_code: u8 = 0,
         completion_message: ?[]u8 = null,
         bytes_written: u64 = 0,
@@ -326,6 +342,15 @@ pub const BackgroundManager = struct {
             cleanupFailedStartedJob(gpa, io, job, thread);
             return err;
         };
+        if (self.shutting_down) {
+            // Teardown already drained the list (#438): appending here would
+            // strand a job the manager will never own. Refuse and let the
+            // caller see the error; the spawned child is killed and freed on
+            // the error path below.
+            self.mutex.unlock(io);
+            cleanupFailedStartedJob(gpa, io, job, thread);
+            return error.ShuttingDown;
+        }
         self.jobs.append(gpa, job) catch |err| {
             self.mutex.unlock(io);
             cleanupFailedStartedJob(gpa, io, job, thread);
@@ -522,7 +547,9 @@ pub const BackgroundManager = struct {
 
     /// Request termination of job `id`, killing the whole process tree. The
     /// reader then reaps it and marks it finished+killed. Returns true if a
-    /// running job matched. The actual kill runs outside the lock so it never stalls the UI's draw/poll path.
+    /// running job matched. The actual kill runs outside the lock so it never
+    /// stalls the UI's draw/poll path; while it runs the job stays pinned
+    /// (`kill_in_progress`) so `takeFinished` cannot reap and free it mid-kill.
     pub fn cancel(self: *BackgroundManager, id: u32) bool {
         var target_job: ?*Job = null;
         if (self.mutex.lock(self.io)) |_| {
@@ -531,6 +558,10 @@ pub const BackgroundManager = struct {
                 if (job.state.load(.acquire) == .running) {
                     job.killed.store(true, .release);
                     job.state.store(.termination_requested, .release);
+                    // Pin before releasing the mutex: the kill below reads
+                    // this raw pointer without it, and `takeFinished` may
+                    // destroy the job as soon as the reader marks it finished.
+                    job.kill_in_progress.store(true, .release);
                     target_job = job;
                 }
                 break;
@@ -542,13 +573,18 @@ pub const BackgroundManager = struct {
 
         if (target_job) |job| {
             terminateTreeSync(self.io, self.gpa, job.pid, job);
+            // The kill no longer touches the job; release the pin so the next
+            // UI tick can reap it.
+            job.kill_in_progress.store(false, .release);
             return true;
         }
         return false;
     }
 
     /// Terminate all running background jobs whose CWD is within `target_cwd`.
-    /// Synchronously kills child processes to release file locks before directory deletion.
+    /// Synchronously kills child processes to release file locks before
+    /// directory deletion. Same pin discipline as `cancel`: jobs are flagged
+    /// and pinned under the mutex, killed outside it, and unpinned afterwards.
     pub fn terminateJobsInCwd(self: *BackgroundManager, target_cwd: []const u8) void {
         var jobs_to_kill: std.ArrayList(*Job) = .empty;
         defer jobs_to_kill.deinit(self.gpa);
@@ -556,19 +592,29 @@ pub const BackgroundManager = struct {
         if (self.mutex.lock(self.io)) |_| {
             for (self.jobs.items) |job| {
                 const s = job.state.load(.acquire);
-                if (s == .running or s == .termination_requested) {
-                    if (isSubpathOrEqual(job.cwd, target_cwd)) {
-                        job.killed.store(true, .release);
-                        job.state.store(.termination_requested, .release);
-                        jobs_to_kill.append(self.gpa, job) catch {};
-                    }
-                }
+                if (s != .running and s != .termination_requested) continue;
+                if (!isSubpathOrEqual(job.cwd, target_cwd)) continue;
+                // A pinned job already has a killer outside the mutex operating
+                // on this raw pointer (e.g. `cancel` claimed it first); a second
+                // killer would let the first clear the pin mid-kill. The
+                // in-flight kill terminates the tree anyway, so leave the job
+                // to it.
+                if (job.kill_in_progress.load(.acquire)) continue;
+                // Track the job before flagging it: a failed append must leave
+                // it unpinned and untouched, since no killer would ever run to
+                // clear the pin (a permanently pinned job would stall
+                // `shutdownAll`'s wait).
+                jobs_to_kill.append(self.gpa, job) catch continue;
+                job.killed.store(true, .release);
+                job.state.store(.termination_requested, .release);
+                job.kill_in_progress.store(true, .release);
             }
             self.mutex.unlock(self.io);
         } else |_| return;
 
         for (jobs_to_kill.items) |job| {
             terminateTreeSync(self.io, self.gpa, job.pid, job);
+            job.kill_in_progress.store(false, .release);
         }
     }
 
@@ -588,7 +634,11 @@ pub const BackgroundManager = struct {
 
         var write_idx: usize = 0;
         for (self.jobs.items) |job| {
-            if (job.state.load(.acquire) == .finished) {
+            // A pinned job has a killer outside the mutex operating on its raw
+            // pointer (#438): joining + destroying it now would race the kill.
+            // Leave it in place and retry next tick, like the buildFinished
+            // failure below.
+            if (job.state.load(.acquire) == .finished and !job.kill_in_progress.load(.acquire)) {
                 if (job.thread) |t| {
                     t.join();
                     job.thread = null;
@@ -628,6 +678,7 @@ pub const BackgroundManager = struct {
     /// Terminate and reap every job, then free everything. Called at clean exit.
     pub fn shutdownAll(self: *BackgroundManager) void {
         self.mutex.lock(self.io) catch return;
+        self.shutting_down = true;
         var list = self.jobs;
         self.jobs = .empty;
         self.mutex.unlock(self.io);
@@ -636,6 +687,15 @@ pub const BackgroundManager = struct {
             if (s == .running or s == .termination_requested) {
                 job.killed.store(true, .release);
                 terminateTreeSync(self.io, self.gpa, job.pid, job);
+            }
+            // A concurrent `cancel`/`terminateJobsInCwd` that claimed this job
+            // before the drain is still inside `terminateTreeSync` on its raw
+            // pointer (#438); its pin clears only when that kill is done, so
+            // wait before joining and freeing the job. (This loop must not set
+            // or clear the pin itself: doing so could clear another killer's
+            // flag mid-kill.)
+            while (job.kill_in_progress.load(.acquire)) {
+                self.io.sleep(.fromMilliseconds(1), .awake) catch break;
             }
             if (job.thread) |thread| {
                 thread.join();
@@ -1173,6 +1233,106 @@ test "takeFinished compacts jobs list in-place and preserves unready jobs" {
     try std.testing.expectEqual(@as(u32, 3), finished[1].id);
     try std.testing.expectEqual(@as(usize, 1), manager.jobs.items.len);
     try std.testing.expectEqual(@as(u32, 2), manager.jobs.items[0].id);
+}
+
+test "takeFinished does not reap a pinned job mid-kill" {
+    // Deterministic regression for #438: `cancel` releases the mutex before
+    // `terminateTreeSync` dereferences the raw job pointer, so `takeFinished`
+    // must skip pinned jobs instead of joining the reader and destroying the
+    // job while the kill is still in flight. No threads: `cancel` drives the
+    // full pin set → kill → clear path (the kill is a no-op for pid <= 1 on
+    // POSIX), and the mid-kill window is reproduced by pinning by hand.
+    if (os.is_windows) return error.SkipZigTest; // pid <= 1 kill guard is POSIX-only
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.deinit();
+
+    const job = try gpa.create(BackgroundManager.Job);
+    job.* = .{
+        .manager = &manager,
+        .id = 7,
+        .label = try gpa.dupe(u8, "bg_7"),
+        .command = try gpa.dupe(u8, "cmd7"),
+        .cwd = try gpa.dupe(u8, "."),
+        .log_path = try gpa.dupe(u8, "log7"),
+        .pid = 1, // terminateTreeSync no-ops on pid <= 1 (POSIX)
+        .owner_generation = 1,
+        .started = std.Io.Timestamp.now(io, .awake),
+        .child = undefined,
+        .log_file = undefined,
+        .script_path = null,
+        .state = .init(.running),
+    };
+    try manager.jobs.append(gpa, job);
+
+    // Cancel flips killed/state and pins the job under the mutex, kills
+    // outside it, and clears the pin once the kill returns.
+    try std.testing.expect(manager.cancel(7));
+    try std.testing.expect(job.killed.load(.acquire));
+    try std.testing.expectEqual(BackgroundManager.State.termination_requested, job.state.load(.acquire));
+    try std.testing.expect(!job.kill_in_progress.load(.acquire));
+
+    // Reproduce the race window: the reader finished while a killer was
+    // outside the mutex on this pointer. takeFinished must return nothing and
+    // keep the job listed for the next tick.
+    job.kill_in_progress.store(true, .release);
+    job.state.store(.finished, .release);
+    const held = try manager.takeFinished(gpa);
+    try std.testing.expectEqual(@as(usize, 0), held.len);
+    gpa.free(held);
+    try std.testing.expectEqual(@as(usize, 1), manager.jobs.items.len);
+    try std.testing.expectEqual(@as(u32, 7), manager.jobs.items[0].id);
+
+    // Once the kill completes and the pin clears, the next tick reaps.
+    job.kill_in_progress.store(false, .release);
+    const finished = try manager.takeFinished(gpa);
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expectEqual(@as(u32, 7), finished[0].id);
+    try std.testing.expect(finished[0].killed);
+    try std.testing.expectEqual(@as(usize, 0), manager.jobs.items.len);
+}
+
+test "start refuses once shutdown has begun and never publishes" {
+    // #438: `shutdownAll` sets `shutting_down` under the mutex before
+    // draining; `start` must check it in its publish critical section and
+    // fail instead of appending a job the manager will never own.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+
+    var manager = BackgroundManager.init(io, gpa);
+    defer manager.deinit();
+
+    // Simulate teardown that has already begun. In production `shutdownAll`
+    // sets this under the mutex before draining; this test is single-threaded.
+    manager.shutting_down = true;
+
+    const is_win = os.is_windows;
+    const result = manager.start(.{
+        .command = if (is_win) "exit 0" else "true",
+        .cwd = cwd,
+        .env_map = &env_map,
+        .owner_generation = 1,
+        .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
+        .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
+        .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
+        .stderr_merge_suffix = if (is_win) "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }" else "",
+    });
+    try std.testing.expectError(error.ShuttingDown, result);
+
+    // Nothing was appended, and the manager still tears down cleanly (the
+    // refused spawn was killed, joined, and freed on the error path).
+    try std.testing.expectEqual(@as(usize, 0), manager.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.activeCount());
 }
 
 test "terminateTreeSync safely handles invalid and guarded pids" {
