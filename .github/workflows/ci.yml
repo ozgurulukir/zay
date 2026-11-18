@@ -30,9 +30,11 @@ jobs:
 
       # vendor/ is excluded on purpose: it mirrors upstream sources and must
       # stay byte-identical to them, so the formatter does not own those files.
+      # lib/, tools/, and bench/ are first-party and compiled by the build, so
+      # they are held to the same fmt gate as src/.
       - name: zig fmt --check
         shell: bash
-        run: zig fmt --check src/ build.zig build.zig.zon
+        run: zig fmt --check src/ lib tools bench build.zig build.zig.zon
 
   test:
     name: zig build test

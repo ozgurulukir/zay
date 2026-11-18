@@ -47,18 +47,37 @@ try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempArtifactPath -UseBasicParsing
 
     Write-Host "==> Verifying SHA256 checksum..." -ForegroundColor Cyan
+    # Wrap ONLY the sidecar download in try/catch: a failed fetch (transient
+    # network error) degrades to a warning. Everything below the catch runs
+    # unguarded, because under $ErrorActionPreference = 'Stop' Write-Error is
+    # a terminating error and the previously adjacent catch swallowed it as
+    # "Checksum verification skipped" — a mismatched binary was then installed
+    # by the Copy-Item below (#451). A mismatch or unparseable sidecar must
+    # abort the install instead.
+    $SidecarFetched = $true
     try {
         Invoke-WebRequest -Uri $ChecksumUrl -OutFile $TempShaPath -UseBasicParsing
-        $ExpectedHash = (Get-Content $TempShaPath).Split(" ")[0].Trim()
+    } catch {
+        $SidecarFetched = $false
+        Write-Host "Warning: Checksum verification skipped ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+    if ($SidecarFetched) {
+        # Get-Content returns $null for a zero-byte sidecar, which made the
+        # .Split below throw into the same skip path; guard it so an empty
+        # sidecar fails closed too.
+        $SidecarContent = Get-Content $TempShaPath
+        if (-not $SidecarContent) {
+            Write-Error "Checksum file is empty; refusing to install an unverified binary."
+            exit 1
+        }
+        $ExpectedHash = $SidecarContent.Split(" ")[0].Trim()
         $ActualHash = (Get-FileHash -Path $TempArtifactPath -Algorithm SHA256).Hash.ToLower()
 
-        if ($ExpectedHash.ToLower() -ne $ActualHash) {
+        if ((-not $ExpectedHash) -or ($ExpectedHash.ToLower() -ne $ActualHash)) {
             Write-Error "Checksum mismatch! Expected: $ExpectedHash, Actual: $ActualHash"
             exit 1
         }
         Write-Host "✓ Checksum verified." -ForegroundColor Green
-    } catch {
-        Write-Host "Warning: Checksum verification skipped ($($_.Exception.Message))" -ForegroundColor Yellow
     }
 
     $TargetBinary = Join-Path $InstallDir $BinName
@@ -79,6 +98,42 @@ try {
     # Add to current session PATH
     if ($env:PATH.Split(';') -notcontains $InstallDir) {
         $env:PATH = "$InstallDir;$env:PATH"
+    }
+
+    # Best-effort: install the offline registry seed (the vendored models.dev
+    # snapshot) at <install-root>\share\zay\api.json — the runtime looks for
+    # it one level above the exe directory and seeds its model cache from it
+    # when the network is unavailable. Unlike the binary checksum above, this
+    # fetch is graceful degradation: any failure warns and continues, and the
+    # app fetches https://models.dev/api.json at runtime. An unverified seed
+    # is never installed.
+    $ApiTargetDir = Join-Path (Split-Path $InstallDir -Parent) "share\zay"
+    $TempApiPath = Join-Path $TempDir "api.json"
+    $TempApiShaPath = Join-Path $TempDir "api.json.sha256"
+    try {
+        Invoke-WebRequest -Uri "$BaseUrl/api.json" -OutFile $TempApiPath -UseBasicParsing
+    } catch {
+        Write-Host "Warning: api.json (offline registry seed) not downloaded ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+    if (Test-Path $TempApiPath) {
+        $SeedVerified = $false
+        try {
+            Invoke-WebRequest -Uri "$BaseUrl/api.json.sha256" -OutFile $TempApiShaPath -UseBasicParsing
+            $SeedExpected = (Get-Content $TempApiShaPath).Split(" ")[0].Trim()
+            $SeedActual = (Get-FileHash -Path $TempApiPath -Algorithm SHA256).Hash.ToLower()
+            if ($SeedExpected -and ($SeedExpected.ToLower() -eq $SeedActual)) {
+                $SeedVerified = $true
+            } else {
+                Write-Host "Warning: api.json checksum mismatch; skipping the offline registry seed." -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "Warning: api.json checksum verification failed; skipping the offline registry seed." -ForegroundColor Yellow
+        }
+        if ($SeedVerified) {
+            New-Item -ItemType Directory -Path $ApiTargetDir -Force | Out-Null
+            Copy-Item -Path $TempApiPath -Destination (Join-Path $ApiTargetDir "api.json") -Force
+            Write-Host "==> Installed offline registry seed to $(Join-Path $ApiTargetDir 'api.json')" -ForegroundColor Green
+        }
     }
 
     Write-Host ""

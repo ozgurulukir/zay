@@ -150,8 +150,16 @@ foreach ($file in $allFirstPartyZigFiles) {
     $inTestBlock = $false
     foreach ($line in $lines) {
         $lineNum++
-        if ($line -match '^\s*test\s+"') {
+        # A test block opens as `test "name" {` or `test {`. Without a reset
+        # the flag stayed on for the rest of the file, misclassifying every
+        # `catch unreachable` after the first test as test code. Reset on a
+        # column-0 `}` (zig fmt closes test blocks at column 0; anything
+        # inside a test block is indented deeper).
+        if ($line -match '^\s*test\s+("|\{)') {
             $inTestBlock = $true
+        }
+        if ($inTestBlock -and $line -match '^\}') {
+            $inTestBlock = $false
         }
         if ($line -match 'catch\s+unreachable' -and -not $inTestBlock) {
             $catchUnreachableSites += [PSCustomObject]@{

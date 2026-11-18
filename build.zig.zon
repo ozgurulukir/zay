@@ -49,6 +49,12 @@
             .lazy = true,
         },
     },
+    // zay is NOT consumable as a Zig package dependency: .paths intentionally
+    // lists the root build files plus src/ only. The build also compiles
+    // vendor/ C sources (SQLite, Lua, fzy) and lib/*.zig leaf modules that
+    // are not listed here, so a package fetch would be incomplete. Clone the
+    // repository and build locally instead; adding vendor/ and lib/ to
+    // .paths would be the first step if package consumption is ever wanted.
     .paths = .{
         "build.zig",
         "build.zig.zon",
