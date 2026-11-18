@@ -12,6 +12,8 @@ different meaning. Ordinary `content` always remains answer text.
 
 JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still accepted at parse time for backward compatibility; `serialize` always writes camelCase.
 
+**File permissions (2026-11-17, #406):** Zay writes `config.json` with POSIX mode `0600` (owner read/write only) on every save — the temp file is created with those permissions and they are re-applied explicitly, because plaintext secrets such as `database.authToken` live in this file. On Windows the platform default file permissions are used instead. This complements `auth.json` (also `0600`), which holds API keys; see the API Keys Security Invariant note in [providers-mcp-and-plugins](providers-mcp-and-plugins.md#provider-configuration).
+
 ```json
 {
   "version": "2.0.0",

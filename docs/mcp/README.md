@@ -85,6 +85,15 @@ secrets never written back) also covers AI provider headers
 (`providers.<name>.headers`), expanded once per client attach — see
 [Configuration Guide — Provider Configuration](../config/providers-mcp-and-plugins.md#provider-configuration).
 
+> [!NOTE]
+> **Header validation (CR/LF injection guard).** SSE header names must be
+> non-empty single-line tokens (no `:`, whitespace, or line breaks) and header
+> values must not contain line breaks — checked *after* `{env:VAR}` expansion.
+> An entry that fails validation is dropped at load with a warning naming the
+> server and header; an empty post-expansion value (e.g. an unset
+> `{env:VAR}`) is allowed. See the
+> [Configuration Guide — MCP Server Configuration](../config/providers-mcp-and-plugins.md#mcp-server-configuration) `headers` row.
+
 **Project-layer trust parity.** When an `mcpServers` entry (or a provider
 header) comes from the *project* config (`<cwd>/.zay/config.json`) and its
 `url`/`headers` carry `{env:VAR}` placeholders, Zay logs a warning at load
@@ -109,3 +118,37 @@ Two common auth shapes for remote servers:
 ```
 
 ---
+
+## 3. Lifecycle and Limits
+
+### Stream bounds
+
+SSE and stdio line buffers are bounded while reading (not only after a line is
+buffered complete). A server that sends an unterminated line beyond the bound
+fails the stream with `McpStreamTooLarge` instead of growing memory without
+limit (#412).
+
+### Crash and session-expiry recovery
+
+A crashed server (`McpServerCrashed`) or an expired HTTP session
+(`McpSessionExpired`, HTTP 404) transitions the client's lifecycle state to
+`failed` — clearing its advertised tools — and attempts **one** re-`initialize`
+(#411). If that re-initialize succeeds the client comes back; if it fails, the
+client stays `failed` with the error surfaced, rather than remaining wedged as
+`connected` while every tool call dies. Tool calls that hit a failed refresh
+return the underlying error to the model.
+
+### Edits recreate the client
+
+Changing a server's transport settings (`url`, `command`, `args`,
+`requestTimeoutMs`, headers) in the `/mcp` overlay retires the existing client
+and creates a fresh one. A monotonic per-slot generation counter correlates the
+async connect with the slot it was launched from, so a stale connect result can
+never install into a recreated client (#413). Disconnect-first disable
+transitions follow the same discipline; rediscovery replaces rather than
+appends tool entries.
+
+### Thread-safety
+
+Client-list access and in-flight request accounting are synchronized under the
+manager lock, closing a retire-time use-after-free window (#410).
