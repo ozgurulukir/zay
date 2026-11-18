@@ -160,6 +160,14 @@ pub const ContextSettings = struct {
 pub const CompactionSettings = struct {
     /// Enable automatic context compaction before reaching limits.
     auto: bool = true,
+    /// Tracks whether the config layer explicitly supplied this setting so it
+    /// can override an inherited value with the default (#447). Parse sets
+    /// these `_is_set` flags only when the JSON key was present; the merge
+    /// overlay applies the field only when the flag is set, so a higher layer
+    /// that omits the key no longer resets it, while an explicit default CAN
+    /// restore it. Serialization treats a set flag as non-default so the
+    /// explicit value survives a save.
+    auto_is_set: bool = false,
     /// Fraction of context window (0.1–0.9) that triggers compaction. The swap
     /// watermark is derived as threshold + 0.20 (capped at 0.95); values above
     /// 0.90 would let the swap watermark fall below the start watermark, so
@@ -167,10 +175,19 @@ pub const CompactionSettings = struct {
     threshold: f64 = 0.75,
     /// Recent conversation tokens retained verbatim alongside the summary.
     keep_recent_tokens: u32 = 8_000,
+    /// Tracks whether the config layer explicitly supplied this setting so it
+    /// can override an inherited value with the default.
+    threshold_is_set: bool = false,
+    /// Tracks whether the config layer explicitly supplied this setting so it
+    /// can override an inherited value with the default.
+    keep_recent_tokens_is_set: bool = false,
     /// Number of recent tool-result turns left alone by historical pruning.
     /// New outputs are already bounded by `tool_output_cap_bytes`; older full
     /// results from existing history are pruned to that same cap. Minimum 1.
     keep_recent_tool_turns: u32 = context_assembly.default_keep_recent_tool_turns,
+    /// Tracks whether the config layer explicitly supplied this setting so it
+    /// can override an inherited value with the default.
+    keep_recent_tool_turns_is_set: bool = false,
     /// Shared byte cap for model-facing tool output and historical tool-result
     /// pruning. Larger results are saved in the active session and represented
     /// by a head+tail preview with retrieval instructions. Minimum 4 KiB.
@@ -185,6 +202,9 @@ pub const CompactionSettings = struct {
     /// path named in the stub. Disable for providers that keep server-side
     /// image state or when every image must stay attached.
     evict_history_images: bool = true,
+    /// Tracks whether the config layer explicitly supplied this setting so it
+    /// can override an inherited value with the default.
+    evict_history_images_is_set: bool = false,
 };
 
 /// Toast notification settings for the generic toast bus. All fields are
@@ -217,36 +237,57 @@ pub const SplitMode = enum {
 };
 
 /// TUI appearance, live theme preview, and picker settings.
+///
+/// Every scalar field carries a paired `<field>_is_set` flag (#447): parse
+/// sets the flag only when the JSON key was present, the merge overlay
+/// applies the field only when the flag is set, and serialization treats a
+/// set flag as non-default. A layer that omits a key no longer resets it to
+/// the built-in default, while a layer that writes the default value
+/// explicitly can restore it over a lower layer's non-default value — and
+/// an explicit default survives a save. `custom_themes_dir` needs no flag:
+/// its optionality already encodes presence.
 pub const TuiSettings = struct {
     /// Recolor the UI live while browsing themes in the /theme picker.
     theme_live_preview: bool = true,
+    theme_live_preview_is_set: bool = false,
     /// Optional directory containing user theme JSON files. When set, it
     /// REPLACES the default scan of `~/.config/zay/themes/` and
     /// `.zay/themes/`. Owned when parsed from disk.
     custom_themes_dir: ?[]u8 = null,
     /// Highlight matching characters in search pickers.
     fuzzy_highlight: bool = true,
+    fuzzy_highlight_is_set: bool = false,
     /// Style of matched runes: 'accent', 'bold', or 'underline'.
     fuzzy_highlight_style: FuzzyHighlightStyle = .accent,
+    fuzzy_highlight_style_is_set: bool = false,
     /// Multi-lane layout arrangement when multiple lanes are open.
     split_mode: SplitMode = .dual,
+    split_mode_is_set: bool = false,
     /// Minimum terminal column width required to trigger split layout.
     min_split_width: u16 = 140,
+    min_split_width_is_set: bool = false,
     /// Render a high-contrast accent border around the focused split column.
     highlight_focused_border: bool = true,
+    highlight_focused_border_is_set: bool = false,
     /// Show real-time streaming token velocity (⚡ tok/s) in the status bar.
     show_token_velocity: bool = true,
+    show_token_velocity_is_set: bool = false,
     /// Display the visual context window capacity progress bar in the status bar.
     show_context_meter: bool = true,
+    show_context_meter_is_set: bool = false,
     /// Show the durable skill inventory in the status bar. Disabled by default
     /// because the inventory is also available through `/skills`.
     show_skill_inventory: bool = false,
+    show_skill_inventory_is_set: bool = false,
     /// EMA smoothing coefficient for token velocity.
     velocity_smoothing_alpha: f64 = 0.35,
+    velocity_smoothing_alpha_is_set: bool = false,
     /// Context usage fraction that transitions the meter to amber warning.
     context_threshold_warn: f64 = 0.70,
+    context_threshold_warn_is_set: bool = false,
     /// Context usage fraction that transitions the meter to red alert.
     context_threshold_alert: f64 = 0.85,
+    context_threshold_alert_is_set: bool = false,
 };
 
 /// Database backend selection for session persistence and roaming sync.

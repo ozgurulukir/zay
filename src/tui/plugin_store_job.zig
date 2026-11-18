@@ -200,7 +200,10 @@ pub fn setEnabled(app: *App, name: []const u8, enabled: bool) !void {
     const config_arena = app.config_arena orelse return error.ConfigArenaUnavailable;
 
     const next_plugins = try clonePluginConfigsWithEnabled(config_arena.allocator(), app.cached_config.plugins, name, enabled);
-    var update_plugins = [_]config_mod.PluginConfig{.{ .name = @constCast(name), .enabled = enabled }};
+    // A hand-built toggle must carry the presence flag (#447): the merge
+    // overlay only applies `enabled` when `enabled_is_set` is true, so an
+    // unflagged update would no longer reach the on-disk entry.
+    var update_plugins = [_]config_mod.PluginConfig{.{ .name = @constCast(name), .enabled = enabled, .enabled_is_set = true }};
     const updates: config_mod.Config = .{ .plugins = &update_plugins };
     try config_mod.mergeAndWriteProject(app.gpa, app.io, runtime.cwd, updates);
 
