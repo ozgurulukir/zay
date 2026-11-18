@@ -52,6 +52,13 @@ pub const Backend = struct {
         \\
     ;
 
+    /// Reject module-qualified location cmdlets in contained workspaces: a
+    /// `Microsoft.PowerShell.Management\...` name bypasses the guard's
+    /// function overrides (#418). The match is case-insensitive (cmdlet names
+    /// are), accepts both path separators (PowerShell qualifies with `\` and
+    /// `/` alike, #439), and skips backtick escape characters. Unqualified
+    /// `Set-Location` is deliberately NOT matched: the guard's override
+    /// function handles it.
     pub fn hasCdGuardBypass(command: []const u8) bool {
         const blocked = [_][]const u8{
             "Microsoft.PowerShell.Management\\Set-Location",
@@ -59,7 +66,7 @@ pub const Backend = struct {
             "Microsoft.PowerShell.Management\\Pop-Location",
         };
         for (blocked) |item| {
-            if (std.ascii.indexOfIgnoreCase(command, item) != null) return true;
+            if (containsQualifiedCmdletIgnoreCase(command, item)) return true;
         }
         return false;
     }
@@ -123,6 +130,39 @@ pub const Backend = struct {
     }
 };
 
+/// Sliding-window matcher for module-qualified cmdlet names (#439): the
+/// needle's `\` may match either `\` or `/` in the command, backtick escape
+/// characters in the command are skipped, and ASCII case is ignored. The
+/// compare runs without a fixed buffer, in the style of `bash_safety
+/// .unescapedStartsWith` (#419).
+fn containsQualifiedCmdletIgnoreCase(command: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > command.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= command.len) : (start += 1) {
+        var cursor = start;
+        var matched = true;
+        for (needle) |needle_byte| {
+            while (cursor < command.len and command[cursor] == '`') cursor += 1;
+            if (cursor == command.len) {
+                matched = false;
+                break;
+            }
+            const command_byte = command[cursor];
+            const bytes_match = if (needle_byte == '\\')
+                command_byte == '\\' or command_byte == '/'
+            else
+                std.ascii.toLower(command_byte) == std.ascii.toLower(needle_byte);
+            if (!bytes_match) {
+                matched = false;
+                break;
+            }
+            cursor += 1;
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
 const impl = shell.Impl(Backend);
 
 pub const tool = impl.tool;
@@ -142,6 +182,36 @@ test "pwsh backend pins the prompt prefix and tool name" {
     // and the model-facing name here so a change fails on every platform.
     try std.testing.expectEqualStrings("> ", Backend.prompt_prefix);
     try std.testing.expectEqualStrings("pwsh", Backend.name);
+}
+
+test "hasCdGuardBypass flags qualified cmdlets across separators, case, and backticks (#439)" {
+    // Pure matcher test — runs on every platform so Linux CI enforces it; the
+    // spawn path is Windows-only (registry.zig picks pwsh there).
+    const flagged = [_][]const u8{
+        "Microsoft.PowerShell.Management\\Set-Location C:\\Windows",
+        "Microsoft.PowerShell.Management/Set-Location C:\\Windows", // forward-slash qualification (#439)
+        "microsoft.powershell.management\\set-location C:\\Windows", // cmdlet names are case-insensitive
+        "MICROSOFT.POWERSHELL.MANAGEMENT/POP-LOCATION C:\\Windows",
+        "`Microsoft.PowerShell.Management\\Set-Location C:\\Windows", // leading backtick escape
+        "Microsoft`.PowerShell.Management\\Push-Location C:\\Windows", // mid-name backtick escape
+    };
+    for (flagged) |command| {
+        try std.testing.expect(Backend.hasCdGuardBypass(command));
+    }
+
+    const allowed = [_][]const u8{
+        // Unqualified: the guard's Set-Location override handles it (#418).
+        "Set-Location C:\\Windows",
+        "cd C:\\Windows",
+        "Set-Location sub",
+        "Microsoft.PowerShell.Utility\\Write-Output hi",
+        "Microsoft.PowerShell.Management\\Get-Location",
+        "",
+        "Microsoft.PowerShell.Management\\Set-Locatio",
+    };
+    for (allowed) |command| {
+        try std.testing.expect(!Backend.hasCdGuardBypass(command));
+    }
 }
 
 test "validateCwd accepts a trailing-slash project root" {
@@ -231,6 +301,25 @@ test "contained pwsh allows Set-Location within the workspace root" {
 
     try std.testing.expectEqual(@as(u8, 0), output.code);
     try std.testing.expect(std.mem.indexOf(u8, output.stdout, "sub") != null);
+}
+
+test "contained pwsh refuses forward-slash qualified Set-Location (#439)" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    // Module-qualified names bypass the guard's function override; the
+    // forward-slash spelling is refused like its backslash twin (#439).
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"Microsoft.PowerShell.Management/Set-Location C:\\\\Windows; Write-Output escaped\",\"description\":\"escape\"}", null, bash_safety.mintClassified("containment-fixture"));
+    defer output.deinit(gpa);
+
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "bypassing cd guard") != null);
 }
 
 test "pwsh observation echoes the invoked command" {
