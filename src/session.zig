@@ -57,15 +57,34 @@ const MessageProjection = struct {
     }
 };
 
-const message_branch_probe_sql =
-    \\with recursive branch(session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid) as (
-    \\  select session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid
+/// Depth cap for the recursive parent-walk CTEs (#446). The parent chain is
+/// compaction-bounded and far shorter in every real session; a walk that
+/// reaches the cap can only mean the chain recurses (the remote schema has no
+/// foreign keys, and even the local self-referencing one permits a two-node
+/// cycle via a direct `parent_id` update), so readers fail with
+/// `error.CycleDetected` instead of recursing forever.
+const branch_depth_max: i64 = 4096;
+
+/// Every branch-walk row carries its walk depth (or, for the scalar walk
+/// queries, the walk's max depth) as the LAST column. A walk that reached the
+/// cap found a parent cycle — legitimate chains end far below it.
+fn checkBranchDepth(row: []const backend_mod.Value) Error!void {
+    const depth = switch (row[row.len - 1]) {
+        .int => |value| value,
+        else => return error.CorruptData,
+    };
+    if (depth >= branch_depth_max) return error.CycleDetected;
+}
+
+const message_branch_probe_sql = std.fmt.comptimePrint(
+    \\with recursive branch(session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid, depth) as (
+    \\  select session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid, 0
     \\    from session_entries where session_id = ? and id = ?
     \\  union all
-    \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.created_at_ms, e.snapshot, e.rowid
+    \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.created_at_ms, e.snapshot, e.rowid, branch.depth + 1
     \\    from session_entries e join branch
     \\      on e.session_id = branch.session_id and e.id = branch.parent_id
-    \\    where branch.parent_id is not null
+    \\    where branch.parent_id is not null and branch.depth < {d}
     \\)
     \\select branch.id, branch.parent_id, branch.kind, branch.role,
     \\       case
@@ -76,33 +95,33 @@ const message_branch_probe_sql =
     \\         ) then e.payload_json
     \\         else null
     \\       end as payload_json,
-    \\       branch.created_at_ms, branch.snapshot, branch.rowid
+    \\       branch.created_at_ms, branch.snapshot, branch.rowid, branch.depth
     \\  from branch join session_entries e
     \\    on e.session_id = branch.session_id and e.id = branch.id
     \\ order by branch.created_at_ms, branch.rowid
-;
+, .{branch_depth_max});
 
-const message_branch_suffix_sql =
-    \\with recursive branch(session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid) as (
-    \\  select session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid
+const message_branch_suffix_sql = std.fmt.comptimePrint(
+    \\with recursive branch(session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid, depth) as (
+    \\  select session_id, id, parent_id, kind, role, created_at_ms, snapshot, rowid, 0
     \\    from session_entries where session_id = ? and id = ?
     \\  union all
-    \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.created_at_ms, e.snapshot, e.rowid
+    \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.created_at_ms, e.snapshot, e.rowid, branch.depth + 1
     \\    from session_entries e join branch
     \\      on e.session_id = branch.session_id and e.id = branch.parent_id
-    \\    where branch.parent_id is not null
+    \\    where branch.parent_id is not null and branch.depth < {d}
     \\)
     \\select branch.id, branch.parent_id, branch.kind, branch.role,
     \\       case
     \\         when branch.id = ? or branch.kind in ('message', 'branch_summary') then e.payload_json
     \\         else null
     \\       end as payload_json,
-    \\       branch.created_at_ms, branch.snapshot, branch.rowid
+    \\       branch.created_at_ms, branch.snapshot, branch.rowid, branch.depth
     \\  from branch join session_entries e
     \\    on e.session_id = branch.session_id and e.id = branch.id
     \\ where branch.created_at_ms > ? or (branch.created_at_ms = ? and branch.rowid >= ?)
     \\ order by branch.created_at_ms, branch.rowid
-;
+, .{branch_depth_max});
 
 /// The backend selection a caller wants the session store to come from.
 /// Borrowed strings — a picker builds it from the live config right before
@@ -575,6 +594,15 @@ pub const SessionManager = struct {
         var qres = try self.backend.query(self.io, sql, params);
         defer qres.deinit();
 
+        // Legacy fallback (#446): rows recorded under another spelling of the
+        // same directory (`/tmp/zay/` vs `/tmp/zay`) match through the
+        // project identity instead of the raw cwd bytes.
+        if (cwd != null and qres.rows.len == 0) {
+            const project_key = try self.projectKeyForCwd(gpa, cwd.?);
+            defer if (project_key) |key| gpa.free(key);
+            if (project_key) |key| return self.listByProject(gpa, key);
+        }
+
         var summaries: std.ArrayList(SessionSummary) = .empty;
         errdefer {
             for (summaries.items) |*summary| summary.deinit(gpa);
@@ -637,7 +665,16 @@ pub const SessionManager = struct {
         var qres = try self.backend.query(self.io, sql, &.{.{ .text = cwd }});
         defer qres.deinit();
 
-        if (qres.rows.len == 0) return null;
+        // Legacy fallback (#446): a session recorded under another spelling
+        // of the same directory matches through the project identity instead
+        // of the raw cwd bytes (the primary surfaces already key on
+        // project_key; this is the pre-v9 fallback path).
+        if (qres.rows.len == 0) {
+            const project_key = try self.projectKeyForCwd(gpa, cwd);
+            defer if (project_key) |key| gpa.free(key);
+            const key = project_key orelse return null;
+            return self.findLatestByProject(gpa, key);
+        }
         switch (qres.rows[0][0]) {
             .text => |t| return try gpa.dupe(u8, t),
             else => return null,
@@ -888,8 +925,19 @@ pub const SessionManager = struct {
             .{ .sql = "delete from sessions where id = ?", .params = &params },
         };
         if (self.backend.kind == .local_sqlite) {
+            // One atomic unit (#446): a failure between the tool-artifact
+            // deletes and the sessions-row delete must not leave orphaned
+            // tool history behind. The entries and prompt history ride the
+            // `on delete cascade` foreign keys (migrate enables
+            // `pragma foreign_keys = on`) — deleting the entries explicitly
+            // BEFORE the sessions row would instead violate the sessions
+            // row's leaf_entry_id foreign key, so the local statement set
+            // intentionally mirrors the old three-write shape.
+            try self.backend.beginTransaction(self.io);
+            errdefer self.backend.rollbackTransaction(self.io) catch {};
             for (statements[0..2]) |statement| try self.backend.exec(self.io, statement.sql, statement.params);
             try self.backend.exec(self.io, statements[4].sql, statements[4].params);
+            try self.backend.commitTransaction(self.io);
         } else {
             try self.backend.execBatch(self.io, &statements);
         }
@@ -927,7 +975,6 @@ pub const Session = struct {
     }
 
     pub fn appendQueuedPayload(self: *Session, kind: []const u8, role: ?[]const u8, payload_json: []const u8, title: ?[]const u8, id_out: *[entry_id_len]u8) Error!void {
-        assert(self.manager.backend.kind != .local_sqlite);
         assert(kind.len > 0);
         assert(payload_json.len > 0);
         fillHex(self.manager.io, id_out);
@@ -1102,17 +1149,18 @@ pub const Session = struct {
     /// session before any file change). Caller owns the returned string.
     pub fn snapshotAt(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
         const leaf_id = self.leaf_entry_id orelse return null;
-        const sql =
+        const sql = std.fmt.comptimePrint(
             \\with recursive anc(id, parent_id, snapshot, depth) as (
             \\  select id, parent_id, snapshot, 0 from session_entries
             \\    where session_id = ? and id = ?
             \\  union all
             \\  select e.id, e.parent_id, e.snapshot, anc.depth + 1
             \\    from session_entries e join anc on e.id = anc.parent_id
-            \\    where e.session_id = ?
+            \\    where e.session_id = ? and anc.depth < {d}
             \\)
-            \\select snapshot from anc where snapshot is not null order by depth limit 1
-        ;
+            \\select (select snapshot from anc where snapshot is not null order by depth limit 1),
+            \\       (select max(depth) from anc)
+        , .{branch_depth_max});
         var qres = try self.manager.backend.query(self.manager.io, sql, &.{
             .{ .text = self.id.slice() },
             .{ .text = leaf_id.slice() },
@@ -1120,6 +1168,7 @@ pub const Session = struct {
         });
         defer qres.deinit();
         if (qres.rows.len == 0) return null;
+        try checkBranchDepth(qres.rows[0]);
         return switch (qres.rows[0][0]) {
             .text => |t| try gpa.dupe(u8, t),
             else => null,
@@ -1134,18 +1183,19 @@ pub const Session = struct {
     /// database itself. Allocation-free: ids are fixed-size.
     pub fn lastUserEntry(self: *Session) Error!?UserEntryRef {
         const leaf_id = self.leaf_entry_id orelse return null;
-        const sql =
+        const sql = std.fmt.comptimePrint(
             \\with recursive anc(id, parent_id, kind, role, depth) as (
             \\  select id, parent_id, kind, role, 0 from session_entries
             \\    where session_id = ? and id = ?
             \\  union all
             \\  select e.id, e.parent_id, e.kind, e.role, anc.depth + 1
             \\    from session_entries e join anc on e.id = anc.parent_id
-            \\    where e.session_id = ?
+            \\    where e.session_id = ? and anc.depth < {d}
             \\)
-            \\select id, parent_id from anc
-            \\  where kind = 'message' and role = 'user' order by depth limit 1
-        ;
+            \\select (select id from anc where kind = 'message' and role = 'user' order by depth limit 1),
+            \\       (select parent_id from anc where kind = 'message' and role = 'user' order by depth limit 1),
+            \\       (select max(depth) from anc)
+        , .{branch_depth_max});
         var qres = try self.manager.backend.query(self.manager.io, sql, &.{
             .{ .text = self.id.slice() },
             .{ .text = leaf_id.slice() },
@@ -1154,9 +1204,10 @@ pub const Session = struct {
         defer qres.deinit();
         if (qres.rows.len == 0) return null;
         const row = qres.rows[0];
+        try checkBranchDepth(row);
         const id_str = switch (row[0]) {
             .text => |t| t,
-            else => return error.BadEntryId,
+            else => return null,
         };
         const id = try EntryId.fromSlice(id_str);
         const parent_id: ?EntryId = switch (row[1]) {
@@ -1302,9 +1353,22 @@ pub const Session = struct {
             const count: usize = if (title == null) 2 else 3;
             try self.manager.backend.execBatch(self.manager.io, statements[0..count]);
         } else {
-            assert(title == null);
+            // The insert and the leaf update are ONE atomic unit (#446): a
+            // failure between them must not commit an entry the sessions row
+            // never points at (the mirror of the remote batch above).
+            try self.manager.backend.beginTransaction(self.manager.io);
+            errdefer self.manager.backend.rollbackTransaction(self.manager.io) catch {};
             try self.manager.backend.exec(self.manager.io, sql, &insert_params);
             try self.updateLeaf(id[0..]);
+            if (title != null) {
+                const title_params = [_]backend_mod.SqlParam{
+                    .{ .text = title.? },
+                    .{ .int = timestamp_ms },
+                    .{ .text = self.id.slice() },
+                };
+                try self.manager.backend.exec(self.manager.io, "update sessions set title = ?, updated_at_ms = ? where id = ?", &title_params);
+            }
+            try self.manager.backend.commitTransaction(self.manager.io);
         }
         self.leaf_entry_id = .{ .bytes = id.* };
     }
@@ -1374,18 +1438,18 @@ pub const Session = struct {
     fn loadBranch(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
         const leaf_id = self.leaf_entry_id orelse return try gpa.alloc(EntryRecord, 0);
 
-        const sql =
-            \\with recursive branch(session_id, id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid) as (
-            \\  select session_id, id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid
+        const sql = std.fmt.comptimePrint(
+            \\with recursive branch(session_id, id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid, depth) as (
+            \\  select session_id, id, parent_id, kind, role, payload_json, created_at_ms, snapshot, rowid, 0
             \\    from session_entries where session_id = ? and id = ?
             \\  union all
-            \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.payload_json, e.created_at_ms, e.snapshot, e.rowid
+            \\  select e.session_id, e.id, e.parent_id, e.kind, e.role, e.payload_json, e.created_at_ms, e.snapshot, e.rowid, branch.depth + 1
             \\    from session_entries e join branch
             \\      on e.session_id = branch.session_id and e.id = branch.parent_id
-            \\    where branch.parent_id is not null
+            \\    where branch.parent_id is not null and branch.depth < {d}
             \\)
-            \\select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from branch order by created_at_ms, rowid
-        ;
+            \\select id, parent_id, kind, role, payload_json, created_at_ms, snapshot, depth from branch order by created_at_ms, rowid
+        , .{branch_depth_max});
         var qres = try self.manager.backend.query(self.manager.io, sql, &.{
             .{ .text = self.id.slice() },
             .{ .text = leaf_id.slice() },
@@ -1400,6 +1464,7 @@ pub const Session = struct {
             records.deinit(gpa);
         }
         for (qres.rows) |row| {
+            try checkBranchDepth(row);
             try records.append(gpa, try readEntryFromRow(gpa, row));
         }
         return records.toOwnedSlice(gpa);
@@ -1418,6 +1483,7 @@ pub const Session = struct {
 
         var latest_compaction_index: ?usize = null;
         for (probe.rows, 0..) |row, index| {
+            try checkBranchDepth(row);
             _ = try readBranchProbeId(row);
             const kind = branchProbeKind(row) catch return error.CorruptData;
             if (std.mem.eql(u8, kind, "compaction")) latest_compaction_index = index;
@@ -1488,6 +1554,7 @@ pub const Session = struct {
         var latest_compaction_id: ?[entry_id_len]u8 = null;
         var summary_payload_json: ?[]const u8 = null;
         for (qres.rows, 0..) |row, index| {
+            try checkBranchDepth(row);
             const id = try readBranchProbeId(row);
             const kind = branchProbeKind(row) catch return error.CorruptData;
             if (std.mem.eql(u8, id[0..], first_kept_id[0..])) boundary_index = index;
@@ -2124,6 +2191,62 @@ test "session branch remains scoped when entry ids collide across sessions" {
     try std.testing.expectEqualStrings("summary", messages[0].text());
     try std.testing.expectEqualStrings("root", messages[1].text());
     try std.testing.expectEqualStrings("leaf", messages[2].text());
+}
+
+// #446: a cyclic parent chain (the self-referencing foreign key permits it
+// locally via a direct update, and the remote schema has no foreign keys)
+// must surface as error.CycleDetected from every parent-walk query instead of
+// recursing forever inside the branch CTEs.
+test "session branch queries detect a cyclic parent chain instead of hanging" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = try SessionManager.init(gpa, io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/zay", .{ .id = "4" ** session_id_len });
+
+    var id_a: [entry_id_len]u8 = undefined;
+    var id_b: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "a", &id_a);
+    try appendTextEntry(&session, gpa, .assistant, "b", &id_b);
+    // Leaf is b with parent a; point a back at b to close the loop.
+    try manager.backend.exec(io, "update session_entries set parent_id = ? where session_id = ? and id = ?", &.{
+        .{ .text = id_b[0..] },
+        .{ .text = session.id.slice() },
+        .{ .text = id_a[0..] },
+    });
+
+    try std.testing.expectError(error.CycleDetected, session.messages(gpa));
+    try std.testing.expectError(error.CycleDetected, session.snapshotAt(gpa));
+    try std.testing.expectError(error.CycleDetected, session.lastUserEntry());
+}
+
+// #446: the legacy cwd fallback matches sessions recorded under another
+// spelling of the same directory through the project identity — a trailing
+// separator must not hide a session from findLatest/list.
+test "findLatest and list match sessions across cwd spellings" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = try SessionManager.init(gpa, io, ":memory:");
+    defer manager.deinit();
+
+    var session = try manager.create("/tmp/zay/", .{ .id = "5" ** session_id_len });
+    var id: [entry_id_len]u8 = undefined;
+    try appendTextEntry(&session, gpa, .user, "hello", &id);
+
+    // Exact cwd match misses (the row stores "/tmp/zay/"); the project-key
+    // fallback finds it.
+    const found = try manager.findLatest(gpa, "/tmp/zay");
+    defer if (found) |found_id| gpa.free(found_id);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings(session.id.slice(), found.?);
+
+    const summaries = try manager.list(gpa, "/tmp/zay");
+    defer {
+        for (summaries) |*summary| summary.deinit(gpa);
+        gpa.free(summaries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    try std.testing.expectEqualStrings("/tmp/zay/", summaries[0].cwd);
 }
 
 test "session compaction boundary replaces summarized prefix" {

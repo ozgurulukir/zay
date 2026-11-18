@@ -412,7 +412,13 @@ pub fn serializeD1Value(writer: anytype, allocator: std.mem.Allocator, val: db.V
     switch (val) {
         .null => try writer.writeAll("null"),
         .int => |i| try writer.print("{d}", .{i}),
-        .float => |f| try writer.print("{d}", .{f}),
+        .float => |f| {
+            // NaN/Infinity are not representable in JSON — reject them before
+            // they can produce an invalid payload the provider would refuse
+            // with a confusing error (#162, #445).
+            if (!std.math.isFinite(f)) return error.InvalidParameter;
+            try writer.print("{d}", .{f});
+        },
         .text => |t| try std.json.Stringify.value(t, .{}, writer),
         // The public D1 REST API has no tagged binary parameter encoding.
         // Sending base64 here would silently store TEXT instead of a BLOB.
@@ -467,6 +473,23 @@ pub fn normalizeD1Url(allocator: std.mem.Allocator, input_url: []const u8) ![]u8
 
     if (std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://")) {
         const without_slash = std.mem.trimEnd(u8, trimmed, "/");
+        // Validation happens here, BEFORE any network activity (#445): every
+        // D1 request carries the API token as a bearer header, so an
+        // unparseable endpoint or embedded credentials fail with InvalidUrl,
+        // and plain http is only accepted for loopback endpoints (the same
+        // gate turso.pipelineUrl applies; loopback keeps local mock/dev
+        // servers working).
+        const uri = std.Uri.parse(without_slash) catch return error.InvalidUrl;
+        if (uri.user != null or uri.password != null) return error.InvalidUrl;
+        const host_component = uri.host orelse return error.InvalidUrl;
+        if (host_component.isEmpty()) return error.InvalidUrl;
+        var host_buffer: [256]u8 = undefined;
+        const host = host_component.toRaw(&host_buffer) catch return error.InvalidUrl;
+        if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+            // Always accepted.
+        } else if (!remote_http.isLoopbackHost(host)) {
+            return error.UnsupportedScheme;
+        }
         if (std.mem.endsWith(u8, without_slash, "/query")) {
             return allocator.dupe(u8, without_slash);
         }
@@ -497,6 +520,29 @@ test "normalizeD1Url normalizes d1 protocol and https endpoints" {
 
     try std.testing.expectError(error.InvalidUrl, normalizeD1Url(gpa, "d1://account/database/extra"));
     try std.testing.expectError(error.InvalidUrl, normalizeD1Url(gpa, "ftp://account/database"));
+}
+
+// #445: the REST endpoint carries the API token as a bearer header, so plain
+// http is only accepted for loopback endpoints (matching turso.pipelineUrl's
+// gate); https is always accepted.
+test "normalizeD1Url gates plain http on loopback endpoints" {
+    const gpa = std.testing.allocator;
+
+    // Loopback plain http stays accepted (local dev/mock servers).
+    const loopback = try normalizeD1Url(gpa, "http://127.0.0.1:8787/query");
+    defer gpa.free(loopback);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8787/query", loopback);
+
+    const localhost = try normalizeD1Url(gpa, "http://localhost:8787");
+    defer gpa.free(localhost);
+    try std.testing.expectEqualStrings("http://localhost:8787/query", localhost);
+
+    // Non-loopback plain http is rejected before any network activity.
+    try std.testing.expectError(error.UnsupportedScheme, normalizeD1Url(gpa, "http://db.example.com/query"));
+    try std.testing.expectError(error.UnsupportedScheme, normalizeD1Url(gpa, "http://127.evil.com/query"));
+
+    // Embedded credentials are almost certainly a mis-pasted URL.
+    try std.testing.expectError(error.InvalidUrl, normalizeD1Url(gpa, "https://user:pass@api.cloudflare.com/client/v4/accounts/a/d1/database/b/query"));
 }
 
 test "serializeD1Payload serializes single statement and batch envelope" {
@@ -536,6 +582,25 @@ test "serializeD1Value rejects blobs instead of storing base64 text" {
         error.UnsupportedValue,
         serializeD1Value(&out.writer, gpa, .{ .blob = "binary" }),
     );
+}
+
+// #445: NaN and infinities are not representable in JSON; they must be
+// rejected at serialization time with a dedicated invalid-parameter error.
+test "serializeD1Value rejects non-finite floats" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try std.testing.expectError(
+        error.InvalidParameter,
+        serializeD1Value(&out.writer, gpa, .{ .float = std.math.nan(f64) }),
+    );
+    try std.testing.expectError(
+        error.InvalidParameter,
+        serializeD1Value(&out.writer, gpa, .{ .float = std.math.inf(f64) }),
+    );
+    // A finite float still serializes.
+    try serializeD1Value(&out.writer, gpa, .{ .float = 1.5 });
 }
 
 test "D1 response validation rejects failed and incomplete batches" {
