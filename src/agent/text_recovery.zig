@@ -13,9 +13,12 @@
 //! Ownership contract (load-bearing): `recoverTextToolCalls` returns
 //! independently-owned strings so `injectRecoveredToolCalls` can MOVE them
 //! into new `.tool_call` blocks — callers free only the recovered slice
-//! shell, never its element strings. The turn-loop window (collect →
-//! recover → inject) and the severed-tool-calls retry ordering live at the
-//! call sites in agent.zig's `run` and are unchanged by this extraction.
+//! shell, never its element strings, on BOTH the success and the error path:
+//! when the content-block reallocation fails, `injectRecoveredToolCalls`
+//! deinits the recovered calls' strings itself before returning the error
+//! (#443). The turn-loop window (collect → recover → inject) and the
+//! severed-tool-calls retry ordering live at the call sites in agent.zig's
+//! `run` and are unchanged by this extraction.
 
 const std = @import("std");
 
@@ -89,12 +92,21 @@ pub fn recoverTextToolCalls(self: *Agent, assistant: *ai.ChatMessage) ![]ai.Tool
 /// NOT free those strings, only the `recovered` slice shell. This mirrors
 /// `collectToolCallsAlloc`'s aliasing contract (slice shell caller-freed,
 /// element strings belong to the message). Existing blocks keep their
-/// strings — only the slice shell is reallocated.
+/// strings — only the slice shell is reallocated. On allocation failure the
+/// move never happened, so this deinits the recovered calls' strings itself
+/// and the caller still frees only the shell (#443).
 pub fn injectRecoveredToolCalls(self: *Agent, assistant: *ai.ChatMessage, recovered: []ai.ToolCall) !void {
     assert(assistant.* == .assistant);
     if (recovered.len == 0) return;
     const old = assistant.assistant.content;
-    const new_blocks = try self.gpa.alloc(ai.ContentBlock, old.len + recovered.len);
+    const new_blocks = self.gpa.alloc(ai.ContentBlock, old.len + recovered.len) catch |err| {
+        // The move never happened: the strings still belong to the `recovered`
+        // elements, so free them here to keep the caller-side contract
+        // unconditional — callers free only the slice shell, on the success
+        // and the error path alike.
+        for (recovered) |*c| c.deinit(self.gpa);
+        return err;
+    };
     // Shallow copy: old blocks keep their owned strings.
     @memcpy(new_blocks[0..old.len], old);
     var i: usize = old.len;
@@ -205,4 +217,35 @@ test "T3 turn-loop window: zero structured calls + text recovery yields executab
     try std.testing.expect(tool_calls.len > 0);
     try std.testing.expectEqualStrings("bash", tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"command\":\"echo done\"}", tool_calls[0].arguments);
+}
+
+test "injectRecoveredToolCalls frees the recovered strings when the block realloc fails" {
+    // #443: the content-block allocation can fail before any string moves;
+    // inject must deinit the recovered calls itself so the caller-side
+    // contract ("free only the slice shell") holds on the error path too.
+    // std.testing.allocator's leak check is the proof.
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, "<tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"x\"}}</tool_call>") } };
+    var assistant: ai.ChatMessage = .{ .assistant = .{ .content = blocks } };
+    defer assistant.deinit(gpa);
+
+    const recovered = try recoverTextToolCalls(&agent, &assistant);
+    try std.testing.expectEqual(@as(usize, 1), recovered.len);
+
+    // Fail the first allocation inside injectRecoveredToolCalls — the content
+    // block realloc — with nothing moved yet, so the strings still belong to
+    // the recovered elements.
+    const real_gpa = agent.gpa;
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    agent.gpa = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, injectRecoveredToolCalls(&agent, &assistant, recovered));
+    agent.gpa = real_gpa;
+
+    // The caller frees only the shell (the documented contract): the leak
+    // check proves inject freed the recovered strings on the error path.
+    gpa.free(recovered);
 }
