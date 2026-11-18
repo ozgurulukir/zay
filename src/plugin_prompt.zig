@@ -116,10 +116,14 @@ pub fn formatForPrompt(gpa: std.mem.Allocator, prompts: []const PluginPrompt) ![
             try out.writer.writeAll("\n  </plugin>\n");
             total_bytes += prompt.body.len;
         } else {
+            // Omit only this plugin; do NOT pin total_bytes to the cap (#449),
+            // which used to freeze the cumulative budget so every later
+            // plugin after one oversized body showed only the error marker.
+            // Greedy in scan order: a small plugin after a huge one is still
+            // included while the running total has room.
             try out.writer.writeAll("  <plugin name=\"");
             try skill_mod.writeXmlEscaped(&out.writer, prompt.name);
             try out.writer.writeAll("\" error=\"aggregate plugin prompt budget exhausted (64 KB)\"></plugin>\n");
-            total_bytes = max_aggregate_prompt_bytes;
         }
     }
     try out.writer.writeAll("</plugin_prompts>");
@@ -569,4 +573,43 @@ test "formatForPrompt enforces 64 KB aggregate cap and emits omission notice" {
     try std.testing.expect(std.mem.indexOf(u8, text, "<plugin name=\"plugin-2\">") != null);
     // Plugin 3 is omitted with error attribute
     try std.testing.expect(std.mem.indexOf(u8, text, "<plugin name=\"plugin-3\" error=\"aggregate plugin prompt budget exhausted (64 KB)\"></plugin>") != null);
+}
+
+test "formatForPrompt omission does not pin the budget for later plugins (#449)" {
+    const gpa = std.testing.allocator;
+
+    var prompts = try gpa.alloc(PluginPrompt, 2);
+    defer deinitAll(gpa, prompts);
+
+    // Plugin 1: alone over the 64 KB aggregate budget — omitted with the
+    // error attribute, and the cumulative budget must NOT freeze at the cap.
+    const body1 = try gpa.alloc(u8, 70 * 1024);
+    @memset(body1, 'a');
+    prompts[0] = .{
+        .name = try gpa.dupe(u8, "huge-plugin"),
+        .body = body1,
+        .path = try gpa.dupe(u8, "/tmp/huge.md"),
+    };
+
+    // Plugin 2: 100 bytes — used to show only the error marker because the
+    // omitted plugin pinned total_bytes to the cap; now it is included.
+    const body2 = try gpa.alloc(u8, 100);
+    @memset(body2, 'b');
+    prompts[1] = .{
+        .name = try gpa.dupe(u8, "small-plugin"),
+        .body = body2,
+        .path = try gpa.dupe(u8, "/tmp/small.md"),
+    };
+
+    const text = try formatForPrompt(gpa, prompts);
+    defer gpa.free(text);
+
+    // The oversized plugin is omitted with the error attribute.
+    try std.testing.expect(std.mem.indexOf(u8, text, "<plugin name=\"huge-plugin\" error=\"aggregate plugin prompt budget exhausted (64 KB)\"></plugin>") != null);
+    // The small plugin after it renders its body with no error attribute.
+    const small_start = std.mem.indexOf(u8, text, "<plugin name=\"small-plugin\">").?;
+    const small_close = std.mem.indexOfPos(u8, text, small_start, "</plugin>").?;
+    const small_block = text[small_start..small_close];
+    try std.testing.expect(std.mem.indexOf(u8, small_block, "error=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, small_block, "bbbbbbbbbb") != null);
 }

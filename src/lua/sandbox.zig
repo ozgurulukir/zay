@@ -28,6 +28,11 @@ pub const Permissions = struct {
     allow_os_execute: bool = false,
     /// Allow os.remove/os.rename
     allow_os_remove: bool = false,
+    /// ENFORCED: gates `zay.get_env` (#448). Without it the bridge serves
+    /// only a fixed allowlist of harmless variables (PATH, HOME, LANG, ...);
+    /// with it, any variable is readable. The flag is copied into the Lua
+    /// registry at state creation so the bridge consults its own state.
+    allow_env: bool = false,
     /// Maximum Lua instructions before abort (0 = unlimited). This is a
     /// **per-dispatch** budget — reset before each tool call / event callback
     /// by `resetInstructionBudget`, so a busy plugin can't exhaust it for the
@@ -151,6 +156,11 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
         io_storage.* = io.?;
         c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_io");
         registerPluginApi(L);
+        // Copy the enforced get_env gate into the state's own registry
+        // (#448): full-access states are trusted host builds and serve
+        // anything; plugin states get exactly what the manifest granted.
+        c.lua_pushboolean(L, @intFromBool(permissions.allow_env or permissions.full_access));
+        c.lua_setfield(L, c.LUA_REGISTRYINDEX, allow_env_registry_key);
     }
 
     // The `plugin` table needs no Io and must exist in full-access states
@@ -180,6 +190,12 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
 /// string is re-parsed per `plugin.get_config()` call, yielding a fresh table
 /// whose mutation cannot corrupt the stored settings.
 pub const settings_registry_key = "zay_plugin_settings";
+
+/// Registry key under which the enforced `allow_env` permission flag is
+/// copied at state creation. `zay.get_env` consults this flag from the
+/// state's own registry (the settings_registry_key pattern) instead of any
+/// host-global, so the gate travels with the state.
+pub const allow_env_registry_key = "zay_allow_env";
 
 /// Register the `plugin` global table (`plugin.get_config`). Like `zay`, it is
 /// set on the real _G AND copied into the restricted environment — full-access

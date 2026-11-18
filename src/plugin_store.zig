@@ -615,12 +615,15 @@ fn installPlugin(
 }
 
 fn verifyFile(file: *const File, bytes: []const u8) !void {
-    if (file.size) |size| if (size != bytes.len) return error.FileSizeMismatch;
-    if (file.sha256) |expected| {
-        var actual: [32]u8 = undefined;
-        Sha256.hash(bytes, &actual, .{});
-        if (!std.mem.eql(u8, &actual, &expected)) return error.FileDigestMismatch;
-    }
+    // Parse-time parsing makes both fields mandatory for remote files (#448);
+    // re-check here so a caller that skips parse cannot silently verify
+    // nothing (two checkpoints on the same invariant, per the dev guide).
+    const expected_digest = file.sha256 orelse return error.IncompleteFileVerification;
+    const expected_size = file.size orelse return error.IncompleteFileVerification;
+    if (expected_size != bytes.len) return error.FileSizeMismatch;
+    var actual: [32]u8 = undefined;
+    Sha256.hash(bytes, &actual, .{});
+    if (!std.mem.eql(u8, &actual, &expected_digest)) return error.FileDigestMismatch;
 }
 
 fn makeInstallReport(gpa: std.mem.Allocator, status: InstallStatus, plugin: *const Plugin) !InstallReport {
@@ -806,7 +809,10 @@ fn parsePlugin(
             if (size_value != .integer or size_value.integer < 0 or size_value.integer > plugin_file_max_bytes) return error.InvalidFileSize;
             size = @intCast(size_value.integer);
         }
-        if ((digest == null) != (size == null)) return error.IncompleteFileVerification;
+        // Both fields are mandatory for every remote files entry (#448): a
+        // catalog that omits either used to pass parse and let verifyFile
+        // "verify nothing" at install time.
+        if (digest == null or size == null) return error.IncompleteFileVerification;
         for (files.items) |existing| {
             if (pathsConflict(existing.path, path)) return error.DuplicateFile;
         }
@@ -1062,22 +1068,46 @@ test "parseCatalog validates explicit remote files" {
     const json =
         "{\"name\":\"Test Store\",\"plugins\":[{" ++
         "\"id\":\"hello-world\",\"name\":\"Hello\",\"version\":\"1.0.0\",\"files\":[" ++
-        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\"}," ++
-        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\"}]}]}";
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":10}," ++
+        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":20}]}]}";
     var catalog = try parseCatalog(std.testing.allocator, "https://example.com/store.json", json, ".", false);
     defer catalog.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Test Store", catalog.name);
     try std.testing.expectEqual(@as(usize, 1), catalog.plugins.len);
     try std.testing.expect(catalog.plugins[0].source == .files);
+
+    // sha256 + size are mandatory for every remote files entry (#448): a
+    // catalog omitting either must fail parse instead of "verifying nothing"
+    // at install time.
+    const missing_digest =
+        "{\"name\":\"T\",\"plugins\":[{\"id\":\"hello-world\",\"name\":\"H\",\"version\":\"1\",\"files\":[" ++
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\",\"size\":10}," ++
+        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":20}]}]}";
+    try std.testing.expectError(error.IncompleteFileVerification, parseCatalog(std.testing.allocator, "x", missing_digest, ".", false));
+
+    const missing_size =
+        "{\"name\":\"T\",\"plugins\":[{\"id\":\"hello-world\",\"name\":\"H\",\"version\":\"1\",\"files\":[" ++
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\"}," ++
+        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":20}]}]}";
+    try std.testing.expectError(error.IncompleteFileVerification, parseCatalog(std.testing.allocator, "x", missing_size, ".", false));
+
+    const missing_both =
+        "{\"name\":\"T\",\"plugins\":[{\"id\":\"hello-world\",\"name\":\"H\",\"version\":\"1\",\"files\":[" ++
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\"}," ++
+        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":20}]}]}";
+    try std.testing.expectError(error.IncompleteFileVerification, parseCatalog(std.testing.allocator, "x", missing_both, ".", false));
 }
+
+/// A syntactically valid 64-hex sha256 for catalog fixtures.
+const test_digest_hex = "00" ** 32;
 
 test "findEntry selects by catalog source and plugin id" {
     const gpa = std.testing.allocator;
     const json =
         "{\"name\":\"Test Store\",\"plugins\":[{" ++
         "\"id\":\"hello-world\",\"name\":\"Hello\",\"version\":\"1\",\"files\":[" ++
-        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\"}," ++
-        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\"}]}]}";
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":10}," ++
+        "{\"path\":\"init.lua\",\"url\":\"https://example.com/init.lua\",\"sha256\":\"" ++ test_digest_hex ++ "\",\"size\":20}]}]}";
     var catalog = try parseCatalog(gpa, "https://example.com/store.json", json, ".", false);
     var catalog_owned = true;
     defer if (catalog_owned) catalog.deinit(gpa);
@@ -1366,6 +1396,14 @@ test "plugin_store official catalog pins one revision and verifies every file" {
         }
     }
     try std.testing.expect(count > 0);
+
+    // #448: sha256 + size are parse-mandatory for remote files entries — the
+    // shipped catalog's every-file-verified property above is now backed by
+    // the parser, so a synthetic entry omitting either fails parse outright.
+    const synthetic_missing =
+        "{\"name\":\"T\",\"plugins\":[{\"id\":\"hello-world\",\"name\":\"H\",\"version\":\"1\",\"files\":[" ++
+        "{\"path\":\"plugin.lua\",\"url\":\"https://example.com/plugin.lua\"}]}]}";
+    try std.testing.expectError(error.IncompleteFileVerification, parseCatalog(gpa, "official", synthetic_missing, ".", false));
 }
 
 test "openRelativeDirectory supports both forward and backslash separators and blocks traversal" {

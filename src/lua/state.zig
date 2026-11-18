@@ -42,6 +42,12 @@ pub const State = struct {
     /// The chunk is left on the stack as a function.
     /// Returns error.LuaLoadError if the bytecode is invalid or
     /// incompatible with the current Lua version.
+    ///
+    /// Audit (#448): this is a deliberate host-side capability paired with
+    /// `dump` and has no plugin-reachable callers — plugin-authored sources
+    /// load through text-only paths (mode "t") in `requireModule` and the
+    /// manager's entrypoint loader. Never point it at plugin-supplied bytes;
+    /// precompiled chunks execute attacker-chosen bytecode.
     pub fn loadBuffer(self: *Self, bytecode: []const u8, name: [:0]const u8) !void {
         const rc = c.luaL_loadbufferx(self.handle, bytecode.ptr, bytecode.len, name.ptr, null);
         if (rc != c.LUA_OK) {
