@@ -84,6 +84,16 @@ const ItemRoute = struct {
     text_parts: std.ArrayList(TextPart) = .empty,
 };
 
+/// Warn-log budget for a dropped/malformed SSE payload: just enough of the
+/// offending line to identify it, without flooding the log when a chatty
+/// provider streams junk (`run` already logs a much larger head at info
+/// level for every well-formed event).
+const event_payload_log_bytes_max: usize = 200;
+
+fn payloadLogHead(bytes: []const u8) []const u8 {
+    return bytes[0..@min(bytes.len, event_payload_log_bytes_max)];
+}
+
 pub const StreamState = struct {
     routes: std.ArrayList(ItemRoute) = .empty,
     blocks: std.ArrayList(ai.ContentBlock) = .empty,
@@ -143,11 +153,28 @@ fn processEventRouted(
     dropped: *u32,
     routes: ?*std.ArrayList(ItemRoute),
 ) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return;
+    // Malformed / mistyped events are SKIPPED, never fatal: a chatty
+    // provider with junk lines must not fail the whole stream mid-turn
+    // (a dropped genuine error/response.failed event degrades into the
+    // generic error.ResponseIncomplete at finish). The skips used to be
+    // silent; the warn lines make them observable (#441).
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch {
+        log.warn("responses.event.dropped malformed_json payload={s}", .{payloadLogHead(data)});
+        return;
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return;
-    const type_value = parsed.value.object.get("type") orelse return;
-    if (type_value != .string) return;
+    if (parsed.value != .object) {
+        log.warn("responses.event.dropped non_object kind={s} payload={s}", .{ @tagName(parsed.value), payloadLogHead(data) });
+        return;
+    }
+    const type_value = parsed.value.object.get("type") orelse {
+        log.warn("responses.event.dropped missing_type payload={s}", .{payloadLogHead(data)});
+        return;
+    };
+    if (type_value != .string) {
+        log.warn("responses.event.dropped non_string_type payload={s}", .{payloadLogHead(data)});
+        return;
+    }
     const event_type = responseEventFromString(type_value.string) orelse {
         log.warn("responses.response.ignored_event type={s}", .{type_value.string});
         return;
@@ -1389,6 +1416,35 @@ test "processEvent ignores malformed JSON payloads gracefully" {
     try state.processJson(gpa, "{\"type\": \"response.output_text.delta\", \"delta\":", ai.streamNoop(), &call_seq);
     try std.testing.expectEqual(@as(usize, 0), state.blocks.items.len);
     try std.testing.expectEqual(false, state.terminal.completed);
+}
+
+test "processEvent drops malformed and mistyped events; finish reports ResponseIncomplete" {
+    const gpa = std.testing.allocator;
+    var state: StreamState = .{};
+    defer state.deinit(gpa);
+    defer state.deinitBlocks(gpa);
+
+    var call_seq: u64 = 0;
+
+    // Skip-not-fail policy (#441): junk payloads — malformed JSON, a valid
+    // non-object, a non-string `type`, and a missing `type` — must neither
+    // error mid-stream nor advance any state; the stream then completes and
+    // `finish` surfaces the generic error.ResponseIncomplete because no
+    // terminal event arrived.
+    const junk_events = [_][]const u8{
+        "{broken",
+        "[1,2]",
+        "{\"type\":3}",
+        "{\"code\":7}",
+    };
+    for (junk_events) |event| {
+        try state.processJson(gpa, event, ai.streamNoop(), &call_seq);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.tools.items.len);
+    try std.testing.expect(!state.terminal.isTerminal());
+
+    try std.testing.expectError(error.ResponseIncomplete, state.finish(gpa, &call_seq));
 }
 
 test "processEvent ignores unknown event types without error" {
