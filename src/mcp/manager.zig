@@ -5,6 +5,7 @@ const log = std.log.scoped(.mcp);
 const ai = @import("../ai.zig");
 const config_mod = @import("../config/config.zig");
 const client_mod = @import("client.zig");
+const lifecycle = @import("lifecycle.zig");
 const os = @import("../os.zig");
 
 const assert = std.debug.assert;
@@ -113,8 +114,20 @@ pub const McpManager = struct {
         return null;
     }
 
-    pub fn releaseClient(client: *client_mod.McpClient) void {
-        _ = client.in_flight_requests.fetchSub(1, .acq_rel);
+    /// Drop one `acquireConnectedClient` pin. When the LAST pin leaves,
+    /// close pipes parked by a concurrent `stop` (#450): the pin is taken
+    /// before any capture bracket exists (`acquireConnectedClient`'s
+    /// fetchAdd), so a stop landing mid-acquisition parks the pipes; if the
+    /// bracket then fails BEFORE its own fetchAdd (error.NotConnected), this
+    /// paired release is the only remaining owner of the parked handles —
+    /// they leaked to deinit before. Replicates `releaseStdioTransport`'s
+    /// closing bracket: the atomic decrement never holds `transport_mutex`,
+    /// the zero-crossing closes under it.
+    pub fn releaseClient(client: *client_mod.McpClient, io: std.Io) void {
+        if (client.in_flight_requests.fetchSub(1, .acq_rel) != 1) return;
+        client.transport_mutex.lock(io) catch return;
+        defer client.transport_mutex.unlock(io);
+        lifecycle.closePendingPipesLocked(client, io);
     }
 
     fn transportMatches(c: *const client_mod.McpClient, expanded: config_mod.McpServerConfig) bool {
@@ -1957,9 +1970,32 @@ test "McpManager acquireConnectedClient pins client against retireClient until r
     try std.testing.expectEqual(@as(usize, 0), manager.clients.items.len);
     try std.testing.expectEqual(@as(usize, 1), manager.pending_destroys.items.len);
 
-    McpManager.releaseClient(acquired);
+    McpManager.releaseClient(acquired, io);
     manager.drainPendingDestroys(io);
     try std.testing.expectEqual(@as(usize, 0), manager.pending_destroys.items.len);
+}
+
+test "McpManager releaseClient closes pipes parked by stop while the pin was held (#450)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = McpManager.init(gpa);
+    defer manager.deinit(io);
+
+    var client = try client_mod.initMockClient(gpa, "pin-park", "default");
+    try client.startStdio(io);
+    try client.initialize(io);
+    try manager.addClient(client);
+
+    // Pin the client, then stop: stop sees the pin (in_flight > 0) and
+    // parks the pipes instead of closing them.
+    const acquired = manager.acquireConnectedClient(io, "pin-park").?;
+    acquired.stop(io);
+    try std.testing.expect(acquired.pending_close != null);
+
+    // The paired release is the last owner — it must consume the parked
+    // pipes instead of leaking them until deinit.
+    McpManager.releaseClient(acquired, io);
+    try std.testing.expect(acquired.pending_close == null);
 }
 
 test "McpManager syncFromConfig replaces client when transport config changes (#413)" {

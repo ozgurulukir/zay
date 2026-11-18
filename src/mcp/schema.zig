@@ -263,6 +263,20 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
                             ev_list[p_enum_count] = try gpa.dupe(u8, formatted);
                             p_enum_count += 1;
                         },
+                        .float => |f| {
+                            // Stringify's float formatting stays JSON-round-trippable
+                            // (extreme values included), matching the default-value
+                            // fragment path. Dropping the entry would null the whole
+                            // enum hint for float/bool enums.
+                            ev_list[p_enum_count] = try std.json.Stringify.valueAlloc(gpa, f, .{});
+                            p_enum_count += 1;
+                        },
+                        .bool => |b| {
+                            ev_list[p_enum_count] = try gpa.dupe(u8, if (b) "true" else "false");
+                            p_enum_count += 1;
+                        },
+                        // object/array/null entries stay dropped: their fragment form
+                        // would not survive the flat description annotation.
                         else => continue,
                     }
                 }
@@ -726,6 +740,52 @@ test "schemaFromJsonSchema appends enum values to description and populates enum
     try std.testing.expectEqualStrings("red", ev[0]);
     try std.testing.expectEqualStrings("green", ev[1]);
     try std.testing.expectEqualStrings("blue", ev[2]);
+}
+
+test "schemaFromJsonSchema keeps float and bool enum values (#450)" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{
+        \\  "ratio":{"type":"number","description":"Ratio","enum":[0.25,0.5,0.75]},
+        \\  "enabled":{"type":"boolean","description":"Flag","enum":[true,false]},
+        \\  "mixed":{"enum":["fast",3,null,0.5,true,{"object":true},[1]]}
+        \\}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var schema = try schemaFromJsonSchema(gpa, parsed.value);
+    defer schema.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), schema.properties.len);
+
+    // Float enum: every value survives as its JSON literal.
+    const ratio = schema.properties[0];
+    const ratio_ev = ratio.enum_values orelse return error.MissingEnumValues;
+    try std.testing.expectEqual(@as(usize, 3), ratio_ev.len);
+    try std.testing.expectEqualStrings("0.25", ratio_ev[0]);
+    try std.testing.expectEqualStrings("0.5", ratio_ev[1]);
+    try std.testing.expectEqualStrings("0.75", ratio_ev[2]);
+    try std.testing.expect(std.mem.indexOf(u8, ratio.description, "[enum: 0.25, 0.5, 0.75]") != null);
+
+    // Bool enum: "true"/"false" fragments.
+    const enabled = schema.properties[1];
+    const enabled_ev = enabled.enum_values orelse return error.MissingEnumValues;
+    try std.testing.expectEqual(@as(usize, 2), enabled_ev.len);
+    try std.testing.expectEqualStrings("true", enabled_ev[0]);
+    try std.testing.expectEqualStrings("false", enabled_ev[1]);
+    try std.testing.expect(std.mem.indexOf(u8, enabled.description, "[enum: true, false]") != null);
+
+    // Mixed enum: string/integer/float/bool survive; null/object/array
+    // entries stay dropped (the pre-#450 behavior nulled the WHOLE hint
+    // when only those remained — here the supported values still carry it).
+    const mixed = schema.properties[2];
+    const mixed_ev = mixed.enum_values orelse return error.MissingEnumValues;
+    try std.testing.expectEqual(@as(usize, 4), mixed_ev.len);
+    try std.testing.expectEqualStrings("fast", mixed_ev[0]);
+    try std.testing.expectEqualStrings("3", mixed_ev[1]);
+    try std.testing.expectEqualStrings("0.5", mixed_ev[2]);
+    try std.testing.expectEqualStrings("true", mixed_ev[3]);
 }
 
 test "MCP default fragments round-trip escaped strings and extreme floats" {

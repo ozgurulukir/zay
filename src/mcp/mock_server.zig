@@ -3,7 +3,28 @@
 const std = @import("std");
 
 const protocol_version = "2024-11-05";
-const tool_list = "{\"tools\":[{\"name\":\"greet\",\"description\":\"Say hello\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Name to greet\"}},\"required\":[\"name\"]}}]}";
+const greet_tools_array = "[{\"name\":\"greet\",\"description\":\"Say hello\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Name to greet\"}},\"required\":[\"name\"]}}]";
+const tool_list = "{\"tools\":" ++ greet_tools_array ++ "}";
+
+/// Second page of the `paginated_tools` discovery fixture (#450): one more
+/// tool, no further cursor — a client that follows `nextCursor` must
+/// concatenate BOTH pages.
+const paginated_tool_list_2 = "{\"tools\":[{\"name\":\"farewell\",\"description\":\"Say goodbye\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}]}";
+
+/// The cursor page 1 of the paginated fixture advertises; page 2 is served
+/// only to a client that echoes it back in `params.cursor`.
+const paginated_cursor = "page-2";
+
+/// The id the `server_request` fixture uses for its server-initiated
+/// requests, and the JSON-RPC 2.0 reserved "method not found" code the
+/// client must answer with (spec-mandated value; kept local so this fixture
+/// stays dependency-free).
+const server_request_id: i64 = 900;
+const server_request_method_not_found: i64 = -32601;
+
+/// Milliseconds between the chunks of a `drip` response: short enough that
+/// the test stays fast, long enough that a client's poll loop sees the gap.
+const drip_chunk_gap_ms: i64 = 15;
 
 /// Comptime-collapse a multiline JSON literal into the single line the stdio
 /// transport requires — JSON-RPC responses are newline-delimited. Raw
@@ -60,6 +81,11 @@ const Mode = enum {
     hang,
     partial,
     rich_schema,
+    drip,
+    server_request,
+    late_response,
+    paginated_tools,
+    paginated_tools_broken,
 };
 
 pub fn parseMode(mode_name: ?[]const u8) !Mode {
@@ -97,6 +123,39 @@ pub fn processRequests(
             try writeRaw(writer, "{\"jsonrpc\":\"2.0\",\"id\":");
             while (true) io.sleep(.fromSeconds(1), .awake) catch {};
         }
+        if (mode == .server_request) {
+            // Emulate a server-initiated request (method + id) ahead of the
+            // response (#450): a conforming client replies with a JSON-RPC
+            // "method not found" error and keeps waiting for the real
+            // response. A client that misclassifies the request as a
+            // response never answers, so the mock fails and the handshake
+            // with it.
+            try writeLine(writer, "{\"jsonrpc\":\"2.0\",\"id\":900,\"method\":\"sampling/createMessage\",\"params\":{}}");
+            const reply = (try readLine(gpa, reader)) orelse return error.MissingErrorReply;
+            defer gpa.free(reply);
+            const reply_parsed = std.json.parseFromSlice(std.json.Value, gpa, reply, .{}) catch return error.InvalidErrorReply;
+            defer reply_parsed.deinit();
+            if (reply_parsed.value != .object) return error.InvalidErrorReply;
+            const reply_obj = reply_parsed.value.object;
+            const reply_id = reply_obj.get("id") orelse return error.InvalidErrorReply;
+            if (reply_id != .integer or reply_id.integer != server_request_id) return error.InvalidErrorReply;
+            const reply_error = reply_obj.get("error") orelse return error.InvalidErrorReply;
+            if (reply_error != .object) return error.InvalidErrorReply;
+            const reply_code = reply_error.object.get("code") orelse return error.InvalidErrorReply;
+            if (reply_code != .integer or reply_code.integer != server_request_method_not_found) return error.InvalidErrorReply;
+        }
+        if (mode == .late_response) {
+            // A decoy response for the PREVIOUS request id first (#450): a
+            // client matching by order misattributes it; matching by id
+            // skips it and waits for the real response.
+            const decoy = try std.fmt.allocPrint(
+                gpa,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{}}}}",
+                .{id_value.integer - 1},
+            );
+            defer gpa.free(decoy);
+            try writeLine(writer, decoy);
+        }
 
         if (std.mem.eql(u8, method, "initialize")) {
             const list_changed = mode == .list_changed or mode == .interleaved;
@@ -117,14 +176,17 @@ pub fn processRequests(
             try response_writer.writer.writeAll("}}}}");
             const response = try response_writer.toOwnedSlice();
             defer gpa.free(response);
-            try writeLine(writer, response);
+            try writeResponseLine(io, mode, writer, response);
         } else if (std.mem.eql(u8, method, "tools/list")) {
             if (mode == .interleaved and !saw_tools_list) {
                 try writeLine(writer, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}");
             }
+            const first_tools_list = !saw_tools_list;
             saw_tools_list = true;
             if (mode == .malformed_tools) {
                 try writeLine(writer, "this is not json");
+            } else if (mode == .paginated_tools or mode == .paginated_tools_broken) {
+                try writePaginatedToolsPage(gpa, mode, &object, first_tools_list, id_value.integer, writer);
             } else {
                 const list = if (mode == .rich_schema) rich_tool_list else tool_list;
                 const response = try std.fmt.allocPrint(
@@ -133,7 +195,7 @@ pub fn processRequests(
                     .{ id_value.integer, list },
                 );
                 defer gpa.free(response);
-                try writeLine(writer, response);
+                try writeResponseLine(io, mode, writer, response);
             }
         } else if (std.mem.eql(u8, method, "tools/call")) {
             const response = try std.fmt.allocPrint(
@@ -142,7 +204,7 @@ pub fn processRequests(
                 .{id_value.integer},
             );
             defer gpa.free(response);
-            try writeLine(writer, response);
+            try writeResponseLine(io, mode, writer, response);
         } else {
             const response = try std.fmt.allocPrint(
                 gpa,
@@ -150,9 +212,68 @@ pub fn processRequests(
                 .{id_value.integer},
             );
             defer gpa.free(response);
-            try writeLine(writer, response);
+            try writeResponseLine(io, mode, writer, response);
         }
     }
+}
+
+/// Serve one `tools/list` page for the paginated fixtures (#450): page 1 is
+/// the greet list plus `nextCursor: page-2`; page 2 is served only to a
+/// client that echoes that cursor back in `params.cursor`, and is garbage
+/// in the `_broken` variant so the fetch fails mid-pagination.
+fn writePaginatedToolsPage(
+    gpa: std.mem.Allocator,
+    mode: Mode,
+    object: *const std.json.ObjectMap,
+    first_page: bool,
+    request_id: i64,
+    writer: anytype,
+) !void {
+    if (first_page) {
+        // `nextCursor` lives INSIDE the result object per the MCP tools/list
+        // pagination contract.
+        const response = try std.fmt.allocPrint(
+            gpa,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":{s},\"nextCursor\":\"{s}\"}}}}",
+            .{ request_id, greet_tools_array, paginated_cursor },
+        );
+        defer gpa.free(response);
+        return writeLine(writer, response);
+    }
+    // Continuation page: require the client to send back the cursor page 1
+    // advertised — a null-params re-request can never reach this branch.
+    const cursor_ok = blk: {
+        const params = object.get("params") orelse break :blk false;
+        if (params != .object) break :blk false;
+        const cursor = params.object.get("cursor") orelse break :blk false;
+        break :blk cursor == .string and std.mem.eql(u8, cursor.string, paginated_cursor);
+    };
+    if (!cursor_ok) return error.InvalidCursor;
+    if (mode == .paginated_tools_broken) {
+        return writeLine(writer, "this is not json");
+    }
+    const response = try std.fmt.allocPrint(
+        gpa,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}",
+        .{ request_id, paginated_tool_list_2 },
+    );
+    defer gpa.free(response);
+    return writeLine(writer, response);
+}
+
+/// Write one newline-delimited response line. In `drip` mode the line is
+/// split into two chunks with sleeps between (#450): a client must keep
+/// making progress on a flowing partial line without tripping its deadline,
+/// which is exactly the per-chunk budget re-check the bounded line reader
+/// performs.
+fn writeResponseLine(io: std.Io, mode: Mode, writer: anytype, line: []const u8) !void {
+    if (mode != .drip) return writeLine(writer, line);
+    const half = line.len / 2;
+    try writeRaw(writer, line[0..half]);
+    io.sleep(.fromMilliseconds(drip_chunk_gap_ms), .awake) catch {};
+    try writeRaw(writer, line[half..]);
+    io.sleep(.fromMilliseconds(drip_chunk_gap_ms), .awake) catch {};
+    try writeRaw(writer, "\n");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -213,6 +334,11 @@ test "parseMode_returnsExpectedMode_whenGivenValidString" {
     try std.testing.expectEqual(Mode.hang, try parseMode("hang"));
     try std.testing.expectEqual(Mode.partial, try parseMode("partial"));
     try std.testing.expectEqual(Mode.rich_schema, try parseMode("rich_schema"));
+    try std.testing.expectEqual(Mode.drip, try parseMode("drip"));
+    try std.testing.expectEqual(Mode.server_request, try parseMode("server_request"));
+    try std.testing.expectEqual(Mode.late_response, try parseMode("late_response"));
+    try std.testing.expectEqual(Mode.paginated_tools, try parseMode("paginated_tools"));
+    try std.testing.expectEqual(Mode.paginated_tools_broken, try parseMode("paginated_tools_broken"));
 }
 
 test "parseMode_returnsInvalidMode_whenGivenUnknownString" {
@@ -336,6 +462,11 @@ test "modeEnum_parsesValidModesAndRejectsInvalid" {
     try std.testing.expectEqual(Mode.hang, std.meta.stringToEnum(Mode, "hang"));
     try std.testing.expectEqual(Mode.partial, std.meta.stringToEnum(Mode, "partial"));
     try std.testing.expectEqual(Mode.rich_schema, std.meta.stringToEnum(Mode, "rich_schema"));
+    try std.testing.expectEqual(Mode.drip, std.meta.stringToEnum(Mode, "drip"));
+    try std.testing.expectEqual(Mode.server_request, std.meta.stringToEnum(Mode, "server_request"));
+    try std.testing.expectEqual(Mode.late_response, std.meta.stringToEnum(Mode, "late_response"));
+    try std.testing.expectEqual(Mode.paginated_tools, std.meta.stringToEnum(Mode, "paginated_tools"));
+    try std.testing.expectEqual(Mode.paginated_tools_broken, std.meta.stringToEnum(Mode, "paginated_tools_broken"));
 
     try std.testing.expectEqual(@as(?Mode, null), std.meta.stringToEnum(Mode, "nonexistent"));
     try std.testing.expectEqual(@as(?Mode, null), std.meta.stringToEnum(Mode, "DEFAULT"));
@@ -436,4 +567,19 @@ test "toolList_containsValidJsonAndGreetTool" {
     const greet_tool = tools_val.?.array.items[0].object;
     try std.testing.expectEqualStrings("greet", greet_tool.get("name").?.string);
     try std.testing.expectEqualStrings("Say hello", greet_tool.get("description").?.string);
+}
+
+test "paginatedToolList2_isValidJsonWithFarewellTool" {
+    // Arrange & Act — the second page of the paginated discovery fixture.
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, paginated_tool_list_2, .{});
+    defer parsed.deinit();
+
+    // Assert
+    try std.testing.expect(parsed.value == .object);
+    const tools_val = parsed.value.object.get("tools").?;
+    try std.testing.expectEqual(@as(usize, 1), tools_val.array.items.len);
+    const farewell_tool = tools_val.array.items[0].object;
+    try std.testing.expectEqualStrings("farewell", farewell_tool.get("name").?.string);
+    try std.testing.expectEqualStrings("Say goodbye", farewell_tool.get("description").?.string);
 }

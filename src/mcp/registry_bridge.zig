@@ -68,7 +68,7 @@ pub fn runMcpTool(
 
     const client = manager.acquireConnectedClient(io, key.server_name) orelse
         return tools_common.fail(gpa, "MCP server not found", 1);
-    defer @import("manager.zig").McpManager.releaseClient(client);
+    defer @import("manager.zig").McpManager.releaseClient(client, io);
 
     const result_text = client.callTool(io, key.tool_name, server_args) catch |err| {
         return tools_common.failFmt(gpa, 1, "MCP tool '{s}' failed: {s}", .{ key.tool_name, @errorName(err) });
