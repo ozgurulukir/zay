@@ -73,7 +73,7 @@ Each entry in `mcpServers` is keyed by server name:
 | `command` | `string`   | Executable for stdio transport.                                                                                    |
 | `args`    | `string[]` | Command arguments for stdio transport.                                                                             |
 | `url`     | `string`   | Endpoint URL for remote Streamable HTTP transport.                                                                 |
-| `headers` | `object`   | Extra HTTP headers for remote servers (string values), e.g. API keys for header-auth servers like Context7.        |
+| `headers` | `object`   | Extra HTTP headers for remote servers (string values), e.g. API keys for header-auth servers like Context7. Names must be non-empty single-line tokens (no `:`, whitespace, or line breaks); values must not contain line breaks — before or after `{env:VAR}` expansion. Invalid entries are **dropped at load** with a warning naming the server and header (CR/LF header-injection guard, #405); an empty post-expansion value (e.g. an unset `{env:VAR}`) is allowed. |
 | `type`    | `string`   | Optional transport discriminator (`"stdio"`/`"remote"`) for compatibility with other MCP clients; Zay ignores it. |
 | `enabled` | `boolean`  | Whether this server is active (default `true`).                                                                    |
 | `requestTimeoutMs` | `integer` | Per-server request timeout in milliseconds (default `30000`). Applied to the stdio read poll and the remote HTTP socket timeouts; values below 1 are clamped to 1 at use. |
