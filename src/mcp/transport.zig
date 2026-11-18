@@ -79,6 +79,29 @@ pub fn formatNotification(gpa: std.mem.Allocator, method: []const u8, params_jso
     return out.toOwnedSlice();
 }
 
+/// JSON-RPC 2.0 reserved code for "the method does not exist". Spec-mandated
+/// value, used to decline server-initiated requests (#450).
+pub const method_not_found_code: i64 = -32601;
+
+/// Format a JSON-RPC 2.0 error response declining a server-initiated request
+/// (#450): Zay is a client only and implements no server-requestable
+/// methods, so every request the server pushes gets "method not found" —
+/// otherwise a server waiting on its request can stall its write side.
+pub fn formatErrorResponse(gpa: std.mem.Allocator, id: i64, method: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // The whole message is one JSON string — Stringify owns the quoting and
+    // escaping (embedding a second quote layer would terminate the string
+    // mid-value and invalidate the frame).
+    const message = try std.fmt.allocPrint(gpa, "Method not found: {s}", .{method});
+    defer gpa.free(message);
+    try out.writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":", .{ id, method_not_found_code });
+    try std.json.Stringify.value(message, .{}, &out.writer);
+    try out.writer.writeAll("}}\n");
+    return out.toOwnedSlice();
+}
+
 /// Parse a JSON-RPC 2.0 message line into a parsed JSON Value tree.
 pub fn parseMessage(gpa: std.mem.Allocator, line: []const u8) !std.json.Parsed(std.json.Value) {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
@@ -101,6 +124,15 @@ pub fn parseMessage(gpa: std.mem.Allocator, line: []const u8) !std.json.Parsed(s
 /// errors rather than letting a misbehaving server stream unbounded work.
 pub const sse_event_max: u32 = 100_000;
 pub const sse_data_bytes_max: u32 = 64 * 1024 * 1024;
+
+/// Aggregate bounds on the server notifications accumulated while one SSE
+/// response is being searched for (#450). The per-event bounds alone allowed
+/// `sse_event_max` events of `sse_data_bytes_max` each — ~100 GB — to pile
+/// up in memory when a server streams notifications but never the response.
+/// The byte cap equals the single-event cap: total notification traffic
+/// during one response read never exceeds what one event may cost.
+pub const sse_notification_max: u32 = 10_000;
+pub const sse_notification_bytes_max: u32 = sse_data_bytes_max;
 
 /// The classification of one raw SSE line. Returned slices borrow the input.
 pub const SseLine = union(enum) {
@@ -151,18 +183,28 @@ fn readSseLine(gpa: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize)
     return try line.toOwnedSlice();
 }
 
+/// Extract the JSON-RPC response `id` from a payload, or null when the
+/// payload is not a response with an integer `id` (notifications and
+/// server-initiated requests carry a `method`; malformed input parses to
+/// nothing). Shared by the SSE matcher and the HTTP JSON-body id check
+/// (#450): both must answer "does this message belong to request N".
+pub fn responseId(gpa: std.mem.Allocator, payload: []const u8) ?i64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    if (obj.get("method") != null) return null;
+    const id_val = obj.get("id") orelse return null;
+    if (id_val != .integer) return null;
+    return id_val.integer;
+}
+
 /// True when `payload` is a JSON-RPC **response** (has an `id`, a `result` or
 /// `error`, and no `method`) whose `id` equals `request_id`. Server-initiated
 /// requests/notifications carry a `method` and are rejected here.
 fn isResponseForId(gpa: std.mem.Allocator, payload: []const u8, request_id: i64) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const obj = parsed.value.object;
-    if (obj.get("method") != null) return false;
-    const id_val = obj.get("id") orelse return false;
-    if (id_val != .integer) return false;
-    return id_val.integer == request_id;
+    const id = responseId(gpa, payload) orelse return false;
+    return id == request_id;
 }
 
 /// If `payload` is a server-initiated notification (has `method`, no `id`),
@@ -188,12 +230,36 @@ fn extractNotification(gpa: std.mem.Allocator, payload: []const u8) ?Notificatio
 /// frees). Events of type other than `message` (or the default empty type) are
 /// skipped. Server-initiated notifications (method, no id) are appended to
 /// `notifications` (owned, caller frees each entry) so the caller can route
-/// them. Bounded by `sse_event_max` / `sse_data_bytes_max`.
+/// them. Bounded by `sse_event_max` / `sse_data_bytes_max` per event and by
+/// the aggregate notification caps (#450): a server that streams
+/// notifications but never the response errors out instead of piling up
+/// unbounded memory.
 pub fn readSseResponse(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
     request_id: i64,
     notifications: *std.ArrayList(Notification),
+) ![]u8 {
+    return readSseResponseBounded(
+        gpa,
+        reader,
+        request_id,
+        notifications,
+        sse_notification_max,
+        sse_notification_bytes_max,
+    );
+}
+
+/// Core of `readSseResponse` with explicit aggregate notification caps —
+/// the public wrapper freezes the call sites; tests exercise the caps with
+/// small values so the flood path stays cheap to run.
+fn readSseResponseBounded(
+    gpa: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    request_id: i64,
+    notifications: *std.ArrayList(Notification),
+    notification_count_max: u32,
+    notification_bytes_max: usize,
 ) ![]u8 {
     var event_type: std.ArrayList(u8) = .empty;
     defer event_type.deinit(gpa);
@@ -201,6 +267,8 @@ pub fn readSseResponse(
     defer data.deinit(gpa);
 
     var events_seen: u32 = 0;
+    var notifications_seen: u32 = 0;
+    var notification_bytes_total: usize = 0;
     while (events_seen < sse_event_max) {
         const line = (try readSseLine(gpa, reader, sse_data_bytes_max)) orelse return error.McpStreamEndedEarly;
         defer gpa.free(line);
@@ -224,9 +292,23 @@ pub fn readSseResponse(
                         return try gpa.dupe(u8, data.items);
                     }
                     // Not our response — record it as a notification if it
-                    // has a method and no id; otherwise drop silently.
-                    if (extractNotification(gpa, data.items)) |n| {
-                        try notifications.append(gpa, n);
+                    // has a method and no id; otherwise drop silently. The
+                    // aggregate caps bound what a notification-flooding
+                    // server can make us hold (#450).
+                    if (extractNotification(gpa, data.items)) |extracted| {
+                        var n = extracted;
+                        const next_count = notifications_seen + 1;
+                        const next_bytes = notification_bytes_total + n.payload.len + n.method.len;
+                        if (next_count > notification_count_max or next_bytes > notification_bytes_max) {
+                            n.deinit(gpa);
+                            return error.McpStreamTooLarge;
+                        }
+                        notifications.append(gpa, n) catch {
+                            n.deinit(gpa);
+                            return error.OutOfMemory;
+                        };
+                        notifications_seen = next_count;
+                        notification_bytes_total = next_bytes;
                     }
                 }
                 event_type.clearRetainingCapacity();
@@ -551,4 +633,85 @@ test "readSseResponse aborts with McpStreamTooLarge on oversized event type (#41
         notifications.deinit(gpa);
     }
     try std.testing.expectError(error.McpStreamTooLarge, readSseResponse(gpa, &reader, 1, &notifications));
+}
+
+// ---------------------------------------------------------------------------
+// Response-id matching and server-request decline (#450)
+// ---------------------------------------------------------------------------
+
+test "responseId extracts the id from responses and rejects everything else" {
+    const gpa = std.testing.allocator;
+
+    // A response (result or error, no method) carries its id.
+    try std.testing.expectEqual(@as(?i64, 7), responseId(gpa, "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}"));
+    try std.testing.expectEqual(@as(?i64, 7), responseId(gpa, "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":1,\"message\":\"x\"}}"));
+
+    // Notifications and server-initiated requests carry a method — never ours.
+    try std.testing.expectEqual(@as(?i64, null), responseId(gpa, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}"));
+    try std.testing.expectEqual(@as(?i64, null), responseId(gpa, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\"}"));
+
+    // Malformed or non-integer ids cannot be matched.
+    try std.testing.expectEqual(@as(?i64, null), responseId(gpa, "this is not json"));
+    try std.testing.expectEqual(@as(?i64, null), responseId(gpa, "{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"result\":{}}"));
+    try std.testing.expectEqual(@as(?i64, null), responseId(gpa, "{\"jsonrpc\":\"2.0\",\"result\":{}}"));
+}
+
+test "formatErrorResponse declines a server request with the spec method-not-found code" {
+    const gpa = std.testing.allocator;
+    const reply = try formatErrorResponse(gpa, 900, "sampling/createMessage");
+    defer gpa.free(reply);
+
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"id\":900") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"code\":-32601") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Method not found") != null);
+    // The method name is JSON-escaped and the frame is newline-terminated.
+    try std.testing.expect(std.mem.indexOf(u8, reply, "sampling/createMessage") != null);
+    try std.testing.expect(std.mem.endsWith(u8, reply, "\"}}\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate notification flood caps (#450)
+// ---------------------------------------------------------------------------
+
+test "readSseResponse aborts when notifications flood past the aggregate count cap (#450)" {
+    const gpa = std.testing.allocator;
+    // Each notification is tiny — the per-event bounds never fire; the
+    // aggregate COUNT cap does. Building the stream past the cap proves the
+    // reader errors instead of accumulating unbounded work.
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+    const notification = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
+    const count_max = sse_notification_max + 1;
+    try stream.ensureTotalCapacity(gpa, notification.len * count_max);
+    var i: u32 = 0;
+    while (i < count_max) : (i += 1) try stream.appendSlice(gpa, notification);
+
+    var reader: std.Io.Reader = .fixed(stream.items);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    try std.testing.expectError(error.McpStreamTooLarge, readSseResponse(gpa, &reader, 1, &notifications));
+}
+
+test "readSseResponse aborts when notification bytes flood past the aggregate byte cap (#450)" {
+    const gpa = std.testing.allocator;
+    // Two fat notifications against a small test bound on the core reader:
+    // the accumulated BYTES exceed the cap long before the count does.
+    const bytes_max: usize = 64 * 1024;
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+    const event = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"blob\":\"" ++ ("x" ** (48 * 1024)) ++ "\"}}\n\n";
+    try stream.appendSlice(gpa, event);
+    try stream.appendSlice(gpa, event);
+    try stream.appendSlice(gpa, event);
+
+    var reader: std.Io.Reader = .fixed(stream.items);
+    var notifications: std.ArrayList(Notification) = .empty;
+    defer {
+        for (notifications.items) |*n| n.deinit(gpa);
+        notifications.deinit(gpa);
+    }
+    try std.testing.expectError(error.McpStreamTooLarge, readSseResponseBounded(gpa, &reader, 1, &notifications, sse_notification_max, bytes_max));
 }
