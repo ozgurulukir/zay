@@ -19,6 +19,32 @@ pub const timeout_seconds_default: u32 = 30;
 pub const timeout_seconds_max: u32 = 300;
 pub const response_max_bytes_default: usize = 16 * 1024 * 1024;
 
+/// True when `host` is a loopback endpoint (`localhost`, `[::1]`, or an IPv4
+/// address in `127.0.0.0/8`). Every database adapter attaches an
+/// `Authorization: Bearer` header through this transport, so plain-HTTP
+/// endpoints are only accepted when the destination is loopback (INV-DB-LOOPBACK-IPV4,
+/// #409: the old `127.` prefix match let `http://127.evil.com` pass and send
+/// the token in cleartext).
+pub fn isLoopbackHost(host: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (std.ascii.eqlIgnoreCase(host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
+    const ip4 = std.Io.net.Ip4Address.parse(host, 0) catch return false;
+    return ip4.bytes[0] == 127;
+}
+
+test "isLoopbackHost accepts loopback spellings and rejects lookalikes" {
+    try std.testing.expect(isLoopbackHost("localhost"));
+    try std.testing.expect(isLoopbackHost("LOCALHOST"));
+    try std.testing.expect(isLoopbackHost("127.0.0.1"));
+    try std.testing.expect(isLoopbackHost("127.9.9.9"));
+    try std.testing.expect(isLoopbackHost("::1"));
+    try std.testing.expect(isLoopbackHost("[::1]"));
+    try std.testing.expect(!isLoopbackHost("127.evil.com"));
+    try std.testing.expect(!isLoopbackHost("db.example.com"));
+    try std.testing.expect(!isLoopbackHost("128.0.0.1"));
+    try std.testing.expect(!isLoopbackHost(""));
+}
+
 pub const Options = struct {
     method: std.http.Method,
     url: []const u8,

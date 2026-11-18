@@ -82,18 +82,11 @@ pub fn pipelineUrl(allocator: std.mem.Allocator, raw_url: []const u8) ![]u8 {
         // Always accepted.
     } else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
         // Plain HTTP is only permitted for loopback endpoints.
-        if (!isLoopbackHost(host)) return error.UnsupportedScheme;
+        if (!remote_http.isLoopbackHost(host)) return error.UnsupportedScheme;
     } else {
         return error.UnsupportedScheme;
     }
     return candidate;
-}
-
-fn isLoopbackHost(host: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
-    if (std.ascii.eqlIgnoreCase(host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
-    const ip4 = std.Io.net.Ip4Address.parse(host, 0) catch return false;
-    return ip4.bytes[0] == 127;
 }
 
 pub const Client = struct {

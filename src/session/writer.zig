@@ -378,7 +378,11 @@ pub const SessionWriter = struct {
             self.thread = null;
         }
         if (self.write_failure) |failure| return failure;
-        while (self.entry_queue.pop(self.queue)) |entry| {
+        // The drain uses the same mutex discipline as the writer thread
+        // (`takeQueuedEntry`): enqueue pushes under the mutex, so an
+        // unprotected pop here could race a model switch that enqueues
+        // mid-turn (#446).
+        while (takeQueuedEntry(self)) |entry| {
             var owned = entry;
             writeQueuedEntry(self, &owned) catch |err| {
                 self.recordFailure(owned, err);
@@ -455,27 +459,15 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
     assert(entry.kind.len > 0);
     assert(entry.payload_json.len > 0);
 
+    // Both backend families commit the entry insert, leaf update, and
+    // optional first title as ONE unit: remotely via the atomic batch,
+    // locally inside `insertEntryWithParentAndTitle`'s own transaction
+    // (#446). On any failure the in-memory leaf is untouched — the session
+    // layer only advances `leaf_entry_id` after its writes commit.
     const should_write_title = !writer.title_written and entry.title_candidate != null;
-    if (writer.manager.backend.kind != .local_sqlite) {
-        var id: [entry_id_len]u8 = undefined;
-        const title = if (should_write_title) entry.title_candidate else null;
-        try writer.session.appendQueuedPayload(entry.kind, entry.role, entry.payload_json, title, &id);
-        if (should_write_title) writer.title_written = true;
-        return;
-    }
-
-    const previous_leaf = writer.session.leaf_entry_id;
-    try writer.manager.backend.beginTransaction(writer.io);
-    errdefer {
-        writer.manager.backend.rollbackTransaction(writer.io) catch {};
-        writer.session.leaf_entry_id = previous_leaf;
-    }
-
     var id: [entry_id_len]u8 = undefined;
-    try writer.session.appendPayload(entry.kind, entry.role, entry.payload_json, &id);
-    if (should_write_title) try writer.session.setTitle(entry.title_candidate.?);
-
-    try writer.manager.backend.commitTransaction(writer.io);
+    const title = if (should_write_title) entry.title_candidate else null;
+    try writer.session.appendQueuedPayload(entry.kind, entry.role, entry.payload_json, title, &id);
     if (should_write_title) writer.title_written = true;
 }
 
@@ -514,6 +506,36 @@ test "session writer failure preserves ordering and refuses incomplete reproject
     for ([_]session_mod.BackendKind{ .local_sqlite, .remote_service, .turso_http, .d1_http }) |kind| {
         try testWriteFailure(kind);
     }
+}
+
+// #446: entries enqueued while the writer thread is stopped are drained by
+// `quiesce` through `takeQueuedEntry` — the same mutex discipline the thread
+// path uses — so a model switch that pushes mid-turn cannot race the drain.
+test "quiesce drains entries enqueued while the writer thread is stopped" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    const session = try manager.create("/tmp/zay", .{});
+    var writer: SessionWriter = undefined;
+    try writer.initWithSession(gpa, std.testing.io, manager, session, 4);
+    defer writer.deinit();
+
+    // `initWithSession` never started a thread: only the mutex-held push
+    // (enqueue) and the quiesce drain's locked pop touch the queue.
+    try writer.recordUsage(.{ .input_tokens = 10, .output_tokens = 2, .total_tokens = 12 });
+    try writer.recordUsage(.{ .input_tokens = 20, .output_tokens = 4, .total_tokens = 24 });
+    try std.testing.expectEqual(@as(u32, 2), writer.entry_queue.len());
+
+    try writer.quiesce();
+    try std.testing.expectEqual(@as(u32, 0), writer.entry_queue.len());
+
+    const entries = try writer.session.entries(gpa);
+    defer {
+        for (entries) |*record| record.deinit(gpa);
+        gpa.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("request_usage", entries[0].kind);
+    try std.testing.expectEqualStrings("request_usage", entries[1].kind);
 }
 
 fn testWriteFailure(kind: session_mod.BackendKind) !void {
