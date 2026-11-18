@@ -78,10 +78,18 @@ pub fn freeHeaders(gpa: std.mem.Allocator, headers: []McpHeader) void {
 pub const McpServerConfig = struct {
     name: []u8,
     enabled: bool = true,
+    /// Tracks whether the config layer explicitly supplied `enabled` (#447).
+    /// Parse sets it only when the JSON key was present; the merge overlay
+    /// applies `enabled` only when the flag is set, so a layer that re-lists
+    /// a server without the key no longer resets it to the parse default
+    /// (true) and can no longer clobber a lower layer's disabled server.
+    /// Hand-built toggle-style updates set the flag explicitly.
+    enabled_is_set: bool = false,
     /// Per-server request timeout in milliseconds (post-connect I/O only —
     /// the connect phase is not bounded). `null` → the client's default (30s).
     /// Applied as SO_RCVTIMEO/SO_SNDTIMEO for the Streamable HTTP transport
-    /// and as the stdio poll timeout.
+    /// and as the stdio poll timeout. `null` means "not specified", which the
+    /// merge overlay treats as "inherit" (no flag needed).
     request_timeout_ms: ?u32 = null,
     /// How the server is reached. Variants make illegal combinations
     /// unrepresentable: a stdio server must have command+args, an sse
@@ -152,6 +160,7 @@ pub const McpServerConfig = struct {
         return .{
             .name = name,
             .enabled = self.enabled,
+            .enabled_is_set = self.enabled_is_set,
             .request_timeout_ms = self.request_timeout_ms,
             .transport = transport,
         };
@@ -166,6 +175,11 @@ pub fn mcpServerFromUrl(gpa: std.mem.Allocator, name: []const u8, raw_url: []con
     return .{
         .name = try gpa.dupe(u8, name),
         .enabled = true,
+        // The add-server flow constructs the server explicitly enabled and
+        // persists it through the merge overlay: carrying the flag lets that
+        // overlay re-enable a lower layer's disabled server with the same
+        // name (the pre-#447 behavior for re-adding a server by URL).
+        .enabled_is_set = true,
         .transport = .{ .sse = .{ .url = try gpa.dupe(u8, raw_url) } },
     };
 }

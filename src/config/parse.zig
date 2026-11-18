@@ -52,10 +52,12 @@ const LoadResult = config_mod.LoadResult;
 const LoadedConfig = config_mod.LoadedConfig;
 
 /// Default `TuiSettings` — the single source for the "still at its default?"
-/// sentinels in `applyTuiOverlay`, `hasNonDefaultTui`, and `writeTui` (same
-/// idiom as `d` in `hasNonDefaultContext`). Field initializers live in
-/// `config.zig`; comparing against `default_tui.<field>` instead of re-typed
-/// literals keeps serialization in lockstep when a default changes.
+/// sentinels in `hasNonDefaultTui` and `writeTui` (same idiom as `d` in
+/// `hasNonDefaultContext`). Field initializers live in `config.zig`;
+/// comparing against `default_tui.<field>` instead of re-typed literals
+/// keeps serialization in lockstep when a default changes. The merge overlay
+/// does NOT compare against it: since #447 it gates on the per-field
+/// `<field>_is_set` presence flags instead.
 const default_tui: TuiSettings = .{};
 
 /// Floor for `overrideContextWindow`/`contextWindow` parses — values below a
@@ -86,6 +88,11 @@ pub const max_system_prompt_chars: usize = 10_000;
 /// Oversized settings are dropped with a diagnostic; the plugin still loads
 /// unconfigured (schema `maxLength: 65536` on the string branch).
 const max_plugin_settings_bytes: usize = 65_536;
+/// Max config file size accepted by `loadFile`. Enforced on the READ result,
+/// not via the stat's size: the file can grow between the stat and the read,
+/// and a stat-sized buffer previously turned that race into a misleading
+/// EndOfStream diagnostic instead of FileTooBig (#447).
+const max_config_bytes: usize = 32 * 1024;
 
 const Provider = provider_types.Provider;
 const AdapterKind = provider_types.AdapterKind;
@@ -244,7 +251,6 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // Legacy fields: apply individual field overrides.
         if (updates.provider_name) |s| try replaceOptionalSlice(gpa, &target.provider_name, s);
         if (updates.use_responses_endpoint) |v| target.use_responses_endpoint = v;
-        if (updates.strict_outputs) |v| target.strict_outputs = v;
         if (updates.base_url) |s| try replaceOptionalSlice(gpa, &target.base_url, s);
         if (updates.api_key) |s| try replaceOptionalSlice(gpa, &target.api_key, s);
         try applyTextOverlay(gpa, &target.bash_classifier_url, updates.bash_classifier_url);
@@ -257,6 +263,12 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // (which prefers model_selection) picks up the changes.
         try syncModelSelectionFromLegacy(gpa, target);
     }
+    // `strict_outputs` is a global setting carried OUTSIDE model_selection
+    // (ModelSelection has no such field; serialize reads it from `config` in
+    // both branches). It must overlay unconditionally — applying it only in
+    // the legacy branch dropped it from every in-memory merge whose updates
+    // carried a hand-built model_selection.
+    if (updates.strict_outputs) |v| target.strict_outputs = v;
     try applyTextOverlay(gpa, &target.database_server_url, updates.database_server_url);
     try applyTextOverlay(gpa, &target.database_auth_token, updates.database_auth_token);
     try applyDatabaseOverlay(gpa, &target.database, updates.database);
@@ -310,33 +322,73 @@ fn applyToastOverlay(gpa: std.mem.Allocator, target: *Config, updates: ToastSett
     }
 }
 
-/// Merge TUI settings: non-default values in `updates` override `target`.
+/// Merge TUI settings: presence-gated (#447). A parsed layer sets
+/// `<field>_is_set` only for keys its JSON carried, so an all-default
+/// `updates` (partial config writes) leaves the target's stored settings
+/// intact, and a higher layer that writes a default value explicitly can
+/// restore it over a lower layer's non-default value — something the old
+/// compare-against-built-in-default gate could never express.
 /// `custom_themes_dir` is owned by `updates`; when it changes, the target's
 /// old value is freed and the new one is duped.
 fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings) !void {
-    // Only non-default values override — a default `updates` must leave the
-    // target's stored settings intact (unrelated partial config writes route
-    // through here with an all-default `tui`).
-    if (updates.theme_live_preview != default_tui.theme_live_preview) target.tui.theme_live_preview = updates.theme_live_preview;
+    // Applying a flagged field marks the target's flag too, so serialize
+    // keeps the merged value alive across a save.
+    if (updates.theme_live_preview_is_set) {
+        target.tui.theme_live_preview = updates.theme_live_preview;
+        target.tui.theme_live_preview_is_set = true;
+    }
     if (updates.custom_themes_dir) |s| {
         if (target.tui.custom_themes_dir) |old| gpa.free(old);
         target.tui.custom_themes_dir = try gpa.dupe(u8, s);
     }
-    if (updates.fuzzy_highlight != default_tui.fuzzy_highlight) target.tui.fuzzy_highlight = updates.fuzzy_highlight;
-    if (updates.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) target.tui.fuzzy_highlight_style = updates.fuzzy_highlight_style;
-    // Layout + telemetry knobs: only non-default values override.
-    if (updates.split_mode != default_tui.split_mode) target.tui.split_mode = updates.split_mode;
-    if (updates.min_split_width != default_tui.min_split_width) target.tui.min_split_width = updates.min_split_width;
-    if (updates.highlight_focused_border != default_tui.highlight_focused_border) target.tui.highlight_focused_border = updates.highlight_focused_border;
-    if (updates.show_token_velocity != default_tui.show_token_velocity) target.tui.show_token_velocity = updates.show_token_velocity;
-    if (updates.show_context_meter != default_tui.show_context_meter) target.tui.show_context_meter = updates.show_context_meter;
-    if (updates.show_skill_inventory != default_tui.show_skill_inventory) target.tui.show_skill_inventory = updates.show_skill_inventory;
-    if (updates.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) target.tui.velocity_smoothing_alpha = updates.velocity_smoothing_alpha;
-    if (updates.context_threshold_warn != default_tui.context_threshold_warn) target.tui.context_threshold_warn = updates.context_threshold_warn;
-    if (updates.context_threshold_alert != default_tui.context_threshold_alert) target.tui.context_threshold_alert = updates.context_threshold_alert;
+    if (updates.fuzzy_highlight_is_set) {
+        target.tui.fuzzy_highlight = updates.fuzzy_highlight;
+        target.tui.fuzzy_highlight_is_set = true;
+    }
+    if (updates.fuzzy_highlight_style_is_set) {
+        target.tui.fuzzy_highlight_style = updates.fuzzy_highlight_style;
+        target.tui.fuzzy_highlight_style_is_set = true;
+    }
+    if (updates.split_mode_is_set) {
+        target.tui.split_mode = updates.split_mode;
+        target.tui.split_mode_is_set = true;
+    }
+    if (updates.min_split_width_is_set) {
+        target.tui.min_split_width = updates.min_split_width;
+        target.tui.min_split_width_is_set = true;
+    }
+    if (updates.highlight_focused_border_is_set) {
+        target.tui.highlight_focused_border = updates.highlight_focused_border;
+        target.tui.highlight_focused_border_is_set = true;
+    }
+    if (updates.show_token_velocity_is_set) {
+        target.tui.show_token_velocity = updates.show_token_velocity;
+        target.tui.show_token_velocity_is_set = true;
+    }
+    if (updates.show_context_meter_is_set) {
+        target.tui.show_context_meter = updates.show_context_meter;
+        target.tui.show_context_meter_is_set = true;
+    }
+    if (updates.show_skill_inventory_is_set) {
+        target.tui.show_skill_inventory = updates.show_skill_inventory;
+        target.tui.show_skill_inventory_is_set = true;
+    }
+    if (updates.velocity_smoothing_alpha_is_set) {
+        target.tui.velocity_smoothing_alpha = updates.velocity_smoothing_alpha;
+        target.tui.velocity_smoothing_alpha_is_set = true;
+    }
+    if (updates.context_threshold_warn_is_set) {
+        target.tui.context_threshold_warn = updates.context_threshold_warn;
+        target.tui.context_threshold_warn_is_set = true;
+    }
+    if (updates.context_threshold_alert_is_set) {
+        target.tui.context_threshold_alert = updates.context_threshold_alert;
+        target.tui.context_threshold_alert_is_set = true;
+    }
 }
 
-/// Merge context settings: non-default values in `updates` override `target`.
+/// Merge context settings: optional fields apply when present; the compaction
+/// knobs are presence-gated via `<field>_is_set` (#447).
 fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void {
     if (updates.override_context_window != null) target.override_context_window = updates.override_context_window;
     if (updates.max_output_tokens != null) target.max_output_tokens = updates.max_output_tokens;
@@ -349,16 +401,38 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.tool_call_limit_per_turn != null) target.tool_call_limit_per_turn = updates.tool_call_limit_per_turn;
     if (updates.soft_stop_on_tool_call_limit != null) target.soft_stop_on_tool_call_limit = updates.soft_stop_on_tool_call_limit;
     if (updates.auto_continue_on_length_cut != null) target.auto_continue_on_length_cut = updates.auto_continue_on_length_cut;
+    // Compaction: presence-gated (#447) like the TUI knobs — a parsed layer
+    // sets `<field>_is_set` only for keys its JSON carried, so a layer that
+    // omits a key inherits the lower layer's value and an explicit default
+    // restores it. Applying a flagged field marks the target's flag too, so
+    // serialize keeps the merged value alive across a save.
+    // `tool_output_cap_bytes` keeps its older dual gate (flag OR non-default)
+    // so hand-built configs still override.
     const d: CompactionSettings = .{};
-    if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
-    if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
-    if (updates.compaction.keep_recent_tokens != d.keep_recent_tokens) target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
-    if (updates.compaction.keep_recent_tool_turns != d.keep_recent_tool_turns) target.compaction.keep_recent_tool_turns = updates.compaction.keep_recent_tool_turns;
+    if (updates.compaction.auto_is_set) {
+        target.compaction.auto = updates.compaction.auto;
+        target.compaction.auto_is_set = true;
+    }
+    if (updates.compaction.threshold_is_set) {
+        target.compaction.threshold = updates.compaction.threshold;
+        target.compaction.threshold_is_set = true;
+    }
+    if (updates.compaction.keep_recent_tokens_is_set) {
+        target.compaction.keep_recent_tokens = updates.compaction.keep_recent_tokens;
+        target.compaction.keep_recent_tokens_is_set = true;
+    }
+    if (updates.compaction.keep_recent_tool_turns_is_set) {
+        target.compaction.keep_recent_tool_turns = updates.compaction.keep_recent_tool_turns;
+        target.compaction.keep_recent_tool_turns_is_set = true;
+    }
     if (updates.compaction.tool_output_cap_bytes_is_set or updates.compaction.tool_output_cap_bytes != d.tool_output_cap_bytes) {
         target.compaction.tool_output_cap_bytes = updates.compaction.tool_output_cap_bytes;
         target.compaction.tool_output_cap_bytes_is_set = true;
     }
-    if (updates.compaction.evict_history_images != d.evict_history_images) target.compaction.evict_history_images = updates.compaction.evict_history_images;
+    if (updates.compaction.evict_history_images_is_set) {
+        target.compaction.evict_history_images = updates.compaction.evict_history_images;
+        target.compaction.evict_history_images_is_set = true;
+    }
 }
 
 /// After applying legacy-field updates, mirror the changes onto
@@ -402,18 +476,24 @@ pub fn syncModelSelectionFromLegacy(gpa: std.mem.Allocator, target: *Config) !vo
 fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpServerConfig) !void {
     for (target.mcp_servers) |*server| {
         if (!std.mem.eql(u8, server.name, updates.name)) continue;
-        server.enabled = updates.enabled;
-        server.request_timeout_ms = updates.request_timeout_ms;
         // Reuse McpServerConfig.clone for the transport (and every other
         // owned field) instead of a hand-inlined copy of it: error-handling
         // fixes to the clone then land in exactly one place. Clone BEFORE
         // freeing the old server (the replaceBaseUrl ordering: freeing
         // first leaves a dangling pointer behind on OOM).
-        const fresh = try updates.clone(gpa);
-        errdefer {
-            var c = fresh;
-            c.deinit(gpa);
+        var fresh = try updates.clone(gpa);
+        errdefer fresh.deinit(gpa);
+        // Presence-gated scalars (#447): the clone wholesale-replaces the
+        // server, so restore the lower layer's value for every field the
+        // higher layer did not carry. `enabled` gates on the parse-time
+        // presence flag; `request_timeout_ms` is already ?u32 where null
+        // means "not specified". A parse default (enabled=true, timeout
+        // null) can no longer clobber a lower layer's explicit value.
+        if (!updates.enabled_is_set) {
+            fresh.enabled = server.enabled;
+            fresh.enabled_is_set = server.enabled_is_set;
         }
+        if (updates.request_timeout_ms == null) fresh.request_timeout_ms = server.request_timeout_ms;
         server.deinit(gpa);
         server.* = fresh;
         return;
@@ -428,15 +508,21 @@ fn applyMcpServerOverlay(gpa: std.mem.Allocator, target: *Config, updates: McpSe
 }
 
 fn applyPluginOverlay(gpa: std.mem.Allocator, target: *Config, updates: PluginConfig) !void {
-    for (target.plugins, 0..) |*plugin, index| {
+    for (target.plugins) |*plugin| {
         if (!std.mem.eql(u8, plugin.name, updates.name)) continue;
-        plugin.enabled = updates.enabled;
+        // Presence-gated (#447): a parse default (enabled=true) can no
+        // longer clobber a lower layer's explicit value. Applying a flagged
+        // field marks the target's flag too, so the merged state serializes
+        // as explicitly set.
+        if (updates.enabled_is_set) {
+            plugin.enabled = updates.enabled;
+            plugin.enabled_is_set = true;
+        }
         if (updates.settings.len > 0) {
             const new_settings = try gpa.dupe(u8, updates.settings);
             if (plugin.settings.len > 0) gpa.free(plugin.settings);
             plugin.settings = new_settings;
         }
-        target.plugins[index] = plugin.*;
         return;
     }
 
@@ -620,7 +706,7 @@ fn loadGlobalFile(
     home_dir: []const u8,
     diagnostics: *std.ArrayList(Diagnostic),
 ) !Config {
-    const path = globalConfigPath(gpa, io, home_dir) catch return .{};
+    const path = globalConfigPath(gpa, home_dir) catch return .{};
     defer gpa.free(path);
     return loadFile(gpa, io, path, diagnostics);
 }
@@ -706,18 +792,31 @@ fn loadFile(
         try appendConfigError(gpa, diagnostics, path, "{s}", .{@errorName(err)});
         return .{};
     };
-    if (stat.size > 32 * 1024) {
-        try appendConfigError(gpa, diagnostics, path, "FileTooBig", .{});
+    // A config path can hold a directory or a symlink target mid-read; name
+    // the problem instead of failing opaquely further down.
+    if (stat.kind != .file) {
+        try appendConfigError(gpa, diagnostics, path, "not a regular file", .{});
         return .{};
     }
-    const bytes = try gpa.alloc(u8, @intCast(stat.size));
-    defer gpa.free(bytes);
+    // Read until EOF with the cap enforced on the result: the file can grow
+    // or shrink between the stat above and this read, so the stat's size
+    // must not pre-size the buffer (#447). The buffer is one byte larger
+    // than the cap so an exactly-at-cap file parses while an over-cap file
+    // fills the whole buffer and is detectable below. `readSliceShort`
+    // returns the actual byte count and never errors on EOF, so a
+    // grown/truncated file surfaces as ordinary bytes, not EndOfStream.
+    const read_buf = try gpa.alloc(u8, max_config_bytes + 1);
+    defer gpa.free(read_buf);
     var reader = file.reader(io, &.{});
-    reader.interface.readSliceAll(bytes) catch |err| {
+    const read_len = reader.interface.readSliceShort(read_buf) catch |err| {
         try appendConfigError(gpa, diagnostics, path, "{s}", .{@errorName(err)});
         return .{};
     };
-    return parseFile(gpa, path, bytes, diagnostics) catch |err| switch (err) {
+    if (read_len > max_config_bytes) {
+        try appendConfigError(gpa, diagnostics, path, "FileTooBig", .{});
+        return .{};
+    }
+    return parseFile(gpa, path, read_buf[0..read_len], diagnostics) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try appendConfigError(gpa, diagnostics, path, "failed to parse config file: {s}", .{@errorName(err)});
@@ -1009,19 +1108,32 @@ fn parseContext(value: std.json.Value) ContextSettings {
 /// (C3). Values are clamped here so configs self-heal on next save.
 const compaction_threshold_max: f64 = 0.90;
 
+/// Parse the `"compaction"` object into `CompactionSettings`. Pure — no
+/// allocation (all fields are scalars). Each `<field>_is_set` flag is set
+/// only when the JSON key was present AND its value was accepted (#447).
 fn parseCompaction(value: std.json.Value) CompactionSettings {
     var comp: CompactionSettings = .{};
-    if (boolField(value, "auto")) |b| comp.auto = b;
+    if (boolField(value, "auto")) |b| {
+        comp.auto = b;
+        comp.auto_is_set = true;
+    }
     if (floatField(value, "threshold")) |f| {
-        if (f >= 0.1 and f <= 1.0) comp.threshold = @min(f, compaction_threshold_max);
+        if (f >= 0.1 and f <= 1.0) {
+            comp.threshold = @min(f, compaction_threshold_max);
+            comp.threshold_is_set = true;
+        }
     }
     if (u32field(value, "keepRecentTokens")) |v| {
         comp.keep_recent_tokens = v;
+        comp.keep_recent_tokens_is_set = true;
     }
     if (u32field(value, "keepRecentToolTurns")) |v| {
         // Minimum 1: keep at least the most recent tool-result turn outside
         // historical pruning.
-        if (v >= 1) comp.keep_recent_tool_turns = v;
+        if (v >= 1) {
+            comp.keep_recent_tool_turns = v;
+            comp.keep_recent_tool_turns_is_set = true;
+        }
     }
     const output_cap = u32field(value, "toolOutputCapBytes") orelse u32field(value, "historicalToolCapBytes");
     if (output_cap) |v| {
@@ -1030,7 +1142,10 @@ fn parseCompaction(value: std.json.Value) CompactionSettings {
             comp.tool_output_cap_bytes_is_set = true;
         }
     }
-    if (boolFieldCompat(value, "evictHistoryImages", "evict_history_images")) |b| comp.evict_history_images = b;
+    if (boolFieldCompat(value, "evictHistoryImages", "evict_history_images")) |b| {
+        comp.evict_history_images = b;
+        comp.evict_history_images_is_set = true;
+    }
     return comp;
 }
 
@@ -1091,32 +1206,77 @@ fn parseToast(gpa: std.mem.Allocator, value: std.json.Value) !ToastSettings {
     return toast;
 }
 
+/// Parse the `"tui"` object into `TuiSettings`. Pure except the owned
+/// `custom_themes_dir` dupe. Each `<field>_is_set` flag is set only when the
+/// JSON key was present AND its value was accepted — out-of-band values and
+/// unknown enum names are dropped (treated as absent), so they neither
+/// override a lower layer nor re-serialize (#447).
 fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
     var tui: TuiSettings = .{};
-    if (boolField(value, "themeLivePreview")) |b| tui.theme_live_preview = b;
+    if (boolField(value, "themeLivePreview")) |b| {
+        tui.theme_live_preview = b;
+        tui.theme_live_preview_is_set = true;
+    }
     if (stringField(value, "customThemesDir")) |s| tui.custom_themes_dir = try gpa.dupe(u8, s);
-    if (boolField(value, "fuzzyHighlight")) |b| tui.fuzzy_highlight = b;
+    if (boolField(value, "fuzzyHighlight")) |b| {
+        tui.fuzzy_highlight = b;
+        tui.fuzzy_highlight_is_set = true;
+    }
     if (stringField(value, "fuzzyHighlightStyle")) |s| {
-        tui.fuzzy_highlight_style = std.meta.stringToEnum(FuzzyHighlightStyle, s) orelse .accent;
+        if (std.meta.stringToEnum(FuzzyHighlightStyle, s)) |style| {
+            tui.fuzzy_highlight_style = style;
+            tui.fuzzy_highlight_style_is_set = true;
+        } else {
+            tui.fuzzy_highlight_style = .accent;
+        }
     }
     if (stringField(value, "splitMode")) |s| {
-        tui.split_mode = std.meta.stringToEnum(SplitMode, s) orelse .dual;
+        if (std.meta.stringToEnum(SplitMode, s)) |mode| {
+            tui.split_mode = mode;
+            tui.split_mode_is_set = true;
+        } else {
+            tui.split_mode = .dual;
+        }
     }
     if (u32field(value, "minSplitWidth")) |v| {
-        if (v >= min_split_width_min and v <= min_split_width_max) tui.min_split_width = @intCast(v);
+        if (v >= min_split_width_min and v <= min_split_width_max) {
+            tui.min_split_width = @intCast(v);
+            tui.min_split_width_is_set = true;
+        }
     }
-    if (boolField(value, "highlightFocusedBorder")) |b| tui.highlight_focused_border = b;
-    if (boolField(value, "showTokenVelocity")) |b| tui.show_token_velocity = b;
-    if (boolField(value, "showContextMeter")) |b| tui.show_context_meter = b;
-    if (boolField(value, "showSkillInventory")) |b| tui.show_skill_inventory = b;
+    if (boolField(value, "highlightFocusedBorder")) |b| {
+        tui.highlight_focused_border = b;
+        tui.highlight_focused_border_is_set = true;
+    }
+    if (boolField(value, "showTokenVelocity")) |b| {
+        tui.show_token_velocity = b;
+        tui.show_token_velocity_is_set = true;
+    }
+    if (boolField(value, "showContextMeter")) |b| {
+        tui.show_context_meter = b;
+        tui.show_context_meter_is_set = true;
+    }
+    if (boolField(value, "showSkillInventory")) |b| {
+        tui.show_skill_inventory = b;
+        tui.show_skill_inventory_is_set = true;
+    }
     if (floatField(value, "velocitySmoothingAlpha")) |f| {
-        if (f >= 0.05 and f <= 1.0) tui.velocity_smoothing_alpha = f;
+        if (f >= 0.05 and f <= 1.0) {
+            tui.velocity_smoothing_alpha = f;
+            tui.velocity_smoothing_alpha_is_set = true;
+        }
     }
     if (floatField(value, "contextThresholdWarn")) |f| {
-        if (f >= 0.1 and f <= 0.9) tui.context_threshold_warn = f;
+        if (f >= 0.1 and f <= 0.9) {
+            tui.context_threshold_warn = f;
+            tui.context_threshold_warn_is_set = true;
+        }
     }
     if (floatField(value, "contextThresholdAlert")) |f| {
-        if (f >= 0.2 and f <= 0.99) tui.context_threshold_alert = f;
+        if (f >= 0.2 and f <= 0.99) {
+            tui.context_threshold_alert = f;
+            tui.context_threshold_alert_is_set = true;
+        }
     }
     return tui;
 }
@@ -1184,7 +1344,13 @@ fn parseMcpServers(
 
         var server: McpServerConfig = undefined;
         server.name = try gpa.dupe(u8, entry.key_ptr.*);
-        server.enabled = boolField(val, "enabled") orelse true;
+        // `enabled` defaults to true, but the presence flag records whether
+        // the key was carried: the merge overlay applies it only when the
+        // flag is set, so a layer that re-lists the server without the key
+        // cannot reset a lower layer's disabled server (#447).
+        const enabled_val = boolField(val, "enabled");
+        server.enabled = enabled_val orelse true;
+        server.enabled_is_set = enabled_val != null;
         server.request_timeout_ms = u32field(val, "requestTimeoutMs");
         errdefer server.deinit(gpa);
 
@@ -1263,10 +1429,16 @@ fn parsePlugins(
         if (entry.value_ptr.* != .object) continue;
         const val = entry.value_ptr.*;
 
-        var plugin: PluginConfig = .{
-            .name = try gpa.dupe(u8, entry.key_ptr.*),
-            .enabled = boolField(val, "enabled") orelse true,
-        };
+        var plugin: PluginConfig = undefined;
+        plugin.name = try gpa.dupe(u8, entry.key_ptr.*);
+        // `enabled` defaults to true, but the presence flag records whether
+        // the key was carried: the merge overlay applies it only when the
+        // flag is set, so a layer that re-lists the plugin without the key
+        // cannot reset a lower layer's disabled plugin (#447).
+        const enabled_val = boolField(val, "enabled");
+        plugin.enabled = enabled_val orelse true;
+        plugin.enabled_is_set = enabled_val != null;
+        plugin.settings = "";
         errdefer plugin.deinit(gpa);
 
         if (stringField(val, "settings")) |s| {
@@ -1528,8 +1700,15 @@ fn loadEnv(
     var out: Config = .{};
     errdefer out.deinit(gpa);
 
-    if (env.get("OPENAI_BASE_URL")) |s| out.base_url = try gpa.dupe(u8, s);
-    if (env.get("OPENAI_API_KEY")) |s| out.api_key = try gpa.dupe(u8, s);
+    // Every env var gets the `s.len > 0` guard: an exported-but-empty value
+    // ("OPENAI_BASE_URL=") must stay absent, not become a non-null empty
+    // string that clobbers a file-configured value in the merge (#447).
+    if (env.get("OPENAI_BASE_URL")) |s| {
+        if (s.len > 0) out.base_url = try gpa.dupe(u8, s);
+    }
+    if (env.get("OPENAI_API_KEY")) |s| {
+        if (s.len > 0) out.api_key = try gpa.dupe(u8, s);
+    }
     if (env.get("ZAY_BASH_CLASSIFIER_URL")) |s| {
         if (s.len > 0) out.bash_classifier_url = try gpa.dupe(u8, s);
     }
@@ -1557,11 +1736,27 @@ fn loadEnv(
     if (env.get("ZAY_DATABASE_PATH")) |s| {
         if (s.len > 0) out.database.path = try gpa.dupe(u8, s);
     }
+    // Booleans: env is the highest-precedence layer, so an unrecognized
+    // value must not silently flip a config-set field to false — record a
+    // diagnostic naming the accepted vocabulary and leave the field unset.
+    // An empty value is treated as absent (same as the vars above).
     if (env.get("ZAY_USE_RESPONSES_ENDPOINT")) |s| {
-        out.use_responses_endpoint = parseBool(s);
+        if (s.len > 0) {
+            if (parseBool(s)) |v| {
+                out.use_responses_endpoint = v;
+            } else {
+                try appendConfigError(gpa, diagnostics, "ZAY_USE_RESPONSES_ENDPOINT", "invalid boolean '{s}' — accepted: {s}", .{ s, env_bool_accepted });
+            }
+        }
     }
     if (env.get("ZAY_STRICT_OUTPUTS")) |s| {
-        out.strict_outputs = parseBool(s);
+        if (s.len > 0) {
+            if (parseBool(s)) |v| {
+                out.strict_outputs = v;
+            } else {
+                try appendConfigError(gpa, diagnostics, "ZAY_STRICT_OUTPUTS", "invalid boolean '{s}' — accepted: {s}", .{ s, env_bool_accepted });
+            }
+        }
     }
     if (env.get("OPENAI_MODEL")) |raw| {
         if (parseModelSelection(gpa, raw)) |parsed| {
@@ -1601,10 +1796,18 @@ fn parseModelSelection(gpa: std.mem.Allocator, raw: []const u8) !ParsedModelSele
     };
 }
 
-fn parseBool(s: []const u8) bool {
+/// Accepted vocabulary for the `ZAY_*` boolean environment variables. Deliberately
+/// minimal: adding "0"/"false" would be a behavior change, not a fix (#447).
+const env_bool_accepted = "1, true";
+
+/// Parse an environment boolean. Null means unrecognized: the caller records
+/// a diagnostic and leaves the field unset — env is the highest-precedence
+/// layer, so mapping unrecognized values to `false` would silently override
+/// a file-configured `true` (#447). Empty is handled by the caller as absent.
+fn parseBool(s: []const u8) ?bool {
     if (std.mem.eql(u8, s, "1")) return true;
     if (std.ascii.eqlIgnoreCase(s, "true")) return true;
-    return false;
+    return null;
 }
 
 /// Extract the major version number from a semver string ("2.0.0" → 2).
@@ -1726,7 +1929,7 @@ pub fn writeGlobal(
     home_dir: []const u8,
     config: Config,
 ) !void {
-    const path = try globalConfigPath(gpa, io, home_dir);
+    const path = try globalConfigPath(gpa, home_dir);
     defer gpa.free(path);
     return writeConfigFile(gpa, io, path, config);
 }
@@ -1740,27 +1943,81 @@ pub fn readGlobal(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Con
     return loadGlobalFile(gpa, io, home_dir, &sink);
 }
 
+/// Identity of config.json at one instant, for the compare-before-write
+/// guard below. `mtime_ns` is null when the file does not exist.
+const ConfigFileIdentity = struct {
+    mtime_ns: ?i96,
+    size: u64 = 0,
+};
+
+fn statConfigFile(io: std.Io, path: []const u8) !ConfigFileIdentity {
+    var file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{ .mtime_ns = null },
+        else => return err,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    return .{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size };
+}
+
+/// Bounded retry for the unlocked read-merge-write sequence in
+/// `mergeAndWriteFile`. A mismatch re-reads and re-merges against the newer
+/// file (so a racing writer's changes are kept, not clobbered); exhausting
+/// the budget returns `error.ConfigChangedOnDisk` and the caller surfaces it
+/// as "config changed on disk, retry".
+const merge_write_attempts_max: u8 = 3;
+
+/// Shared body of `mergeAndWriteGlobal` / `mergeAndWriteProject`: load the
+/// layer file, overlay `updates`, and atomically rewrite it.
+///
+/// The per-write rename is atomic, but the read-merge-write SEQUENCE is not
+/// (no portable advisory lock in std.Io), so two concurrent writers could
+/// each rename and the second would silently clobber the first. Guard: stat
+/// the file right after the load and again right before the write; on an
+/// mtime+size mismatch, retry the whole read-merge loop (bounded), refusing
+/// with `error.ConfigChangedOnDisk` once the budget is exhausted. The window
+/// between the second stat and the rename remains — the guard narrows it
+/// from "since the load" to "since just before the write".
+fn mergeAndWriteFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, updates: Config) !void {
+    var attempts_left: u8 = merge_write_attempts_max;
+    while (true) {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*d| d.deinit(gpa);
+            diagnostics.deinit(gpa);
+        }
+        var current = try loadFile(gpa, io, path, &diagnostics);
+        defer current.deinit(gpa);
+        // The merge rewrites the whole file. If the on-disk config produced
+        // diagnostics (invalid JSON, over-limit fields, ...), the re-read has
+        // already dropped those values — writing would erase them from disk
+        // with no user-visible signal. Refuse and leave the file untouched;
+        // the user fixes the file and retries.
+        if (diagnostics.items.len > 0) return error.ConfigRoundTripLoss;
+
+        const read_identity = try statConfigFile(io, path);
+        try applyConfigOverlay(gpa, &current, updates);
+
+        const write_identity = try statConfigFile(io, path);
+        if (write_identity.mtime_ns != read_identity.mtime_ns or write_identity.size != read_identity.size) {
+            if (attempts_left == 0) return error.ConfigChangedOnDisk;
+            attempts_left -= 1;
+            continue;
+        }
+        try writeConfigFile(gpa, io, path, current);
+        return;
+    }
+}
+
 pub fn mergeAndWriteGlobal(
     gpa: std.mem.Allocator,
     io: std.Io,
     home_dir: []const u8,
     updates: Config,
 ) !void {
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
-    defer {
-        for (diagnostics.items) |*d| d.deinit(gpa);
-        diagnostics.deinit(gpa);
-    }
-    var current = try loadGlobalFile(gpa, io, home_dir, &diagnostics);
-    defer current.deinit(gpa);
-    // The merge rewrites the whole file. If the on-disk config produced
-    // diagnostics (invalid JSON, over-limit fields, ...), the re-read has
-    // already dropped those values — writing would erase them from disk
-    // with no user-visible signal. Refuse and leave the file untouched;
-    // the user fixes the file and retries.
-    if (diagnostics.items.len > 0) return error.ConfigRoundTripLoss;
-    try applyConfigOverlay(gpa, &current, updates);
-    try writeGlobal(gpa, io, home_dir, current);
+    const path = try globalConfigPath(gpa, home_dir);
+    defer gpa.free(path);
+    return mergeAndWriteFile(gpa, io, path, updates);
 }
 
 pub fn readProject(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) !Config {
@@ -1789,17 +2046,9 @@ pub fn mergeAndWriteProject(
     cwd: []const u8,
     updates: Config,
 ) !void {
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
-    defer {
-        for (diagnostics.items) |*d| d.deinit(gpa);
-        diagnostics.deinit(gpa);
-    }
-    var current = try loadProjectFile(gpa, io, cwd, &diagnostics);
-    defer current.deinit(gpa);
-    // Same round-trip invariant as `mergeAndWriteGlobal`.
-    if (diagnostics.items.len > 0) return error.ConfigRoundTripLoss;
-    try applyConfigOverlay(gpa, &current, updates);
-    try writeProject(gpa, io, cwd, current);
+    const path = try projectConfigPath(gpa, cwd);
+    defer gpa.free(path);
+    return mergeAndWriteFile(gpa, io, path, updates);
 }
 
 /// Remove a project-layer plugin override so lower config layers take effect again.
@@ -2064,8 +2313,23 @@ fn writeToast(writer: *std.Io.Writer, toast: ToastSettings) !void {
 }
 
 fn hasNonDefaultTui(tui: TuiSettings) bool {
-    if (tui.theme_live_preview != default_tui.theme_live_preview) return true;
+    // A set presence flag means the config layer carried the key explicitly —
+    // even at the built-in default value it must survive a save, so it counts
+    // as non-default here (#447).
+    if (tui.theme_live_preview_is_set) return true;
     if (tui.custom_themes_dir != null) return true;
+    if (tui.fuzzy_highlight_is_set) return true;
+    if (tui.fuzzy_highlight_style_is_set) return true;
+    if (tui.split_mode_is_set) return true;
+    if (tui.min_split_width_is_set) return true;
+    if (tui.highlight_focused_border_is_set) return true;
+    if (tui.show_token_velocity_is_set) return true;
+    if (tui.show_context_meter_is_set) return true;
+    if (tui.show_skill_inventory_is_set) return true;
+    if (tui.velocity_smoothing_alpha_is_set) return true;
+    if (tui.context_threshold_warn_is_set) return true;
+    if (tui.context_threshold_alert_is_set) return true;
+    if (tui.theme_live_preview != default_tui.theme_live_preview) return true;
     if (tui.fuzzy_highlight != default_tui.fuzzy_highlight) return true;
     if (tui.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) return true;
     if (tui.split_mode != default_tui.split_mode) return true;
@@ -2080,10 +2344,15 @@ fn hasNonDefaultTui(tui: TuiSettings) bool {
     return false;
 }
 
+/// Write the `"tui"` object. Each scalar field is written when its presence
+/// flag is set OR its value differs from the built-in default: the flag keeps
+/// an explicitly-written default alive across a save, while the value
+/// comparison preserves the hand-built (all-flags-false) partial-write
+/// contract (#447).
 fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     try writer.writeByte('{');
     var wrote_any = false;
-    if (tui.theme_live_preview != default_tui.theme_live_preview) {
+    if (tui.theme_live_preview_is_set or tui.theme_live_preview != default_tui.theme_live_preview) {
         try writeKeyNoIndent(writer, "themeLivePreview", &wrote_any);
         try writer.writeAll(if (tui.theme_live_preview) "true" else "false");
     }
@@ -2091,47 +2360,47 @@ fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
         try writeKeyNoIndent(writer, "customThemesDir", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
     }
-    if (tui.fuzzy_highlight != default_tui.fuzzy_highlight) {
+    if (tui.fuzzy_highlight_is_set or tui.fuzzy_highlight != default_tui.fuzzy_highlight) {
         try writeKeyNoIndent(writer, "fuzzyHighlight", &wrote_any);
         try writer.writeAll(if (tui.fuzzy_highlight) "true" else "false");
     }
-    if (tui.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) {
+    if (tui.fuzzy_highlight_style_is_set or tui.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) {
         try writeKeyNoIndent(writer, "fuzzyHighlightStyle", &wrote_any);
         try std.json.Stringify.value(@tagName(tui.fuzzy_highlight_style), .{}, writer);
     }
-    if (tui.split_mode != default_tui.split_mode) {
+    if (tui.split_mode_is_set or tui.split_mode != default_tui.split_mode) {
         try writeKeyNoIndent(writer, "splitMode", &wrote_any);
         try std.json.Stringify.value(@tagName(tui.split_mode), .{}, writer);
     }
-    if (tui.min_split_width != default_tui.min_split_width) {
+    if (tui.min_split_width_is_set or tui.min_split_width != default_tui.min_split_width) {
         try writeKeyNoIndent(writer, "minSplitWidth", &wrote_any);
         try writer.print("{d}", .{tui.min_split_width});
     }
-    if (tui.highlight_focused_border != default_tui.highlight_focused_border) {
+    if (tui.highlight_focused_border_is_set or tui.highlight_focused_border != default_tui.highlight_focused_border) {
         try writeKeyNoIndent(writer, "highlightFocusedBorder", &wrote_any);
         try writer.writeAll(if (tui.highlight_focused_border) "true" else "false");
     }
-    if (tui.show_token_velocity != default_tui.show_token_velocity) {
+    if (tui.show_token_velocity_is_set or tui.show_token_velocity != default_tui.show_token_velocity) {
         try writeKeyNoIndent(writer, "showTokenVelocity", &wrote_any);
         try writer.writeAll(if (tui.show_token_velocity) "true" else "false");
     }
-    if (tui.show_context_meter != default_tui.show_context_meter) {
+    if (tui.show_context_meter_is_set or tui.show_context_meter != default_tui.show_context_meter) {
         try writeKeyNoIndent(writer, "showContextMeter", &wrote_any);
         try writer.writeAll(if (tui.show_context_meter) "true" else "false");
     }
-    if (tui.show_skill_inventory != default_tui.show_skill_inventory) {
+    if (tui.show_skill_inventory_is_set or tui.show_skill_inventory != default_tui.show_skill_inventory) {
         try writeKeyNoIndent(writer, "showSkillInventory", &wrote_any);
         try writer.writeAll(if (tui.show_skill_inventory) "true" else "false");
     }
-    if (tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) {
+    if (tui.velocity_smoothing_alpha_is_set or tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) {
         try writeKeyNoIndent(writer, "velocitySmoothingAlpha", &wrote_any);
         try writer.print("{d:.2}", .{tui.velocity_smoothing_alpha});
     }
-    if (tui.context_threshold_warn != default_tui.context_threshold_warn) {
+    if (tui.context_threshold_warn_is_set or tui.context_threshold_warn != default_tui.context_threshold_warn) {
         try writeKeyNoIndent(writer, "contextThresholdWarn", &wrote_any);
         try writer.print("{d:.2}", .{tui.context_threshold_warn});
     }
-    if (tui.context_threshold_alert != default_tui.context_threshold_alert) {
+    if (tui.context_threshold_alert_is_set or tui.context_threshold_alert != default_tui.context_threshold_alert) {
         try writeKeyNoIndent(writer, "contextThresholdAlert", &wrote_any);
         try writer.print("{d:.2}", .{tui.context_threshold_alert});
     }
@@ -2151,12 +2420,19 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.tool_call_limit_per_turn != null) return true;
     if (ctx.soft_stop_on_tool_call_limit != null) return true;
     if (ctx.auto_continue_on_length_cut != null) return true;
+    // A set presence flag means the config layer carried the key explicitly —
+    // even at the built-in default value it must survive a save (#447).
+    if (ctx.compaction.auto_is_set) return true;
+    if (ctx.compaction.threshold_is_set) return true;
+    if (ctx.compaction.keep_recent_tokens_is_set) return true;
+    if (ctx.compaction.keep_recent_tool_turns_is_set) return true;
+    if (ctx.compaction.tool_output_cap_bytes_is_set) return true;
+    if (ctx.compaction.evict_history_images_is_set) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
     if (ctx.compaction.keep_recent_tool_turns != d.compaction.keep_recent_tool_turns) return true;
     if (ctx.compaction.tool_output_cap_bytes != d.compaction.tool_output_cap_bytes) return true;
-    if (ctx.compaction.tool_output_cap_bytes_is_set) return true;
     if (ctx.compaction.evict_history_images != d.compaction.evict_history_images) return true;
     return false;
 }
@@ -2214,12 +2490,18 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     try writer.writeByte('}');
 }
 
+/// Write the `"compaction"` object. `auto`, `keepRecentToolTurns`, and
+/// `evictHistoryImages` are written when their presence flag is set OR the
+/// value differs from the built-in default, so an explicitly-written default
+/// survives a save while the hand-built (all-flags-false) partial-write
+/// contract is preserved (#447). `threshold` and `keepRecentTokens` were
+/// already unconditional here and stay so.
 fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
     try writer.writeByte('{');
     var wrote_any = false;
-    if (!comp.auto) {
+    if (comp.auto_is_set or !comp.auto) {
         try writeKeyNoIndent(writer, "auto", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (comp.auto) "true" else "false");
     }
     {
         try writeKeyNoIndent(writer, "threshold", &wrote_any);
@@ -2230,7 +2512,7 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
         try writer.print("{d}", .{comp.keep_recent_tokens});
     }
     const d: CompactionSettings = .{};
-    if (comp.keep_recent_tool_turns != d.keep_recent_tool_turns) {
+    if (comp.keep_recent_tool_turns_is_set or comp.keep_recent_tool_turns != d.keep_recent_tool_turns) {
         try writeKeyNoIndent(writer, "keepRecentToolTurns", &wrote_any);
         try writer.print("{d}", .{comp.keep_recent_tool_turns});
     }
@@ -2238,9 +2520,9 @@ fn writeCompaction(writer: *std.Io.Writer, comp: CompactionSettings) !void {
         try writeKeyNoIndent(writer, "toolOutputCapBytes", &wrote_any);
         try writer.print("{d}", .{comp.tool_output_cap_bytes});
     }
-    if (!comp.evict_history_images) {
+    if (comp.evict_history_images_is_set or !comp.evict_history_images) {
         try writeKeyNoIndent(writer, "evictHistoryImages", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (comp.evict_history_images) "true" else "false");
     }
     try writer.writeByte('}');
 }
@@ -2429,7 +2711,7 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
     wrote_any.* = true;
 }
 
-pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
+pub fn globalConfigPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
 
     // Platform-correct base: Windows -> %APPDATA%\zay, POSIX -> ~/.config/zay.
@@ -2441,14 +2723,9 @@ pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8
     errdefer gpa.free(base);
     const config_path = try std.fs.path.join(gpa, &.{ base, "config.json" });
     gpa.free(base);
-
-    // Prefer an existing file; otherwise return the platform-correct path so new
-    // writes land in the right place. (No free — returning it.)
-    if (std.Io.Dir.access(.cwd(), io, config_path, .{})) |_| {
-        return config_path;
-    } else |_| {}
-    // access failed: config_path is still the correct write target, just return it.
-    // It was allocated without an errdefer, so the caller owns it.
+    // The same path serves reads and writes: whether the file exists yet
+    // changes nothing about where it lives (the dead access probe here was
+    // removed in #447 — both branches returned config_path).
     return config_path;
 }
 
@@ -2927,6 +3204,95 @@ test "loadEnv: ZAY_USE_RESPONSES_ENDPOINT parses bools" {
     try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
 }
 
+test "loadEnv: empty OPENAI_BASE_URL and OPENAI_API_KEY leave the fields null" {
+    // #447: an exported-but-empty value must stay absent. A non-null empty
+    // string in the env layer would clobber file-configured values in the
+    // merge (replaceOptionalSlice overwrites with ""), and Config.validate
+    // skips empty URLs, so nothing would surface the loss.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    const env: TestEnv = .{ .entries = &.{
+        .{ .key = "OPENAI_BASE_URL", .value = "" },
+        .{ .key = "OPENAI_API_KEY", .value = "" },
+    } };
+    var cfg = try loadEnv(gpa, env, &sink);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(?[]u8, null), cfg.base_url);
+    try std.testing.expectEqual(@as(?[]u8, null), cfg.api_key);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+}
+
+test "loadEnv: empty ZAY booleans are absent, unrecognized values record one diagnostic" {
+    // #447: parseBool no longer maps every non-"1"/"true" value to false.
+    // Env is the highest-precedence layer, so an unrecognized value must not
+    // silently flip a config-set field; empty is treated as absent. Each
+    // block gets its own sink so the counts stay independent.
+    const gpa = std.testing.allocator;
+
+    // Empty values: absent, no diagnostic.
+    {
+        var sink: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (sink.items) |*d| d.deinit(gpa);
+            sink.deinit(gpa);
+        }
+        const env: TestEnv = .{ .entries = &.{
+            .{ .key = "ZAY_USE_RESPONSES_ENDPOINT", .value = "" },
+            .{ .key = "ZAY_STRICT_OUTPUTS", .value = "" },
+        } };
+        var cfg = try loadEnv(gpa, env, &sink);
+        defer cfg.deinit(gpa);
+        try std.testing.expectEqual(@as(?bool, null), cfg.use_responses_endpoint);
+        try std.testing.expectEqual(@as(?bool, null), cfg.strict_outputs);
+        try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    }
+
+    // Unrecognized values: one diagnostic per var, naming the var and the
+    // accepted vocabulary; the fields stay unset.
+    {
+        var sink: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (sink.items) |*d| d.deinit(gpa);
+            sink.deinit(gpa);
+        }
+        const env: TestEnv = .{ .entries = &.{
+            .{ .key = "ZAY_USE_RESPONSES_ENDPOINT", .value = "yes" },
+            .{ .key = "ZAY_STRICT_OUTPUTS", .value = "0" },
+        } };
+        var cfg = try loadEnv(gpa, env, &sink);
+        defer cfg.deinit(gpa);
+        try std.testing.expectEqual(@as(?bool, null), cfg.use_responses_endpoint);
+        try std.testing.expectEqual(@as(?bool, null), cfg.strict_outputs);
+        try std.testing.expectEqual(@as(usize, 2), sink.items.len);
+        for (sink.items) |*d| {
+            try std.testing.expect(d.* == .config_parse_error);
+            // The sink's own defer frees the diagnostics; borrow only.
+            const bad = d.config_parse_error;
+            const recognized = std.mem.eql(u8, bad.path, "ZAY_USE_RESPONSES_ENDPOINT") or
+                std.mem.eql(u8, bad.path, "ZAY_STRICT_OUTPUTS");
+            try std.testing.expect(recognized);
+            try std.testing.expect(std.mem.indexOf(u8, bad.reason, "accepted: 1, true") != null);
+        }
+    }
+
+    // The positive space: an accepted spelling of true (case-insensitive).
+    {
+        var sink: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (sink.items) |*d| d.deinit(gpa);
+            sink.deinit(gpa);
+        }
+        const env: TestEnv = .{ .entries = &.{
+            .{ .key = "ZAY_USE_RESPONSES_ENDPOINT", .value = "TRUE" },
+        } };
+        var cfg = try loadEnv(gpa, env, &sink);
+        defer cfg.deinit(gpa);
+        try std.testing.expectEqual(true, cfg.use_responses_endpoint.?);
+        try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    }
+}
+
 test "serialize: skips api_key even if present" {
     const gpa = std.testing.allocator;
     var provider_models = try gpa.alloc(ProviderModel, 1);
@@ -3090,9 +3456,8 @@ test "serialize writes strictOutputs even when model_selection is set" {
 
 test "globalConfigPath resolves the platform-correct config.json path" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
 
-    const path = try globalConfigPath(gpa, io, "/home/testuser");
+    const path = try globalConfigPath(gpa, "/home/testuser");
     defer gpa.free(path);
 
     // The returned path must end in the platform-correct config file location.
@@ -3531,6 +3896,49 @@ test "applyConfigOverlay: model_selection present uses canonical form" {
     // they resolve from the provider catalogue at connection time.
     try std.testing.expect(target.base_url == null);
     try std.testing.expect(target.api_key == null);
+}
+
+test "applyConfigOverlay: model_selection branch still applies strict_outputs" {
+    // #447: `strict_outputs` is a global setting carried outside
+    // model_selection (ModelSelection has no such field; serialize reads it
+    // from `config` in both branches). The canonical branch used to skip it,
+    // dropping the value from every in-memory merge whose updates carried a
+    // hand-built model_selection.
+    const gpa = std.testing.allocator;
+    var target: Config = .{};
+    defer target.deinit(gpa);
+    target.strict_outputs = true;
+
+    var updates: Config = .{};
+    defer updates.deinit(gpa);
+    updates.strict_outputs = false;
+    updates.model_selection = .{
+        .builtin = .{
+            .provider = .openai,
+            .provider_name = try gpa.dupe(u8, "openai"),
+            .model = .{ .id = try gpa.dupe(u8, "gpt-5.5") },
+        },
+    };
+
+    try applyConfigOverlay(gpa, &target, updates);
+    try std.testing.expectEqual(false, target.strict_outputs.?);
+
+    // And the model_selection branch path keeps an update-set value too:
+    // a hand-built selection must not erase an accompanying strict_outputs.
+    var target2: Config = .{};
+    defer target2.deinit(gpa);
+    var updates2: Config = .{};
+    defer updates2.deinit(gpa);
+    updates2.strict_outputs = true;
+    updates2.model_selection = .{
+        .builtin = .{
+            .provider = .anthropic,
+            .provider_name = try gpa.dupe(u8, "anthropic"),
+            .model = .{ .id = try gpa.dupe(u8, "claude-3.7-sonnet") },
+        },
+    };
+    try applyConfigOverlay(gpa, &target2, updates2);
+    try std.testing.expectEqual(true, target2.strict_outputs.?);
 }
 
 test "applyConfigOverlay: legacy fields sync to model_selection" {
@@ -4106,7 +4514,13 @@ test "applyContextOverlay merges non-default values" {
     const updates: ContextSettings = .{
         .override_context_window = 64_000,
         .max_concurrent_requests = 4,
-        .compaction = .{ .threshold = 0.90, .keep_recent_tool_turns = 10, .tool_output_cap_bytes = 16_384 },
+        .compaction = .{
+            .threshold = 0.90,
+            .threshold_is_set = true, // hand-built update: mark the keys it manages (#447)
+            .keep_recent_tool_turns = 10,
+            .keep_recent_tool_turns_is_set = true,
+            .tool_output_cap_bytes = 16_384,
+        },
     };
     applyContextOverlay(&target, updates);
     try std.testing.expectEqual(@as(u32, 64_000), target.override_context_window.?);
@@ -4305,9 +4719,12 @@ test "applyTuiOverlay overrides non-default values and dupes customThemesDir" {
     var updates: Config = .{
         .tui = .{
             .theme_live_preview = false,
+            .theme_live_preview_is_set = true, // hand-built update: mark the keys it manages (#447)
             .custom_themes_dir = try gpa.dupe(u8, "/tmp/custom"),
             .fuzzy_highlight = false,
+            .fuzzy_highlight_is_set = true,
             .fuzzy_highlight_style = .bold,
+            .fuzzy_highlight_style_is_set = true,
         },
     };
     defer updates.deinit(gpa);
@@ -4341,6 +4758,87 @@ test "applyTuiOverlay with default updates preserves stored non-default settings
     try std.testing.expectEqual(false, target.tui.theme_live_preview);
     try std.testing.expectEqual(false, target.tui.fuzzy_highlight);
     try std.testing.expectEqual(FuzzyHighlightStyle.underline, target.tui.fuzzy_highlight_style);
+}
+
+test "mergeLayers: a higher layer restores a tui default over a lower layer's value" {
+    // #447: the old compare-against-built-in-default gate meant NO higher
+    // layer could restore a default once a lower layer set non-default.
+    // Presence flags make "explicit default" expressible.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var global = try parseFile(gpa, "<global>", "{\"tui\":{\"splitMode\":\"grid\",\"themeLivePreview\":false}}", &sink);
+    defer global.deinit(gpa);
+    var project = try parseFile(gpa, "<project>", "{\"tui\":{\"splitMode\":\"dual\"}}", &sink);
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+    try std.testing.expectEqual(SplitMode.dual, merged.tui.split_mode); // restored by project
+    try std.testing.expectEqual(false, merged.tui.theme_live_preview); // kept from global
+    try std.testing.expectEqual(@as(u16, 140), merged.tui.min_split_width); // untouched default
+}
+
+test "serialize keeps an explicitly-written tui default across a round-trip" {
+    // #447 write path: a parsed layer that carries a key at its default
+    // value (fuzzyHighlight:true IS the default) sets the presence flag,
+    // so the section is written and the key survives — the same bug class
+    // re-entering through the write path would silently drop it.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var parsed = try parseFile(gpa, "<test>", "{\"tui\":{\"fuzzyHighlight\":true,\"minSplitWidth\":140}}", &sink);
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqual(true, parsed.tui.fuzzy_highlight_is_set);
+    try std.testing.expectEqual(true, parsed.tui.min_split_width_is_set);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, parsed);
+    const text = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"fuzzyHighlight\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"minSplitWidth\":140") != null);
+
+    // An out-of-band value is treated as absent: no flag, no serialize.
+    var dropped = try parseFile(gpa, "<test>", "{\"tui\":{\"minSplitWidth\":50,\"fuzzyHighlightStyle\":\"bogus\"}}", &sink);
+    defer dropped.deinit(gpa);
+    try std.testing.expectEqual(false, dropped.tui.min_split_width_is_set);
+    try std.testing.expectEqual(@as(u16, 140), dropped.tui.min_split_width);
+    try std.testing.expectEqual(FuzzyHighlightStyle.accent, dropped.tui.fuzzy_highlight_style);
+    try std.testing.expectEqual(false, dropped.tui.fuzzy_highlight_style_is_set);
+    var buf2: std.Io.Writer.Allocating = .init(gpa);
+    defer buf2.deinit();
+    try serialize(gpa, &buf2.writer, dropped);
+    try std.testing.expect(std.mem.indexOf(u8, buf2.written(), "\"tui\"") == null);
+}
+
+test "mergeLayers: a higher layer restores the compaction auto default" {
+    // #447: same presence-gating for the compaction knobs — a layer that
+    // writes `"auto": true` explicitly must re-enable what a lower layer
+    // disabled, and an explicit default survives a save.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var global = try parseFile(gpa, "<global>", "{\"context\":{\"compaction\":{\"auto\":false,\"keepRecentToolTurns\":4}}}", &sink);
+    defer global.deinit(gpa);
+    var project = try parseFile(gpa, "<project>", "{\"context\":{\"compaction\":{\"auto\":true}}}", &sink);
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+    try std.testing.expectEqual(true, merged.context.compaction.auto); // restored
+    try std.testing.expectEqual(@as(u32, 4), merged.context.compaction.keep_recent_tool_turns); // kept
+
+    // The explicit default re-serialize keeps both keys.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, merged);
+    const text = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"auto\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"keepRecentToolTurns\":4") != null);
 }
 
 test "parseTui round-trips all nine layout + telemetry fields" {
@@ -4512,7 +5010,7 @@ test "mergeAndWriteGlobal refuses to rewrite a config that would lose fields" {
 
     // Hand-written on-disk config whose systemPrompt is over the limit: the
     // merge re-read drops the field, so an unchecked rewrite would erase it.
-    const dirty_path = try globalConfigPath(gpa, io, home_dir);
+    const dirty_path = try globalConfigPath(gpa, home_dir);
     defer gpa.free(dirty_path);
     const dirname = std.fs.path.dirname(dirty_path).?;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
@@ -4556,6 +5054,127 @@ test "mergeAndWriteGlobal refuses to rewrite a config that would lose fields" {
     defer merged.deinit(gpa);
     try std.testing.expectEqualStrings("fresh", merged.system_prompt.?);
     try std.testing.expectEqualStrings("default", merged.theme.?);
+}
+
+// Test-only hook for the compare-before-write guard below: rewrites the
+// config file when the mock's openFile is called for the Nth time. Tests run
+// sequentially in one binary, so the static state is safe to reset per test.
+const MergeRaceMock = struct {
+    var open_count: usize = 0;
+    var mutate_at_open: usize = 0;
+    var mutate_every_open_from: usize = 0;
+    var path: []const u8 = "";
+    var payload: []const u8 = "";
+
+    fn openFile(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        sub_path: []const u8,
+        flags: std.Io.File.OpenFlags,
+    ) std.Io.File.OpenError!std.Io.File {
+        _ = userdata;
+        open_count += 1;
+        const should_mutate = (mutate_at_open != 0 and open_count == mutate_at_open) or
+            (mutate_every_open_from != 0 and open_count >= mutate_every_open_from);
+        if (should_mutate and std.mem.endsWith(u8, sub_path, path)) {
+            // A concurrent writer's rename landed between the load and the
+            // write: replace the file's contents via the REAL io (the mock
+            // only diverts openFile) so the next stat sees new mtime+size.
+            std.Io.Dir.writeFile(dir, std.testing.io, .{ .sub_path = sub_path, .data = payload }) catch {};
+        }
+        return std.Io.Dir.openFile(dir, std.testing.io, sub_path, flags);
+    }
+
+    fn reset(config_path: []const u8, new_payload: []const u8) void {
+        open_count = 0;
+        mutate_at_open = 0;
+        mutate_every_open_from = 0;
+        path = config_path;
+        payload = new_payload;
+    }
+};
+
+test "mergeAndWriteGlobal retries and merges over a concurrent rewrite" {
+    // #447: the read-merge-write sequence is unlocked (no portable advisory
+    // lock in std.Io). When config.json changes between the load and the
+    // write, the mtime+size guard must trigger a retry that re-reads the NEW
+    // file and merges onto it — keeping the concurrent writer's change
+    // instead of clobbering it with a stale rewrite.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_dir);
+
+    var initial: Config = .{};
+    defer initial.deinit(gpa);
+    initial.theme = try gpa.dupe(u8, "initial");
+    try writeGlobal(gpa, io, home_dir, initial);
+    const config_path = try globalConfigPath(gpa, home_dir);
+    defer gpa.free(config_path);
+
+    // The guard's write-side stat is the third openFile call (load, read-side
+    // stat, write-side stat): land the concurrent rewrite there, exactly once.
+    MergeRaceMock.reset(config_path, "{\"theme\":\"concurrent\"}");
+    MergeRaceMock.mutate_at_open = 3;
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.dirOpenFile = MergeRaceMock.openFile;
+    const mock_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &mock_vtable };
+
+    var updates: Config = .{};
+    defer updates.deinit(gpa);
+    updates.system_prompt = try gpa.dupe(u8, "fresh");
+
+    try mergeAndWriteGlobal(gpa, mock_io, home_dir, updates);
+
+    // The result keeps BOTH the concurrent change and the update.
+    var merged = try readGlobal(gpa, io, home_dir);
+    defer merged.deinit(gpa);
+    try std.testing.expectEqualStrings("concurrent", merged.theme.?);
+    try std.testing.expectEqualStrings("fresh", merged.system_prompt.?);
+}
+
+test "mergeAndWriteGlobal refuses with ConfigChangedOnDisk when the file keeps changing" {
+    // Every guard pass sees a fresh rewrite: after the bounded retry budget
+    // is exhausted the merge refuses instead of racing on, and the on-disk
+    // file keeps the concurrent writer's content.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer gpa.free(home_dir);
+
+    var initial: Config = .{};
+    defer initial.deinit(gpa);
+    initial.theme = try gpa.dupe(u8, "initial");
+    try writeGlobal(gpa, io, home_dir, initial);
+    const config_path = try globalConfigPath(gpa, home_dir);
+    defer gpa.free(config_path);
+
+    MergeRaceMock.reset(config_path, "{\"theme\":\"racing\"}");
+    MergeRaceMock.mutate_every_open_from = 3;
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.dirOpenFile = MergeRaceMock.openFile;
+    const mock_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &mock_vtable };
+
+    var updates: Config = .{};
+    defer updates.deinit(gpa);
+    updates.system_prompt = try gpa.dupe(u8, "fresh");
+
+    try std.testing.expectError(error.ConfigChangedOnDisk, mergeAndWriteGlobal(gpa, mock_io, home_dir, updates));
+
+    // The refusal leaves the racing writer's content on disk — never a
+    // stale overwrite of it.
+    var on_disk = try readGlobal(gpa, io, home_dir);
+    defer on_disk.deinit(gpa);
+    try std.testing.expectEqualStrings("racing", on_disk.theme.?);
+    try std.testing.expectEqual(@as(?[]u8, null), on_disk.system_prompt);
 }
 
 test "removeProjectPlugin removes only the named override and is idempotent" {
@@ -5063,7 +5682,7 @@ test "load preserves user systemPrompt when model_selection is null (cold start)
     const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
     defer gpa.free(fake_cwd);
 
-    const config_dir = try globalConfigPath(gpa, io, fake_home);
+    const config_dir = try globalConfigPath(gpa, fake_home);
     defer gpa.free(config_dir);
     const dirname = std.fs.path.dirname(config_dir).?;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
@@ -5099,7 +5718,7 @@ test "loadInto merges into a caller-owned arena twice without leaking (cross-pro
     const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
     defer gpa.free(fake_cwd);
 
-    const config_dir = try globalConfigPath(gpa, io, fake_home);
+    const config_dir = try globalConfigPath(gpa, fake_home);
     defer gpa.free(config_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, std.fs.path.dirname(config_dir).?);
 
@@ -5279,6 +5898,91 @@ test "loadFile catches invalid MCP configuration fail-soft and records diagnosti
     try std.testing.expect(diags.items.len > 0);
 }
 
+test "loadFile accepts an exactly-at-cap file and refuses one byte over" {
+    // #447: the 32 KiB cap is enforced on the READ result, not on the stat's
+    // size — the file can grow between the stat and the read, and a
+    // stat-sized buffer turned that race into a misleading EndOfStream
+    // diagnostic. The buffer is one byte larger than the cap so an
+    // exactly-at-cap file parses and an over-cap file is detectable.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const test_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(test_dir);
+
+    // {"theme":"…"}: prefix+suffix is 12 bytes, the theme fills the rest.
+    const at_cap = try std.fmt.allocPrint(gpa, "{{\"theme\":\"{s}\"}}", .{"a" ** (max_config_bytes - 12)});
+    defer gpa.free(at_cap);
+    try std.testing.expectEqual(max_config_bytes, at_cap.len);
+    const at_cap_path = try std.fs.path.join(gpa, &.{ test_dir, "at_cap.json" });
+    defer gpa.free(at_cap_path);
+    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = at_cap_path, .data = at_cap });
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var loaded = try loadFile(gpa, io, at_cap_path, &sink);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    try std.testing.expectEqual(@as(usize, max_config_bytes - 12), loaded.theme.?.len);
+
+    // One byte over the cap: refused with FileTooBig, not a read error.
+    const over_cap = try std.fmt.allocPrint(gpa, "{{\"theme\":\"{s}\"}}", .{"a" ** (max_config_bytes - 11)});
+    defer gpa.free(over_cap);
+    try std.testing.expectEqual(max_config_bytes + 1, over_cap.len);
+    const over_cap_path = try std.fs.path.join(gpa, &.{ test_dir, "over_cap.json" });
+    defer gpa.free(over_cap_path);
+    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = over_cap_path, .data = over_cap });
+
+    var over_sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (over_sink.items) |*d| d.deinit(gpa);
+        over_sink.deinit(gpa);
+    }
+    var refused = try loadFile(gpa, io, over_cap_path, &over_sink);
+    defer refused.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), over_sink.items.len);
+    try std.testing.expectEqualStrings("FileTooBig", over_sink.items[0].config_parse_error.reason);
+    try std.testing.expectEqual(@as(?[]u8, null), refused.theme);
+}
+
+test "loadFile reports a non-file config path with one diagnostic" {
+    // #447: stat the path and name the problem when config.json is not a
+    // regular file. Whether openFile itself rejects a directory first is
+    // platform-dependent; either way the caller sees exactly one diagnostic
+    // and an empty config, never a parse error or a hang.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const test_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(test_dir);
+
+    const dir_path = try std.fs.path.join(gpa, &.{ test_dir, "config.json" });
+    defer gpa.free(dir_path);
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_path);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+    var loaded = try loadFile(gpa, io, dir_path, &sink);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+    try std.testing.expect(loaded.theme == null);
+    try std.testing.expectEqual(@as(?Provider, null), loaded.providerFromName());
+}
+
 test "load executes validate and surfaces diagnostics for invalid schema version" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5292,7 +5996,7 @@ test "load executes validate and surfaces diagnostics for invalid schema version
     const fake_cwd = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path, "project" });
     defer gpa.free(fake_cwd);
 
-    const config_dir = try globalConfigPath(gpa, io, fake_home);
+    const config_dir = try globalConfigPath(gpa, fake_home);
     defer gpa.free(config_dir);
     const dirname = std.fs.path.dirname(config_dir).?;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
@@ -5368,6 +6072,10 @@ test "applyMcpServerOverlay updates existing server transport without memory lea
     var update_server: McpServerConfig = .{
         .name = try gpa.dupe(u8, "test-mcp"),
         .enabled = false,
+        // The update explicitly disables the server — like a parsed layer
+        // carrying `"enabled": false`, it must carry the presence flag
+        // (#447) or the overlay would inherit the target's enabled=true.
+        .enabled_is_set = true,
         .transport = .{ .sse = .{
             .url = try gpa.dupe(u8, "https://mcp.example.com"),
             .headers = sse_headers,
@@ -5386,6 +6094,131 @@ test "applyMcpServerOverlay updates existing server transport without memory lea
         },
         .stdio => unreachable,
     }
+}
+
+test "applyMcpServerOverlay: fields the update omits inherit the lower layer" {
+    // #447: the overlay wholesale-replaces the server via clone, so a layer
+    // that re-lists a server without `enabled` / `requestTimeoutMs` used to
+    // reset them to the parse defaults (enabled=true, timeout=null → client
+    // default 30s), clobbering a lower layer's explicit values.
+    const gpa = std.testing.allocator;
+    var target: Config = .{};
+    defer target.deinit(gpa);
+
+    var lower: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "srv"),
+        .enabled = false,
+        .enabled_is_set = true, // parse-shaped: the key was carried
+        .request_timeout_ms = 5_000,
+        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "old") } },
+    };
+    defer lower.deinit(gpa);
+    try applyMcpServerOverlay(gpa, &target, lower);
+
+    // Re-listing without the keys: transport is replaced, scalars inherit.
+    var re_listing: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "srv"),
+        .enabled = true, // parse default — flag NOT set
+        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "new") } },
+    };
+    defer re_listing.deinit(gpa);
+    try applyMcpServerOverlay(gpa, &target, re_listing);
+
+    try std.testing.expectEqual(@as(usize, 1), target.mcp_servers.len);
+    try std.testing.expectEqual(false, target.mcp_servers[0].enabled);
+    try std.testing.expect(target.mcp_servers[0].enabled_is_set);
+    try std.testing.expectEqual(@as(?u32, 5_000), target.mcp_servers[0].request_timeout_ms);
+    try std.testing.expectEqualStrings("new", target.mcp_servers[0].transport.stdio.command);
+
+    // An update carrying `enabled: true` explicitly (flag set) restores the
+    // default over the lower layer's non-default — the whole point of the
+    // presence flag.
+    var enabling: McpServerConfig = .{
+        .name = try gpa.dupe(u8, "srv"),
+        .enabled = true,
+        .enabled_is_set = true,
+        .transport = .{ .stdio = .{ .command = try gpa.dupe(u8, "new") } },
+    };
+    defer enabling.deinit(gpa);
+    try applyMcpServerOverlay(gpa, &target, enabling);
+    try std.testing.expectEqual(true, target.mcp_servers[0].enabled);
+    // The inherited timeout survives a second wholesale replace too.
+    try std.testing.expectEqual(@as(?u32, 5_000), target.mcp_servers[0].request_timeout_ms);
+}
+
+test "applyPluginOverlay: update without enabled keeps the lower layer's value" {
+    // #447: same defect class as the MCP server overlay — the unconditional
+    // `plugin.enabled = updates.enabled` let a re-listing layer's parse
+    // default (true) re-enable a lower layer's disabled plugin.
+    const gpa = std.testing.allocator;
+    var target: Config = .{};
+    defer target.deinit(gpa);
+
+    var lower: PluginConfig = .{
+        .name = try gpa.dupe(u8, "plug"),
+        .enabled = false,
+        .enabled_is_set = true, // parse-shaped
+    };
+    defer lower.deinit(gpa);
+    try applyPluginOverlay(gpa, &target, lower);
+
+    var re_listing: PluginConfig = .{ .name = try gpa.dupe(u8, "plug") };
+    defer re_listing.deinit(gpa);
+    try applyPluginOverlay(gpa, &target, re_listing);
+    try std.testing.expectEqual(false, target.plugins[0].enabled);
+
+    var enabling: PluginConfig = .{
+        .name = try gpa.dupe(u8, "plug"),
+        .enabled = true,
+        .enabled_is_set = true,
+    };
+    defer enabling.deinit(gpa);
+    try applyPluginOverlay(gpa, &target, enabling);
+    try std.testing.expectEqual(true, target.plugins[0].enabled);
+}
+
+test "mergeLayers: re-listing an mcp server without enabled keeps it disabled" {
+    // End-to-end #447 shape: global disables a server, a higher layer
+    // re-lists it (transport-only), the disabled state must survive the
+    // merge AND the rewrite.
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var global = try parseFile(gpa, "<global>", "{\"mcpServers\":{\"a\":{\"command\":\"old\",\"enabled\":false}}}", &sink);
+    defer global.deinit(gpa);
+    var project = try parseFile(gpa, "<project>", "{\"mcpServers\":{\"a\":{\"command\":\"new\"}}}", &sink);
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), merged.mcp_servers.len);
+    try std.testing.expectEqual(false, merged.mcp_servers[0].enabled);
+    try std.testing.expectEqualStrings("new", merged.mcp_servers[0].transport.stdio.command);
+
+    // Serialize keeps writing the explicit false so a later save does not
+    // silently re-enable the server.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, merged);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"enabled\":false") != null);
+}
+
+test "mergeLayers: re-listing a plugin without enabled keeps it disabled" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+
+    var global = try parseFile(gpa, "<global>", "{\"plugins\":{\"plug\":{\"enabled\":false}}}", &sink);
+    defer global.deinit(gpa);
+    var project = try parseFile(gpa, "<project>", "{\"plugins\":{\"plug\":{\"settings\":\"{\\\"x\\\":1}\"}}}", &sink);
+    defer project.deinit(gpa);
+
+    var merged = try mergeLayers(gpa, &.{ global, project });
+    defer merged.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), merged.plugins.len);
+    try std.testing.expectEqual(false, merged.plugins[0].enabled);
+    try std.testing.expectEqualStrings("{\"x\":1}", merged.plugins[0].settings);
 }
 
 test "applyProviderModelsOverlay updates reasoning options without memory leak" {
