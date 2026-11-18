@@ -17,6 +17,13 @@ pub const PluginConfig = struct {
     name: []u8,
     /// Whether this plugin is active
     enabled: bool = true,
+    /// Tracks whether the config layer explicitly supplied `enabled` (#447).
+    /// Parse sets it only when the JSON key was present; the merge overlay
+    /// applies `enabled` only when the flag is set, so a layer that re-lists
+    /// a plugin without the key no longer resets it to the parse default
+    /// (true) and can no longer clobber a lower layer's disabled plugin.
+    /// Hand-built toggle-style updates set the flag explicitly.
+    enabled_is_set: bool = false,
     /// Plugin-specific settings as a JSON object string (e.g. `{"theme":"dark"}`).
     /// Empty string means no settings. The plugin's Lua code parses this.
     settings: []u8 = "",
@@ -31,6 +38,7 @@ pub const PluginConfig = struct {
         var out: PluginConfig = .{
             .name = try gpa.dupe(u8, self.name),
             .enabled = self.enabled,
+            .enabled_is_set = self.enabled_is_set,
         };
         // A failing settings dupe must not leak the already-duped name —
         // `PluginManager.syncPluginConfig` loops this over N entries, so the
