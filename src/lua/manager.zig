@@ -807,12 +807,15 @@ pub const PluginManager = struct {
         defer self.allocator.free(null_term);
 
         // Strip UTF-8 BOM if present
-        var script_ptr = null_term.ptr;
-        if (null_term.len >= 3 and std.mem.startsWith(u8, null_term, "\xEF\xBB\xBF")) {
-            script_ptr = null_term[3..].ptr;
+        var script: [:0]const u8 = null_term;
+        if (std.mem.startsWith(u8, null_term, "\xEF\xBB\xBF")) {
+            script = null_term[3..];
         }
 
-        const load_rc = c.luaL_loadstring(L.handle, script_ptr);
+        // Mode "t" pins text-only loads (#448): the plugin entrypoint is
+        // plugin-authored bytes, so a precompiled binary chunk must fail the
+        // load instead of executing attacker-chosen bytecode.
+        const load_rc = c.luaL_loadbufferx(L.handle, script.ptr, script.len, script.ptr, "t");
         if (load_rc != c.LUA_OK) {
             const err_ptr = c.lua_tolstring(L.handle, -1, null);
             const msg = if (err_ptr) |p| std.mem.sliceTo(p, 0) else "unknown Lua load error";
@@ -1036,6 +1039,28 @@ test "disabled hostile manifests cannot access the host or evade budgets" {
     try testing.expectEqualStrings("InvalidManifest", manager.load_failures.get(hostile_key).?);
     try testing.expectEqualStrings("ManifestInstructionLimit", manager.load_failures.get(looping_key).?);
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, marker, .{}));
+}
+
+test "plugin manager rejects a precompiled binary entrypoint (#448)" {
+    const testing = std.testing;
+    const root = "/tmp/zay_test_binary_entrypoint";
+    const plugins_root = root ++ "/plugins";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+    try writeFixturePlugin(plugins_root, "binary_init", "return {}");
+    // Overwrite init.lua with a crafted precompiled chunk (LUA_SIGNATURE
+    // header). Mode "t" must fail the load instead of executing bytecode.
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = plugins_root ++ "/binary_init/init.lua",
+        .data = "\x1bLua\x54\x00\x19\x93\x0d\x0a\x1a\x0a" ++ "crafted-bytecode-payload",
+    });
+
+    var manager = PluginManager.init(testing.allocator, testing.io, "", root);
+    defer manager.deinit();
+    try testing.expectEqual(@as(usize, 0), try manager.loadAll());
+
+    const plugin_key = try std.fs.path.join(testing.allocator, &.{ root, "plugins", "binary_init" });
+    defer testing.allocator.free(plugin_key);
+    try testing.expectEqualStrings("PluginInitFailed", manager.load_failures.get(plugin_key).?);
 }
 
 test "plugin manager: syncPluginConfig skips disabled plugins (P2)" {

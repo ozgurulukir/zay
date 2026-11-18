@@ -205,7 +205,7 @@ Run all registered test suites. Returns `true` if all tests pass.
 | `zay.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (`pwsh.exe` on Windows, `bash` on POSIX) |
 | `zay.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution (git-bash on Windows) |
 | `zay.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, or `"native"`) | quoted `string` or `nil, err` | Quote one argument for a shell command line (see below) |
-| `zay.get_env(name)` | `name` | `string` or `nil` | Environment variable |
+| `zay.get_env(name)` | `name` | `string` or `nil, err` | Environment variable. Without the `allow_env` permission only a harmless allowlist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`, `TZ`) is readable; other names return `nil` plus a denial message |
 | `zay.get_cwd()` | — | `string` | Effective cwd of the current dispatch/event callback — a lane worktree root, or a resumed session's cwd; outside dispatch (init.lua load) the process cwd |
 | `zay.get_project_root()` | — | `string` | Git root of the effective cwd (worktree root in a worktree, matching `git rev-parse --show-toplevel`) |
 
@@ -267,7 +267,7 @@ The git bridges bypass the shell safety classifier — they run fixed `git`
 invocations without prompting; see [Permissions and runtime](permissions-and-runtime.md)
 for why that boundary is safe and the rules future git bridges must follow.
 
-**Result row shapes:** `search_files` rows are `{file, line, content}` (content truncated to 200 bytes per line); `find_files` rows are `{path, name}`; `list_dir`'s `files`/`directories` are **arrays of plain name strings**, not tables. On a mid-walk failure, `search_files`/`find_files` return partial data with an `error` string field and **no** `truncated` field — check `result.error` before trusting `results`.
+**Result row shapes:** `search_files` rows are `{file, line, content}` (content truncated to 200 bytes per line); `find_files` rows are `{path, name}`; `list_dir`'s `files`/`directories` are **arrays of plain name strings**, not tables. On a mid-walk failure, `search_files`/`find_files` return partial data with an `error` string field plus the usual `total_matches`/`truncated` fields — check `result.error` before trusting `results`.
 
 ### Lane & session awareness
 
