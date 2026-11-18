@@ -38,7 +38,9 @@ bundle or the Store UI — and removing a source with `x` purges every
 registration of it.
 
 Remote catalogs use explicit file URLs and must include `plugin.lua` and
-`init.lua` for each plugin. Catalogs and files have bounded sizes, relative
+`init.lua` for each plugin. Every `files` entry must also carry both a
+`sha256` digest and an exact `size` — a catalog entry omitting either fails
+catalog parse. Catalogs and files have bounded sizes, relative
 package paths, and safe plugin IDs; installs are published only after all
 files are validated. Restart Zay to activate a newly installed plugin.
 Same-project sessions reuse the loaded plugin set. A guarded cross-project
@@ -72,7 +74,7 @@ changes take effect at restart or the guarded project-switch boundary.
 | `zay.move_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Move/rename a file or directory |
 | `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory (recursive opt-in) |
 
-Result rows: `search_files` → `{file, line, content}` (content truncated to 200 bytes per line); `find_files` → `{path, name}`. On a mid-walk failure the bridge returns partial data with an `error` string field and **no** `truncated` field — check `result.error` before trusting `results`.
+Result rows: `search_files` → `{file, line, content}` (content truncated to 200 bytes per line); `find_files` → `{path, name}`. On a mid-walk failure the bridge returns partial data with an `error` string field plus the usual `total_matches`/`truncated` fields — check `result.error` before trusting `results`.
 
 All filesystem functions validate paths through `sanitizePath`: relative paths
 resolve against the active workspace/effective cwd and are **rejected if they
@@ -95,7 +97,7 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 | `zay.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution, gated by the shell safety classifier |
 | `zay.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (pwsh on Windows, bash on POSIX), same gate |
 | `zay.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, `"native"`) | `string` or `nil, err` | Quote one argument for a shell command line — use it for every interpolated value |
-| `zay.get_env(name)` | `name` | `string` or `nil` | Environment variable |
+| `zay.get_env(name)` | `name` | `string` or `nil, err` | Environment variable. Without the `allow_env` permission only a harmless allowlist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`, `TZ`) is readable; other names return `nil` plus a denial message |
 | `zay.get_cwd()` | — | `string` | Current working directory |
 | `zay.get_project_root()` | — | `string` | Git repo root or cwd |
 
@@ -244,7 +246,7 @@ forms (escaped JSON string or inline object).
 ## Permissions
 
 Plugins declare permissions in their manifest. Permissions are granted at load
-time and cannot be changed at runtime. Only the two `allow_*` keys actually
+time and cannot be changed at runtime. Only the three `allow_*` keys actually
 gate runtime behavior; the first three are **advisory metadata** — declared
 intent for readers and review — because the sandbox never exposes `io.*` or
 sockets to any plugin regardless of what it declares.
@@ -256,5 +258,6 @@ sockets to any plugin regardless of what it declares.
 | `require_others` | Declares the plugin may `require()` modules | `true` | advisory only — `zay.require` is always scoped to the plugin's own directory |
 | `allow_os_execute` | Allow `os.execute` | `false` | yes |
 | `allow_os_remove` | Allow `os.remove`/`os.rename` (routed to sandboxed `deletePath`/`movePath`) | `false` | yes |
+| `allow_env` | Allow `zay.get_env` to read arbitrary environment variables; without it only the harmless allowlist above is served | `false` | yes |
 
 Embedded plugins (shipped with Zay) always get full access.

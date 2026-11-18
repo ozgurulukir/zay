@@ -155,6 +155,7 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
     if (bridge.getTableBoolean(L, -1, "require_others")) |v| perms.require_others = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_execute")) |v| perms.allow_os_execute = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_remove")) |v| perms.allow_os_remove = v;
+    if (bridge.getTableBoolean(L, -1, "allow_env")) |v| perms.allow_env = v;
 
     // Clamp on the i64 before the u32 cast so a negative value (a manifest typo
     // or a hand-edited plugin.lua) cannot wrap to ~4e9. 0 keeps its "unlimited"
@@ -175,6 +176,7 @@ fn isRecognizedPermissionKey(key: []const u8) bool {
         "require_others",
         "allow_os_execute",
         "allow_os_remove",
+        "allow_env",
         "instruction_limit",
         "memory_limit_mb",
         "timeout_ms",
@@ -359,6 +361,7 @@ test "manifest: parse permissions" {
         \\    file_access = true,
         \\    network_access = true,
         \\    allow_os_execute = true,
+        \\    allow_env = true,
         \\    instruction_limit = 50000,
         \\    memory_limit_mb = 32,
         \\  }
@@ -371,6 +374,7 @@ test "manifest: parse permissions" {
     try testing.expect(manifest.permissions.file_access);
     try testing.expect(manifest.permissions.network_access);
     try testing.expect(manifest.permissions.allow_os_execute);
+    try testing.expect(manifest.permissions.allow_env);
     try testing.expectEqual(@as(u32, 50000), manifest.permissions.instruction_limit);
     try testing.expectEqual(@as(u32, 32), manifest.permissions.memory_limit_mb);
 }
@@ -389,6 +393,7 @@ test "manifest: default permissions when not specified" {
 
     try testing.expect(!manifest.permissions.file_access);
     try testing.expect(!manifest.permissions.network_access);
+    try testing.expect(!manifest.permissions.allow_env);
     try testing.expect(manifest.permissions.require_others);
 }
 
@@ -400,6 +405,7 @@ test "manifest: isRecognizedPermissionKey accepts all valid keys (T3)" {
         "require_others",
         "allow_os_execute",
         "allow_os_remove",
+        "allow_env",
         "instruction_limit",
         "memory_limit_mb",
         "timeout_ms",

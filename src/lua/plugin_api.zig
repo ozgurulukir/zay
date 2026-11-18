@@ -54,11 +54,48 @@ pub const mime_map = fs_bridge.mime_map;
 /// Retrieve the Io instance stored in the Lua registry.
 pub const getIo = bridge.getIo;
 
+/// Static loading marker stored in the module cache while a module's chunk
+/// is executing (#449). A lightuserdata is the marker because plugins cannot
+/// construct one (sandboxed states expose no such value), so a module value
+/// can never collide with it.
+var require_loading_marker: u8 = 0;
+
+/// Realpath re-check for a resolved module against the plugin directory
+/// (#448). The lexical resolve above follows nothing, but the read below
+/// would follow a symlink planted inside the plugin dir; comparing real
+/// paths catches it. Mirrors `bridges/shell.zig sanitizePath`: on a missing
+/// leaf the walk climbs to the deepest existing ancestor, and allocation
+/// failure fails closed. POSIX only — `std.c.realpath` is unavailable on
+/// Windows, where the lexical confinement check stays authoritative.
+fn requirePathWithinRealPluginDir(plugin_dir: []const u8, candidate: []const u8) bool {
+    var plugin_dir_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const plugin_dir_real = blk: {
+        const plugin_dir_z = std.heap.page_allocator.dupeZ(u8, plugin_dir) catch return false;
+        defer std.heap.page_allocator.free(plugin_dir_z);
+        const ptr = std.c.realpath(plugin_dir_z.ptr, &plugin_dir_real_buf) orelse break :blk plugin_dir;
+        break :blk std.mem.span(ptr);
+    };
+
+    var probe = candidate;
+    while (true) {
+        const probe_z = std.heap.page_allocator.dupeZ(u8, probe) catch return false;
+        defer std.heap.page_allocator.free(probe_z);
+        var probe_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.c.realpath(probe_z.ptr, &probe_real_buf)) |rp| {
+            const real = std.mem.span(rp);
+            if (!std.mem.startsWith(u8, real, plugin_dir_real)) return false;
+            if (real.len > plugin_dir_real.len and real[plugin_dir_real.len] != std.fs.path.sep) return false;
+            return true;
+        }
+        probe = std.fs.path.dirname(probe) orelse return false;
+    }
+}
+
 /// ── zay.require(path) ───────────────────────────────────────────────
 ///
 /// Loads a Lua module relative to the plugin's root directory.
-/// Modules are confined to the plugin directory (INV-REQ-1) and cached
-/// in `zay_loaded_modules` (INV-REQ-3).
+/// Modules are confined to the plugin directory (INV-REQ-1), loaded
+/// text-only (INV-REQ-2), and cached in `zay_loaded_modules` (INV-REQ-3).
 pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
@@ -143,6 +180,15 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
+    // Symlink re-check (INV-REQ-1, #448): the module file exists, so its
+    // realpath resolves the chain; a symlink pointing outside the plugin
+    // directory must fail the require instead of redirecting the read.
+    if (!os.is_windows and !requirePathWithinRealPluginDir(plugin_dir_owned, resolved_path)) {
+        state.pushNil();
+        state.pushString("access denied: cannot require module outside plugin directory");
+        return 2;
+    }
+
     // Check registry table zay_loaded_modules
     _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, "zay_loaded_modules");
     const reg_tbl_idx = c.lua_gettop(L_ptr);
@@ -157,6 +203,23 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
 
     _ = c.lua_getfield(L_ptr, reg_tbl_idx, resolved_path_z.ptr);
     if (!c.lua_isnil(L_ptr, -1)) {
+        // Module is already loaded/cached. A cache slot holding the loading
+        // marker means the module's chunk is still executing above us — a
+        // circular require (#449: the slot used to hold `true`, which leaked
+        // out as the module value).
+        if (c.lua_type(L_ptr, -1) == c.LUA_TLIGHTUSERDATA) {
+            const msg = std.fmt.allocPrint(std.heap.page_allocator, "circular require of {s}", .{resolved_path}) catch {
+                c.lua_pop(L_ptr, 2); // pop marker value and cache table
+                state.pushNil();
+                state.pushString("circular require");
+                return 2;
+            };
+            defer std.heap.page_allocator.free(msg);
+            c.lua_pop(L_ptr, 2); // pop marker value and cache table
+            state.pushNil();
+            state.pushString(msg);
+            return 2;
+        }
         // Module is already loaded/cached. Remove the cache table from under the value.
         c.lua_remove(L_ptr, reg_tbl_idx);
         return 1;
@@ -173,18 +236,22 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     };
     defer std.heap.page_allocator.free(content);
 
-    // Load chunk
-    const load_rc = c.luaL_loadbufferx(L_ptr, content.ptr, content.len, resolved_path_z.ptr, null);
+    // Load chunk. Mode "t" accepts text sources only (INV-REQ-2, #448): a
+    // precompiled binary chunk planted in the plugin directory must fail the
+    // load instead of executing attacker-chosen bytecode.
+    const load_rc = c.luaL_loadbufferx(L_ptr, content.ptr, content.len, resolved_path_z.ptr, "t");
     if (load_rc != c.LUA_OK) {
-        c.lua_pop(L_ptr, 1); // pop reg_tbl
-        // Error message is on top of stack from loadbuffer
+        // Stack here is [ ... | cache table | load error ]. Remove the cache
+        // table so the error message ends up on top (the old `lua_pop(1)`
+        // popped the error instead, returning the cache table as the error).
+        c.lua_remove(L_ptr, reg_tbl_idx);
         state.pushNil();
         c.lua_insert(L_ptr, -2); // swap so nil is 1st and err msg is 2nd
         return 2;
     }
 
-    // Mark module as loading (boolean true sentinel to guard circular require)
-    c.lua_pushboolean(L_ptr, 1);
+    // Mark module as loading (lightuserdata sentinel to guard circular require)
+    c.lua_pushlightuserdata(L_ptr, @constCast(&require_loading_marker));
     c.lua_setfield(L_ptr, reg_tbl_idx, resolved_path_z.ptr);
 
     // Execute chunk under pcall(0, 1)
@@ -647,8 +714,18 @@ pub fn callToolHandler(
     _ = c.lua_rawgeti(L, -1, tool_index);
     _ = c.lua_getfield(L, -1, "handler_ref");
     var isnum: c_int = 0;
-    const handler_ref = @as(c_int, @intCast(c.lua_tointegerx(L, -1, &isnum)));
+    const handler_ref_i64 = c.lua_tointegerx(L, -1, &isnum);
     c.lua_pop(L, 2); // pop handler_ref and entry table
+
+    // Validate before any registry deref: a non-integer or out-of-range ref
+    // used to hit @intCast (panic on out-of-i32-range values) and then
+    // lua_rawgeti with an arbitrary integer (#449). Registry refs from
+    // luaL_ref are positive c_int values.
+    if (isnum == 0 or handler_ref_i64 < 1 or handler_ref_i64 > std.math.maxInt(c_int)) {
+        const text = try gpa.dupe(u8, "invalid tool handler reference");
+        return .{ .text = text, .code = 1 };
+    }
+    const handler_ref: c_int = @intCast(handler_ref_i64);
 
     // Get the handler function from registry
     _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, handler_ref);
@@ -874,6 +951,83 @@ test "registerTool rejects invalid tool names (T6)" {
         \\return "OK"
     );
     try std.testing.expectEqual(@as(u32, 1), countTools(L.handle));
+}
+
+// ── #449 F5: callToolHandler validates the handler reference ─────────
+
+test "callToolHandler rejects a non-integer handler_ref with an explicit error" {
+    const gpa = std.testing.allocator;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer sandbox.destroySandboxedState(&L);
+    try expectLuaOk(&L,
+        \\zay.register_tool({
+        \\  name = "guarded_tool", description = "d",
+        \\  handler = function() return "ok" end,
+        \\})
+        \\return "OK"
+    );
+
+    // Corrupt the stored ref: a non-integer slot used to pass lua_tointegerx
+    // (isnum ignored) and deref garbage from the registry.
+    _ = c.lua_getfield(L.handle, c.LUA_REGISTRYINDEX, "zay_tools");
+    _ = c.lua_rawgeti(L.handle, -1, 1);
+    c.lua_pushnil(L.handle);
+    c.lua_setfield(L.handle, -2, "handler_ref");
+    c.lua_pop(L.handle, 2);
+
+    var result = try callToolHandler(L.handle, gpa, 1, "{}");
+    defer result.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 1), result.code);
+    try std.testing.expectEqualStrings("invalid tool handler reference", result.text);
+}
+
+test "callToolHandler rejects an out-of-range handler_ref without panicking" {
+    const gpa = std.testing.allocator;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer sandbox.destroySandboxedState(&L);
+    try expectLuaOk(&L,
+        \\zay.register_tool({
+        \\  name = "guarded_tool", description = "d",
+        \\  handler = function() return "ok" end,
+        \\})
+        \\return "OK"
+    );
+
+    // Capture the genuine ref so the loop can corrupt and restore it.
+    _ = c.lua_getfield(L.handle, c.LUA_REGISTRYINDEX, "zay_tools");
+    _ = c.lua_rawgeti(L.handle, -1, 1);
+    _ = c.lua_getfield(L.handle, -1, "handler_ref");
+    const genuine_ref = c.lua_tointegerx(L.handle, -1, null);
+    c.lua_pop(L.handle, 3);
+
+    // An out-of-i32-range integer used to panic in the @intCast; zero,
+    // negative, and huge refs must all fail with the explicit error text.
+    for ([_]i64{ 0, -7, 5_000_000_000 }) |bad_ref| {
+        _ = c.lua_getfield(L.handle, c.LUA_REGISTRYINDEX, "zay_tools");
+        _ = c.lua_rawgeti(L.handle, -1, 1);
+        c.lua_pushinteger(L.handle, bad_ref);
+        c.lua_setfield(L.handle, -2, "handler_ref");
+        c.lua_pop(L.handle, 2);
+
+        var result = try callToolHandler(L.handle, gpa, 1, "{}");
+        defer result.deinit(gpa);
+        try std.testing.expectEqual(@as(u8, 1), result.code);
+        try std.testing.expectEqualStrings("invalid tool handler reference", result.text);
+    }
+
+    // Restore the genuine ref and dispatch: the positive space still works.
+    _ = c.lua_getfield(L.handle, c.LUA_REGISTRYINDEX, "zay_tools");
+    _ = c.lua_rawgeti(L.handle, -1, 1);
+    c.lua_pushinteger(L.handle, genuine_ref);
+    c.lua_setfield(L.handle, -2, "handler_ref");
+    c.lua_pop(L.handle, 2);
+
+    var result = try callToolHandler(L.handle, gpa, 1, "{}");
+    defer result.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expectEqualStrings("ok", result.text);
 }
 
 test "onEvent rejects unknown event names (T6)" {
@@ -2122,6 +2276,25 @@ test "plugin_api: zay.require loads modules, caches results, and rejects breakou
     try w2.interface.flush();
     submod_file.close(io);
 
+    // 3. Create binary.lua: a crafted precompiled chunk (LUA_SIGNATURE header).
+    // Mode "t" must reject it at load time instead of executing bytecode (#448).
+    var binary_file = try std.Io.Dir.cwd().createFile(io, test_plugin_dir ++ "/binary.lua", .{});
+    var w3 = binary_file.writer(io, &buf);
+    try w3.interface.writeAll("\x1bLua\x54\x00\x19\x93\x0d\x0a\x1a\x0a" ++ "crafted-bytecode-payload");
+    try w3.interface.flush();
+    binary_file.close(io);
+
+    // 4. Create selfref.lua: requires its own file. The loading marker must
+    // surface a circular-require error, not leak the sentinel as a module (#449).
+    var selfref_file = try std.Io.Dir.cwd().createFile(io, test_plugin_dir ++ "/selfref.lua", .{});
+    var w4 = selfref_file.writer(io, &buf);
+    try w4.interface.writeAll(
+        \\local again, err = zay.require("selfref.lua")
+        \\return { circular_err = err }
+    );
+    try w4.interface.flush();
+    selfref_file.close(io);
+
     const abs_plugin_dir = try std.fs.path.resolve(gpa, &.{ root, test_plugin_dir });
     defer gpa.free(abs_plugin_dir);
 
@@ -2153,8 +2326,44 @@ test "plugin_api: zay.require loads modules, caches results, and rejects breakou
         \\assert(outside == nil, "breakout should have failed")
         \\assert(string.find(err, "access denied") ~= nil, "unexpected error: " .. tostring(err))
         \\
+        \\-- Reject a precompiled binary chunk (mode "t", #448)
+        \\local binary_mod, binary_err = zay.require("binary")
+        \\assert(binary_mod == nil, "binary chunk should have failed")
+        \\assert(string.find(binary_err, "binary") ~= nil, "expected binary-chunk load error, got: " .. tostring(binary_err))
+        \\
+        \\-- A module requiring itself gets a circular-require error, not the
+        \\-- loading sentinel (#449)
+        \\local self_mod = zay.require("selfref")
+        \\assert(type(self_mod) == "table", "selfref returns its own table")
+        \\assert(string.find(self_mod.circular_err, "circular require") ~= nil, "expected circular require error, got: " .. tostring(self_mod.circular_err))
+        \\-- The module value was still cached after the inner circular failure.
+        \\local self_again = zay.require("selfref.lua")
+        \\assert(self_again == self_mod, "selfref module cached after circular inner require")
+        \\
         \\return "OK"
     );
+
+    // Symlink escaping the plugin directory (#448): the lexical resolve stays
+    // inside, but the read would follow the link outside — the realpath
+    // re-check must deny it. POSIX only (std.c.realpath).
+    if (!os.is_windows) {
+        const outside_target = try std.fs.path.resolve(gpa, &.{ root, ".zig-cache/test_escape_target.lua" });
+        defer gpa.free(outside_target);
+        defer std.Io.Dir.cwd().deleteFile(io, outside_target) catch {};
+        var target_file = try std.Io.Dir.cwd().createFile(io, outside_target, .{});
+        target_file.close(io);
+
+        const link_path = try std.fs.path.resolve(gpa, &.{ root, test_plugin_dir ++ "/escape.lua" });
+        defer gpa.free(link_path);
+        try std.Io.Dir.cwd().symLink(io, outside_target, link_path, .{});
+
+        try expectLuaOk(&L,
+            \\local mod, err = zay.require("escape.lua")
+            \\assert(mod == nil, "escaping symlink should have failed")
+            \\assert(string.find(err, "access denied") ~= nil, "unexpected error: " .. tostring(err))
+            \\return "OK"
+        );
+    }
 }
 
 test "plugin_api: zay.git_add and selective zay.git_commit validate arguments" {
