@@ -130,13 +130,15 @@ limit (#412).
 
 ### Crash and session-expiry recovery
 
-A crashed server (`McpServerCrashed`) or an expired HTTP session
-(`McpSessionExpired`, HTTP 404) transitions the client's lifecycle state to
-`failed` — clearing its advertised tools — and attempts **one** re-`initialize`
-(#411). If that re-initialize succeeds the client comes back; if it fails, the
-client stays `failed` with the error surfaced, rather than remaining wedged as
-`connected` while every tool call dies. Tool calls that hit a failed refresh
-return the underlying error to the model.
+An expired HTTP session (`McpSessionExpired`, HTTP 404) transitions the
+client's lifecycle state to `failed` — clearing its advertised tools — and
+attempts **one** re-`initialize`: if it succeeds the client comes back and the
+request is retried; if it fails, the client stays `failed` with the error
+surfaced, rather than remaining wedged as `connected` while every tool call
+dies (#411). A crashed server (`McpServerCrashed`) goes straight to `failed`
+(clearing tools) with no re-initialize — recovery is an explicit reconnect
+(TUI toggle or `reconnectClient`), not an inline handshake retry. Tool calls
+that hit a failed refresh return the underlying error to the model.
 
 ### Edits recreate the client
 
