@@ -131,8 +131,9 @@ fn awaitExit(io: std.Io, pid: std.posix.pid_t, grace_ms: u64) bool {
 /// only when the child is in a waitable state, so the pid field is pre-zeroed
 /// to make the "no status" answer distinguishable; any waitid error (ECHILD
 /// among them) is reported as exited — nothing is left to signal.
-/// Linux only: `awaitExit` never probes on the other POSIX targets.
-fn processExited(pid: std.posix.pid_t) bool {
+/// Linux only: `awaitExit` never probes on the other POSIX targets. Shared
+/// with `capture_sink.childExitedBounded`'s post-EOF bounded wait (#440).
+pub fn processExited(pid: std.posix.pid_t) bool {
     comptime assert(tag == .linux);
     var info: std.os.linux.siginfo_t = std.mem.zeroes(std.os.linux.siginfo_t);
     const rc = std.os.linux.waitid(

@@ -131,6 +131,11 @@ pub fn drainChild(
     }
 
     try multi_reader.checkAnyError();
+    // EOF need not mean exit (#440): a child that closed both pipes but keeps
+    // running must not park `child.wait` — Zig 0.16's wait blocks
+    // unconditionally — past the deadline. The Windows arm already bounds this
+    // wait with its `NtWaitForSingleObject` probe; mirror it on POSIX.
+    if (!try childExitedBounded(io, child, deadline, cancel_requested)) return error.Timeout;
     const term = try child.wait(io);
 
     const stdout_slice = try multi_reader.toOwnedSlice(0);
@@ -146,6 +151,41 @@ pub fn drainChild(
 }
 
 const cancel_poll_ms: i64 = 10;
+
+/// Bounded post-EOF liveness wait shared by `drainChild` and the per-shell
+/// capture loops (#440). After the pipes hit EOF, a child that closed its
+/// streams but keeps running (e.g. `exec 1>&- 2>&-; sleep 5`) must not park
+/// the caller's `child.wait` — Zig 0.16's wait blocks unconditionally — past
+/// the deadline. Polls the non-consuming liveness probe (`os.processExited`,
+/// Linux `waitid(NOHANG | NOWAIT)`) and returns true as soon as the child is
+/// in a waitable state, so the caller proceeds to its single reap via
+/// `child.wait`/`child.kill`. Returns false when the deadline expired first.
+/// Never signals and never reaps: a second reap panics in std's
+/// `childWaitPosix` (ECHILD → `errnoBug`), so `child.wait`/`child.kill` stay
+/// the single reap point. Windows has its own probe
+/// (`NtWaitForSingleObject`) and never calls this; other POSIX targets have
+/// no zombie-aware probe (see `os.awaitExit`), so this reports "exited"
+/// immediately and the caller keeps the historical blocking wait — correct,
+/// just unbounded there.
+pub fn childExitedBounded(
+    io: std.Io,
+    child: *const std.process.Child,
+    deadline: std.Io.Timeout,
+    cancel_requested: ?*const std.atomic.Value(bool),
+) error{Canceled}!bool {
+    const pid = child.id orelse return true;
+    if (comptime os.tag != .linux) return true;
+    while (true) {
+        if (isCanceled(cancel_requested)) return error.Canceled;
+        var sleep_ms: i64 = cancel_poll_ms;
+        if (deadline.toDurationFromNow(io)) |remaining| {
+            if (remaining.raw.nanoseconds <= 0) return false;
+            sleep_ms = @intCast(@min(sleep_ms, @divTrunc(remaining.raw.nanoseconds, std.time.ns_per_ms)));
+        }
+        if (os.processExited(pid)) return true;
+        try io.sleep(.fromMilliseconds(sleep_ms), .awake);
+    }
+}
 
 const windows = std.os.windows;
 extern "kernel32" fn PeekNamedPipe(
@@ -279,6 +319,30 @@ fn readWindowsPipeToSink(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, 
     if (count == 0) return true;
     try sink.ingest(gpa, io, buffer[0..count]);
     return false;
+}
+
+test "POSIX drainChild timeout does not wait for a child that closed both pipes" {
+    // Mirror of the Windows silent-child test (#440): a child that closes both
+    // pipe write ends and keeps running must surface `error.Timeout` at the
+    // deadline, not park `child.wait` until the child exits on its own.
+    // Linux-only: the liveness probe (`os.processExited`) is Linux-only; other
+    // POSIX targets keep the historical blocking wait (see
+    // `childExitedBounded`).
+    if (os.is_windows or os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exec 1>&- 2>&-; sleep 5" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, drainChild(std.testing.allocator, io, &child, .{
+        .duration = .{ .raw = .fromSeconds(1), .clock = .awake },
+    }, null));
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake));
+    try std.testing.expect(elapsed.nanoseconds < 3 * std.time.ns_per_s);
 }
 
 test "Windows drainChild timeout does not wait for a silent child" {
@@ -464,7 +528,11 @@ pub fn Sink(comptime config: type) type {
         fn openSpill(gpa: std.mem.Allocator, io: std.Io) !Spill {
             const path = try tempSpillPath(gpa, io);
             errdefer gpa.free(path);
-            const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+            // 0600: the spill file mirrors full command output (which may hold
+            // secrets) that the observation only samples; the default mode would
+            // leave it group/other-readable after umask (#440). Windows has no
+            // mode bits.
+            const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .permissions = if (comptime os.is_windows) .default_file else std.Io.File.Permissions.fromMode(0o600) });
             return .{ .file = file, .path = path };
         }
 

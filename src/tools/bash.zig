@@ -42,20 +42,24 @@ pub const Backend = struct {
 
     /// Reject `builtin`/`command`-prefixed `cd`/`pushd`/`popd` in contained
     /// workspaces: Bash resolves builtins directly when prefixed, bypassing the
-    /// `cd()`/`pushd()`/`popd()` shell functions (#418).
+    /// `cd()`/`pushd()`/`popd()` shell functions (#418). The compare skips
+    /// quotes and backslashes because bash strips them before command lookup,
+    /// so `'builtin'`, `"builtin"`, and `\builtin` all reach the real builtin
+    /// (#439).
     pub fn hasCdGuardBypass(command: []const u8) bool {
         var it = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()");
         while (it.next()) |tok| {
-            if (!std.mem.eql(u8, tok, "builtin") and !std.mem.eql(u8, tok, "command")) continue;
+            const is_command = tokenUnescapedEquals(tok, "command");
+            if (!tokenUnescapedEquals(tok, "builtin") and !is_command) continue;
             var next = it.next() orelse break;
-            if (std.mem.eql(u8, tok, "command")) {
+            if (is_command) {
                 while (next.len > 0 and next[0] == '-') {
                     next = it.next() orelse break;
                 }
             }
-            if (std.mem.eql(u8, next, "cd") or
-                std.mem.eql(u8, next, "pushd") or
-                std.mem.eql(u8, next, "popd"))
+            if (tokenUnescapedEquals(next, "cd") or
+                tokenUnescapedEquals(next, "pushd") or
+                tokenUnescapedEquals(next, "popd"))
             {
                 return true;
             }
@@ -128,6 +132,29 @@ pub const Backend = struct {
         return true;
     }
 };
+
+/// Compare a token against `target` while skipping bash quote and backslash
+/// characters: bash strips them before command lookup, so `'builtin'`,
+/// `"builtin"`, and `\builtin` all resolve to the same word (#439). Streaming
+/// and allocation-free, in the style of `bash_safety.unescapedStartsWith`
+/// (#419).
+fn tokenUnescapedEquals(token: []const u8, target: []const u8) bool {
+    var token_index: usize = 0;
+    var target_index: usize = 0;
+    while (token_index < token.len) {
+        switch (token[token_index]) {
+            '\'', '"', '\\' => {
+                token_index += 1;
+                continue;
+            },
+            else => {},
+        }
+        if (target_index == target.len or token[token_index] != target[target_index]) return false;
+        token_index += 1;
+        target_index += 1;
+    }
+    return target_index == target.len;
+}
 
 const impl = shell.Impl(Backend);
 
@@ -553,10 +580,56 @@ test "contained bash rejects builtin cd and command cd (#418)" {
         "{\"command\":\"builtin cd /tmp && pwd\",\"description\":\"bypass\"}",
         "{\"command\":\"command cd /tmp && pwd\",\"description\":\"bypass\"}",
         "{\"command\":\"command -p cd /tmp && pwd\",\"description\":\"bypass\"}",
+        // Quote/backslash removal happens before command lookup, so each of
+        // these also reaches the real builtin (#439).
+        "{\"command\":\"'builtin' cd /tmp && pwd\",\"description\":\"bypass\"}",
+        "{\"command\":\"\\\"builtin\\\" cd /tmp && pwd\",\"description\":\"bypass\"}",
+        "{\"command\":\"\\\\builtin cd /tmp && pwd\",\"description\":\"bypass\"}",
+        "{\"command\":\"\\\\command cd /tmp && pwd\",\"description\":\"bypass\"}",
     }) |args| {
         var output = try runContained(gpa, std.testing.io, root_abs, args, null, bash_safety.mintClassified("containment-fixture"));
         defer output.deinit(gpa);
         try std.testing.expect(output.code != 0);
         try std.testing.expect(std.mem.indexOf(u8, output.stderr, "bypassing cd guard") != null);
+    }
+}
+
+test "hasCdGuardBypass flags quoted and escaped builtin spellings (#439)" {
+    // Pure matcher test — runs on every platform so Linux CI enforces it.
+    // The e2e loop above covers the same spellings through the real tool.
+    const flagged = [_][]const u8{
+        "builtin cd /tmp",
+        "command cd /tmp",
+        "command -p cd /tmp",
+        "'builtin' cd /tmp",
+        "\"builtin\" cd /tmp",
+        "\\builtin cd /tmp",
+        "\\command cd /tmp",
+        "builtin pushd /tmp",
+        "builtin popd /tmp",
+        // A bare target-less cd still bypasses the function override.
+        "builtin cd",
+        "'bui\"ltin' cd /tmp",
+        // Over-broad in the safe direction: the token stream looks like a
+        // builtin prefix regardless of the command context (`echo builtin cd`
+        // is refused too).
+        "echo builtin cd /tmp",
+    };
+    for (flagged) |command| {
+        try std.testing.expect(Backend.hasCdGuardBypass(command));
+    }
+
+    const allowed = [_][]const u8{
+        "cd /tmp",
+        "builtin ls /tmp",
+        "command -p ls /tmp",
+        // Bash command lookup is case-sensitive.
+        "Builtin cd /tmp",
+        "COMMAND cd /tmp",
+        "",
+        "ls 'builtin' /tmp",
+    };
+    for (allowed) |command| {
+        try std.testing.expect(!Backend.hasCdGuardBypass(command));
     }
 }

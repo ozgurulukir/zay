@@ -153,7 +153,10 @@ fn writeScriptTemp(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8
     defer gpa.free(name);
     const path = try bash_exec.namedTempPath(gpa, name);
     errdefer gpa.free(path);
-    var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    // 0600: the script embeds model commands (which may reference secrets);
+    // the default mode would leave it group/other-readable after umask (#440).
+    // Windows has no mode bits.
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .permissions = if (comptime os.is_windows) .default_file else std.Io.File.Permissions.fromMode(0o600) });
     defer file.close(io);
     // Prefix UTF-8 BOM (\xEF\xBB\xBF) so Windows PowerShell 5.1 interprets the
     // script as UTF-8 rather than ANSI/Windows-1252, while PowerShell 7+ handles it seamlessly.
@@ -283,6 +286,13 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
                 try sink.ingest(gpa, io, stderr_reader.buffered());
                 stderr_reader.tossBuffered();
             }
+        }
+        if (!timed_out) {
+            // EOF need not mean exit (#440): a child that closed both pipes
+            // but keeps running must not park `child.wait` past the deadline.
+            // Deadline expiry here maps to the same 124 contract as a
+            // mid-stream timeout.
+            if (!try capture_sink.childExitedBounded(io, &child, deadline, options.cancel_requested)) timed_out = true;
         }
         if (!timed_out) try multi_reader.checkAnyError();
     }
@@ -424,6 +434,20 @@ test "pwsh spill stops growing at cap" {
     try sink.ingest(gpa, std.testing.io, "dddd");
     try sink.ingest(gpa, std.testing.io, "eeee");
     try std.testing.expectEqual(@as(usize, 16), sink.spill_bytes);
+}
+
+test "writeScriptTemp creates the script owner-only (0600)" {
+    // Regression for #440: script temp files were created with default perms
+    // (0644 after umask) though they embed model commands. The private helper
+    // is callable from this file's tests (precedent: `exitCheckedScript`).
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = try writeScriptTemp(gpa, io, "Write-Output hi");
+    defer cleanupScriptTemp(gpa, io, path);
+
+    const st = try std.Io.Dir.statFile(.cwd(), io, path, .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
 }
 
 test "exitCheckedScript wraps command and normalizes exit" {
