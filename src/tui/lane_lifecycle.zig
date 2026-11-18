@@ -3444,6 +3444,80 @@ test "deleteLaneOp discards a live worker's idle-turn completion (B2)" {
     try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // lane removed
 }
 
+test "bridge delete of the focused lane re-points focus to a surviving lane" {
+    // #444: the driver may delete the lane the user is viewing (bridge ops run
+    // on the UI tick). abandonLane must re-point `app.thread` before the
+    // removal triple — the freed lane under a live `app.thread` is a
+    // deterministic use-after-free on the next liveRuntime() deref.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_helpers = @import("test_helpers.zig");
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try addFakeWorkingLane(gpa, &app, "survivor");
+    try test_helpers.addIdleFocusedLane(gpa, &app, "doomed"); // focuses it
+    const survivor = app.threads.slice()[1];
+    try std.testing.expectEqual(@as(usize, 3), app.threads.len());
+    app.split_mode = .dual;
+    app.focused_worker_index = 2; // "doomed" is worker #2
+
+    var req = lane_bridge.Request{ .op = .delete, .lane = try gpa.dupe(u8, "doomed"), .requester = &agent };
+    defer req.deinit(gpa);
+    const result = postAndService(io, &app, &req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Deleted open lane doomed") != null);
+    // Focus landed on the surviving neighbor (index - 1), never the freed
+    // lane; `app.deinit` frees the survivors once, so a dangling app.thread
+    // or a double free trips the testing allocator before this point.
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+    try std.testing.expect(app.thread == survivor);
+    // The dual-mode worker focus clamped into the shrunken range.
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+}
+
+test "bridge merge of the focused lane re-points focus to the primary" {
+    // #444 merge path: mergeLaneOp frees the source lane without the
+    // destination re-point mergeLane performs, so a focused source lane must
+    // be re-pointed by abandonLane itself.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    var fx = try GitFixture.init(gpa, io);
+    defer fx.deinit(gpa);
+    const app = &fx.app;
+
+    var create_req = lane_bridge.Request{ .op = .create, .requester = &fx.runtime.agent };
+    defer create_req.deinit(gpa);
+    const create_resp = postAndService(io, app, &create_req);
+    defer app.gpa.free(create_resp.text);
+    try std.testing.expectEqual(@as(u8, 0), create_resp.code);
+    const id = try gpa.dupe(u8, create_resp.lane_id.?);
+    defer gpa.free(id);
+    const lane = app.threads.slice()[1];
+    // The user is viewing the lane when the driver merges it out from under
+    // them — the repro shape from #444.
+    app.thread = lane;
+    app.split_mode = .dual;
+    app.focused_worker_index = 1;
+    try std.testing.expectEqual(@as(usize, 2), app.threads.len());
+
+    var merge_req = lane_bridge.Request{ .op = .merge, .lane = try gpa.dupe(u8, id), .requester = &fx.runtime.agent };
+    defer merge_req.deinit(gpa);
+    const result = postAndService(io, app, &merge_req);
+    defer app.gpa.free(result.text);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Merged lane") != null);
+    // Focus landed on the surviving primary (index - 1); the lane count is
+    // back to the fixture base.
+    try std.testing.expectEqual(@as(usize, 1), app.threads.len());
+    try std.testing.expect(app.thread == app.threads.slice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+}
+
 test "clearWorkspaceBorrowForPath & deleteLaneOp tolerate slash format differences across platforms" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

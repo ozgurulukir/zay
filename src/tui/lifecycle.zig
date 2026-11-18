@@ -150,14 +150,11 @@ fn deinitSharedServices(self: *App) void {
 }
 
 /// Tear down per-lane owned data and UI input buffers.  Lanes are destroyed
-/// after their dependent state (retired transcripts, resume lists, search
-/// state) is freed.
+/// after their dependent state (resume lists, search state) is freed.
 fn deinitOwnedState(self: *App) void {
     self.closeAtSearch();
     self.clearLanesState();
 
-    for (self.retired_transcripts.items) |*transcript| transcript.deinit(self.gpa);
-    self.retired_transcripts.deinit(self.gpa);
     self.resumeClear();
     self.resumeClearFolds();
     // `resumeClear` only clears items (keeps capacity for the next open);
@@ -525,7 +522,17 @@ pub fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
 
                 // A discarded (interrupted) turn's events are swallowed inside
                 // applyAgentEvent — the Turn machine refuses to project them.
-                const changed = try root.app.applyAgentEvent(lane, event_ptr.*);
+                // A failing projection is swallowed too: the queue already
+                // popped the whole batch, so an abort could neither restore it
+                // nor free the untouched remainder (the drain loop is each
+                // event's sole owner from the pop onward; the queue's
+                // discardAll is the teardown-time analogue). The defers above
+                // free this event on every path; losing one projection beats
+                // losing the rest of the batch and the tick.
+                const changed = root.app.applyAgentEvent(lane, event_ptr.*) catch |err| {
+                    log.warn("drain: applyAgentEvent failed: {s}", .{@errorName(err)});
+                    continue;
+                };
                 if (lane != active) continue; // a background lane never touches the view
                 if (changed) visible_change = true;
                 switch (event_ptr.*) {
@@ -535,7 +542,15 @@ pub fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                     },
                     else => {},
                 }
-                if (lane.turn_view.awaitingOutput()) try ensureTick(root, ctx);
+                if (lane.turn_view.awaitingOutput()) {
+                    ensureTick(root, ctx) catch |err| {
+                        // ensureTick armed the flag before scheduling; with
+                        // the tick refused it would never fire, so un-arm and
+                        // let the next frame retry.
+                        root.app.metrics.loading_tick_active = false;
+                        log.warn("drain: re-tick scheduling failed: {s}", .{@errorName(err)});
+                    };
+                }
             }
 
             if (lane_bytes >= drain_byte_budget) break;

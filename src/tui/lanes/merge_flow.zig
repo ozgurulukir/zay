@@ -13,6 +13,8 @@ const vaxis = @import("vaxis");
 const worktree_job = @import("worktree_job.zig");
 const branch_naming = @import("branch_naming.zig");
 const lane_recovery = @import("recovery.zig");
+const mode_lifecycle = @import("../mode_lifecycle.zig");
+const lifecycle = @import("../lifecycle.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -196,9 +198,33 @@ pub fn abandonLane(app: *App, index: u32) !void {
 
     branch_naming.cancelLaneNaming(app, lane);
     discardUndeliveredCompletion(app, lane);
+    // The driver may delete/merge the lane the user is currently viewing —
+    // the lane workspace boundary makes that legal — so the focused-lane
+    // pointer must never dangle here. Re-point it to the surviving neighbor
+    // BEFORE the removal (the same re-point closeActiveLane performs);
+    // `index > 0` is asserted above.
+    const focused = lane == app.thread;
+    if (focused) app.thread = app.threads.slice()[index - 1];
+    if (app.git_label_thread == lane) app.git_label_thread = null;
+    // A focused lane that still owns a runtime loses it to this teardown:
+    // open runtime-bound overlays would deref a null liveRuntime() on submit
+    // (the FocusHandler crash class parkFinishedWorker guards). Close them
+    // and pin vxfw focus to the root before the runtime dies. The re-point
+    // above already moved `app.thread`, so the helper's notice lands on the
+    // surviving lane's transcript instead of the lane about to be freed.
+    var refocus_input = false;
+    if (focused and lane.engine == .live) {
+        refocus_input = mode_lifecycle.closeRuntimeBoundOverlays(app, laneIdOf(lane) orelse "this lane");
+        if (refocus_input) lifecycle.pinFocusToRoot(app);
+    }
     _ = app.threads.orderedRemove(index);
     lane.deinit(app.gpa);
     app.gpa.destroy(lane);
+    // Keep the dual-mode worker focus inside the shrunken range. The read
+    // sites clamp defensively too (layout.computeSplitLayout,
+    // drawRoot), so this is semantics, not crash prevention.
+    app.focused_worker_index = @max(@min(app.focused_worker_index, app.threads.len() - 1), 1);
+    if (refocus_input) lifecycle.focusPrimaryInput(app);
 
     if (app.repoRoot()) |repo| {
         worktree_job.cleanupLaneWorktreeAndBranch(app, repo, dir, branch);
