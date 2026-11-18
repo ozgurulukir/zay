@@ -21,6 +21,10 @@
 //! - `prependCdGuard(gpa, project_root, command) ![]u8` — the per-shell
 //!   containment-guard script (bash `cd`/`pushd`/`popd` overrides vs
 //!   PowerShell `Set-Location`/`Push-Location`/`Pop-Location`).
+//! - `hasCdGuardBypass(command) bool` — the per-shell static refusal for
+//!   spellings that would bypass the guard's function overrides (quoted
+//!   `builtin`/`command` prefixes for bash; module-qualified location cmdlets
+//!   for pwsh).
 //! - `validateCwd(gpa, io, project_root, resolved_cwd) bool` — the per-shell
 //!   cwd-containment semantics (lexical prefix + best-effort realpath for
 //!   bash; slash/case-tolerant `pathsEqual` for pwsh). SEMANTIC divergence —
@@ -60,9 +64,9 @@ fn validateBackend(comptime B: type) void {
     if (!@hasDecl(B, "command_mode") or @TypeOf(B.command_mode) != background.BackgroundManager.CommandMode) {
         @compileError("shell.Impl backend must declare `command_mode: background.BackgroundManager.CommandMode`");
     }
-    inline for (.{ "prependCdGuard", "validateCwd" }) |decl| {
+    inline for (.{ "prependCdGuard", "hasCdGuardBypass", "validateCwd" }) |decl| {
         if (!@hasDecl(B, decl)) {
-            @compileError("shell.Impl backend must declare `" ++ decl ++ "` (the containment hook)");
+            @compileError("shell.Impl backend must declare `" ++ decl ++ "` (the containment static-refusal hook)");
         }
     }
 }
@@ -898,6 +902,13 @@ const TestBackend = struct {
 
     pub fn prependCdGuard(gpa: std.mem.Allocator, project_root: []const u8, command: []const u8) std.mem.Allocator.Error![]u8 {
         return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ project_root, command });
+    }
+
+    /// The containment static-refusal hook (#440): `runToolImpl` calls this on
+    /// every contained run, so the test backend satisfies the same contract
+    /// the comptime check enforces on the real backends.
+    pub fn hasCdGuardBypass(_: []const u8) bool {
+        return false;
     }
 
     pub fn validateCwd(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8) bool {
