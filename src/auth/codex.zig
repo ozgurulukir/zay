@@ -474,12 +474,19 @@ fn refreshAccessToken(gpa: std.mem.Allocator, io: std.Io, refresh_token: []const
     return try tokenRequest(gpa, io, body.written());
 }
 
+/// Stall bound for the OAuth token exchange: auth.openai.com answers in well
+/// under a second, so a server that accepts and then stops sending must fail
+/// the login/refresh instead of wedging its worker forever. Socket-level
+/// (per-read), so the connect phase itself stays kernel-bounded — the login
+/// job runs on a worker thread, keeping any connect hang off the UI thread.
+const token_timeout_seconds: u32 = 30;
+
 /// Executes OAuth token exchange / refresh HTTP request.
 /// Security note: To prevent leaking OAuth refresh tokens, access tokens, or
 /// authorization codes, the request and response bodies containing credential
 /// payloads MUST NEVER be logged.
 fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentials {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    var client: std.http.Client = .{ .allocator = gpa, .io = http.timeoutAwareIo(io) };
     defer client.deinit();
     log.info("codex.token.request POST {s}", .{token_url});
     var req = try client.request(.POST, try std.Uri.parse(token_url), .{ .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } } });
@@ -490,6 +497,10 @@ fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentia
     try body_writer.writer.writeAll(body);
     try body_writer.end();
     try req.connection.?.flush();
+    // Post-connect stall bound (head + body reads): the connection exists
+    // once `flush` succeeded. Windows skips the setsockopt inside
+    // `setSocketTimeout`; see token_timeout_seconds.
+    if (req.connection) |conn| http.setSocketTimeout(conn, token_timeout_seconds);
     var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
     const status: u16 = @intFromEnum(response.head.status);
@@ -504,6 +515,11 @@ fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentia
 /// the AI clients, so this deliberately keeps its own 8 KB size instead of
 /// aliasing `http.transfer_buffer_bytes`.
 const token_transfer_buffer_bytes: usize = 8192;
+
+/// Upper bound on a decompressed token response. The real payload is a few
+/// KiB; the registry fetcher's sizing discipline applies here too, so a
+/// misbehaving server cannot balloon this reader's memory.
+const token_response_bytes_max: usize = 1 * 1024 * 1024;
 
 fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     var empty_decompress_buffer: [0]u8 = .{};
@@ -525,10 +541,10 @@ fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response)
     var transfer_buffer: [token_transfer_buffer_bytes]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    _ = try reader.streamRemaining(&out.writer);
-    return try out.toOwnedSlice();
+    return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
+        error.StreamTooLong => error.TokenResponseTooLarge,
+        else => |e| e,
+    };
 }
 
 const TokenResponse = struct {
