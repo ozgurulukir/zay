@@ -158,6 +158,7 @@ pub const Client = struct {
 
     fn requestUrl(self: *const Client, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         const trimmed = std.mem.trimEnd(u8, self.endpoint, "/");
+        try validateEndpoint(trimmed);
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, path });
     }
 
@@ -209,7 +210,7 @@ pub const Client = struct {
 
         return ExecResult{
             .success = (success_val == .bool and success_val.bool),
-            .changes = if (changes_val != null and changes_val.? == .integer) @intCast(changes_val.?.integer) else 0,
+            .changes = try parseExecChanges(changes_val),
             .last_insert_rowid = if (last_id_val != null and last_id_val.? == .integer) last_id_val.?.integer else null,
         };
     }
@@ -410,6 +411,40 @@ fn parseTypeString(s: []const u8) db.ColumnType {
     return .text;
 }
 
+/// Validate the service endpoint BEFORE any network activity (#445). Every
+/// request carries the auth token as a bearer header, so an unparseable
+/// endpoint or embedded credentials fail with InvalidEndpoint, and plain
+/// http is only accepted for loopback endpoints (the same gate
+/// `turso.pipelineUrl` applies; the loopback exception keeps the common
+/// `http://localhost:8766` companion-service setup working).
+fn validateEndpoint(endpoint: []const u8) !void {
+    const uri = std.Uri.parse(endpoint) catch return error.InvalidEndpoint;
+    // Embedded credentials in a database endpoint are almost certainly a
+    // mis-pasted URL; reject rather than silently send them as auth material.
+    if (uri.user != null or uri.password != null) return error.InvalidEndpoint;
+    const host_component = uri.host orelse return error.InvalidEndpoint;
+    if (host_component.isEmpty()) return error.InvalidEndpoint;
+    var host_buffer: [256]u8 = undefined;
+    const host = host_component.toRaw(&host_buffer) catch return error.InvalidEndpoint;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        // Always accepted.
+    } else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
+        // Plain HTTP is only permitted for loopback endpoints.
+        if (!remote_http.isLoopbackHost(host)) return error.UnsupportedScheme;
+    } else {
+        return error.UnsupportedScheme;
+    }
+}
+
+/// The `changes` field is remote-controlled: a missing field stays lenient
+/// (reported as 0), but an integer outside i32 would have panicked the old
+/// `@intCast` (#445) — out-of-range values fail with InvalidResponse instead.
+fn parseExecChanges(value: ?std.json.Value) !i32 {
+    const v = value orelse return 0;
+    if (v != .integer) return 0;
+    return std.math.cast(i32, v.integer) orelse error.InvalidResponse;
+}
+
 pub fn serializeParams(writer: anytype, params: []const db.Value) !void {
     try writer.writeByte('[');
     for (params, 0..) |p, i| {
@@ -417,7 +452,13 @@ pub fn serializeParams(writer: anytype, params: []const db.Value) !void {
         switch (p) {
             .null => try writer.writeAll("null"),
             .int => |v| try writer.print("{d}", .{v}),
-            .float => |v| try writer.print("{d}", .{v}),
+            .float => |v| {
+                // NaN/Infinity are not representable in JSON — reject them
+                // before they can produce an invalid payload the provider
+                // would refuse with a confusing error (#162, #445).
+                if (!std.math.isFinite(v)) return error.InvalidParameter;
+                try writer.print("{d}", .{v});
+            },
             .text => |v| try std.json.Stringify.value(v, .{}, writer),
             .blob => |v| try std.json.Stringify.value(v, .{}, writer),
         }
@@ -449,6 +490,59 @@ test "serializeSqlPayload formats valid JSON with mixed parameters" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"sql\":\"INSERT INTO test VALUES (?, ?, ?, ?)\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"params\":[42,\"hello world\",3.14,null]") != null);
+}
+
+// #445: the service transport attaches a bearer token, so plain http is only
+// accepted for loopback endpoints (matching turso.pipelineUrl's gate). The
+// loopback exception keeps the common `http://localhost:8766` companion
+// service working (config round-trips that spelling).
+test "validateEndpoint gates plain http on loopback endpoints" {
+    // Loopback plain http stays accepted (local companion service).
+    try validateEndpoint("http://localhost:8766");
+    try validateEndpoint("http://127.0.0.1:8766");
+    // https is always accepted.
+    try validateEndpoint("https://db.example.com");
+    try validateEndpoint("https://db.example.com/");
+
+    // Non-loopback plain http is rejected before any network activity.
+    try std.testing.expectError(error.UnsupportedScheme, validateEndpoint("http://db.example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, validateEndpoint("http://127.evil.com:8766"));
+    // Other schemes are rejected too.
+    try std.testing.expectError(error.UnsupportedScheme, validateEndpoint("ftp://db.example.com"));
+    // Embedded credentials are almost certainly a mis-pasted URL.
+    try std.testing.expectError(error.InvalidEndpoint, validateEndpoint("https://user:pass@db.example.com"));
+    // Unparseable / hostless endpoints are rejected.
+    try std.testing.expectError(error.InvalidEndpoint, validateEndpoint("not a url"));
+}
+
+// #445: `changes` is remote-controlled; a missing field stays lenient (0) but
+// an integer outside i32 must fail instead of panicking the old @intCast.
+test "parseExecChanges bounds remote-controlled integers" {
+    try std.testing.expectEqual(@as(i32, 0), try parseExecChanges(null));
+    try std.testing.expectEqual(@as(i32, 0), try parseExecChanges(.{ .bool = true }));
+    try std.testing.expectEqual(@as(i32, 5), try parseExecChanges(.{ .integer = 5 }));
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), try parseExecChanges(.{ .integer = std.math.maxInt(i32) }));
+    try std.testing.expectError(error.InvalidResponse, parseExecChanges(.{ .integer = 1 << 40 }));
+    try std.testing.expectError(error.InvalidResponse, parseExecChanges(.{ .integer = -(1 << 40) }));
+}
+
+// #445: NaN and infinities are not representable in JSON; they must be
+// rejected at serialization time with a dedicated invalid-parameter error.
+test "serializeParams rejects non-finite floats" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try std.testing.expectError(
+        error.InvalidParameter,
+        serializeParams(&out.writer, &.{.{ .float = std.math.nan(f64) }}),
+    );
+    try std.testing.expectError(
+        error.InvalidParameter,
+        serializeParams(&out.writer, &.{.{ .float = std.math.inf(f64) }}),
+    );
+    // A finite float still serializes.
+    try serializeParams(&out.writer, &.{.{ .float = 1.5 }});
 }
 
 test "parseTypeString maps standard types" {
