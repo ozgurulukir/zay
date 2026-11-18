@@ -52,7 +52,8 @@ panel's About tab.
    are cross-targeted to `x86_64-linux-musl` and `x86_64-windows`, while macOS
    builds for its own host triple. Each build embeds the tag as the version,
    computes SHA-256 checksums, and creates a GitHub Release with all three
-   binaries and their `.sha256` files attached.
+   binaries, the `api.json` offline registry seed, and their `.sha256` files
+   attached.
 
 ### Pre-releases
 
@@ -75,6 +76,10 @@ git push origin "$RELEASE_TAG"
 - `zay-windows-x86_64.exe` + `zay-windows-x86_64.exe.sha256` (PE ships debug info in a
   sidecar natively)
 - `zay-macos-aarch64` + `zay-macos-aarch64.sha256` (Apple Silicon; built on `macos-latest`)
+- `api.json` + `api.json.sha256` (offline registry seed — the vendored
+  models.dev snapshot `vendor/models.dev/api.json`, staged from the Linux
+  build's `dist/share/zay/api.json` and published once per release; the
+  installers place it at the runtime's lookup path, see below)
 
 Verify a downloaded asset with:
 
@@ -99,7 +104,7 @@ Users can install the latest release directly via the root installer scripts:
 - **Linux / macOS:** `curl -fsSL https://raw.githubusercontent.com/ozgurulukir/zay/main/install.sh | bash`
 - **Windows (PowerShell):** `irm https://raw.githubusercontent.com/ozgurulukir/zay/main/install.ps1 | iex`
 
-The scripts automatically download the platform binary, verify the SHA256 checksum, place it in the user's PATH, and make it executable.
+The scripts automatically download the platform binary, verify the SHA256 checksum, place it in the user's PATH, and make it executable. The binary checksum is **fail-closed on verification failure**: `install.sh` aborts on a mismatch and also refuses when the checksum file is unavailable or no `sha256sum`/`shasum` tool exists (`ZAY_SKIP_CHECKSUM=1` is the explicit opt-out for those "verification is impossible" cases — it never bypasses a failed verification); `install.ps1` aborts on a mismatch or unparseable checksum file and warns when the checksum file cannot be downloaded. They also fetch `api.json` into the runtime's seed location — `<install-root>/share/zay/api.json`, the parent of the binary directory (e.g. `~/.local/share/zay/api.json` on Linux, `%LOCALAPPDATA%\Programs\share\zay\api.json` on Windows) — so offline first runs can still resolve models. That fetch is best-effort: a failure warns and continues, and an unverified seed is never installed.
 
 ## Notes
 
