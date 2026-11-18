@@ -44,6 +44,13 @@ fn deleteImpl(comptime Backend: type, gpa: std.mem.Allocator, service: []const u
 /// in tests. Reset to null in a `defer` after use.
 pub var forced_error: ?Error = null;
 
+/// Test seam: when set, ONLY `save` fails with this error, leaving
+/// `load`/`delete` on the real backend. Store tests use it to stage a
+/// previously-successful save (stale entry present) whose follow-up save
+/// fails, proving the fallback cleans up the stale entry. Reset to null in
+/// a `defer` after use.
+pub var forced_save_error: ?Error = null;
+
 /// Read the secret for `service`/`account`. Returns gpa-owned bytes, or null
 /// when no such entry exists.
 pub fn load(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!?[]u8 {
@@ -54,6 +61,7 @@ pub fn load(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Er
 /// Create or replace the secret for `service`/`account`.
 pub fn save(gpa: std.mem.Allocator, service: []const u8, account: []const u8, secret: []const u8) Error!void {
     if (forced_error) |err| return err;
+    if (forced_save_error) |err| return err;
     return saveImpl(impl, gpa, service, account, secret);
 }
 

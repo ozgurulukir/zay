@@ -423,8 +423,15 @@ fn lookupBuiltin(builtins: []const Provider, id: []const u8) ?Provider {
 
 const fetch_user_agent = "zay/1.0 (models.dev registry fetcher)";
 
+/// Stall bound for the models.dev fetch: a wedged connection must fail the
+/// background job (which falls back to the cache/vendored snapshot) instead
+/// of hanging it forever. Socket-level (per-read), so a slow-but-flowing
+/// download still completes; the connect phase itself stays kernel-bounded,
+/// exactly like the inference client (`ai/transport.zig`).
+const fetch_timeout_seconds: u32 = 30;
+
 fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    var client: std.http.Client = .{ .allocator = gpa, .io = http.timeoutAwareIo(io) };
     defer client.deinit();
 
     const uri = try std.Uri.parse(api_url);
@@ -433,6 +440,11 @@ fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     });
     defer request.deinit();
     try request.sendBodiless();
+    // Post-connect stall bound (head + body reads): after `sendBodiless` the
+    // connection exists, so this cannot fire during connect. Windows skips
+    // the setsockopt inside `setSocketTimeout`; the fetch runs on a worker
+    // thread, so a connect-phase hang stays off the UI thread.
+    if (request.connection) |conn| http.setSocketTimeout(conn, fetch_timeout_seconds);
 
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);

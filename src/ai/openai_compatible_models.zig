@@ -11,6 +11,14 @@ const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const response_bytes_max: u32 = 1 * 1024 * 1024;
 const model_count_max: u32 = 512;
 
+/// Stall bound for the picker's `/v1/models` probe: a server that accepts
+/// the connection and then stops sending must fail the probe instead of
+/// pinning the model-loader job forever. Socket-level (per-read), so a
+/// slow-but-flowing catalogue download still completes; the connect phase
+/// itself stays kernel-bounded, exactly like the inference client
+/// (`ai/transport.zig`).
+const probe_timeout_seconds: u32 = 30;
+
 pub const ModelEntry = struct {
     id: []u8,
 
@@ -61,7 +69,7 @@ pub fn listModels(
     var header_set = provider_headers.HeaderSet.init(&extra_headers);
     header_set.append(specs, .{ .session_id = options.session_id });
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = http.timeoutAwareIo(io) };
     defer http_client.deinit();
 
     var request = try http_client.request(.GET, try std.Uri.parse(url), .{
@@ -70,6 +78,11 @@ pub fn listModels(
     });
     defer request.deinit();
     try request.sendBodiless();
+    // Post-connect stall bound (head + body reads): after `sendBodiless` the
+    // connection exists, so this cannot fire during connect. Windows skips
+    // the setsockopt inside `setSocketTimeout`; the probe runs on a worker
+    // thread, so a connect-phase hang stays off the UI thread.
+    if (request.connection) |conn| http.setSocketTimeout(conn, probe_timeout_seconds);
     log.info("openai_compatible.models.request GET {s}", .{url});
 
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
