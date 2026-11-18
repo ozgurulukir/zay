@@ -61,9 +61,15 @@ pub const Client = struct {
     core_client: core.Client,
 
     pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config) !void {
-        std.debug.assert(config.account_id.len > 0);
-        std.debug.assert(config.session_id.len > 0);
-        std.debug.assert(config.system_prompt.len > 0);
+        // Codex identifies the account on every request (`chatgpt-account-id`
+        // header) and every websocket frame, and the system prompt drives the
+        // `instructions` field. These used to be std.debug.assert calls, which
+        // are no-ops in ReleaseFast: a persisted blob with an empty accountId
+        // then sailed through and sent a blank account header. Return explicit
+        // errors instead — the attach path is `try`-based and surfaces them.
+        if (config.account_id.len == 0) return error.MissingAccountId;
+        if (config.session_id.len == 0) return error.MissingSessionId;
+        if (config.system_prompt.len == 0) return error.MissingSystemPrompt;
         var codex_config = config;
         codex_config.base_url = codexBaseUrl(config.base_url);
         try target.core_client.init(gpa, io, codex_config, codex_responses_config);
@@ -433,6 +439,42 @@ test "codex version header present on websocket handshake and sse request header
     }
     try std.testing.expectEqual(@as(usize, 1), found);
     try std.testing.expect(codex_responses_config.headers.len <= 8);
+}
+
+test "codex client init rejects empty account id, session id, and system prompt" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The persisted-blob path can deliver an empty field; init must fail
+    // with an explicit error (ReleaseFast has no asserts) instead of sending
+    // a blank `chatgpt-account-id` header (#441).
+    const base: ai.Config = .{
+        .base_url = ai.codex_responses.default_codex_endpoint,
+        .account_id = "acc",
+        .session_id = "sess",
+        .api_key = "tok",
+        .model = "gpt-5.6-sol",
+        .system_prompt = "sp",
+    };
+
+    {
+        var config = base;
+        config.account_id = "";
+        var client: Client = undefined;
+        try std.testing.expectError(error.MissingAccountId, client.init(gpa, io, config));
+    }
+    {
+        var config = base;
+        config.session_id = "";
+        var client: Client = undefined;
+        try std.testing.expectError(error.MissingSessionId, client.init(gpa, io, config));
+    }
+    {
+        var config = base;
+        config.system_prompt = "";
+        var client: Client = undefined;
+        try std.testing.expectError(error.MissingSystemPrompt, client.init(gpa, io, config));
+    }
 }
 
 test "codex websocket watchdog shuts down Windows Io sockets without Winsock" {

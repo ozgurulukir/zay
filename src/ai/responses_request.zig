@@ -42,7 +42,12 @@ pub fn writeRequestPayload(
     }
     try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
     try out.writeAll(tools_json);
-    try out.writeAll(",\"tool_choice\":\"auto\"");
+    // `tool_choice` accompanies a non-empty tools array, mirroring the
+    // chat-completions path (openai_request.writeRequestPayload): several
+    // Responses endpoints reject the pair when the array is empty.
+    if (!std.mem.eql(u8, tools_json, "[]")) {
+        try out.writeAll(",\"tool_choice\":\"auto\"");
+    }
     if (config.system_prompt.len > 0) {
         try out.writeAll(",\"instructions\":");
         try wire_json.writeString(out, gpa, config.system_prompt);
@@ -686,6 +691,29 @@ test "writeRequestPayload handles empty messages and empty tools array" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[]") != null);
+    // tool_choice accompanies a non-empty tools array only — several
+    // Responses endpoints reject the pair when the array is empty (#441).
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
+}
+
+test "writeRequestPayload emits tool_choice auto alongside a non-empty tools array" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "test-model",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+
+    const tools_json = "[{\"type\":\"function\",\"name\":\"bash\"}]";
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, tools_json);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
 }
 
 test "writeRequestPayload skips system messages in history when config system_prompt is set" {

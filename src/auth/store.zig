@@ -229,12 +229,23 @@ pub fn readBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8
 
 /// Persist the blob: try the keychain, and on success drop the plaintext
 /// file so the secret isn't left on disk. Falls back to auth.json when the
-/// keychain is unavailable or rejects the blob.
+/// keychain is unavailable or rejects the blob — removing any keychain
+/// entry first, because `readBlob` prefers the keychain and a stale entry
+/// left behind by a previously-successful save would otherwise shadow the
+/// fresh file forever.
 pub fn writeBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
     var account_buf: [20]u8 = undefined;
     const account = keyringAccount(home_dir, &account_buf);
     keyring.save(gpa, keyring_service, account, bytes) catch |err| {
         if (err != error.Unsupported) log.warn("keyring save failed ({s}); writing auth.json", .{@errorName(err)});
+        // Best-effort: without this, a keychain save that succeeded earlier
+        // but fails now leaves the OLD secret in the keychain while the new
+        // one lands in auth.json — and readBlob keeps returning the stale
+        // bytes. Removal failure is logged by `deleteBlob`-style callers;
+        // here it must not block the file fallback.
+        _ = keyring.delete(gpa, keyring_service, account) catch |delete_err| {
+            if (delete_err != error.Unsupported) log.warn("keyring stale entry delete failed ({s})", .{@errorName(delete_err)});
+        };
         return writeBlobFile(gpa, io, home_dir, bytes);
     };
     deleteBlobFile(gpa, io, home_dir) catch {};
@@ -336,6 +347,13 @@ fn parseCredentials(gpa: std.mem.Allocator, bytes: []const u8) !?Credentials {
     const parsed = std.json.parseFromSlice(AuthFile, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
     defer parsed.deinit();
     const provider = parsed.value.openaiCodex orelse return null;
+    // The codex client sends `accountId` as the `chatgpt-account-id` header
+    // on every request and websocket frame; a blob without it is corrupt,
+    // not merely anonymous. Reject it here (the deserializer had no
+    // emptiness check) so an empty identity can never reach Client.init —
+    // which now fails closed with error.MissingAccountId as its second
+    // gate (#441).
+    if (provider.accountId.len == 0) return error.InvalidCredentials;
     return .{
         .access = try gpa.dupe(u8, provider.access),
         .refresh = try gpa.dupe(u8, provider.refresh),
@@ -397,32 +415,75 @@ fn readBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !?[]u8
     return bytes;
 }
 
+/// Process-wide counter giving every auth write a distinct temp name, even
+/// two writes in the same clock tick or two threads racing on one file.
+/// Mirrors `config/parse.zig::writeConfigFile`, which solved the same
+/// collision after a fixed `<path>.tmp` name caused a failed rename.
+var blob_write_serial: std.atomic.Value(u64) = .init(0);
+
+/// `<path>.<wallclock_ns>.<serial>.tmp` — the unique temporary sibling the
+/// atomic write renames over the destination. Pure so the same-tick
+/// collision guarantee (the serial counter) is testable in isolation.
+fn blobTempPath(gpa: std.mem.Allocator, path: []const u8, wallclock_ns: i96, serial: u64) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}.{d}.{d}.tmp", .{ path, wallclock_ns, serial });
+}
+
 fn writeBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
     const path = try authPath(gpa, home_dir);
     defer gpa.free(path);
     const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
     try std.Io.Dir.createDirPath(.cwd(), io, dirname);
-    // The blob is plaintext provider API keys, and on keyring-less platforms
-    // (Linux/BSD) this file is the only credential store. Create it
-    // owner-only — 0600 survives any umask, unlike the 0o666 default — and
-    // narrow an existing wider mode on every save, since a truncating
-    // rewrite keeps the old mode from when an older build created the file.
-    // Fails closed: a file that cannot be narrowed is not written. Windows
-    // keeps its attribute-based default (the keyring is native there).
-    const file_permissions: std.Io.File.Permissions = if (os.is_windows)
-        .default_file
-    else
-        .fromMode(0o600);
-    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{
-        .truncate = true,
-        .permissions = file_permissions,
-    });
-    defer file.close(io);
-    if (!os.is_windows) try file.setPermissions(io, file_permissions);
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
+
+    // Atomic temp + rename: on keyring-less platforms (Linux/BSD) this file
+    // is the ONLY credential store, so a crash mid-write must never destroy
+    // every stored credential. The payload goes to a per-writer unique
+    // temporary sibling, is synced, and is then renamed over the
+    // destination. The temp name embeds the wall clock and a process-wide
+    // counter because a fixed `<path>.tmp` was a collision point for two
+    // concurrent writers. The file is synced before the rename so a crash
+    // cannot leave the rename durable while its data blocks are not;
+    // std.Io exposes no directory sync, so the rename's own durability
+    // stays filesystem-dependent. A failed write unlinks its temp file; a
+    // failed unlink (an antivirus hold on Windows) is swallowed so it
+    // cannot mask the write error, and may leave a stale `.tmp` behind.
+    const tmp_path = try blobTempPath(
+        gpa,
+        path,
+        std.Io.Clock.now(.real, io).toNanoseconds(),
+        blob_write_serial.fetchAdd(1, .monotonic),
+    );
+    defer gpa.free(tmp_path);
+    errdefer std.Io.Dir.deleteFile(.cwd(), io, tmp_path) catch {};
+
+    {
+        // The blob is plaintext provider API keys: write owner-only — 0600
+        // survives any umask, unlike the 0o666 default. With rename-based
+        // saves every write creates a fresh file, so narrowing a wider mode
+        // an older build left behind is now implicit (the rename replaces
+        // the file wholesale); the explicit setPermissions still guarantees
+        // 0600 when the create would honor a laxer umask. Fails closed: a
+        // file that cannot be narrowed is not written. Windows keeps its
+        // attribute-based default (the keyring is native there).
+        const file_permissions: std.Io.File.Permissions = if (os.is_windows)
+            .default_file
+        else
+            .fromMode(0o600);
+        var file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{
+            .truncate = true,
+            .permissions = file_permissions,
+        });
+        defer file.close(io);
+        if (!os.is_windows) try file.setPermissions(io, file_permissions);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll(bytes);
+        try writer.interface.flush();
+        // Data before name: make the payload durable before the rename can
+        // publish it.
+        try file.sync(io);
+    }
+
+    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
 }
 
 fn deleteBlobFile(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !void {
@@ -477,6 +538,14 @@ test "parseApiKeys returns empty map when section absent" {
 test "parseCredentials returns InvalidCredentials on malformed json" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidCredentials, parseCredentials(gpa, "{invalid json"));
+}
+
+test "parseCredentials rejects a blob whose accountId is empty" {
+    const gpa = std.testing.allocator;
+    // The deserializer had no emptiness check, so a corrupt blob loaded as
+    // credentials with an empty identity; the codex client asserts non-empty
+    // (a ReleaseFast no-op). Both gates now fail closed (#441).
+    try std.testing.expectError(error.InvalidCredentials, parseCredentials(gpa, "{\"openaiCodex\":{\"access\":\"a\",\"refresh\":\"r\",\"expires\":12,\"accountId\":\"\"}}"));
 }
 
 test "parseApiKeys returns InvalidCredentials on malformed json" {
@@ -661,6 +730,129 @@ test "writeBlob handles large payload triggering keyring error and falls back to
     try std.testing.expectEqualSlices(u8, large_payload, loaded);
 }
 
+/// Count leftover `*.tmp` files in the auth config directory. The atomic
+/// write must clean up after itself on every path — the errdefer unlinks
+/// the temp on failure, and the rename consumes it on success.
+fn countTempLitter(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !usize {
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var dir = try std.Io.Dir.openDir(.cwd(), io, dirname, .{ .iterate = true });
+    defer dir.close(io);
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".tmp")) count += 1;
+    }
+    return count;
+}
+
+test "blob temp names never collide for two writes in the same clock tick" {
+    const gpa = std.testing.allocator;
+    const path = "/tmp/h/.config/zay/auth.json";
+    // Identical wall-clock timestamps (the same tick) with consecutive
+    // serials produce distinct temp names — the process-wide counter, not
+    // the clock, carries uniqueness.
+    const first = try blobTempPath(gpa, path, 1_700_000_000_000_000_000, 0);
+    defer gpa.free(first);
+    const second = try blobTempPath(gpa, path, 1_700_000_000_000_000_000, 1);
+    defer gpa.free(second);
+    try std.testing.expect(std.mem.startsWith(u8, first, path));
+    try std.testing.expect(std.mem.startsWith(u8, second, path));
+    try std.testing.expect(std.mem.endsWith(u8, first, ".tmp"));
+    try std.testing.expect(std.mem.endsWith(u8, second, ".tmp"));
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "writeBlobFile leaves no temp litter behind and overwrites atomically" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/zay-writeblob-litter-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    // Two sequential writes exercise the rename-overwrite path; each rename
+    // consumes its temp file, so none may survive either write.
+    try writeBlobFile(gpa, io, home_dir, "{\"apiKeys\":{}}");
+    try writeBlobFile(gpa, io, home_dir, "{\"apiKeys\":{\"openrouter\":\"or-key\"}}");
+
+    const loaded = (try readBlobFile(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualStrings("{\"apiKeys\":{\"openrouter\":\"or-key\"}}", loaded);
+    try std.testing.expectEqual(@as(usize, 0), try countTempLitter(gpa, io, home_dir));
+}
+
+test "writeBlobFile failure leaves the previous blob intact with no temp litter" {
+    if (os.is_windows) return error.SkipZigTest; // chmod-based failure injection is POSIX-only
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/zay-writeblob-fail-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    try writeBlobFile(gpa, io, home_dir, "previous");
+
+    // Inject the failure at the filesystem level: a read-only config dir
+    // makes the temp-file create fail before anything is touched, while the
+    // previous blob stays in place.
+    const path = try authPath(gpa, home_dir);
+    defer gpa.free(path);
+    const dirname = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    {
+        // `.iterate = true` matters beyond listing here: without it, POSIX
+        // openDir opens an O_PATH handle and `setPermissions` (fchmod on
+        // that handle) fails with EBADF.
+        var dir = try std.Io.Dir.openDir(.cwd(), io, dirname, .{ .iterate = true });
+        defer dir.close(io);
+        try dir.setPermissions(io, .fromMode(0o500));
+        defer {
+            // Restore before the outer `defer deleteBlob` runs, or its
+            // unlink would also fail on the read-only directory.
+            dir.setPermissions(io, .fromMode(0o700)) catch {};
+        }
+
+        try std.testing.expectError(error.AccessDenied, writeBlobFile(gpa, io, home_dir, "fresh"));
+    }
+
+    // The previous blob is untouched and the failed attempt left no `.tmp`.
+    const loaded = (try readBlobFile(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualStrings("previous", loaded);
+    try std.testing.expectEqual(@as(usize, 0), try countTempLitter(gpa, io, home_dir));
+}
+
+test "writeBlob removes a stale keychain entry when the save fails and the file wins" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/zay-writeblob-stale-keyring-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    var account_buf: [20]u8 = undefined;
+    const account = keyringAccount(home_dir, &account_buf);
+
+    // Stage the bug's precondition on a real keychain: a successful save
+    // leaves an entry that `readBlob` prefers over auth.json. Skips on
+    // keyring-less platforms (Linux/BSD), where the file is authoritative
+    // and the scenario is unreachable.
+    keyring.save(gpa, keyring_service, account, "stale-blob") catch |err| switch (err) {
+        error.Unsupported, error.Backend => return error.SkipZigTest,
+        else => return err,
+    };
+    defer _ = keyring.delete(gpa, keyring_service, account) catch {};
+
+    // Now the follow-up save fails while load/delete stay on the real
+    // backend — exactly the "saved fine yesterday, fails today" sequence.
+    keyring.forced_save_error = error.Backend;
+    defer keyring.forced_save_error = null;
+
+    const fresh_payload = "{\"apiKeys\":{\"openrouter\":\"or-key-fresh\"}}";
+    try writeBlob(gpa, io, home_dir, fresh_payload);
+
+    // readBlob must return the FILE bytes: the fallback removed the stale
+    // keychain entry, so it can no longer shadow the fresh blob (#442).
+    const loaded = (try readBlob(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualStrings(fresh_payload, loaded);
+}
+
 test "writeBlob keeps auth.json owner-only regardless of umask" {
     // Arrange
     const gpa = std.testing.allocator;
@@ -684,7 +876,9 @@ test "writeBlob keeps auth.json owner-only regardless of umask" {
     }
 
     // A file created wide by an older build (umask-derived 0644) is narrowed
-    // on the next save instead of staying readable by group and other.
+    // on the next save instead of staying readable by group and other. The
+    // rename-based write makes this implicit — every save creates a fresh
+    // 0600 file — where the old in-place truncate kept the old mode.
     if (os.tag != .windows) {
         var wide = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
         defer wide.close(io);
