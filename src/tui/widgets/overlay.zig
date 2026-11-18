@@ -313,6 +313,7 @@ const OverlayInner = struct {
             if (row.permissions.network_access) try requested.append(ctx.arena, "network");
             if (row.permissions.allow_os_execute) try requested.append(ctx.arena, "os.execute");
             if (row.permissions.allow_os_remove) try requested.append(ctx.arena, "os.remove/rename");
+            if (row.permissions.allow_env) try requested.append(ctx.arena, "env");
             if (row.permissions.full_access) try requested.append(ctx.arena, "full Lua access");
             const permission_summary = if (requested.items.len == 0) "no extra permissions requested" else try std.mem.join(ctx.arena, ", ", requested.items);
             break :blk try std.fmt.allocPrint(ctx.arena, "v{s} · {s} · {s} · manifest requests: {s} · {s}", .{ row.version, row.origin, if (row.managed) "Store-managed" else "manual", permission_summary, row.diagnostic orelse row.path });

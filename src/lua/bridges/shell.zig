@@ -13,6 +13,7 @@ const pwsh_exec = @import("../../tools/pwsh_exec.zig");
 const bash_safety = @import("../../tools/bash_safety.zig");
 const os = @import("../../os.zig");
 const git_bridge = @import("git.zig");
+const sandbox_mod = @import("../sandbox.zig");
 
 fn getIo(L: *c.lua_State) std.Io {
     return bridge.getIo(L);
@@ -275,6 +276,18 @@ pub fn runShell(L: ?*c.lua_State) callconv(.c) c_int {
     return runShellWithBackend(L, if (os.is_windows) .pwsh else .bash);
 }
 
+/// Environment variables a plugin may always read. These identify the
+/// runtime environment but carry no secrets, so they stay readable without
+/// the `allow_env` permission (#448). Exact, case-sensitive matches.
+const safe_env_names = [_][]const u8{ "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER", "TZ" };
+
+fn isSafeEnvName(name: []const u8) bool {
+    for (safe_env_names) |safe| {
+        if (std.mem.eql(u8, name, safe)) return true;
+    }
+    return false;
+}
+
 pub fn getEnv(L: ?*c.lua_State) callconv(.c) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
@@ -284,6 +297,19 @@ pub fn getEnv(L: ?*c.lua_State) callconv(.c) c_int {
         state.pushString("name argument is required");
         return 2;
     };
+
+    // Enforced permission gate (#448): without `allow_env`, only the harmless
+    // allowlist above is readable. The flag is copied into this state's
+    // registry at creation (`sandbox.allow_env_registry_key`); a state
+    // without it (raw unit-test states) fails closed.
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, sandbox_mod.allow_env_registry_key);
+    const allow_env = c.lua_toboolean(L_ptr, -1) != 0;
+    c.lua_pop(L_ptr, 1);
+    if (!allow_env and !isSafeEnvName(name)) {
+        state.pushNil();
+        state.pushString("get_env denied: reading arbitrary environment variables requires the allow_env permission");
+        return 2;
+    }
 
     const name_buf = std.heap.page_allocator.alloc(u8, name.len + 1) catch {
         state.pushNil();
@@ -383,4 +409,66 @@ test "sanitizePath rejects escaping symlink even when leaf does not exist (#415)
 
     try std.testing.expectError(error.PathTraversal, sanitizePath(io, "link/nonexistent.txt", workspace));
     try std.testing.expectError(error.PathTraversal, sanitizePath(io, "link/sub/nonexistent.txt", workspace));
+}
+
+// ── #448 F5: enforced allow_env permission gate on zay.get_env ───────
+
+test "isSafeEnvName matches the harmless allowlist exactly" {
+    for (safe_env_names) |safe| try std.testing.expect(isSafeEnvName(safe));
+    // Negative space: secrets and near-misses must not slip through.
+    try std.testing.expect(!isSafeEnvName("OPENAI_API_KEY"));
+    try std.testing.expect(!isSafeEnvName("AWS_SECRET_ACCESS_KEY"));
+    try std.testing.expect(!isSafeEnvName("path"));
+    try std.testing.expect(!isSafeEnvName("PATHS"));
+    try std.testing.expect(!isSafeEnvName(""));
+}
+
+test "get_env serves the safe allowlist without allow_env and denies the rest" {
+    const io = std.testing.io;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    try std.testing.expect(L.doString(
+        \\-- PATH is on the harmless allowlist and must stay readable.
+        \\local path = zay.get_env("PATH")
+        \\assert(path ~= nil, "PATH readable without the permission")
+        \\-- Any other variable is denied with an error message, whether or
+        \\-- not it exists in the process environment.
+        \\local v, err = zay.get_env("OPENAI_API_KEY")
+        \\assert(v == nil, "secret variables denied without the permission")
+        \\assert(err ~= nil and string.find(err, "allow_env") ~= nil, "denial names the permission: " .. tostring(err))
+        \\return "OK"
+    ));
+}
+
+test "get_env with the allow_env permission serves anything without denial" {
+    const io = std.testing.io;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_env = true }, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    try std.testing.expect(L.doString(
+        \\-- With the permission the lookup reaches the real environment: an
+        \\-- unset variable yields plain nil (no error), a set one a string.
+        \\local v, err = zay.get_env("OPENAI_API_KEY")
+        \\assert(err == nil, "permitted lookup must not be denied: " .. tostring(err))
+        \\assert(v == nil or type(v) == "string", "unset yields nil, set yields a string")
+        \\local path = zay.get_env("PATH")
+        \\assert(path ~= nil, "PATH still readable with the permission")
+        \\return "OK"
+    ));
+}
+
+test "get_env full-access states serve anything without denial" {
+    const io = std.testing.io;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{ .full_access = true }, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    try std.testing.expect(L.doString(
+        \\local v, err = zay.get_env("OPENAI_API_KEY")
+        \\assert(err == nil, "trusted host build is not denied: " .. tostring(err))
+        \\return "OK"
+    ));
 }

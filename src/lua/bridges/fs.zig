@@ -187,6 +187,11 @@ pub fn editFile(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// Cancellation checkpoint interval for `listDir`'s entry loop (#448): the
+/// per-dispatch budget is consulted every N entries so a huge directory
+/// cannot pin a plugin dispatch.
+const list_dir_cancellation_interval: u32 = 64;
+
 /// ── zay.list_dir(path) ─────────────────────────────────────────────
 ///
 /// Lists directory contents. Returns a table with:
@@ -228,7 +233,30 @@ pub fn listDir(L: ?*c.lua_State) callconv(.c) c_int {
     var dir_count: u32 = 0;
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    var entry_index: u32 = 0;
+    while (true) {
+        // Cooperative-stop checkpoint every N entries (#448): on a stopped
+        // budget the partial listing is abandoned for the error return; the
+        // execution hook re-raises once Lua resumes.
+        if (entry_index % list_dir_cancellation_interval == 0) {
+            execution.check(L_ptr);
+            if (execution.stopped(L_ptr)) {
+                state.pushNil();
+                state.pushString("PluginExecutionStopped");
+                return 2;
+            }
+        }
+
+        // Surface iteration failures (#449): a partial listing must never be
+        // presented as a complete one, so an error here matches the
+        // open-failure shape (nil + error message).
+        const maybe_entry = iter.next(io) catch |err| {
+            state.pushNil();
+            state.pushString(@errorName(err));
+            return 2;
+        };
+        const entry = maybe_entry orelse break;
+
         if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
         switch (entry.kind) {
             .file => {
@@ -243,6 +271,7 @@ pub fn listDir(L: ?*c.lua_State) callconv(.c) c_int {
             },
             else => {},
         }
+        entry_index += 1;
     }
 
     _ = c.lua_setfield(L_ptr, -3, "directories");
@@ -498,4 +527,48 @@ test "bridges.fs: file_info returns directory type for directories" {
     try std.testing.expect(L.doString("info = zay.file_info('.')"));
     try std.testing.expect(L.doString("assert(info ~= nil, 'info should not be nil')"));
     try std.testing.expect(L.doString("assert(info.type == 'directory', 'type should be directory')"));
+}
+
+test "bridges.fs: list_dir lists files and directories with the full shape" {
+    const io = std.testing.io;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "" });
+    try tmp.dir.createDir(io, "subdir", .default_dir);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    execution.setDispatchCtx(L.handle, .{ .cwd = root_buf[0..root_len] });
+
+    try std.testing.expect(L.doString(
+        \\local listing = zay.list_dir(".")
+        \\assert(type(listing) == "table", "listing returns a table")
+        \\assert(listing.total_items == 2, "expected 2 items, got " .. tostring(listing.total_items))
+        \\assert(#listing.files == 1 and listing.files[1] == "a.txt", "file listed")
+        \\assert(#listing.directories == 1 and listing.directories[1] == "subdir", "directory listed")
+        \\return "OK"
+    ));
+}
+
+test "bridges.fs: list_dir returns nil + error for a missing directory" {
+    const io = std.testing.io;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    execution.setDispatchCtx(L.handle, .{ .cwd = root_buf[0..root_len] });
+
+    try std.testing.expect(L.doString(
+        \\local listing, err = zay.list_dir("./no-such-zay-dir-xyz")
+        \\assert(listing == nil, "missing directory yields nil")
+        \\assert(err ~= nil, "error message present")
+        \\return "OK"
+    ));
 }

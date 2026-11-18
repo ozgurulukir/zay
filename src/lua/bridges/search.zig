@@ -82,6 +82,8 @@ pub fn searchFiles(L: ?*c.lua_State) callconv(.c) c_int {
         _ = c.lua_setfield(L_ptr, -2, "error");
         state.pushInteger(@as(i64, @intCast(total)));
         _ = c.lua_setfield(L_ptr, -2, "total_matches");
+        state.pushBoolean(result_count < total);
+        _ = c.lua_setfield(L_ptr, -2, "truncated");
         return 1;
     };
 
@@ -139,6 +141,8 @@ pub fn findFiles(L: ?*c.lua_State) callconv(.c) c_int {
         _ = c.lua_setfield(L_ptr, -2, "error");
         state.pushInteger(@as(i64, @intCast(ctx.total)));
         _ = c.lua_setfield(L_ptr, -2, "total_matches");
+        state.pushBoolean(ctx.result_count < ctx.total);
+        _ = c.lua_setfield(L_ptr, -2, "truncated");
         return 1;
     };
 
@@ -159,8 +163,20 @@ pub const FindCtx = struct {
     L: ?*c.lua_State,
 };
 
+/// Cooperative-stop checkpoint for the walk loops (#448): honor the dispatch
+/// budget's timeout/cancellation state so a wide tree cannot pin a plugin
+/// dispatch. A stopped budget surfaces as a Zig error — the bridge's catch
+/// records it and the execution hook re-raises once Lua resumes. Safe no-op
+/// without a budget (`execution.check` returns early).
+fn checkWalkBudget(L: ?*c.lua_State) !void {
+    const l = L orelse return;
+    execution.check(l);
+    if (execution.stopped(l)) return error.PluginExecutionStopped;
+}
+
 /// Walk a directory recursively, matching each file's relative path against pattern.
 pub fn walkAndMatch(io: std.Io, dir_path: []const u8, pattern: []const u8, ctx: *FindCtx) !void {
+    try checkWalkBudget(ctx.L);
     // An exact root uses the same basename glob contract as search_files.
     if (dir_path.len == ctx.root_len) {
         const stat = try std.Io.Dir.cwd().statFile(io, dir_path, .{});
@@ -354,6 +370,7 @@ pub fn walkAndSearch(
 }
 
 fn walkSearchDirectory(io: std.Io, dir_path: []const u8, ctx: *SearchCtx) !void {
+    try checkWalkBudget(ctx.L);
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
     var iter = dir.iterate();
@@ -502,4 +519,96 @@ test "matchGlob_returnsFalse_whenNameIsEmptyAndPatternIsNonEmpty" {
     // Arrange & Act & Assert
     try std.testing.expect(!matchGlob("", "*.zig"));
     try std.testing.expect(matchGlob("", "**"));
+}
+
+// ── #448/#449: bounded walks and error-path table shape ──────────────
+
+test "search walks stop with an expired dispatch budget (#448)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "needle here\n" });
+    try tmp.dir.createDir(io, "sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/b.txt", .data = "needle again\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    // Deterministic stop: an already-expired deadline arms the timeout stop
+    // reason on the first per-directory checkpoint (no wall-clock race).
+    execution.budget(L.handle).?.deadline_ns = 1;
+
+    var total: u32 = 0;
+    var count: u32 = 0;
+    try std.testing.expectError(error.PluginExecutionStopped, walkAndSearch(io, root, null, "needle", false, 50, &total, &count, L.handle));
+    try std.testing.expect(execution.stopped(L.handle));
+
+    var ctx = FindCtx{ .total = 0, .result_count = 0, .max_results = 50, .root_len = root.len, .L = L.handle };
+    try std.testing.expectError(error.PluginExecutionStopped, walkAndMatch(io, root, "*.txt", &ctx));
+}
+
+test "search walks complete under a healthy budget and surface matches" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "needle here\n" });
+    try tmp.dir.createDir(io, "sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/b.txt", .data = "needle again\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    // The walks push match rows with lua_rawseti relative to the results
+    // table the bridges leave on the stack; mirror that layout here.
+    var st = State{ .handle = L.handle };
+    st.newTable();
+    defer st.pop(1);
+
+    var total: u32 = 0;
+    var count: u32 = 0;
+    try walkAndSearch(io, root, null, "needle", false, 50, &total, &count, L.handle);
+    try std.testing.expectEqual(@as(u32, 2), total);
+    try std.testing.expectEqual(@as(u32, 2), count);
+
+    var ctx = FindCtx{ .total = 0, .result_count = 0, .max_results = 50, .root_len = root.len, .L = L.handle };
+    try walkAndMatch(io, root, "*.txt", &ctx);
+    try std.testing.expectEqual(@as(u32, 2), ctx.total);
+    try std.testing.expectEqual(@as(u32, 2), ctx.result_count);
+}
+
+test "search bridge error paths keep the table shape including truncated (#449)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+    // Hermetic root: the nonexistent search target resolves under the tmp
+    // dir, so the stat failure reaches the walk's error branch instead of
+    // the path-sanitizer's.
+    execution.setDispatchCtx(L.handle, .{ .cwd = root_buf[0..root_len] });
+
+    try std.testing.expect(L.doString(
+        \\local s = zay.search_files("./no-such-zay-dir", "p")
+        \\assert(type(s) == "table", "search error path returns a table")
+        \\assert(s.error ~= nil, "error field present")
+        \\assert(s.total_matches ~= nil, "total_matches field present")
+        \\assert(type(s.truncated) == "boolean", "truncated field present on search error path")
+        \\local f = zay.find_files("./no-such-zay-dir", "*.p")
+        \\assert(type(f) == "table", "find error path returns a table")
+        \\assert(f.error ~= nil, "error field present")
+        \\assert(type(f.truncated) == "boolean", "truncated field present on find error path")
+        \\return "OK"
+    ));
 }
