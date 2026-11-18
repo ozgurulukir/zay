@@ -141,6 +141,18 @@ jobs:
           strip --strip-debug dist/${{ matrix.artifact }}
           objcopy --add-gnu-debuglink=dist/${{ matrix.artifact }}.debug dist/${{ matrix.artifact }}
 
+      # The offline registry seed (vendor/models.dev/api.json) installs to
+      # <prefix>/share/zay/api.json next to the binary and is loaded at
+      # runtime when the network is unavailable (src/models/registry.zig
+      # loadVendored). zig build install stages it at dist/share/zay/api.json;
+      # publish it as a release asset so the installers can fetch it. One copy
+      # per release is enough — the file is byte-identical across matrix
+      # entries, so only the Linux build stages and uploads it.
+      - name: Stage api.json seed (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cp dist/share/zay/api.json dist/api.json
+
       # Every published asset gets its checksum from THIS step, and every
       # checksum is written from inside dist/ so the recorded path is the
       # bare basename. `sha256sum` records the path it was handed, so
@@ -170,12 +182,32 @@ jobs:
               shasum -a 256 ${{ matrix.artifact }}.debug > ${{ matrix.artifact }}.debug.sha256
             fi
           fi
+          # The api.json seed is staged only on the Linux runner (see the
+          # staging step above), so the guard skips on Windows/macOS — every
+          # published asset still gets its checksum from this one step.
+          if [ -f api.json ]; then
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum api.json > api.json.sha256
+            else
+              shasum -a 256 api.json > api.json.sha256
+            fi
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}*
+
+      # The seed and its checksum ride their own artifact so the release job's
+      # dist/ merge publishes exactly one api.json per release (see the
+      # staging step above).
+      - name: Upload api.json seed
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: api-json-seed
+          path: dist/api.json*
 
   release:
     name: release
