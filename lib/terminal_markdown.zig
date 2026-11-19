@@ -13,11 +13,17 @@ pub const Style = enum {
     code,
     strong,
     emphasis,
+    link,
+    code_keyword,
+    code_string,
+    code_comment,
+    code_number,
 };
 
 pub const Span = struct {
     text: []const u8,
     style: Style,
+    link_url: []const u8 = "",
 };
 
 pub const Row = struct {
@@ -185,7 +191,10 @@ fn lineAt(text: []const u8, start: usize) Line {
     };
 }
 
-pub const BlockState = struct { in_code: bool = false };
+pub const BlockState = struct {
+    in_code: bool = false,
+    code_lang: []const u8 = "",
+};
 
 /// Block boundary for append-only incremental rendering: the byte offset just
 /// after the most recent blank line that is not inside a ``` code fence.
@@ -316,11 +325,29 @@ pub const Incremental = struct {
 
 fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u16, state: *BlockState) !void {
     if (isFence(line)) {
-        state.in_code = !state.in_code;
+        if (state.in_code) {
+            state.in_code = false;
+            state.code_lang = "";
+        } else {
+            state.in_code = true;
+            const trimmed = trimLeft(line);
+            if (trimmed.len > 3) {
+                state.code_lang = std.mem.trim(u8, trimmed[3..], " \t\r");
+            } else {
+                state.code_lang = "";
+            }
+        }
         return;
     }
     if (line.len == 0) return appendEmptyRow(gpa, b);
-    if (state.in_code) return renderPlainLine(gpa, b, line, width, .code, 0, &.{});
+    if (state.in_code) {
+        const spans = tokenizeCodeLine(gpa, line, state.code_lang) catch null;
+        if (spans) |s| {
+            defer gpa.free(s);
+            return appendWrapped(gpa, b, &.{}, 0, s, width);
+        }
+        return renderPlainLine(gpa, b, line, width, .code, 0, &.{});
+    }
     if (headingBody(line)) |body| {
         const spans = try inlineSpans(gpa, body.text, .heading);
         defer gpa.free(spans);
@@ -358,10 +385,24 @@ fn renderPlainLine(
 
 fn countLineRows(gpa: std.mem.Allocator, line: []const u8, width: u16, state: *BlockState) u16 {
     if (isFence(line)) {
-        state.in_code = !state.in_code;
+        if (state.in_code) {
+            state.in_code = false;
+            state.code_lang = "";
+        } else {
+            state.in_code = true;
+            const trimmed = trimLeft(line);
+            if (trimmed.len > 3) {
+                state.code_lang = std.mem.trim(u8, trimmed[3..], " \t\r");
+            } else {
+                state.code_lang = "";
+            }
+        }
         return 0;
     }
     if (line.len == 0) return 1;
+    if (state.in_code) {
+        return countWrappedRows(gpa, line, width, 0, 0);
+    }
     var body = line;
     var prefix_width: u16 = 0;
     var continuation_indent: u16 = 0;
@@ -682,6 +723,105 @@ fn isFence(line: []const u8) bool {
     return std.mem.startsWith(u8, trimmed, "```");
 }
 
+fn isCodeKeyword(word: []const u8) bool {
+    const keywords = [_][]const u8{
+        "pub",        "fn",        "const",    "var",     "return",      "if",       "else",   "while",     "for",    "switch",
+        "case",       "break",     "continue", "try",     "catch",       "orelse",   "struct", "enum",      "union",  "errdefer",
+        "defer",      "comptime",  "inline",   "test",    "unreachable", "error",    "export", "extern",    "align",  "async",
+        "await",      "suspend",   "resume",   "anytype", "anyerror",    "def",      "class",  "import",    "from",   "as",
+        "with",       "except",    "finally",  "lambda",  "pass",        "yield",    "raise",  "elif",      "then",   "fi",
+        "do",         "done",      "esac",     "local",   "let",         "function", "throw",  "interface", "type",   "extends",
+        "implements", "mut",       "impl",     "use",     "match",       "mod",      "trait",  "where",     "static", "void",
+        "int",        "char",      "bool",     "true",    "false",       "null",     "nil",    "None",      "self",   "this",
+        "new",        "undefined",
+    };
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
+
+fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8) ![]Span {
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(gpa);
+
+    if (line.len == 0) return spans.toOwnedSlice(gpa);
+
+    const is_hash_comment_lang = blk: {
+        if (std.ascii.eqlIgnoreCase(lang, "python") or std.ascii.eqlIgnoreCase(lang, "py")) break :blk true;
+        if (std.ascii.eqlIgnoreCase(lang, "bash") or std.ascii.eqlIgnoreCase(lang, "sh")) break :blk true;
+        if (std.ascii.eqlIgnoreCase(lang, "yaml") or std.ascii.eqlIgnoreCase(lang, "yml")) break :blk true;
+        if (std.ascii.eqlIgnoreCase(lang, "toml")) break :blk true;
+        break :blk false;
+    };
+
+    var i: usize = 0;
+    while (i < line.len) {
+        // Comments:
+        if (is_hash_comment_lang and line[i] == '#') {
+            try appendSpan(&spans, gpa, line[i..], .code_comment);
+            break;
+        } else if (!is_hash_comment_lang and i + 1 < line.len and line[i] == '/' and line[i + 1] == '/') {
+            try appendSpan(&spans, gpa, line[i..], .code_comment);
+            break;
+        }
+
+        // Strings:
+        if (line[i] == '"' or line[i] == '\'') {
+            const quote = line[i];
+            var end = i + 1;
+            while (end < line.len) {
+                if (line[end] == '\\') {
+                    end = @min(end + 2, line.len);
+                    continue;
+                }
+                if (line[end] == quote) {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            try appendSpan(&spans, gpa, line[i..end], .code_string);
+            i = end;
+            continue;
+        }
+
+        // Numbers:
+        if (std.ascii.isDigit(line[i]) or (line[i] == '0' and i + 1 < line.len and (line[i + 1] == 'x' or line[i + 1] == 'b' or line[i + 1] == 'o'))) {
+            var end = i + 1;
+            if (end < line.len and (line[end] == 'x' or line[end] == 'b' or line[end] == 'o')) end += 1;
+            while (end < line.len and (std.ascii.isHex(line[end]) or line[end] == '.' or line[end] == '_')) : (end += 1) {}
+            try appendSpan(&spans, gpa, line[i..end], .code_number);
+            i = end;
+            continue;
+        }
+
+        // Identifiers & keywords:
+        if (std.ascii.isAlphabetic(line[i]) or line[i] == '_') {
+            var end = i + 1;
+            while (end < line.len and (std.ascii.isAlphanumeric(line[end]) or line[end] == '_')) : (end += 1) {}
+            const word = line[i..end];
+            const style: Style = if (isCodeKeyword(word)) .code_keyword else .code;
+            try appendSpan(&spans, gpa, word, style);
+            i = end;
+            continue;
+        }
+
+        // Punctuation, operators, whitespace:
+        var end = i + 1;
+        while (end < line.len) {
+            const c = line[end];
+            if (c == '#' or (c == '/' and end + 1 < line.len and line[end + 1] == '/') or c == '"' or c == '\'' or std.ascii.isAlphanumeric(c) or c == '_') break;
+            end += 1;
+        }
+        try appendSpan(&spans, gpa, line[i..end], .code);
+        i = end;
+    }
+
+    if (spans.items.len == 0) try appendSpan(&spans, gpa, "", .code);
+    return spans.toOwnedSlice(gpa);
+}
+
 fn inlineSpans(gpa: std.mem.Allocator, line: []const u8, base: Style) ![]Span {
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(gpa);
@@ -715,6 +855,27 @@ fn inlineSpans(gpa: std.mem.Allocator, line: []const u8, base: Style) ![]Span {
                 continue;
             }
         }
+        if (line[index] == '[') {
+            if (std.mem.indexOfScalarPos(u8, line, index + 1, ']')) |close_bracket| {
+                if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, line, close_bracket + 2, ')')) |close_paren| {
+                        const anchor_text = line[index + 1 .. close_bracket];
+                        const link_url = line[close_bracket + 2 .. close_paren];
+                        try appendSpanWithLink(&spans, gpa, anchor_text, .link, link_url);
+                        index = close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if (std.mem.startsWith(u8, line[index..], "https://") or std.mem.startsWith(u8, line[index..], "http://")) {
+            var url_end = index;
+            while (url_end < line.len and !std.ascii.isWhitespace(line[url_end]) and line[url_end] != ')' and line[url_end] != ']' and line[url_end] != '>') : (url_end += 1) {}
+            const url = line[index..url_end];
+            try appendSpanWithLink(&spans, gpa, url, .link, url);
+            index = url_end;
+            continue;
+        }
 
         const next = nextInlineMarker(line, index + 1);
         try appendSpan(&spans, gpa, line[index..next], base);
@@ -730,13 +891,19 @@ fn nextInlineMarker(line: []const u8, start: usize) usize {
     while (index < line.len) : (index += 1) {
         if (line[index] == '`') return index;
         if (line[index] == '*') return index;
+        if (line[index] == '[') return index;
+        if (line[index] == 'h' and (std.mem.startsWith(u8, line[index..], "https://") or std.mem.startsWith(u8, line[index..], "http://"))) return index;
     }
     return line.len;
 }
 
-fn appendSpan(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style) !void {
+fn appendSpanWithLink(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style, link_url: []const u8) !void {
     if (text.len == 0) return;
-    try spans.append(gpa, .{ .text = text, .style = style });
+    try spans.append(gpa, .{ .text = text, .style = style, .link_url = link_url });
+}
+
+fn appendSpan(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style) !void {
+    return appendSpanWithLink(spans, gpa, text, style, "");
 }
 
 /// The two consumers of word-wrapping: rendering (emit spans into the builder
@@ -756,9 +923,9 @@ const CountState = struct { rows: u16, has_content: bool = false };
 /// Sink-aware span addition: the push sink materializes spans into the
 /// builder's scratch buffer for rendering; the count sink only tracks whether
 /// the current row has content (via `has_content`), so it touches no heap.
-fn addSpan(sink: RowSink, current: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style) !void {
+fn addSpan(sink: RowSink, current: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style, link_url: []const u8) !void {
     switch (sink) {
-        .push => try appendSpan(current, gpa, text, style),
+        .push => try appendSpanWithLink(current, gpa, text, style, link_url),
         .count => |state| {
             if (text.len > 0) state.has_content = true;
         },
@@ -866,7 +1033,7 @@ fn wrapCore(
                     current_indent = continuation_indent;
                     current_width = try startRow(gpa, sink, current, &.{}, current_indent);
                 } else {
-                    try addSpan(sink, current, gpa, " ", span.style);
+                    try addSpan(sink, current, gpa, " ", span.style, span.link_url);
                     current_width += 1;
                 }
             }
@@ -879,7 +1046,7 @@ fn wrapCore(
                     const capacity = @max(width -| current_width, 1);
                     const end = graphemeSliceEnd(word, hi, capacity);
                     const slice = word[hi..end];
-                    try addSpan(sink, current, gpa, slice, span.style);
+                    try addSpan(sink, current, gpa, slice, span.style, span.link_url);
                     current_width += textWidth(slice);
                     hi = end;
                     if (hi < word.len) {
@@ -889,7 +1056,7 @@ fn wrapCore(
                     }
                 }
             } else {
-                try addSpan(sink, current, gpa, word, span.style);
+                try addSpan(sink, current, gpa, word, span.style, span.link_url);
                 current_width += word_width;
             }
             index = word_end;
@@ -901,7 +1068,7 @@ fn wrapCore(
         .count => |state| !state.has_content,
     };
     if (row_is_empty) {
-        try addSpan(sink, current, gpa, "", .normal);
+        try addSpan(sink, current, gpa, "", .normal, "");
     }
     try commitRow(gpa, sink, current, current_indent);
 }
@@ -1481,4 +1648,57 @@ test "countRows returns expected values and makes no allocations" {
             try std.testing.expectEqual(@as(usize, 0), counting.count);
         }
     }
+}
+
+test "code blocks highlight syntax tokens" {
+    const gpa = std.testing.allocator;
+    const code =
+        \\```zig
+        \\pub fn main() void {
+        \\    // comment
+        \\    const x = 42;
+        \\    const s = "hello";
+        \\}
+        \\```
+    ;
+    var out = try render(gpa, code, 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expect(out.rows.len >= 5);
+    // Line 0: pub (keyword), fn (keyword)
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "pub"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "fn"));
+    // Line 1: // comment tokens
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "//"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "comment"));
+    // Line 2: const (keyword), 42 (number)
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_keyword, "const"));
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_number, "42"));
+    // Line 3: "hello" (string)
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_string, "\"hello\""));
+}
+
+test "markdown links and bare urls attach link_url" {
+    const gpa = std.testing.allocator;
+    const text = "Visit [Zay Home](https://zay.org) or bare https://github.com/ozgurulukir/zay today";
+    var out = try render(gpa, text, 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.rows.len);
+    var found_named = false;
+    var found_bare = false;
+    for (out.rows[0].spans) |span| {
+        if (std.mem.eql(u8, span.text, "Zay")) {
+            try std.testing.expectEqual(Style.link, span.style);
+            try std.testing.expectEqualStrings("https://zay.org", span.link_url);
+            found_named = true;
+        }
+        if (std.mem.eql(u8, span.text, "https://github.com/ozgurulukir/zay")) {
+            try std.testing.expectEqual(Style.link, span.style);
+            try std.testing.expectEqualStrings("https://github.com/ozgurulukir/zay", span.link_url);
+            found_bare = true;
+        }
+    }
+    try std.testing.expect(found_named);
+    try std.testing.expect(found_bare);
 }

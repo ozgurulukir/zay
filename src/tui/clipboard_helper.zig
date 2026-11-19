@@ -95,6 +95,61 @@ pub fn copySelectedTranscriptBlock(app: *App) !bool {
     return true;
 }
 
+/// Extract the first fenced code block content from a markdown body.
+pub fn extractFirstCodeBlock(text: []const u8) ?[]const u8 {
+    var line_start: usize = 0;
+    var fence_start: ?usize = null;
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = std.mem.trim(u8, text[line_start..line_end], " \t\r");
+        if (std.mem.startsWith(u8, line, "```")) {
+            if (fence_start) |start| {
+                // Closing fence: content is text[start..line_start].
+                return text[start..line_start];
+            } else {
+                // Opening fence: content starts after the line_end newline.
+                fence_start = if (line_end < text.len) line_end + 1 else text.len;
+            }
+        }
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
+    }
+    return null;
+}
+
+/// Copy the first code block of the selected transcript message (falling back
+/// to the full transcript block if no code fence is present).
+pub fn copySelectedCodeBlock(app: *App) !bool {
+    const selected_idx = app.thread.transcript.selected orelse blk: {
+        if (app.thread.transcript.messages.items.len == 0) return false;
+        var i = app.thread.transcript.messages.items.len;
+        while (i > 0) {
+            i -= 1;
+            const msg = &app.thread.transcript.messages.items[i];
+            if (msg.* == .agent) break :blk @as(u32, @intCast(i));
+        }
+        break :blk @as(u32, @intCast(app.thread.transcript.messages.items.len - 1));
+    };
+
+    if (selected_idx >= app.thread.transcript.messages.items.len) return false;
+    const msg = &app.thread.transcript.messages.items[selected_idx];
+    const mirror = msg.mirror();
+    const text = mirror.body;
+    if (text.len == 0) return false;
+
+    if (extractFirstCodeBlock(text)) |code| {
+        if (code.len > 0) {
+            clipboard_mod.copyToClipboard(app.gpa, app.getIo(), code);
+            var notice_buf: [256]u8 = undefined;
+            const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied code block to clipboard ({d} bytes).", .{code.len});
+            _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
+            return true;
+        }
+    }
+
+    return copySelectedTranscriptBlock(app);
+}
+
 /// Copy current diff file patch or review text to clipboard.
 pub fn copyDiffToClipboard(app: *App) !bool {
     if (!app.isDiffViewerMode()) return false;
@@ -185,4 +240,20 @@ test "pasteToFocusedInput inserts text into provider key input in provider form"
     // Paste bypasses ProviderPicker.handle, so it must mark the key dirty to
     // reveal the pasted value for verification.
     try std.testing.expect(app.pickers.provider.key_dirty);
+}
+
+test "extractFirstCodeBlock extracts fenced content" {
+    const markdown =
+        \\Here is some code:
+        \\```zig
+        \\const x = 10;
+        \\```
+        \\and trailing text.
+    ;
+    const extracted = extractFirstCodeBlock(markdown);
+    try std.testing.expect(extracted != null);
+    try std.testing.expectEqualStrings("const x = 10;\n", extracted.?);
+
+    const none = "No code blocks here";
+    try std.testing.expect(extractFirstCodeBlock(none) == null);
 }

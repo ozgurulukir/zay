@@ -194,7 +194,53 @@ pub const okabe_ito: Theme = .{
     .markdown_heading = .{ 240, 228, 66 }, // yellow
 };
 
-const themes = [_]Theme{ default_theme, cappuccino_theme, tokyo_night, dracula, nord, gruvbox_dark, okabe_ito };
+/// Catppuccin Latte (light) — https://github.com/catppuccin/catppuccin (MIT)
+pub const catppuccin_latte: Theme = .{
+    .name = "catppuccin_latte",
+    .thinking_blue = .{ 30, 102, 245 }, // blue #1e66f5
+    .user_yellow = .{ 223, 142, 29 }, // yellow #df8e1d
+    .success_green = .{ 64, 160, 43 }, // green #40a02b
+    .failure_red = .{ 210, 15, 57 }, // red #d20f39
+    .accent_orange = .{ 254, 100, 11 }, // peach #fe640b
+    .skill_purple = .{ 136, 57, 239 }, // mauve #8839ef
+    .lane_pink = .{ 234, 118, 203 }, // pink #ea76cb
+    .muted_gray = .{ 108, 111, 133 }, // overlay0 #6c6f85
+    .selection_bg = .{ 188, 192, 204 }, // surface1 #bcc0cc
+    .amber_yellow = .{ 223, 142, 29 },
+    .white = .{ 76, 79, 105 }, // text #4c4f69
+    .code_blue = .{ 32, 159, 181 }, // sapphire #209fb5
+    .faint_add_bg = .{ 215, 235, 210 },
+    .faint_del_bg = .{ 240, 215, 220 },
+    .body = .{ 76, 79, 105 }, // text #4c4f69
+    .background = .{ 239, 241, 245 }, // base #eff1f5
+    .blackhole_orange = .{ 254, 100, 11 },
+    .markdown_heading = .{ 136, 57, 239 },
+};
+
+/// Tokyo Night Day (light) — https://github.com/enkia/tokyo-night-vscode-theme (MIT)
+pub const tokyo_night_day: Theme = .{
+    .name = "tokyo_night_day",
+    .thinking_blue = .{ 46, 125, 233 }, // blue #2e7de9
+    .user_yellow = .{ 140, 108, 62 }, // yellow #8c6c3e
+    .success_green = .{ 56, 112, 104 }, // green #387068
+    .failure_red = .{ 245, 42, 101 }, // red #f52a65
+    .accent_orange = .{ 177, 92, 0 }, // orange #b15c00
+    .skill_purple = .{ 152, 84, 241 }, // purple #9854f1
+    .lane_pink = .{ 210, 0, 101 }, // pink #d20065
+    .muted_gray = .{ 132, 137, 155 }, // comment #84899b
+    .selection_bg = .{ 180, 181, 185 },
+    .amber_yellow = .{ 140, 108, 62 },
+    .white = .{ 52, 59, 88 }, // text #343b58
+    .code_blue = .{ 0, 113, 151 }, // cyan #007197
+    .faint_add_bg = .{ 210, 230, 215 },
+    .faint_del_bg = .{ 240, 215, 220 },
+    .body = .{ 52, 59, 88 }, // text #343b58
+    .background = .{ 225, 226, 231 }, // bg #e1e2e7
+    .blackhole_orange = .{ 177, 92, 0 },
+    .markdown_heading = .{ 46, 125, 233 },
+};
+
+const themes = [_]Theme{ default_theme, cappuccino_theme, tokyo_night, dracula, nord, gruvbox_dark, okabe_ito, catppuccin_latte, tokyo_night_day };
 
 /// The authoritative builtin theme list, in canonical order. Exposed for the
 /// theme picker so it lists exactly the themes `resolveTheme` validates
@@ -210,6 +256,7 @@ pub fn resolveTheme(name: ?[]const u8) Theme {
     const n = name orelse return default_theme;
     const trimmed = std.mem.trim(u8, n, " \t\r\n");
     if (trimmed.len == 0) return default_theme;
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return default_theme;
     for (themes) |t| if (std.ascii.eqlIgnoreCase(trimmed, t.name)) return t;
     return default_theme;
 }
@@ -309,10 +356,31 @@ pub const ThemeRegistry = struct {
         const n = name orelse return default_theme;
         const trimmed = std.mem.trim(u8, n, " \t\r\n");
         if (trimmed.len == 0) return default_theme;
+        if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return default_theme;
         for (self.all_themes.items) |t| {
             if (std.ascii.eqlIgnoreCase(trimmed, t.name)) return t;
         }
         return default_theme;
+    }
+
+    /// Resolve a theme name with dynamic terminal color-scheme awareness.
+    /// When name is "auto", selects `light_theme` or `dark_theme` depending on `scheme`.
+    pub fn resolveWithScheme(
+        self: *const ThemeRegistry,
+        name: ?[]const u8,
+        scheme: ?vaxis.Color.Scheme,
+        light_theme: ?[]const u8,
+        dark_theme: ?[]const u8,
+    ) Theme {
+        const n = name orelse return default_theme;
+        const trimmed = std.mem.trim(u8, n, " \t\r\n");
+        if (trimmed.len == 0) return default_theme;
+        if (std.ascii.eqlIgnoreCase(trimmed, "auto")) {
+            const is_light = if (scheme) |s| s == .light else false;
+            const target = if (is_light) (light_theme orelse "catppuccin_latte") else (dark_theme orelse "default");
+            return self.resolve(target);
+        }
+        return self.resolve(trimmed);
     }
 
     fn loadThemesFromDir(self: *ThemeRegistry, gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
@@ -511,6 +579,81 @@ pub fn contrastRatio(a: Rgb, b: Rgb) f32 {
     return (lighter + 0.05) / (darker + 0.05);
 }
 
+/// Check if a theme is a light theme based on background relative luminance.
+pub fn isLight(theme: Theme) bool {
+    return relativeLuminance(theme.background) > 0.5;
+}
+
+/// Derive a high-contrast monochrome palette for NO_COLOR / accessibility mode.
+/// Avoids ANSI RGB hues and uses attributes (bold, dim, underline, reverse, italic).
+pub fn buildMonochromePalette() Palette {
+    return .{
+        .selected = .{ .reverse = true },
+        .selected_item = .{ .bold = true, .reverse = true },
+
+        .user = .{ .bold = true },
+        .skill = .{ .bold = true, .ul_style = .single },
+        .tool = .{},
+        .tool_failed = .{ .bold = true, .reverse = true },
+        .success = .{ .bold = true },
+        .notice = .{ .italic = true },
+        .warning = .{ .bold = true, .italic = true },
+        .error_style = .{ .bold = true, .reverse = true },
+        .info = .{},
+        .border_label = .{ .bold = true },
+        .background_badge = .{ .reverse = true },
+        .lanes_badge = .{ .bold = true, .reverse = true },
+        .model_status = .{},
+        .thinking_label = .{ .italic = true },
+        .thinking_body = .{ .dim = true },
+        .body = .{},
+        .background = .{},
+        .intro_accent = .{ .bold = true },
+        .checkpoint = .{ .bold = true },
+        .checkpoint_mark = .{ .bold = true },
+        .thinking_bar = .{ .dim = true },
+        .markdown_code = .{},
+        .panel_header = .{ .bold = true, .ul_style = .single },
+
+        .diff_file_header = .{ .bold = true },
+        .diff_hunk = .{ .dim = true },
+        .diff_gutter = .{ .dim = true },
+        .diff_bracket = .{},
+        .diff_comment = .{ .italic = true },
+        .diff_bracket_active = .{ .bold = true },
+        .diff_comment_active = .{ .bold = true, .italic = true },
+        .diff_added_row = .{},
+        .diff_removed_row = .{ .dim = true },
+        .diff_inline_del = .{ .dim = true, .reverse = true },
+        .diff_inline_add = .{ .bold = true, .reverse = true },
+
+        .markdown_heading = .{ .bold = true, .ul_style = .single },
+        .settings_active_tab = .{ .bold = true, .ul_style = .single },
+        .permission_approve = .{ .bold = true },
+    };
+}
+
+pub var active_is_no_color: bool = false;
+
+pub fn setNoColor(no_color: bool) void {
+    active_is_no_color = no_color;
+    if (no_color) {
+        active = buildMonochromePalette();
+    }
+}
+
+pub fn getNoColor() bool {
+    return active_is_no_color;
+}
+
+pub fn isNoColorActive(config_switch: bool) bool {
+    if (config_switch) return true;
+    if (std.c.getenv("NO_COLOR")) |val| {
+        if (val[0] != 0) return true;
+    }
+    return false;
+}
+
 /// The active runtime palette, installed once at startup by `tui.run`.
 ///
 /// Thread Safety Invariant:
@@ -528,13 +671,23 @@ pub fn activePalette() *const Palette {
 
 /// Rebuild the active palette from a theme. Called on the UI thread only.
 pub fn setActive(theme: Theme) void {
-    active = buildPalette(theme);
+    if (active_is_no_color) {
+        active = buildMonochromePalette();
+    } else {
+        active = buildPalette(theme);
+    }
 }
 
 /// Merge a selection background into a row style when the row is selected.
 pub fn onSelectionBg(style: vaxis.Style, selected: bool) vaxis.Style {
     var merged = style;
-    if (selected) merged.bg = active.selected.bg;
+    if (selected) {
+        if (active_is_no_color) {
+            merged.reverse = true;
+        } else {
+            merged.bg = active.selected.bg;
+        }
+    }
     return merged;
 }
 
@@ -678,6 +831,10 @@ test "resolveTheme matches each builtin theme case-insensitively" {
         .{ .name = "NORD", .theme = nord },
         .{ .name = "gruvbox_dark", .theme = gruvbox_dark },
         .{ .name = "GRUVBOX_DARK", .theme = gruvbox_dark },
+        .{ .name = "Catppuccin_Latte", .theme = catppuccin_latte },
+        .{ .name = "CATPPUCCIN_LATTE", .theme = catppuccin_latte },
+        .{ .name = "Tokyo_Night_Day", .theme = tokyo_night_day },
+        .{ .name = "TOKYO_NIGHT_DAY", .theme = tokyo_night_day },
     };
     for (cases) |c| try std.testing.expectEqual(c.theme, resolveTheme(c.name));
 }
@@ -689,8 +846,8 @@ test "spaced theme names do not match (underscore convention)" {
 
 test "allThemes returns the exact builtin set with unique non-empty names" {
     const list = allThemes();
-    try std.testing.expectEqual(@as(usize, 7), list.len);
-    const expected = [_][]const u8{ "default", "cappuccino", "tokyo_night", "dracula", "nord", "gruvbox_dark", "okabe_ito" };
+    try std.testing.expectEqual(@as(usize, 9), list.len);
+    const expected = [_][]const u8{ "default", "cappuccino", "tokyo_night", "dracula", "nord", "gruvbox_dark", "okabe_ito", "catppuccin_latte", "tokyo_night_day" };
     for (list, expected) |theme, name| {
         try std.testing.expectEqualStrings(name, theme.name);
         try std.testing.expect(theme.name.len > 0);
@@ -789,11 +946,11 @@ test "parseThemeJson rejects low selection_bg/background channel delta (m6)" {
     try std.testing.expectError(error.InsufficientContrast, parseThemeJson(gpa, parsed.value));
 }
 
-test "ThemeRegistry.init seeds the 7 builtins (gpa only)" {
+test "ThemeRegistry.init seeds builtins (gpa only)" {
     const gpa = std.testing.allocator;
     var registry = try ThemeRegistry.init(gpa);
     defer registry.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 7), registry.slice().len);
+    try std.testing.expectEqual(allThemes().len, registry.slice().len);
     try std.testing.expectEqualStrings("default", registry.slice()[0].name);
     try std.testing.expectEqualStrings("okabe_ito", registry.slice()[6].name);
 }
@@ -805,7 +962,7 @@ test "ThemeRegistry.loadCustom with missing dirs is a no-op (n2)" {
     var registry = try ThemeRegistry.init(gpa);
     defer registry.deinit(gpa);
     try registry.loadCustom(gpa, std.testing.io, "/nonexistent/home", "/nonexistent/cwd", null);
-    try std.testing.expectEqual(@as(usize, 7), registry.slice().len);
+    try std.testing.expectEqual(allThemes().len, registry.slice().len);
 }
 
 test "ThemeRegistry.loadCustom loads a custom theme and resolve finds it case-insensitively" {
@@ -835,7 +992,7 @@ test "ThemeRegistry.loadCustom loads a custom theme and resolve finds it case-in
     var registry = try ThemeRegistry.init(gpa);
     defer registry.deinit(gpa);
     try registry.loadCustom(gpa, io, home_dir, "/nonexistent/cwd", null);
-    try std.testing.expectEqual(@as(usize, 8), registry.slice().len);
+    try std.testing.expectEqual(allThemes().len + 1, registry.slice().len);
     // Case-insensitive resolve finds the custom slug.
     const resolved = registry.resolve("MY_THEME");
     try std.testing.expectEqualStrings("my_theme", resolved.name);
@@ -888,7 +1045,54 @@ test "ThemeRegistry.loadCustom customThemesDir replaces the default scan (m5)" {
     // Setting customThemesDir scans ONLY that dir — the default-location theme
     // is ignored.
     try registry.loadCustom(gpa, io, home_dir, "/nonexistent/cwd", custom_dir);
-    try std.testing.expectEqual(@as(usize, 8), registry.slice().len);
+    try std.testing.expectEqual(allThemes().len + 1, registry.slice().len);
     try std.testing.expect(registry.resolve("from_custom").name.len > 0);
     try std.testing.expectEqual(default_theme, registry.resolve("from_default"));
+}
+
+test "isLight correctly distinguishes light and dark themes" {
+    try std.testing.expect(!isLight(default_theme));
+    try std.testing.expect(!isLight(tokyo_night));
+    try std.testing.expect(!isLight(dracula));
+    try std.testing.expect(!isLight(nord));
+    try std.testing.expect(!isLight(gruvbox_dark));
+    try std.testing.expect(isLight(catppuccin_latte));
+    try std.testing.expect(isLight(tokyo_night_day));
+}
+
+test "monochrome palette and NO_COLOR mode" {
+    defer {
+        setNoColor(false);
+        setActive(default_theme);
+    }
+
+    const mono = buildMonochromePalette();
+    try std.testing.expect(mono.selected.reverse);
+    try std.testing.expect(mono.user.bold);
+    try std.testing.expect(mono.error_style.reverse);
+
+    setNoColor(true);
+    try std.testing.expect(getNoColor());
+    setActive(tokyo_night);
+    const act = activePalette();
+    try std.testing.expect(act.selected.reverse);
+
+    setNoColor(false);
+    setActive(tokyo_night);
+    try std.testing.expect(!activePalette().selected.reverse);
+}
+
+test "ThemeRegistry.resolveWithScheme resolves auto to light or dark theme" {
+    const gpa = std.testing.allocator;
+    var registry = try ThemeRegistry.init(gpa);
+    defer registry.deinit(gpa);
+
+    const light_res = registry.resolveWithScheme("auto", .light, "catppuccin_latte", "default");
+    try std.testing.expectEqualStrings("catppuccin_latte", light_res.name);
+
+    const dark_res = registry.resolveWithScheme("auto", .dark, "catppuccin_latte", "tokyo_night");
+    try std.testing.expectEqualStrings("tokyo_night", dark_res.name);
+
+    const explicit_res = registry.resolveWithScheme("nord", .light, "catppuccin_latte", "default");
+    try std.testing.expectEqualStrings("nord", explicit_res.name);
 }

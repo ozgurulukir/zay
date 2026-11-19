@@ -75,15 +75,19 @@ pub const Content = struct {
             const selected = match_idx == self.selection;
             const screen_row = viewport.screenRow(match_idx);
 
+            const mark: ?[]const u8 = if (std.mem.eql(u8, theme.name, self.active_name))
+                (if (tui_style.isLight(theme)) "  [light]  ✓ current" else "  [dark]  ✓ current")
+            else
+                (if (tui_style.isLight(theme)) "  [light]" else "  [dark]");
+
             try panel.drawFuzzyListRow(surface, screen_row, ctx, .{
                 .prefix = "  ./",
                 .text = theme.name,
                 .query = self.filter,
                 .selected = selected,
                 .start_col = 1,
-                // Mark the currently-active theme so the highlighted row is
-                // obvious even when the cursor still sits elsewhere.
-                .trailing_mark = if (std.mem.eql(u8, theme.name, self.active_name)) "  ✓ current" else null,
+                // Mark the currently-active theme and its light/dark mode.
+                .trailing_mark = mark,
                 .highlight_enabled = self.highlight_enabled,
                 .highlight_style = self.highlight_style,
             });
@@ -148,7 +152,8 @@ test "countMatching returns 0 for a filter matching nothing" {
 }
 
 test "countMatching counts partial matches" {
-    try std.testing.expectEqual(@as(u32, 1), countMatching(tui_style.allThemes(), "tok"));
+    try std.testing.expectEqual(@as(u32, 2), countMatching(tui_style.allThemes(), "tok"));
+    try std.testing.expectEqual(@as(u32, 1), countMatching(tui_style.allThemes(), "drac"));
 }
 
 test "countMatching returns the full count for an empty filter" {
