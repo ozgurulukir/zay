@@ -481,6 +481,12 @@
           "maximum": 0.99,
           "default": 0.85,
           "description": "Context usage fraction that transitions the meter to red alert."
+        },
+        "animations": {
+          "type": "string",
+          "enum": ["full", "reduced", "off"],
+          "default": "full",
+          "description": "Animation detail level: 'full', 'reduced' (static logo, slow spinner, lower tick rate), or 'off' (stops animation ticks entirely)."
         }
       },
       "additionalProperties": false

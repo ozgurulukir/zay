@@ -143,11 +143,13 @@ fn submitGeneralItem(app: *App, state: *State) !void {
     switch (state.selection[@intFromEnum(Tab.general)]) {
         0 => {
             // Toggle use_responses_endpoint.
-            state.dirty = togglePending(&state.pending_use_responses_endpoint, currentResponsesEndpoint(&app.cached_config));
+            _ = togglePending(&state.pending_use_responses_endpoint, currentResponsesEndpoint(&app.cached_config));
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         1 => {
             // Toggle toast notifications.
-            state.dirty = togglePending(&state.pending_toast_enabled, app.cached_config.toast.enabled orelse true);
+            _ = togglePending(&state.pending_toast_enabled, app.cached_config.toast.enabled orelse true);
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         2 => {
             // Cycle animations: full -> reduced -> off -> full.
@@ -158,7 +160,7 @@ fn submitGeneralItem(app: *App, state: *State) !void {
                 .off => .full,
             };
             state.pending_animations = next;
-            state.dirty = next != app.cached_config.tui.animations;
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         else => {},
     }
@@ -240,6 +242,7 @@ pub fn saveSettings(app: *App) !bool {
         if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
         state.pending_bash_classifier_url = null;
         state.pending_toast_enabled = null;
+        state.pending_animations = null;
         _ = try app.thread.transcript.append(app.gpa, .info, "Settings", "No changes to save");
         return false;
     }
