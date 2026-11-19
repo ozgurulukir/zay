@@ -224,6 +224,14 @@ pub const App = struct {
     theme_preview_original: ?tui_style.Theme = null,
     /// Terminal color scheme (light / dark) detected via query or events.
     terminal_color_scheme: ?vaxis.Color.Scheme = null,
+    /// Terminal window OS focus state (tracked via focus_in / focus_out).
+    is_focused: bool = true,
+    /// Last activity seen on active lane's turn_view (for unfocused completion notification).
+    last_activity: tui_turn_view.TurnView.Activity = .idle,
+    /// Last permission pending state (for unfocused approval notification).
+    last_permission_pending: bool = false,
+    /// Cached terminal title string, to avoid redundant OSC setTitle writes.
+    last_terminal_title: ?[]const u8 = null,
     /// Process environment map — stored once at startup so cross-project
     /// session resume can reload config (`.zay/config.json`) from the
     /// target project's cwd without re-reading the OS environment.
