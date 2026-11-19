@@ -28,6 +28,7 @@ const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const mcp_client_mod = @import("../mcp/client.zig");
 const lifecycle = @import("lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
+const event_router = @import("event_router.zig");
 const turn_view_mod = @import("turn_view.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const codex = @import("../auth/codex.zig");
@@ -4419,4 +4420,103 @@ test "handleTick keeps git label refresh active until the worker completes" {
     }
     try std.testing.expect(!app.git_label_dirty);
     try std.testing.expect(app.git_label_job == null);
+}
+
+test "pageTranscript and jumpTranscript keys navigate transcript and preserve input" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // Populate transcript with messages
+    _ = try app.thread.transcript.append(gpa, .user, "User", "Message 1");
+    _ = try app.thread.transcript.append(gpa, .agent, "Agent", "Response 1");
+    _ = try app.thread.transcript.append(gpa, .user, "User", "Message 2");
+    _ = try app.thread.transcript.append(gpa, .agent, "Agent", "Response 2");
+
+    app.thread.transcript_view_height = 20;
+
+    try app.inputs.input.insertSliceAtCursor("hello user input");
+    try std.testing.expectEqualStrings("hello user input", app.inputs.input.buf.firstHalf());
+
+    // Jump to top
+    app.jumpTranscriptToTop();
+    try std.testing.expect(app.getBlockNav());
+    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
+    try std.testing.expect(!app.thread.auto_scroll);
+
+    // Page down
+    _ = app.pageTranscript(.next);
+    try std.testing.expect(app.thread.transcript.selected.? > 0);
+
+    // Jump to bottom
+    app.jumpTranscriptToBottom();
+    try std.testing.expect(!app.getBlockNav());
+    try std.testing.expect(app.thread.auto_scroll);
+
+    // Input editing content remained completely undisturbed
+    try std.testing.expectEqualStrings("hello user input", app.inputs.input.buf.firstHalf());
+}
+
+test "mouse click on new output pill jumps transcript to bottom" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(gpa, .user, "User", "M1");
+    _ = try app.thread.transcript.append(gpa, .agent, "Agent", "M2");
+
+    app.thread.auto_scroll = false;
+    app.nav.new_output_rect = .{ .row = 10, .col = 60, .width = 14 };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const mouse_click: vaxis.Mouse = .{
+        .row = 10,
+        .col = 65,
+        .type = .press,
+        .button = .left,
+        .mods = .{},
+    };
+
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = mouse_click });
+    try std.testing.expect(app.thread.auto_scroll);
+    try std.testing.expect(!app.getBlockNav());
+}
+
+test "mouse click outside modal overlay dismisses overlay" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.setMode(.command);
+    app.nav.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // Click outside: row 2, col 2
+    const outside_click: vaxis.Mouse = .{
+        .row = 2,
+        .col = 2,
+        .type = .press,
+        .button = .left,
+        .mods = .{},
+    };
+
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = outside_click });
+    try std.testing.expectEqual(app_state_mod.Mode.normal, app.getMode());
 }

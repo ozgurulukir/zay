@@ -100,6 +100,12 @@ fn localClassify(command: []const u8) Verdict {
     return if (localClassifyRule(trimmed) == null) .safe else .unsafe;
 }
 
+pub fn isDestructiveRule(command: []const u8) bool {
+    const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
+    if (trimmed.len == 0) return false;
+    return localClassifyRule(trimmed) != null;
+}
+
 /// Identifies which local rule fired for `command` — the same disjunction
 /// `localClassify` folds into a verdict, exposed for diagnostics and tests.
 /// Module-private by design: the remote path has no rule id, and no caller

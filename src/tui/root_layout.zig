@@ -343,18 +343,29 @@ fn buildOverlayChildren(
 
     if (flags.overlay_visible) {
         var centered_overlay: vxfw.Center = .{ .child = overlay_view.widget() };
+        const overlay_surface = try centered_overlay.widget().draw(ctx.withConstraints(
+            .{ .width = max_width, .height = layout.transcript_height },
+            .{ .width = max_width, .height = layout.transcript_height },
+        ));
         children[idx] = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try centered_overlay.widget().draw(ctx.withConstraints(
-                .{ .width = max_width, .height = layout.transcript_height },
-                .{ .width = max_width, .height = layout.transcript_height },
-            )),
+            .surface = overlay_surface,
             .z_index = 2,
         };
+        if (overlay_surface.children.len > 0) {
+            const sub = overlay_surface.children[0];
+            app.nav.overlay_panel_rect = .{
+                .row = @intCast(@max(0, sub.origin.row)),
+                .col = @intCast(@max(0, sub.origin.col)),
+                .width = sub.surface.size.width,
+                .height = sub.surface.size.height,
+            };
+        }
         idx += 1;
     } else {
         app.drawn_overlay_width = 0;
         app.drawn_overlay_height = 0;
+        app.nav.overlay_panel_rect = null;
     }
 
     if (flags.permission_visible) {
@@ -370,14 +381,24 @@ fn buildOverlayChildren(
             }
         } else "Tool Approval Request";
 
+        const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
+        const panel_row = layout.input_row -| panel_height;
+        app.nav.permission_panel_rect = .{
+            .row = panel_row,
+            .col = 0,
+            .width = max_width,
+            .height = panel_height,
+        };
+
         var permission_view: permission.PermissionWidget = .{
             .snapshot = snapshot,
             .scroll = app.thread.permission_scroll,
             .label = label,
+            .base_screen_row = panel_row,
+            .buttons_out = &app.nav.permission_buttons,
         };
-        const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
         children[idx] = .{
-            .origin = .{ .row = layout.input_row -| panel_height, .col = 0 },
+            .origin = .{ .row = panel_row, .col = 0 },
             .surface = try permission_view.widget().draw(ctx.withConstraints(
                 .{ .width = max_width, .height = panel_height },
                 .{ .width = max_width, .height = panel_height },
@@ -385,6 +406,9 @@ fn buildOverlayChildren(
             .z_index = 3,
         };
         idx += 1;
+    } else {
+        app.nav.permission_panel_rect = null;
+        app.nav.permission_buttons = null;
     }
 
     if (flags.background_visible) {
@@ -501,6 +525,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     app.split_rect_count = split_cols.len;
     app.input_surface_row = layout.input_row;
     app.nav.lanes_chip_rect = null;
+    app.nav.new_output_rect = null;
 
     const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
     var transcript_view: tx_widget.TranscriptWidget = .{
@@ -511,6 +536,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
         .blackhole_visible = &app.metrics.blackhole_visible,
         .splash_suppressed = app.inputs.input.buf.realLength() > 0,
+        .new_output_rect_out = &app.nav.new_output_rect,
     };
     var loading_view: loading.LoadingWidget = .{
         .awaiting_output = app.thread.turn_view.awaitingOutput(),

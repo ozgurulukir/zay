@@ -82,7 +82,7 @@ turn_future: ?std.Io.Future(void) = null,
 /// `turn_lifecycle.beginTurnCancel`; joined and freed by `drainTurnCancels`
 /// (or `deinitWorkersTop` at teardown), so it is always null in `deinit`.
 cancel_job: ?*turn_cancel.TurnCancelJob = null,
-permission_selection: agent_worker.ApprovalDecision = .approve,
+permission_selection: agent_worker.ApprovalChoice = .approve,
 permission_scroll: u32 = 0,
 /// The turn-driving handle: enqueue user input, start turns, read messages.
 /// Orthogonal to `engine` — in production it points into the live runtime's

@@ -32,6 +32,61 @@ pub fn jumpTranscriptToBottom(app: *App) void {
     app.thread.transcript_list.scroll.wants_cursor = false;
 }
 
+pub fn jumpTranscriptToTop(app: *App) void {
+    app.setBlockNav(true);
+    if (app.thread.transcript.messages.items.len > 0) {
+        app.thread.transcript.selected = 0;
+        app.thread.auto_scroll = false;
+        setSelectedMessageOffset(app, 0, 0);
+    }
+}
+
+pub fn pageTranscript(app: *App, direction: TranscriptNavigation) bool {
+    app.setBlockNav(true);
+    app.thread.auto_scroll = false;
+    const height = app.thread.transcript_view_height;
+    const page_step: u16 = @max(1, height / 2);
+
+    const selected = app.thread.transcript.selected orelse {
+        switch (direction) {
+            .previous => app.thread.transcript.selectLast(),
+            .next => app.thread.transcript.selectFirst(),
+        }
+        return false;
+    };
+
+    if (selected < app.thread.transcript.messages.items.len) {
+        const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width));
+        if (rows > height) {
+            const rows_hidden = rows - height;
+            const offset = selectedMessageOffset(app, selected);
+            switch (direction) {
+                .next => {
+                    if (offset < rows_hidden) {
+                        setSelectedMessageOffset(app, selected, @min(rows_hidden, offset + page_step));
+                        return true;
+                    }
+                },
+                .previous => {
+                    if (offset > 0) {
+                        setSelectedMessageOffset(app, selected, offset - @min(offset, page_step));
+                        return true;
+                    }
+                },
+            }
+        }
+    }
+
+    switch (direction) {
+        .previous => app.thread.transcript.moveSelection(.previous),
+        .next => app.thread.transcript.moveSelection(.next),
+    }
+    if (app.thread.transcript.selected != selected) {
+        anchorSelectedLongMessage(app, direction);
+    }
+    return false;
+}
+
 pub fn updateMouseAutoScroll(app: *App) void {
     app.thread.auto_scroll = !app.thread.transcript_list.scroll.has_more and
         selectionIsLastMessage(app) and

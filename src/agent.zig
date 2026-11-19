@@ -460,6 +460,7 @@ pub const replaceConversation = compaction_ops.replaceConversation;
 pub const BashApproval = struct {
     ptr: *anyopaque,
     request: *const fn (*anyopaque, []const u8) anyerror!bool,
+    rejection_reason: ?*const fn (*anyopaque) ?[]const u8 = null,
 };
 
 const tool_display = @import("tools/display.zig");

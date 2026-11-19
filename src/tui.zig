@@ -666,6 +666,22 @@ pub const App = struct {
         self.thread.transcript.toggleSelected();
     }
 
+    pub fn toggleAllTranscriptBlocks(self: *App) void {
+        self.thread.transcript.toggleAll();
+    }
+
+    pub fn jumpTranscriptToTop(self: *App) void {
+        transcript_nav.jumpTranscriptToTop(self);
+    }
+
+    pub fn pageTranscript(self: *App, direction: transcript_nav.TranscriptNavigation) bool {
+        return transcript_nav.pageTranscript(self, direction);
+    }
+
+    pub fn isInputEmpty(self: *const App) bool {
+        return self.inputRealLength() == 0;
+    }
+
     pub fn getBlockNav(self: *const App) bool {
         return self.nav.block_nav;
     }

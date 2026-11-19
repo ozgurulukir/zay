@@ -187,6 +187,7 @@ pub fn ToolCallObserver(Ctx: type) type {
         on_started: *const fn (ctx: *Ctx, call: ai.ToolCall) anyerror!void,
         on_finished: *const fn (ctx: *Ctx, result: *const ToolResult) anyerror!void,
         approve_unsafe_bash: *const fn (ctx: *Ctx, call: ai.ToolCall, arg: []const u8) anyerror!bool,
+        rejection_reason: ?*const fn (ctx: *Ctx) ?[]const u8 = null,
     };
 }
 

@@ -23,6 +23,7 @@ const model_catalogue = @import("model_catalogue.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
 const settings_widget = @import("widgets/settings.zig");
 const help_picker = @import("widgets/help_picker.zig");
+const agent_worker = @import("agent_worker.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
 const mcp_status = @import("widgets/mcp_status.zig");
 const plugins_status = @import("widgets/plugins_status.zig");
@@ -213,6 +214,10 @@ pub const NavState = struct {
     /// (a slash exit command was issued; the next event loop drains it).
     quit: QuitState = .none,
     lanes_chip_rect: ?tui.ChipRect = null,
+    new_output_rect: ?tui.ChipRect = null,
+    permission_buttons: ?[4]PermissionButton = null,
+    permission_panel_rect: ?tui.ChipRect = null,
+    overlay_panel_rect: ?tui.ChipRect = null,
 };
 
 /// State for the Ctrl+O background-jobs modal: the open flag, the
@@ -451,8 +456,23 @@ pub const ChipRect = struct {
     row: u16,
     col: u16,
     width: u16,
+    height: u16 = 1,
 
     pub fn contains(self: ChipRect, row: i16, col: i16) bool {
+        if (row < 0 or col < 0) return false;
+        const r: u16 = @intCast(row);
+        const c: u16 = @intCast(col);
+        return r >= self.row and r < self.row + self.height and c >= self.col and c < self.col + self.width;
+    }
+};
+
+pub const PermissionButton = struct {
+    choice: agent_worker.ApprovalChoice,
+    row: u16,
+    col: u16,
+    width: u16,
+
+    pub fn contains(self: PermissionButton, row: i16, col: i16) bool {
         if (row < 0 or col < 0) return false;
         const r: u16 = @intCast(row);
         const c: u16 = @intCast(col);

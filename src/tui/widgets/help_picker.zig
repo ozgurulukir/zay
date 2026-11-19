@@ -278,7 +278,7 @@ pub const Content = struct {
 
         // Draw scrollbar on rightmost column if content exceeds body height.
         if (total_count > body_height and body_height > 2) {
-            drawScrollbar(&surface, body_height, self.state.scroll, total_count);
+            panel.drawScrollbar(&surface, body_height, self.state.scroll, total_count);
         }
 
         // Draw bottom hint bar.
@@ -289,25 +289,3 @@ pub const Content = struct {
         return surface;
     }
 };
-
-fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) void {
-    const p = tui_style.activePalette();
-    const col = surface.size.width -| 1;
-    const max_s = total -| height;
-    if (max_s == 0) return;
-
-    const bar_height: usize = @max(1, @as(usize, height) * @as(usize, height) / @as(usize, total));
-    const max_top = height -| @as(u16, @intCast(bar_height));
-    const top: u16 = @intCast(@as(usize, scroll) * @as(usize, max_top) / @as(usize, max_s));
-
-    var r: u16 = 0;
-    while (r < height) : (r += 1) {
-        const is_thumb = r >= top and r < top + bar_height;
-        const grapheme: []const u8 = if (r == 0) "▲" else if (r == height - 1) "▼" else if (is_thumb) "█" else "│";
-        const style: vaxis.Style = if (is_thumb) p.border_label else p.thinking_body;
-        surface.writeCell(col, r, .{
-            .char = .{ .grapheme = grapheme, .width = 1 },
-            .style = style,
-        });
-    }
-}
