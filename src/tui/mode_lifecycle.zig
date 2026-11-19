@@ -667,17 +667,19 @@ pub fn resolveCommand(app: *App, filter: []const u8) ?Command {
         score: f64,
         idx: usize,
     };
-    var ranked: std.ArrayList(Scored) = .empty;
-    defer ranked.deinit(app.gpa);
+    var buf: [commands.len]Scored = undefined;
+    var count: usize = 0;
 
     for (commands, 0..) |entry, idx| {
         if (!tui.commandVisible(app, entry)) continue;
         if (panel.scoreCandidate(filter, entry.name, entry.description)) |score| {
-            ranked.append(app.gpa, .{ .command = entry.command, .score = score, .idx = idx }) catch return null;
+            buf[count] = .{ .command = entry.command, .score = score, .idx = idx };
+            count += 1;
         }
     }
 
-    if (ranked.items.len == 0) return null;
+    if (count == 0) return null;
+    const ranked = buf[0..count];
 
     const Sorter = struct {
         fn lessThan(_: void, a: Scored, b: Scored) bool {
@@ -685,13 +687,13 @@ pub fn resolveCommand(app: *App, filter: []const u8) ?Command {
             return a.idx < b.idx;
         }
     };
-    std.mem.sort(Scored, ranked.items, {}, Sorter.lessThan);
+    std.mem.sort(Scored, ranked, {}, Sorter.lessThan);
 
-    if (app.nav.command_selection < ranked.items.len) {
-        return ranked.items[app.nav.command_selection].command;
+    if (app.nav.command_selection < ranked.len) {
+        return ranked[app.nav.command_selection].command;
     }
-    if (ranked.items.len == 1) {
-        return ranked.items[0].command;
+    if (ranked.len == 1) {
+        return ranked[0].command;
     }
     return null;
 }

@@ -51,16 +51,10 @@ pub const Content = struct {
         if (height == 0) return;
 
         // 1. Collect and score matching themes — same rule `countMatching` uses.
-        const ScoredTheme = struct {
-            idx: usize,
-            score: f64,
-        };
         var matching_themes: std.ArrayList(ScoredTheme) = .empty;
         defer matching_themes.deinit(ctx.arena);
         for (self.themes, 0..) |theme, idx| {
-            if (self.filter.len == 0) {
-                try matching_themes.append(ctx.arena, .{ .idx = idx, .score = 0 });
-            } else if (panel.fzyScore(self.filter, theme.name)) |s| {
+            if (scoreTheme(theme, self.filter)) |s| {
                 try matching_themes.append(ctx.arena, .{ .idx = idx, .score = s });
             }
         }
@@ -71,13 +65,7 @@ pub const Content = struct {
             return;
         }
 
-        const Sorter = struct {
-            fn lessThan(_: void, a: ScoredTheme, b: ScoredTheme) bool {
-                if (a.score != b.score) return a.score > b.score;
-                return a.idx < b.idx;
-            }
-        };
-        std.mem.sort(ScoredTheme, matching_themes.items, {}, Sorter.lessThan);
+        std.mem.sort(ScoredTheme, matching_themes.items, {}, ScoredTheme.lessThan);
 
         const viewport = panel.ViewportWindow.compute(self.selection, total_matches, height);
         var match_idx = viewport.start_index;
@@ -103,11 +91,26 @@ pub const Content = struct {
     }
 };
 
-/// Whether a theme matches the picker filter. Empty filter matches all;
+const ScoredTheme = struct {
+    idx: usize,
+    score: f64,
+
+    fn lessThan(_: void, a: ScoredTheme, b: ScoredTheme) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.idx < b.idx;
+    }
+};
+
+/// Score a theme against the picker filter. Empty filter matches all with score 0;
 /// otherwise a ranked fuzzy match on the theme slug.
+fn scoreTheme(theme: tui_style.Theme, filter: []const u8) ?f64 {
+    if (filter.len == 0) return 0.0;
+    return panel.fzyScore(filter, theme.name);
+}
+
+/// Whether a theme matches the picker filter.
 fn matchesTheme(theme: tui_style.Theme, filter: []const u8) bool {
-    if (filter.len == 0) return true;
-    return panel.fzyScore(filter, theme.name) != null;
+    return scoreTheme(theme, filter) != null;
 }
 
 /// Count the themes that the picker filter selects. Pure and shared — the
@@ -124,19 +127,10 @@ pub fn countMatching(themes: []const tui_style.Theme, filter: []const u8) u32 {
 /// list, or null when the selection is out of range. The Enter-apply path
 /// resolves this to a concrete theme before submitting.
 pub fn selectedName(themes: []const tui_style.Theme, filter: []const u8, selection: u32) ?[]const u8 {
-    const ScoredTheme = struct {
-        idx: usize,
-        score: f64,
-    };
-    var buf: [64]ScoredTheme = undefined;
+    var buf: [256]ScoredTheme = undefined;
     var count: usize = 0;
     for (themes, 0..) |theme, idx| {
-        if (filter.len == 0) {
-            if (count < buf.len) {
-                buf[count] = .{ .idx = idx, .score = 0 };
-                count += 1;
-            }
-        } else if (panel.fzyScore(filter, theme.name)) |s| {
+        if (scoreTheme(theme, filter)) |s| {
             if (count < buf.len) {
                 buf[count] = .{ .idx = idx, .score = s };
                 count += 1;
@@ -145,13 +139,7 @@ pub fn selectedName(themes: []const tui_style.Theme, filter: []const u8, selecti
     }
     if (selection >= count) return null;
 
-    const Sorter = struct {
-        fn lessThan(_: void, a: ScoredTheme, b: ScoredTheme) bool {
-            if (a.score != b.score) return a.score > b.score;
-            return a.idx < b.idx;
-        }
-    };
-    std.mem.sort(ScoredTheme, buf[0..count], {}, Sorter.lessThan);
+    std.mem.sort(ScoredTheme, buf[0..count], {}, ScoredTheme.lessThan);
     return themes[buf[selection].idx].name;
 }
 

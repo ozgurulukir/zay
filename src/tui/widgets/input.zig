@@ -769,14 +769,15 @@ pub const InputWidget = struct {
     }
 };
 
-/// Format hint text for available width. When the full hint fits, returns it verbatim.
+/// Format hint text for available width (in display cells). When the full hint fits, returns it verbatim.
 /// When available width is constrained, retains the highest-priority action (such as
 /// [ESC] Cancel / [ESC] Close) and adds additional segments from the left as space allows,
 /// ensuring that critical cancel/escape affordances are never lost behind an ellipsis.
 pub fn formatWidthAwareHint(full_hint: []const u8, available_width: u16, arena: std.mem.Allocator) []const u8 {
     if (full_hint.len == 0 or available_width == 0) return full_hint;
     const sep = symbols.separator_dot_padded;
-    if (full_hint.len <= available_width) return full_hint;
+    const sep_w = gw(sep);
+    if (gw(full_hint) <= available_width) return full_hint;
 
     var seg_iter = std.mem.splitSequence(u8, full_hint, sep);
     var count: usize = 0;
@@ -793,14 +794,15 @@ pub fn formatWidthAwareHint(full_hint: []const u8, available_width: u16, arena: 
     }
 
     const esc_seg = segs[num_segs - 1];
-    if (esc_seg.len >= available_width) return esc_seg;
+    const esc_w = gw(esc_seg);
+    if (esc_w >= available_width) return esc_seg;
 
     var chosen_count: usize = 0;
-    var current_len: usize = esc_seg.len;
+    var current_w: u16 = esc_w;
     for (0..num_segs - 1) |i| {
-        const added_len = segs[i].len + sep.len;
-        if (current_len + added_len <= available_width) {
-            current_len += added_len;
+        const added_w = gw(segs[i]) +| sep_w;
+        if (current_w +| added_w <= available_width) {
+            current_w +|= added_w;
             chosen_count += 1;
         } else {
             break;
@@ -824,13 +826,14 @@ test "formatWidthAwareHint prioritizes escape action when space is constrained" 
     const dot = symbols.separator_dot_padded;
     const full = "↑↓ Navigate" ++ dot ++ "[ENTER] Execute" ++ dot ++ "[ESC] Cancel";
 
-    // Fits completely:
-    try std.testing.expectEqualStrings(full, formatWidthAwareHint(full, 100, arena));
+    // Fits completely (display cell width of full is 44 cells, though byte length is 52):
+    try std.testing.expectEqualStrings(full, formatWidthAwareHint(full, 44, arena));
 
     // Constrained width: retains "[ESC] Cancel" and fits leading actions if possible
     const mid = formatWidthAwareHint(full, 30, arena);
+    defer arena.free(mid);
     try std.testing.expect(std.mem.endsWith(u8, mid, "[ESC] Cancel"));
-    try std.testing.expect(mid.len <= 30);
+    try std.testing.expect(gw(mid) <= 30);
 
     // Very narrow width: keeps just "[ESC] Cancel"
     const narrow = formatWidthAwareHint(full, 15, arena);
