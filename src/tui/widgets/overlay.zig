@@ -287,7 +287,12 @@ const OverlayInner = struct {
 
     fn drawThemeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const filter = try app.peekPaletteInputArena(ctx.arena);
-        const active_name = app.theme_registry.resolve(app.cached_config.theme).name;
+        const active_name = app.theme_registry.resolveWithScheme(
+            app.cached_config.theme,
+            app.terminal_color_scheme,
+            app.cached_config.tui.effectiveLightTheme(),
+            app.cached_config.tui.effectiveDarkTheme(),
+        ).name;
         var content: theme_picker.Content = .{
             .themes = app.theme_registry.slice(),
             .selection = app.pickers.theme.selection,

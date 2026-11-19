@@ -417,6 +417,21 @@
           "default": null,
           "description": "Optional directory path containing user theme JSON files. When set, it REPLACES the default scan of ~/.config/zay/themes/ and .zay/themes/."
         },
+        "lightTheme": {
+          "type": ["string", "null"],
+          "default": "catppuccin_latte",
+          "description": "Theme slug to activate when theme is 'auto' and the terminal background is light."
+        },
+        "darkTheme": {
+          "type": ["string", "null"],
+          "default": "default",
+          "description": "Theme slug to activate when theme is 'auto' and the terminal background is dark."
+        },
+        "noColor": {
+          "type": "boolean",
+          "default": false,
+          "description": "Disable ANSI color styling and render with a high-contrast monochrome attribute palette (also enabled when the NO_COLOR environment variable is set and non-empty)."
+        },
         "fuzzyHighlight": {
           "type": "boolean",
           "default": true,

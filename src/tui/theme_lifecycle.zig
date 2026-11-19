@@ -156,7 +156,7 @@ pub fn applyTheme(app: *App, raw_name: []const u8) !void {
     // Overwrite-in-arena: the previous theme name stays valid inside the App
     // config arena until the arena is released — no free of the old slice.
     if (app.config_arena) |config_arena| {
-        app.cached_config.theme = try config_arena.allocator().dupe(u8, theme.name);
+        app.cached_config.theme = try config_arena.allocator().dupe(u8, if (is_auto) "auto" else theme.name);
     }
 
     // User notification reflecting persistence status
