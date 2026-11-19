@@ -258,6 +258,7 @@ pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, ro
 pub fn fzyScore(query: []const u8, text: []const u8) ?f64 {
     if (query.len == 0) return 0.0;
     if (query.len > 256 or text.len > 1024) return null;
+    if (std.mem.indexOfScalar(u8, query, 0) != null or std.mem.indexOfScalar(u8, text, 0) != null) return null;
     var q_buf: [257:0]u8 = undefined;
     var t_buf: [1025:0]u8 = undefined;
     for (query, 0..) |b, i| {
@@ -278,6 +279,7 @@ pub fn fzyScore(query: []const u8, text: []const u8) ?f64 {
 pub fn fzyMatchPositions(query: []const u8, text: []const u8, positions: []usize) ?f64 {
     if (query.len == 0) return 0.0;
     if (query.len > 256 or text.len > 1024) return null;
+    if (std.mem.indexOfScalar(u8, query, 0) != null or std.mem.indexOfScalar(u8, text, 0) != null) return null;
     var q_buf: [257:0]u8 = undefined;
     var t_buf: [1025:0]u8 = undefined;
     for (query, 0..) |b, i| {
