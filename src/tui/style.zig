@@ -646,8 +646,14 @@ pub fn getNoColor() bool {
     return active_is_no_color;
 }
 
-pub fn isNoColorActive(config_switch: bool) bool {
+pub fn isNoColorActive(config_switch: bool, env_map: ?*const std.process.Environ.Map) bool {
     if (config_switch) return true;
+    if (env_map) |map| {
+        if (map.get("NO_COLOR")) |val| {
+            return val.len > 0;
+        }
+        return false;
+    }
     if (std.c.getenv("NO_COLOR")) |val| {
         if (val[0] != 0) return true;
     }

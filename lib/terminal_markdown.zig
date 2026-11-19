@@ -400,9 +400,6 @@ fn countLineRows(gpa: std.mem.Allocator, line: []const u8, width: u16, state: *B
         return 0;
     }
     if (line.len == 0) return 1;
-    if (state.in_code) {
-        return countWrappedRows(gpa, line, width, 0, 0);
-    }
     var body = line;
     var prefix_width: u16 = 0;
     var continuation_indent: u16 = 0;
@@ -786,16 +783,6 @@ fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8) 
             continue;
         }
 
-        // Numbers:
-        if (std.ascii.isDigit(line[i]) or (line[i] == '0' and i + 1 < line.len and (line[i + 1] == 'x' or line[i + 1] == 'b' or line[i + 1] == 'o'))) {
-            var end = i + 1;
-            if (end < line.len and (line[end] == 'x' or line[end] == 'b' or line[end] == 'o')) end += 1;
-            while (end < line.len and (std.ascii.isHex(line[end]) or line[end] == '.' or line[end] == '_')) : (end += 1) {}
-            try appendSpan(&spans, gpa, line[i..end], .code_number);
-            i = end;
-            continue;
-        }
-
         // Identifiers & keywords:
         if (std.ascii.isAlphabetic(line[i]) or line[i] == '_') {
             var end = i + 1;
@@ -807,11 +794,21 @@ fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8) 
             continue;
         }
 
+        // Numbers:
+        if (std.ascii.isDigit(line[i])) {
+            var end = i + 1;
+            if (line[i] == '0' and end < line.len and (line[end] == 'x' or line[end] == 'b' or line[end] == 'o')) end += 1;
+            while (end < line.len and (std.ascii.isHex(line[end]) or line[end] == '.' or line[end] == '_')) : (end += 1) {}
+            try appendSpan(&spans, gpa, line[i..end], .code_number);
+            i = end;
+            continue;
+        }
+
         // Punctuation, operators, whitespace:
         var end = i + 1;
         while (end < line.len) {
             const c = line[end];
-            if (c == '#' or (c == '/' and end + 1 < line.len and line[end + 1] == '/') or c == '"' or c == '\'' or std.ascii.isAlphanumeric(c) or c == '_') break;
+            if ((is_hash_comment_lang and c == '#') or (!is_hash_comment_lang and c == '/' and end + 1 < line.len and line[end + 1] == '/') or c == '"' or c == '\'' or std.ascii.isAlphanumeric(c) or c == '_') break;
             end += 1;
         }
         try appendSpan(&spans, gpa, line[i..end], .code);
@@ -860,7 +857,8 @@ fn inlineSpans(gpa: std.mem.Allocator, line: []const u8, base: Style) ![]Span {
                 if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
                     if (std.mem.indexOfScalarPos(u8, line, close_bracket + 2, ')')) |close_paren| {
                         const anchor_text = line[index + 1 .. close_bracket];
-                        const link_url = line[close_bracket + 2 .. close_paren];
+                        const raw_url = line[close_bracket + 2 .. close_paren];
+                        const link_url = if (isSafeHyperlinkUri(raw_url)) raw_url else "";
                         try appendSpanWithLink(&spans, gpa, anchor_text, .link, link_url);
                         index = close_paren + 1;
                         continue;
@@ -871,8 +869,9 @@ fn inlineSpans(gpa: std.mem.Allocator, line: []const u8, base: Style) ![]Span {
         if (std.mem.startsWith(u8, line[index..], "https://") or std.mem.startsWith(u8, line[index..], "http://")) {
             var url_end = index;
             while (url_end < line.len and !std.ascii.isWhitespace(line[url_end]) and line[url_end] != ')' and line[url_end] != ']' and line[url_end] != '>') : (url_end += 1) {}
-            const url = line[index..url_end];
-            try appendSpanWithLink(&spans, gpa, url, .link, url);
+            const raw_url = line[index..url_end];
+            const link_url = if (isSafeHyperlinkUri(raw_url)) raw_url else "";
+            try appendSpanWithLink(&spans, gpa, raw_url, .link, link_url);
             index = url_end;
             continue;
         }
@@ -884,6 +883,15 @@ fn inlineSpans(gpa: std.mem.Allocator, line: []const u8, base: Style) ![]Span {
 
     if (spans.items.len == 0) try appendSpan(&spans, gpa, "", base);
     return spans.toOwnedSlice(gpa);
+}
+
+fn isSafeHyperlinkUri(uri: []const u8) bool {
+    if (uri.len == 0 or uri.len > 2048) return false;
+    for (uri) |b| {
+        if (b < 0x20 or b == 0x7f) return false;
+        if (b >= 0x80 and b <= 0x9f) return false;
+    }
+    return true;
 }
 
 fn nextInlineMarker(line: []const u8, start: usize) usize {

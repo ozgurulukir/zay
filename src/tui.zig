@@ -438,7 +438,7 @@ pub const App = struct {
         // custom slugs so a config with `"theme": "<custom>"` is applied at
         // startup instead of silently falling back to `default`.
         try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
-        tui_style.setNoColor(tui_style.isNoColorActive(app.cached_config.tui.no_color));
+        tui_style.setNoColor(tui_style.isNoColorActive(app.cached_config.tui.no_color, environ_map));
         const active_theme = app.theme_registry.resolveWithScheme(
             app.cached_config.theme,
             app.terminal_color_scheme,
@@ -1420,7 +1420,7 @@ pub fn run(
     if (config.toast.max_visible) |n| toast.global.max_visible = n;
 
     // Install the active color theme before the first frame is drawn.
-    tui_style.setNoColor(tui_style.isNoColorActive(config.tui.no_color));
+    tui_style.setNoColor(tui_style.isNoColorActive(config.tui.no_color, init.environ_map));
     tui_style.setActive(tui_style.resolveTheme(config.theme));
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, config_arena, init.environ_map, host_id);
