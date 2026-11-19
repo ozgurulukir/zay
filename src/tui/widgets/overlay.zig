@@ -35,9 +35,9 @@ const plugin_store_job = @import("../plugin_store_job.zig");
 
 const App = tui.App;
 
-const OverlaySize = struct { width: u16, height: u16 };
+pub const OverlaySize = struct { width: u16, height: u16 };
 
-fn overlaySize(mode: App.Mode) OverlaySize {
+pub fn preferredOverlaySize(mode: App.Mode) OverlaySize {
     return switch (mode) {
         .normal => .{ .width = 0, .height = 0 },
         .command => .{ .width = 64, .height = 16 },
@@ -55,6 +55,52 @@ fn overlaySize(mode: App.Mode) OverlaySize {
         .theme_picker => .{ .width = 64, .height = 16 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
+}
+
+pub fn isListPicker(mode: App.Mode) bool {
+    return switch (mode) {
+        .command, .session_picker, .model_picker, .tree_picker, .lanes, .help, .mcp, .plugins, .search, .theme_picker => true,
+        else => false,
+    };
+}
+
+pub fn overlaySize(mode: App.Mode, max_cols: u16, max_rows: u16) OverlaySize {
+    if (mode == .normal or mode == .diff_viewer) return .{ .width = 0, .height = 0 };
+
+    if (mode == .save_message) {
+        const min_w = @min(@as(u16, 40), max_cols);
+        const max_w_target = (max_cols * 9) / 10;
+        const upper_w = @min(max_cols, @max(min_w, max_w_target));
+        const w = @max(min_w, @min(@as(u16, 60), upper_w));
+        const h = @min(@as(u16, 3), max_rows);
+        return .{ .width = w, .height = h };
+    }
+
+    const pref = preferredOverlaySize(mode);
+
+    // Width: clamp(preferred, 40, ~90% of columns)
+    const min_w = @min(@as(u16, 40), max_cols);
+    const max_w_target = (max_cols * 9) / 10;
+    const upper_w = @min(max_cols, @max(min_w, max_w_target));
+    const width = if (pref.width <= min_w)
+        min_w
+    else if (pref.width >= upper_w)
+        upper_w
+    else
+        pref.width;
+
+    // Height: clamp(preferred, 8, ~70% of rows), growing list pickers on tall terminals (rows >= 35)
+    const min_h = @min(@as(u16, 8), max_rows);
+    const max_h_target = (max_rows * 7) / 10;
+    const upper_h = @min(max_rows, @max(min_h, max_h_target));
+    const height = if (max_rows >= 35 and isListPicker(mode) and upper_h > pref.height)
+        upper_h
+    else if (pref.height < min_h)
+        min_h
+    else
+        @min(pref.height, upper_h);
+
+    return .{ .width = width, .height = height };
 }
 
 fn overlayLabel(app: *const App) []const u8 {
@@ -96,14 +142,16 @@ pub const OverlayWidget = struct {
     fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
+        const max_w: u16 = ctx.max.width orelse 80;
+        const max_h: u16 = ctx.max.height orelse 24;
         const size = if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form)
-            OverlaySize{ .width = 72, .height = 12 }
+            OverlaySize{ .width = @min(max_w, @max(@min(@as(u16, 40), max_w), (max_w * 9) / 10)), .height = @min(max_h, 12) }
         else
-            overlaySize(self.app.mode);
-        const max_w: u16 = ctx.max.width orelse size.width;
-        const max_h: u16 = ctx.max.height orelse size.height;
+            overlaySize(self.app.mode, max_w, max_h);
         const total_w: u16 = @min(size.width, max_w);
         const total_h: u16 = @min(size.height, max_h);
+        self.app.drawn_overlay_width = total_w;
+        self.app.drawn_overlay_height = total_h;
         var inner: OverlayInner = .{ .app = self.app };
         const label_text = overlayLabel(self.app);
         const border_labels: []const vxfw.Border.BorderLabel = if (label_text.len > 0)
@@ -509,7 +557,7 @@ test "overlaySize gives every mode a panel and zeroes the chromeless ones" {
     // must fail here, not show up as a zero-sized popup at runtime.
     inline for (std.meta.fields(App.Mode)) |field| {
         const mode: App.Mode = @enumFromInt(field.value);
-        const size = overlaySize(mode);
+        const size = overlaySize(mode, 100, 30);
         switch (mode) {
             // Rendered inline, no overlay panel.
             .normal, .diff_viewer => {
@@ -525,13 +573,42 @@ test "overlaySize gives every mode a panel and zeroes the chromeless ones" {
     }
 }
 
-test "overlaySize pins known panel dimensions" {
+test "overlaySize pins known panel dimensions on standard terminal" {
     // The exact grid the root layout clamps against — these are load-bearing
     // numbers (a screen smaller than a panel must still fit).
-    try std.testing.expectEqual(@as(u16, 64), overlaySize(.command).width);
-    try std.testing.expectEqual(@as(u16, 90), overlaySize(.settings).width);
-    try std.testing.expectEqual(@as(u16, 22), overlaySize(.settings).height);
-    try std.testing.expectEqual(@as(u16, 20), overlaySize(.tree_picker).height);
+    try std.testing.expectEqual(@as(u16, 64), overlaySize(.command, 100, 30).width);
+    try std.testing.expectEqual(@as(u16, 90), overlaySize(.settings, 100, 40).width);
+    try std.testing.expectEqual(@as(u16, 22), overlaySize(.settings, 100, 40).height);
+    try std.testing.expectEqual(@as(u16, 20), overlaySize(.tree_picker, 100, 30).height);
     // The commit-message box is a one-line input, deliberately tiny.
-    try std.testing.expectEqual(@as(u16, 3), overlaySize(.save_message).height);
+    try std.testing.expectEqual(@as(u16, 3), overlaySize(.save_message, 100, 30).height);
+}
+
+test "overlaySize table-driven across heights 5..80 and widths 20..200" {
+    const heights = [_]u16{ 5, 8, 12, 24, 40, 60, 80 };
+    const widths = [_]u16{ 20, 35, 50, 80, 100, 160, 200 };
+    const modes = [_]App.Mode{ .command, .session_picker, .tree_picker, .help, .settings, .save_message };
+
+    for (heights) |h| {
+        for (widths) |w| {
+            for (modes) |m| {
+                const s = overlaySize(m, w, h);
+                // 1. Output size must never exceed terminal boundaries
+                try std.testing.expect(s.width <= w);
+                try std.testing.expect(s.height <= h);
+
+                if (m == .save_message) {
+                    try std.testing.expect(s.height <= 3);
+                } else {
+                    // 2. On tall terminals (e.g. h=80), list pickers grow to ~70% of rows
+                    if (h >= 40) {
+                        try std.testing.expect(s.height >= 20);
+                    }
+                    // 3. Last item reachability: width and height are positive
+                    try std.testing.expect(s.width > 0);
+                    try std.testing.expect(s.height > 0);
+                }
+            }
+        }
+    }
 }

@@ -1503,6 +1503,47 @@ test "advanceLoadingFrame wraps at 8" {
     try std.testing.expectEqual(@as(u8, 2), app.metrics.loading_frame);
 }
 
+test "with animations off an idle session produces no periodic redraws" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.tui.animations = .off;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(false, app.metrics.loading_tick_active);
+    try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
+}
+
+test "with animations off spinner does not advance even during active turn" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.tui.animations = .off;
+    app.thread.turn.submit();
+    app.thread.turn_view.activity = .{ .writing_response = 0 };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
+    try std.testing.expectEqual(@as(u32, 0), root.spinner_tick_accum);
+}
+
 test "chooseLoadingWordIndex returns a valid spinner index" {
     const index = turn_view_mod.chooseLoadingWordIndex(std.testing.io);
     try std.testing.expect(index < turn_view_mod.loading_spinners.len);

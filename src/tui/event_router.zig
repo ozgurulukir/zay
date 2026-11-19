@@ -101,7 +101,7 @@ fn routeMouse(
             return;
         }
         if (mouse.button == .wheel_down) {
-            app.pickers.help.scrollDown(2, help_picker.bodyRows(help_picker.help_overlay_height));
+            app.pickers.help.scrollDown(2, help_picker.bodyRows(app.drawnOverlayHeight()));
             ctx.consumeAndRedraw();
             return;
         }

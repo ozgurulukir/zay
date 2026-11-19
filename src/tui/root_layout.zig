@@ -352,6 +352,9 @@ fn buildOverlayChildren(
             .z_index = 2,
         };
         idx += 1;
+    } else {
+        app.drawn_overlay_width = 0;
+        app.drawn_overlay_height = 0;
     }
 
     if (flags.permission_visible) {
@@ -465,6 +468,24 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     }
     const max_width = ctx.max.width orelse ctx.min.width;
     const max_height = ctx.max.height orelse ctx.min.height;
+    if (max_width < root_layout.min_usable_width or max_height < root_layout.min_usable_height) {
+        app.split_rect_count = 0;
+        app.drawn_overlay_width = 0;
+        app.drawn_overlay_height = 0;
+        var surface = try vxfw.Surface.init(ctx.arena, root_widget, .{ .width = max_width, .height = max_height });
+        @memset(surface.buffer, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
+        const warning = "Terminal too small";
+        const write_len = @min(max_width, @as(u16, @intCast(warning.len)));
+        var col: u16 = 0;
+        while (col < write_len) : (col += 1) {
+            surface.writeCell(col, 0, .{
+                .char = .{ .grapheme = warning[col .. col + 1], .width = 1 },
+                .style = tui_style.activePalette().notice,
+            });
+        }
+        try materializeBlankCells(ctx.arena, &surface);
+        return surface;
+    }
     const loading_visible = app.thread.turn_view.awaitingOutput();
     const split = app.split_mode != .tab and app.threads.len() > 1;
 

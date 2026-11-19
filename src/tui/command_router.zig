@@ -589,7 +589,7 @@ pub const HelpPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         // Same body-row derivation `Content.draw` renders with — the keyboard
         // and mouse clamps must agree or the last items become unreachable.
-        const body_height: u16 = help_picker.bodyRows(help_picker.help_overlay_height);
+        const body_height: u16 = help_picker.bodyRows(app.drawnOverlayHeight());
         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{}) or key.matches('q', .{})) {
             app.setMode(.normal);
             app.pickers.help.reset();
