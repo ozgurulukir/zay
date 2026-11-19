@@ -111,8 +111,16 @@ pub const MessageWidget = struct {
                     drawWrapped(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null);
                 }
             },
-            .notice => |m| drawWrapped(surface, m.body, p.notice, styled_as_selected, &row, ctx, 2, p.notice),
-            .success => |m| drawWrapped(surface, m.body, p.tool, styled_as_selected, &row, ctx, 2, p.tool),
+            .notice => |m| {
+                const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ")) "" else "! ";
+                const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
+                drawWrapped(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice);
+            },
+            .success => |m| {
+                const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "✓ ")) "" else "✓ ";
+                const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
+                drawWrapped(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool);
+            },
             .info => |m| drawWrapped(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
