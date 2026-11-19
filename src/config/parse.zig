@@ -341,6 +341,18 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
         if (target.tui.custom_themes_dir) |old| gpa.free(old);
         target.tui.custom_themes_dir = try gpa.dupe(u8, s);
     }
+    if (updates.light_theme) |s| {
+        if (target.tui.light_theme) |old| gpa.free(old);
+        target.tui.light_theme = try gpa.dupe(u8, s);
+    }
+    if (updates.dark_theme) |s| {
+        if (target.tui.dark_theme) |old| gpa.free(old);
+        target.tui.dark_theme = try gpa.dupe(u8, s);
+    }
+    if (updates.no_color_is_set) {
+        target.tui.no_color = updates.no_color;
+        target.tui.no_color_is_set = true;
+    }
     if (updates.fuzzy_highlight_is_set) {
         target.tui.fuzzy_highlight = updates.fuzzy_highlight;
         target.tui.fuzzy_highlight_is_set = true;
@@ -1222,6 +1234,12 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
         tui.theme_live_preview_is_set = true;
     }
     if (stringField(value, "customThemesDir")) |s| tui.custom_themes_dir = try gpa.dupe(u8, s);
+    if (stringField(value, "lightTheme")) |s| tui.light_theme = try gpa.dupe(u8, s);
+    if (stringField(value, "darkTheme")) |s| tui.dark_theme = try gpa.dupe(u8, s);
+    if (boolField(value, "noColor")) |b| {
+        tui.no_color = b;
+        tui.no_color_is_set = true;
+    }
     if (boolField(value, "fuzzyHighlight")) |b| {
         tui.fuzzy_highlight = b;
         tui.fuzzy_highlight_is_set = true;
@@ -2330,6 +2348,9 @@ fn hasNonDefaultTui(tui: TuiSettings) bool {
     // as non-default here (#447).
     if (tui.theme_live_preview_is_set) return true;
     if (tui.custom_themes_dir != null) return true;
+    if (tui.light_theme != null) return true;
+    if (tui.dark_theme != null) return true;
+    if (tui.no_color_is_set) return true;
     if (tui.fuzzy_highlight_is_set) return true;
     if (tui.fuzzy_highlight_style_is_set) return true;
     if (tui.split_mode_is_set) return true;
@@ -2373,6 +2394,18 @@ fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     if (tui.custom_themes_dir) |s| {
         try writeKeyNoIndent(writer, "customThemesDir", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
+    }
+    if (tui.light_theme) |s| {
+        try writeKeyNoIndent(writer, "lightTheme", &wrote_any);
+        try std.json.Stringify.value(s, .{}, writer);
+    }
+    if (tui.dark_theme) |s| {
+        try writeKeyNoIndent(writer, "darkTheme", &wrote_any);
+        try std.json.Stringify.value(s, .{}, writer);
+    }
+    if (tui.no_color_is_set or tui.no_color != default_tui.no_color) {
+        try writeKeyNoIndent(writer, "noColor", &wrote_any);
+        try writer.writeAll(if (tui.no_color) "true" else "false");
     }
     if (tui.fuzzy_highlight_is_set or tui.fuzzy_highlight != default_tui.fuzzy_highlight) {
         try writeKeyNoIndent(writer, "fuzzyHighlight", &wrote_any);
