@@ -19,6 +19,7 @@ pub const Segment = struct {
     text: []const u8,
     style: vaxis.Style,
     width: u16,
+    gap_before: u16 = 1,
 };
 
 /// Priority ranking for extensible status bar segments.
@@ -80,7 +81,8 @@ pub fn layoutSegments(
                 if (@intFromEnum(cand.priority) > priority_ceiling) continue;
                 const w: u16 = @intCast(@min(vaxis.gwidth.gwidth(cand.text, .unicode), std.math.maxInt(u16)));
                 if (w == 0) continue;
-                segs[idx] = .{ .text = cand.text, .style = cand.style, .width = w };
+                const gap: u16 = if (idx > 0) cand.gap_before else 0;
+                segs[idx] = .{ .text = cand.text, .style = cand.style, .width = w, .gap_before = gap };
                 idx += 1;
             }
             return .{ .segments = segs, .total_width = needed_width };
@@ -297,8 +299,17 @@ pub const StatusBarWidget = struct {
         var child_count: usize = 0;
 
         for (layout.segments, 0..) |seg, i| {
-            if (i > 0) {
-                flex_children[child_count] = .{ .widget = spacer_widget, .flex = 0 };
+            if (i > 0 and seg.gap_before > 0) {
+                if (seg.gap_before == 1) {
+                    flex_children[child_count] = .{ .widget = spacer_widget, .flex = 0 };
+                } else {
+                    const gap_box = try ctx.arena.create(vxfw.SizedBox);
+                    gap_box.* = .{
+                        .child = spacer_widget,
+                        .size = .{ .width = seg.gap_before, .height = 1 },
+                    };
+                    flex_children[child_count] = .{ .widget = gap_box.widget(), .flex = 0 };
+                }
                 child_count += 1;
             }
             const text_widget = try ctx.arena.create(vxfw.Text);
