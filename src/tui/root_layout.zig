@@ -177,7 +177,7 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
         .gpa = app.gpa,
         .has_model_configured = has_model,
         .loading_frame = app.metrics.loading_frame,
-        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
         .blackhole_visible = &app.metrics.blackhole_visible,
         // Only the pane whose lane owns the shared input yields its splash;
         // sibling lanes keep theirs until their own first prompt.
@@ -508,7 +508,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .gpa = app.gpa,
         .has_model_configured = has_model,
         .loading_frame = app.metrics.loading_frame,
-        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
         .blackhole_visible = &app.metrics.blackhole_visible,
         .splash_suppressed = app.inputs.input.buf.realLength() > 0,
     };
