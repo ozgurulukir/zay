@@ -61,6 +61,11 @@ pub const TelemetryTracker = struct {
         const max_k = @as(f64, @floatFromInt(max_tokens)) / 1000.0;
         const percent: usize = @intFromFloat(clamped * 100.0);
         const level: MeterLevel = if (clamped >= alert) .alert else if (clamped >= warn) .warn else .normal;
+        const marker: []const u8 = switch (level) {
+            .normal => "",
+            .warn => "! ",
+            .alert => "!! ",
+        };
 
         // Build the bar into a scratch buffer (█/░ are 3-byte UTF-8).
         var blocks: [bar_blocks * 3]u8 = undefined;
@@ -70,7 +75,7 @@ pub const TelemetryTracker = struct {
             @memcpy(blocks[bn..][0..3], block);
             bn += 3;
         }
-        const text = std.fmt.bufPrint(buf, "[{s}] {d}% ({d:.1}k/{d:.0}k)", .{ blocks[0..bn], percent, used_k, max_k }) catch return .{ .text = "", .level = .normal };
+        const text = std.fmt.bufPrint(buf, "{s}[{s}] {d}% ({d:.1}k/{d:.0}k)", .{ marker, blocks[0..bn], percent, used_k, max_k }) catch return .{ .text = "", .level = .normal };
         return .{ .text = text, .level = level };
     }
 
@@ -129,15 +134,15 @@ test "formatContextBar renders 75% at warn level" {
     // 0.75 * 128000 = 96000 — above the 0.70 warn threshold, below 0.85.
     const meter = TelemetryTracker.formatContextBar(96000, 128000, 0.70, 0.85, &buf);
     try std.testing.expectEqual(MeterLevel.warn, meter.level);
-    // 7 filled blocks, 96.0k / 128k, 75%.
-    try std.testing.expectEqualStrings("[███████░░░] 75% (96.0k/128k)", meter.text);
+    // 7 filled blocks, 96.0k / 128k, 75% with warn marker '! '.
+    try std.testing.expectEqualStrings("! [███████░░░] 75% (96.0k/128k)", meter.text);
 }
 
 test "formatContextBar renders 100% at alert level" {
     var buf: [64]u8 = undefined;
     const meter = TelemetryTracker.formatContextBar(128000, 128000, 0.70, 0.85, &buf);
     try std.testing.expectEqual(MeterLevel.alert, meter.level);
-    try std.testing.expectEqualStrings("[██████████] 100% (128.0k/128k)", meter.text);
+    try std.testing.expectEqualStrings("!! [██████████] 100% (128.0k/128k)", meter.text);
 }
 
 test "formatContextBar returns empty when max_tokens is zero" {

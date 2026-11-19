@@ -65,6 +65,7 @@ const model_picker = @import("tui/widgets/model_picker.zig");
 const provider_picker = @import("tui/widgets/provider_picker.zig");
 const tree_selector = @import("tui/widgets/tree_selector.zig");
 const lanes_picker = @import("tui/widgets/lanes_picker.zig");
+const help_picker = @import("tui/widgets/help_picker.zig");
 const tui_provider = @import("tui/provider_controller.zig");
 const tui_style = @import("tui/style.zig");
 pub const modelsdev = @import("models/registry.zig");
@@ -152,6 +153,11 @@ pub const App = struct {
     /// input widget translate its local chip position into absolute coordinates
     /// for `lanes_chip_rect`.
     input_surface_row: u16 = 0,
+    /// The actual drawn dimensions of the mode overlay computed during the most
+    /// recent frame. Enables keyboard/mouse scroll clamps to agree with responsive
+    /// or clipped overlay sizes.
+    drawn_overlay_width: u16 = 0,
+    drawn_overlay_height: u16 = 0,
     inputs: app_state.InputState,
     /// Cross-pane navigation cursors and the lane-chip hit-test rect.
     nav: app_state.NavState = .{},
@@ -511,6 +517,11 @@ pub const App = struct {
 
     pub fn getMode(self: *const App) Mode {
         return self.mode;
+    }
+
+    pub fn drawnOverlayHeight(self: *const App) u16 {
+        if (self.drawn_overlay_height > 0) return self.drawn_overlay_height;
+        return help_picker.help_overlay_height;
     }
 
     pub fn getTreeState(self: *App) *tree_selector.TreeState {

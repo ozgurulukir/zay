@@ -31,7 +31,27 @@ pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
 
 pub fn messageContentRows(message: *transcript_mod.Message, width: u16) u16 {
     return switch (message.*) {
-        .user, .notice, .success, .info => |m| textRows(m.body, width -| 2),
+        .user, .info => |m| textRows(m.body, width -| 2),
+        .notice => |m| blk: {
+            const has_marker = std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ");
+            var stack_buf: [256]u8 = undefined;
+            if (!has_marker and m.body.len + 2 <= stack_buf.len) {
+                @memcpy(stack_buf[0..2], "! ");
+                @memcpy(stack_buf[2 .. 2 + m.body.len], m.body);
+                break :blk textRows(stack_buf[0 .. 2 + m.body.len], width -| 2);
+            }
+            break :blk textRows(m.body, width -| (if (has_marker) @as(u16, 2) else @as(u16, 4)));
+        },
+        .success => |m| blk: {
+            const has_marker = std.mem.startsWith(u8, m.body, "✓ ");
+            var stack_buf: [256]u8 = undefined;
+            if (!has_marker and m.body.len + 4 <= stack_buf.len) {
+                @memcpy(stack_buf[0..4], "✓ ");
+                @memcpy(stack_buf[4 .. 4 + m.body.len], m.body);
+                break :blk textRows(stack_buf[0 .. 4 + m.body.len], width -| 2);
+            }
+            break :blk textRows(m.body, width -| (if (has_marker) @as(u16, 2) else @as(u16, 4)));
+        },
         .agent => |m| agentContentRows(message, m, width),
         .skill => |m| textRows(m.title, width -| 2) + if (m.expanded and m.body.len > 0) textRows(m.body, width) else 0,
         .logo => blackhole.intro_block_rows,

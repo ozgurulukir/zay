@@ -63,6 +63,9 @@ fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool 
     if (state.pending_toast_enabled) |v| {
         if (v != (config.toast.enabled orelse true)) return true;
     }
+    if (state.pending_animations) |v| {
+        if (v != config.tui.animations) return true;
+    }
     return false;
 }
 
@@ -140,11 +143,24 @@ fn submitGeneralItem(app: *App, state: *State) !void {
     switch (state.selection[@intFromEnum(Tab.general)]) {
         0 => {
             // Toggle use_responses_endpoint.
-            state.dirty = togglePending(&state.pending_use_responses_endpoint, currentResponsesEndpoint(&app.cached_config));
+            _ = togglePending(&state.pending_use_responses_endpoint, currentResponsesEndpoint(&app.cached_config));
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         1 => {
             // Toggle toast notifications.
-            state.dirty = togglePending(&state.pending_toast_enabled, app.cached_config.toast.enabled orelse true);
+            _ = togglePending(&state.pending_toast_enabled, app.cached_config.toast.enabled orelse true);
+            state.dirty = hasActualChanges(state, &app.cached_config);
+        },
+        2 => {
+            // Cycle animations: full -> reduced -> off -> full.
+            const cur = state.pending_animations orelse app.cached_config.tui.animations;
+            const next: config_mod.AnimationsMode = switch (cur) {
+                .full => .reduced,
+                .reduced => .off,
+                .off => .full,
+            };
+            state.pending_animations = next;
+            state.dirty = hasActualChanges(state, &app.cached_config);
         },
         else => {},
     }
@@ -226,6 +242,7 @@ pub fn saveSettings(app: *App) !bool {
         if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
         state.pending_bash_classifier_url = null;
         state.pending_toast_enabled = null;
+        state.pending_animations = null;
         _ = try app.thread.transcript.append(app.gpa, .info, "Settings", "No changes to save");
         return false;
     }
@@ -272,6 +289,10 @@ pub fn saveSettings(app: *App) !bool {
     }
     if (state.pending_toast_enabled) |v| {
         updates.toast.enabled = v;
+    }
+    if (state.pending_animations) |v| {
+        updates.tui.animations = v;
+        updates.tui.animations_is_set = true;
     }
 
     const runtime = app.liveRuntime() orelse return false;
@@ -321,6 +342,7 @@ pub fn saveSettings(app: *App) !bool {
     state.pending_system_prompt = null;
     state.pending_bash_classifier_url = null;
     state.pending_toast_enabled = null;
+    state.pending_animations = null;
     state.edit_target = .none;
 
     // Show success feedback to user.
@@ -433,6 +455,10 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
     }
     // Toast toggle applies regardless of model_selection shape.
     if (state.pending_toast_enabled) |v| app.cached_config.toast.enabled = v;
+    if (state.pending_animations) |v| {
+        app.cached_config.tui.animations = v;
+        app.cached_config.tui.animations_is_set = true;
+    }
 }
 
 /// The classifier URL a config currently resolves to — the model_selection

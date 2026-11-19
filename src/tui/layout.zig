@@ -16,6 +16,11 @@ const SplitMode = config_mod.SplitMode;
 
 pub const loading_status_rows: u16 = 2;
 
+/// Minimum usable terminal dimensions. Displays a single-line warning surface
+/// when the terminal is smaller than these bounds.
+pub const min_usable_width: u16 = 20;
+pub const min_usable_height: u16 = 5;
+
 /// Rows reserved around the content: top border + bottom border + one
 /// hint/diff-counts row.
 const root_chrome_rows: u16 = 3;
@@ -105,7 +110,13 @@ pub fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, lo
     // line the InputWidget draws above the border for it. Omitting the queued row
     // here starves the InputWidget so it silently drops the hint + diff counts.
     const desired: u16 = root_chrome_rows + input_text_rows + @intFromBool(queued_visible);
-    const max_allowed: u16 = @max(input_height_floor, max_height -| root_chrome_rows);
+    // Cap input box at 40% of terminal height on taller terminals (with input_height_floor,
+    // clamped to max_height -| root_chrome_rows) so large text pastes cannot starve the transcript pane.
+    const cap_40_pct: u16 = (max_height * 40) / 100;
+    const max_allowed: u16 = if (max_height >= 15)
+        @max(input_height_floor, cap_40_pct)
+    else
+        max_height -| root_chrome_rows;
     const input_height: u16 = @min(max_height, @min(desired, max_allowed));
     const above_input_height: u16 = max_height - input_height;
     const loading_height: u16 = if (loading_visible) @min(loading_status_rows, above_input_height) else 0;
@@ -194,4 +205,43 @@ test "computeSplitLayout grid spans a trailing odd lane across its row" {
     try std.testing.expectEqual(@as(u16, 0), cols[2].col);
     try std.testing.expectEqual(@as(u16, 200), cols[2].width);
     try std.testing.expectEqual(@as(u16, 20), cols[2].height);
+}
+
+test "rootLayout table-driven across heights 5..80 and input sizes" {
+    const Case = struct {
+        height: u16,
+        text_rows: u16,
+        panel: bool,
+        loading: bool,
+        queued: bool,
+    };
+    const cases = [_]Case{
+        .{ .height = 5, .text_rows = 1, .panel = false, .loading = false, .queued = false },
+        .{ .height = 5, .text_rows = 50, .panel = false, .loading = false, .queued = false },
+        .{ .height = 10, .text_rows = 1, .panel = false, .loading = false, .queued = false },
+        .{ .height = 10, .text_rows = 20, .panel = true, .loading = true, .queued = true },
+        .{ .height = 24, .text_rows = 1, .panel = false, .loading = false, .queued = false },
+        .{ .height = 24, .text_rows = 10, .panel = true, .loading = false, .queued = false },
+        .{ .height = 40, .text_rows = 1, .panel = false, .loading = true, .queued = false },
+        .{ .height = 40, .text_rows = 100, .panel = true, .loading = true, .queued = true },
+        .{ .height = 80, .text_rows = 1, .panel = false, .loading = false, .queued = false },
+        .{ .height = 80, .text_rows = 100, .panel = true, .loading = true, .queued = true },
+    };
+
+    for (cases) |c| {
+        const res = rootLayout(c.height, c.panel, c.text_rows, c.loading, c.queued);
+        // Invariants:
+        // 1. input_height + loading_height + transcript_height == height
+        try std.testing.expectEqual(c.height, res.input_height + res.loading_height + res.transcript_height);
+        // 2. input_row == transcript_height + loading_height
+        try std.testing.expectEqual(res.transcript_height + res.loading_height, res.input_row);
+        // 3. panel_height <= transcript_height
+        try std.testing.expect(res.panel_height <= res.transcript_height);
+        // 4. Input height never starves the transcript when height > 6 and text_rows is large (capped around 40%)
+        if (c.height >= 20 and c.text_rows >= 50) {
+            const max_input_fraction = (c.height * 40) / 100;
+            try std.testing.expect(res.input_height <= max_input_fraction or res.input_height <= input_height_floor);
+            try std.testing.expect(res.transcript_height > 0);
+        }
+    }
 }
