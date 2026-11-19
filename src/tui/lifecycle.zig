@@ -325,15 +325,28 @@ pub fn updateTerminalTitleAndAttention(app: *App, ctx: *vxfw.EventContext) void 
         .calling_tools => "running tool",
     };
 
-    const session_name = if (app.thread.title) |t| (if (t.len > 0) t else "new session") else "new session";
+    const raw_session_name = if (app.thread.title) |t| (if (t.len > 0) t else "new session") else "new session";
+    var clean_session_buf: [128]u8 = undefined;
+    var clean_len: usize = 0;
+    for (raw_session_name) |b| {
+        if (clean_len >= clean_session_buf.len) break;
+        if (b < 0x20 or b == 0x7f or (b >= 0x80 and b <= 0x9f)) {
+            clean_session_buf[clean_len] = ' ';
+        } else {
+            clean_session_buf[clean_len] = b;
+        }
+        clean_len += 1;
+    }
+    const session_name = clean_session_buf[0..clean_len];
 
     var title_buf: [256]u8 = undefined;
     const title = std.fmt.bufPrint(&title_buf, "zay — {s} [lane {d}/{d}] ({s})", .{ session_name, lane_idx, total_lanes, state_str }) catch return;
 
     if (app.last_terminal_title == null or !std.mem.eql(u8, app.last_terminal_title.?, title)) {
-        ctx.setTitle(title) catch {};
+        const owned_title = app.gpa.dupe(u8, title) catch return;
         if (app.last_terminal_title) |prev| app.gpa.free(prev);
-        app.last_terminal_title = app.gpa.dupe(u8, title) catch null;
+        app.last_terminal_title = owned_title;
+        ctx.setTitle(owned_title) catch {};
     }
 }
 
