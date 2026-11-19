@@ -9,10 +9,12 @@ const vxfw = vaxis.vxfw;
 
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
+const app_state = @import("../app_state.zig");
 const agent_worker = @import("../agent_worker.zig");
 
 pub const ApprovalSnapshot = agent_worker.ApprovalSnapshot;
 pub const ApprovalDecision = agent_worker.ApprovalDecision;
+pub const ApprovalChoice = agent_worker.ApprovalChoice;
 
 /// Outer border widget. Shows the current approval snapshot (the
 /// command the agent is about to run + Approve/Reject actions).
@@ -20,6 +22,8 @@ pub const PermissionWidget = struct {
     snapshot: ?ApprovalSnapshot = null,
     scroll: u32 = 0,
     label: []const u8 = "Tool Approval Request",
+    base_screen_row: u16 = 0,
+    buttons_out: ?*?[4]app_state.PermissionButton = null,
 
     pub fn widget(self: *PermissionWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -41,7 +45,12 @@ pub const PermissionWidget = struct {
         if (width == 0 or height == 0) return surface;
 
         const inner = try ctx.arena.create(PermissionInner);
-        inner.* = .{ .snapshot = snapshot, .scroll = self.scroll };
+        inner.* = .{
+            .snapshot = snapshot,
+            .scroll = self.scroll,
+            .base_screen_row = self.base_screen_row,
+            .buttons_out = self.buttons_out,
+        };
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .labels = &.{.{ .text = self.label, .alignment = .top_left }},
@@ -55,6 +64,8 @@ pub const PermissionWidget = struct {
 const PermissionInner = struct {
     snapshot: ApprovalSnapshot,
     scroll: u32,
+    base_screen_row: u16,
+    buttons_out: ?*?[4]app_state.PermissionButton = null,
 
     pub fn widget(self: *PermissionInner) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -68,13 +79,21 @@ const PermissionInner = struct {
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
 
-        panel.lineStyledAt(&surface, 0, "Review before running:", ctx, 1, p.panel_header) catch {};
+        const tool = self.snapshot.tool_name orelse "bash";
+        const lane = self.snapshot.lane_id orelse "1";
+        const cwd = self.snapshot.cwd orelse "";
+        const header = if (cwd.len > 0)
+            std.fmt.allocPrint(ctx.arena, "Review {s} (lane {s}) in {s}:", .{ tool, lane, cwd }) catch "Review before running:"
+        else
+            std.fmt.allocPrint(ctx.arena, "Review {s} (lane {s}):", .{ tool, lane }) catch "Review before running:";
+        panel.lineStyledAt(&surface, 0, header, ctx, 1, p.panel_header) catch {};
+
         const body_rows = height -| 3;
         drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
         // TUX03: tell the user when a long command is scrollable and where
         // they are in it (Up/Down scroll, see handlePermissionKey).
         drawScrollHint(&surface, ctx, self.snapshot.command, self.scroll, body_rows, height);
-        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected);
+        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected, self.base_screen_row + 1, self.buttons_out);
         return surface;
     }
 };
@@ -124,17 +143,42 @@ fn scrollHintText(arena: std.mem.Allocator, command: []const u8, scroll: u32, bo
     }) catch null;
 }
 
-fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalDecision) void {
+fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalChoice, base_screen_row: u16, buttons_out: ?*?[4]app_state.PermissionButton) void {
     if (row >= surface.size.height) return;
     const p = tui_style.activePalette();
-    const approve_selected = selected == .approve;
-    const reject_selected = selected == .reject;
+    const w = surface.size.width;
 
-    const approve_style: vaxis.Style = if (approve_selected) p.permission_approve else p.thinking_body;
-    const reject_style: vaxis.Style = if (reject_selected) p.error_style else p.thinking_body;
+    const items = [_]struct {
+        choice: ApprovalChoice,
+        text: []const u8,
+        style: vaxis.Style,
+    }{
+        .{ .choice = .approve, .text = "Approve [Y]", .style = p.permission_approve },
+        .{ .choice = .approve_session, .text = "Session [S]", .style = p.info },
+        .{ .choice = .reject, .text = "Reject [N]", .style = p.error_style },
+        .{ .choice = .reject_with_reason, .text = "Reason [R]", .style = p.thinking_body },
+    };
 
-    panel.lineStyledAt(surface, row, actionLabel(ctx, "Approve [Y]", approve_selected), ctx, 1, approve_style) catch {};
-    panel.lineStyledAt(surface, row, actionLabel(ctx, "Reject [N]", reject_selected), ctx, 18, reject_style) catch {};
+    var col: u16 = 1;
+    var recorded: [4]app_state.PermissionButton = undefined;
+    for (items, 0..) |item, i| {
+        if (col >= w) break;
+        const is_sel = selected == item.choice;
+        const style: vaxis.Style = if (is_sel) item.style else p.thinking_body;
+        const label = actionLabel(ctx, item.text, is_sel);
+        const label_len: u16 = @intCast(label.len);
+        panel.lineStyledAt(surface, row, label, ctx, col, style) catch {};
+        recorded[i] = .{
+            .choice = item.choice,
+            .row = base_screen_row + row,
+            .col = col,
+            .width = label_len,
+        };
+        col += label_len + 2;
+    }
+    if (buttons_out) |out| {
+        out.* = recorded;
+    }
 }
 
 fn actionLabel(ctx: vxfw.DrawContext, text: []const u8, selected: bool) []const u8 {

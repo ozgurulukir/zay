@@ -13,6 +13,9 @@ const vxfw = vaxis.vxfw;
 
 const tui_message = @import("message.zig");
 const tui_metrics = @import("../metrics.zig");
+const tui_style = @import("../style.zig");
+const panel = @import("panel.zig");
+const app_state = @import("../app_state.zig");
 const Thread = @import("../thread.zig");
 const transcript_mod = @import("../../transcript.zig");
 
@@ -36,6 +39,8 @@ pub const TranscriptWidget = struct {
     /// The active input has text — the splash yields its rows while typing.
     /// Computed at the construction site (INV-WIDGET-1 scalar).
     splash_suppressed: bool = false,
+    /// Write-back: hit-test geometry for the "↓ new output" pill.
+    new_output_rect_out: ?*?app_state.ChipRect = null,
 
     pub fn widget(self: *TranscriptWidget) vxfw.Widget {
         return .{
@@ -73,8 +78,61 @@ pub const TranscriptWidget = struct {
             .child = self.thread.transcript_list.widget(),
             .padding = ConversationLayout.verticalPadding(),
         };
-        const surface = try list_padding.widget().draw(ctx);
+        var surface = try list_padding.widget().draw(ctx);
         self.updateBlackholeVisibility();
+
+        // 1. Draw thin scrollbar if transcript overflows viewport
+        const total_items: u16 = @intCast(messages.len);
+        const view_height = surface.size.height;
+        const view_width = surface.size.width;
+        const needs_scrollbar = view_height > 0 and view_width > 0 and total_items > 0 and (self.thread.transcript_list.scroll.has_more or self.thread.transcript_list.scroll.top > 0 or self.thread.transcript_list.scroll.offset > 0);
+
+        // 2. "↓ new output" pill when auto-scroll is paused and unseen/new messages exist
+        const is_last = if (self.thread.transcript.selected) |sel| sel + 1 >= messages.len else true;
+        const pill_text = " ↓ new output ";
+        const pill_len: u16 = @intCast(pill_text.len);
+        const needs_pill = !self.thread.auto_scroll and (self.thread.transcript_list.scroll.has_more or !is_last) and view_width > pill_len + 4 and view_height > 2;
+
+        if (!needs_scrollbar and !needs_pill) {
+            return surface;
+        }
+
+        const extra_children: usize = @as(usize, @intFromBool(needs_scrollbar)) + @as(usize, @intFromBool(needs_pill));
+        const new_children = try ctx.arena.alloc(vxfw.SubSurface, surface.children.len + extra_children);
+        @memcpy(new_children[0..surface.children.len], surface.children);
+        var idx: usize = surface.children.len;
+
+        if (needs_scrollbar) {
+            const scroll_pos: u16 = @intCast(@min(total_items, self.thread.transcript_list.scroll.top));
+            const total: u16 = @max(total_items, view_height + 1);
+            var sb_surf = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = 1, .height = view_height });
+            panel.drawScrollbar(&sb_surf, view_height, scroll_pos, total);
+            new_children[idx] = .{
+                .origin = .{ .row = 0, .col = @intCast(view_width -| 1) },
+                .surface = sb_surf,
+                .z_index = 10,
+            };
+            idx += 1;
+        }
+
+        if (needs_pill) {
+            const p = tui_style.activePalette();
+            const pill_row = view_height -| 2;
+            const pill_col = view_width -| pill_len -| 2;
+            var pill_surf = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = pill_len, .height = 1 });
+            panel.lineStyledAt(&pill_surf, 0, pill_text, ctx, 0, p.permission_approve) catch {};
+            if (self.new_output_rect_out) |out| {
+                out.* = .{ .row = pill_row, .col = pill_col, .width = pill_len };
+            }
+            new_children[idx] = .{
+                .origin = .{ .row = @intCast(pill_row), .col = @intCast(pill_col) },
+                .surface = pill_surf,
+                .z_index = 11,
+            };
+            idx += 1;
+        }
+
+        surface.children = new_children[0..idx];
         return surface;
     }
 

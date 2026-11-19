@@ -260,6 +260,12 @@ fn ExecutorBridge(comptime L: type) type {
             return approval.request(approval.ptr, command);
         }
 
+        fn rejectionReason(ctx: *@This()) ?[]const u8 {
+            const approval = ctx.agent.bash_approval orelse return null;
+            if (approval.rejection_reason) |rf| return rf(approval.ptr);
+            return null;
+        }
+
         /// Build the executor's `ToolCallObserver` for this bridge. The
         /// observer's ctx is `*@This()` (the bridge itself), and the
         /// callbacks receive it typed — no `@ptrCast` at the seam.
@@ -269,6 +275,7 @@ fn ExecutorBridge(comptime L: type) type {
                 .on_started = onStarted,
                 .on_finished = onFinished,
                 .approve_unsafe_bash = approveUnsafeBash,
+                .rejection_reason = rejectionReason,
             };
         }
     };

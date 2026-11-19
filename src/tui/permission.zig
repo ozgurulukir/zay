@@ -35,11 +35,21 @@ pub fn permissionPending(app: *App) bool {
 
 pub fn handlePermissionKey(app: *App, key: vaxis.Key) !bool {
     if (key.matches(vaxis.Key.left, .{})) {
-        app.thread.permission_selection = .approve;
+        app.thread.permission_selection = switch (app.thread.permission_selection) {
+            .approve => .reject_with_reason,
+            .approve_session => .approve,
+            .reject => .approve_session,
+            .reject_with_reason => .reject,
+        };
         return true;
     }
     if (key.matches(vaxis.Key.right, .{})) {
-        app.thread.permission_selection = .reject;
+        app.thread.permission_selection = switch (app.thread.permission_selection) {
+            .approve => .approve_session,
+            .approve_session => .reject,
+            .reject => .reject_with_reason,
+            .reject_with_reason => .approve,
+        };
         return true;
     }
     if (key.matches(vaxis.Key.up, .{})) {
@@ -51,15 +61,29 @@ pub fn handlePermissionKey(app: *App, key: vaxis.Key) !bool {
         return true;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
-        try resolvePermission(app, app.thread.permission_selection);
+        const decision: agent_worker.ApprovalDecision = switch (app.thread.permission_selection) {
+            .approve => .approve,
+            .approve_session => .approve_session,
+            .reject => .reject,
+            .reject_with_reason => .{ .reject_with_reason = "Rejected by user: command refused" },
+        };
+        try resolvePermission(app, decision);
         return true;
     }
     if (key.matches('y', .{}) or key.matches('a', .{})) {
         try resolvePermission(app, .approve);
         return true;
     }
-    if (key.matches('n', .{}) or key.matches('r', .{})) {
+    if (key.matches('s', .{})) {
+        try resolvePermission(app, .approve_session);
+        return true;
+    }
+    if (key.matches('n', .{})) {
         try resolvePermission(app, .reject);
+        return true;
+    }
+    if (key.matches('r', .{})) {
+        try resolvePermission(app, .{ .reject_with_reason = "Rejected by user: command refused" });
         return true;
     }
     return false;
@@ -151,4 +175,68 @@ test "approvalLane prefers the visible lane when several gates pend" {
     app.thread.worker_context.?.approval.command = try gpa.dupe(u8, "visible cmd");
     background.worker_context.?.approval.command = try gpa.dupe(u8, "background cmd");
     try std.testing.expect(approvalLane(&app) == app.thread);
+}
+
+test "approve_session registers command prefix and auto-approves safe commands" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane = try addLaneWithWorker(gpa, &app, io, "session1");
+    const worker = &lane.worker_context.?;
+
+    // 1. Initial request on safe command "git status"
+    var outcome1 = GateOutcome{};
+    const worker_run1 = struct {
+        fn run(w: *agent_worker.Context, o: *GateOutcome) void {
+            o.approved = w.approval.request(w.io, w.gpa, "git status") catch unreachable;
+        }
+    }.run;
+    const thread1 = try std.Thread.spawn(.{}, worker_run1, .{ worker, &outcome1 });
+    var spins: u32 = 0;
+    while (!pendingOn(lane) and spins < 10_000) : (spins += 1) {
+        io.sleep(.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(pendingOn(lane));
+
+    // Resolve with approve_session
+    try resolvePermission(&app, .approve_session);
+    thread1.join();
+    try std.testing.expectEqual(true, outcome1.approved.?);
+
+    // 2. Subsequent command "git diff" with same prefix auto-approves without blocking
+    const approved_direct = try worker.approval.request(io, gpa, "git diff");
+    try std.testing.expectEqual(true, approved_direct);
+
+    // 3. Classifier-blocked destructive command "rm -rf /" is NEVER auto-approved
+    try std.testing.expect(!worker.approval.isSessionApproved("rm -rf /"));
+}
+
+test "reject_with_reason records rejection explanation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const lane = try addLaneWithWorker(gpa, &app, io, "reject1");
+    const worker = &lane.worker_context.?;
+
+    var outcome = GateOutcome{};
+    const thread = try std.Thread.spawn(.{}, gateRequestWorker, .{ worker, &outcome });
+    var spins: u32 = 0;
+    while (!pendingOn(lane) and spins < 10_000) : (spins += 1) {
+        io.sleep(.fromMilliseconds(2), .awake) catch {};
+    }
+    try std.testing.expect(pendingOn(lane));
+
+    const reason = "Please use test environment instead";
+    try resolvePermission(&app, .{ .reject_with_reason = reason });
+    thread.join();
+    try std.testing.expectEqual(false, outcome.approved.?);
+    try std.testing.expectEqualStrings(reason, worker.approval.last_rejection_reason.?);
 }
