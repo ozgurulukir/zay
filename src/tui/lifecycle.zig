@@ -167,6 +167,7 @@ fn deinitOwnedState(self: *App) void {
     // empty default is a literal, so guard on length before freeing.
     if (self.metrics.git_label.len > 0) self.gpa.free(self.metrics.git_label);
     if (self.metrics.diff_cache()) |raw| self.gpa.free(raw);
+    if (self.last_terminal_title) |title| self.gpa.free(title);
 
     for (self.threads.slice()) |lane| {
         lane.deinit(self.gpa);
@@ -258,6 +259,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     try advanceAnimations(root, &visible_change);
     try scheduleDiffRefreshIfPending(root, ctx);
     advanceBlackholeIfVisible(root, &visible_change);
+    updateTerminalTitleAndAttention(root.app, ctx);
 
     if (decideShouldTick(root)) {
         const tick_interval: u32 = switch (root.app.cached_config.tui.animations) {
@@ -274,6 +276,64 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         ctx.consumeAndRedraw();
     } else {
         ctx.consumeEvent();
+    }
+}
+
+pub fn updateTerminalTitleAndAttention(app: *App, ctx: *vxfw.EventContext) void {
+    const is_approval = app.permissionPending();
+    const cur_activity = app.thread.turn_view.activity;
+    const was_busy = switch (app.last_activity) {
+        .idle => false,
+        else => true,
+    };
+    const is_busy = switch (cur_activity) {
+        .idle => false,
+        else => true,
+    };
+
+    if (!app.is_focused) {
+        // Turn completed while unfocused
+        if (was_busy and !is_busy) {
+            ctx.addCmd(.{ .notify = .{ .title = "Zay", .body = "Agent completed response" } }) catch {};
+        }
+        // Tool approval requested while unfocused
+        if (is_approval and !app.last_permission_pending) {
+            ctx.addCmd(.{ .notify = .{ .title = "Zay", .body = "Tool execution requires approval" } }) catch {};
+        }
+    }
+
+    app.last_activity = cur_activity;
+    app.last_permission_pending = is_approval;
+
+    // Format dynamic terminal title
+    var lane_idx: usize = 1;
+    for (app.threads.slice(), 0..) |lane, idx| {
+        if (lane == app.thread) {
+            lane_idx = idx + 1;
+            break;
+        }
+    }
+    const total_lanes = app.threads.len();
+
+    const state_str: []const u8 = if (is_approval)
+        "waiting approval"
+    else switch (cur_activity) {
+        .idle => "idle",
+        .awaiting_model => "contacting model",
+        .thinking => "thinking",
+        .writing_response => "generating",
+        .calling_tools => "running tool",
+    };
+
+    const session_name = if (app.thread.title) |t| (if (t.len > 0) t else "new session") else "new session";
+
+    var title_buf: [256]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "zay — {s} [lane {d}/{d}] ({s})", .{ session_name, lane_idx, total_lanes, state_str }) catch return;
+
+    if (app.last_terminal_title == null or !std.mem.eql(u8, app.last_terminal_title.?, title)) {
+        ctx.setTitle(title) catch {};
+        if (app.last_terminal_title) |prev| app.gpa.free(prev);
+        app.last_terminal_title = app.gpa.dupe(u8, title) catch null;
     }
 }
 
@@ -882,4 +942,45 @@ test "anyJobActive clears once the git label is no longer dirty" {
     // With the label clean and no other families armed (diff idle, no
     // registry/model/login/plugin jobs), nothing is left to poll.
     try std.testing.expect(!anyJobActive(&app));
+}
+
+test "updateTerminalTitleAndAttention emits title command and notifies when unfocused" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    var ctx: vxfw.EventContext = .{
+        .io = io,
+        .alloc = arena.allocator(),
+        .cmds = .empty,
+    };
+
+    // 1. Initial title update in idle state
+    updateTerminalTitleAndAttention(&app, &ctx);
+    try std.testing.expect(app.last_terminal_title != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.last_terminal_title.?, "idle") != null);
+    try std.testing.expect(ctx.cmds.items.len > 0);
+
+    // 2. State changes to writing_response
+    app.thread.turn_view.activity = .{ .writing_response = 0 };
+    updateTerminalTitleAndAttention(&app, &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, app.last_terminal_title.?, "generating") != null);
+
+    // 3. Unfocused: transitioning back to idle emits notification
+    app.is_focused = false;
+    app.thread.turn_view.activity = .idle;
+    const cmds_before = ctx.cmds.items.len;
+    updateTerminalTitleAndAttention(&app, &ctx);
+    try std.testing.expect(ctx.cmds.items.len > cmds_before);
+    var found_notify = false;
+    for (ctx.cmds.items[cmds_before..]) |cmd| {
+        if (cmd == .notify) found_notify = true;
+    }
+    try std.testing.expect(found_notify);
 }
