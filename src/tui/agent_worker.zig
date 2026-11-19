@@ -4,6 +4,7 @@ const bounded_queue = @import("bounded_queue");
 const agent_mod = @import("../agent.zig");
 const queue_ops = @import("../agent/queue_ops.zig");
 const runtime_mod = @import("../runtime.zig");
+const bash_safety = @import("../tools/bash_safety.zig");
 const BoundedList = @import("bounded_list.zig").BoundedList;
 
 const event_queue_capacity: u32 = 4096;
@@ -128,14 +129,26 @@ pub const PendingPrompt = struct {
     }
 };
 
-pub const ApprovalSnapshot = struct {
-    command: []u8,
-    selected: ApprovalDecision,
+pub const ApprovalChoice = enum {
+    approve,
+    approve_session,
+    reject,
+    reject_with_reason,
 };
 
-pub const ApprovalDecision = enum {
+pub const ApprovalDecision = union(enum) {
     approve,
+    approve_session,
     reject,
+    reject_with_reason: []const u8,
+};
+
+pub const ApprovalSnapshot = struct {
+    command: []u8,
+    selected: ApprovalChoice,
+    tool_name: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    lane_id: ?[]const u8 = null,
 };
 
 const ApprovalGate = struct {
@@ -143,15 +156,65 @@ const ApprovalGate = struct {
     condition: std.Io.Condition = .init,
     command: ?[]u8 = null,
     decision: ?ApprovalDecision = null,
+    session_approvals: std.ArrayList([]u8) = .empty,
+    tool_name: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    lane_id: ?[]const u8 = null,
+    last_rejection_reason: ?[]u8 = null,
+
+    fn containsShellMetachars(command: []const u8) bool {
+        return std.mem.indexOfAny(u8, command, ";|&`$><\n\r()") != null;
+    }
+
+    fn isSessionApprovalBannedPrefix(prefix: []const u8) bool {
+        const base = if (std.mem.lastIndexOfAny(u8, prefix, "/\\")) |sep|
+            prefix[sep + 1 ..]
+        else
+            prefix;
+        const banned = [_][]const u8{
+            "sh",    "bash",    "zsh",    "fish",    "dash",
+            "ksh",   "csh",     "tcsh",   "pwsh",    "powershell",
+            "cmd",   "cmd.exe", "python", "python3", "node",
+            "perl",  "ruby",    "lua",    "php",     "eval",
+            "exec",  "env",     "sudo",   "doas",    "su",
+            "xargs", "nohup",   "setsid",
+        };
+        for (banned) |b| {
+            if (std.ascii.eqlIgnoreCase(base, b)) return true;
+        }
+        return false;
+    }
+
+    fn extractSessionPrefix(command: []const u8) ?[]const u8 {
+        if (bash_safety.isDestructiveRule(command)) return null;
+        const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
+        if (trimmed.len == 0 or containsShellMetachars(trimmed)) return null;
+        const first_ws = std.mem.indexOfAny(u8, trimmed, &std.ascii.whitespace) orelse trimmed.len;
+        const prefix = trimmed[0..first_ws];
+        if (prefix.len == 0 or isSessionApprovalBannedPrefix(prefix)) return null;
+        return prefix;
+    }
+
+    pub fn isSessionApproved(self: *ApprovalGate, command: []const u8) bool {
+        const candidate = extractSessionPrefix(command) orelse return false;
+        for (self.session_approvals.items) |prefix| {
+            if (std.mem.eql(u8, candidate, prefix)) return true;
+        }
+        return false;
+    }
 
     /// Block until the gate is resolved; returns whether the command was
     /// approved. Pub so tests can drive the worker side of the handshake.
     pub fn request(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, command: []const u8) !bool {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+
+        // Check session approval whitelist first
+        if (self.isSessionApproved(command)) return true;
+
         const owned = try gpa.dupe(u8, command);
         errdefer gpa.free(owned);
 
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
         std.debug.assert(self.command == null);
         self.command = owned;
         self.decision = null;
@@ -168,7 +231,36 @@ const ApprovalGate = struct {
         if (self.command) |command_pending| gpa.free(command_pending);
         self.command = null;
         self.decision = null;
-        return decision == .approve;
+
+        switch (decision) {
+            .approve => return true,
+            .approve_session => {
+                if (extractSessionPrefix(command)) |prefix| {
+                    var exists = false;
+                    for (self.session_approvals.items) |existing| {
+                        if (std.mem.eql(u8, existing, prefix)) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        const duped = gpa.dupe(u8, prefix) catch null;
+                        if (duped) |d| self.session_approvals.append(gpa, d) catch gpa.free(d);
+                    }
+                }
+                return true;
+            },
+            .reject => {
+                if (self.last_rejection_reason) |r| gpa.free(r);
+                self.last_rejection_reason = null;
+                return false;
+            },
+            .reject_with_reason => |reason| {
+                if (self.last_rejection_reason) |r| gpa.free(r);
+                self.last_rejection_reason = gpa.dupe(u8, reason) catch null;
+                return false;
+            },
+        }
     }
 
     pub fn resolve(self: *ApprovalGate, io: std.Io, decision: ApprovalDecision) !void {
@@ -179,13 +271,16 @@ const ApprovalGate = struct {
         self.condition.signal(io);
     }
 
-    pub fn snapshot(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, selected: ApprovalDecision) std.mem.Allocator.Error!?ApprovalSnapshot {
+    pub fn snapshot(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, selected: ApprovalChoice) std.mem.Allocator.Error!?ApprovalSnapshot {
         self.mutex.lock(io) catch return null;
         defer self.mutex.unlock(io);
         const command = self.command orelse return null;
         return .{
             .command = try gpa.dupe(u8, command),
             .selected = selected,
+            .tool_name = self.tool_name,
+            .cwd = self.cwd,
+            .lane_id = self.lane_id,
         };
     }
 
@@ -201,6 +296,10 @@ const ApprovalGate = struct {
         if (self.command) |command| gpa.free(command);
         self.command = null;
         self.decision = null;
+        for (self.session_approvals.items) |prefix| gpa.free(prefix);
+        self.session_approvals.deinit(gpa);
+        if (self.last_rejection_reason) |r| gpa.free(r);
+        self.last_rejection_reason = null;
     }
 };
 
@@ -223,9 +322,17 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime
     agent.cancel_requested = &worker_context.cancel_requested;
     defer agent.cancel_requested = null;
 
+    worker_context.approval.tool_name = "bash";
+    worker_context.approval.cwd = agent.effectiveCwd();
+    defer {
+        worker_context.approval.tool_name = null;
+        worker_context.approval.cwd = null;
+    }
+
     agent.bash_approval = .{
         .ptr = worker_context,
         .request = requestBashApproval,
+        .rejection_reason = getRejectionReason,
     };
     defer agent.bash_approval = null;
 
@@ -278,6 +385,11 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime
 fn requestBashApproval(context: *anyopaque, command: []const u8) anyerror!bool {
     const worker_context: *Context = @ptrCast(@alignCast(context));
     return worker_context.approval.request(worker_context.io, worker_context.gpa, command);
+}
+
+fn getRejectionReason(context: *anyopaque) ?[]const u8 {
+    const worker_context: *Context = @ptrCast(@alignCast(context));
+    return worker_context.approval.last_rejection_reason;
 }
 
 /// Post a `turn_failed` notice followed by the terminal `turn_finished`, so the

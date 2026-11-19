@@ -397,6 +397,14 @@ pub const Transcript = struct {
         self.selected = index;
     }
 
+    pub fn selectFirst(self: *Transcript) void {
+        if (self.messages.items.len == 0) {
+            self.selected = null;
+            return;
+        }
+        self.selected = self.nearestSelectable(0);
+    }
+
     pub fn selectLast(self: *Transcript) void {
         if (self.messages.items.len == 0) {
             self.selected = null;
@@ -608,6 +616,42 @@ pub const Transcript = struct {
                 message.invalidateRowCache();
             },
             .user, .agent, .logo, .status, .notice, .success, .info => {},
+        }
+    }
+
+    /// Toggle expand/collapse all collapsible blocks (.thinking, .tool, .skill).
+    /// If any block is currently collapsed, expand all; otherwise collapse all.
+    pub fn toggleAll(self: *Transcript) void {
+        var has_collapsed = false;
+        for (self.messages.items) |*message| {
+            switch (message.*) {
+                .thinking, .tool => {
+                    if (!message.expandedPtr().*) {
+                        has_collapsed = true;
+                        break;
+                    }
+                },
+                .skill => if (message.skill.body.len > 0 and !message.skill.expanded) {
+                    has_collapsed = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        const target_expanded = has_collapsed;
+        for (self.messages.items) |*message| {
+            switch (message.*) {
+                .thinking, .tool => {
+                    message.expandedPtr().* = target_expanded;
+                    message.invalidateRowCache();
+                },
+                .skill => if (message.skill.body.len > 0) {
+                    message.skill.expanded = target_expanded;
+                    message.invalidateRowCache();
+                },
+                else => {},
+            }
         }
     }
 
@@ -844,4 +888,27 @@ test "appendTool builds a json part from a JSON resume body" {
     const t = &transcript.messages.items[index].tool;
     try std.testing.expectEqual(@as(usize, 1), t.parts.len);
     try std.testing.expect(parts_mod.PartKind.json == t.parts[0].kind);
+}
+
+test "toggleAll expands and collapses all tool and thinking blocks" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.appendTool(gpa, "curl", "{\"ok\":true}", false);
+    _ = try transcript.append(gpa, .thinking, "thinking", "reasoning");
+
+    // Initially both are collapsed
+    try std.testing.expect(!transcript.messages.items[0].tool.expanded);
+    try std.testing.expect(!transcript.messages.items[1].thinking.expanded);
+
+    // toggleAll expands all
+    transcript.toggleAll();
+    try std.testing.expect(transcript.messages.items[0].tool.expanded);
+    try std.testing.expect(transcript.messages.items[1].thinking.expanded);
+
+    // toggleAll again collapses all
+    transcript.toggleAll();
+    try std.testing.expect(!transcript.messages.items[0].tool.expanded);
+    try std.testing.expect(!transcript.messages.items[1].thinking.expanded);
 }

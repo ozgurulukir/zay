@@ -537,6 +537,30 @@ pub const BlockNav = struct {
             } else if (key.matches('y', .{}) or key.matches('c', .{ .ctrl = true })) {
                 if (try clipboard_helper.copySelectedTranscriptBlock(app)) return true;
             }
+            if (key.matches('a', .{})) {
+                app.toggleAllTranscriptBlocks();
+                return true;
+            }
+        }
+        if (key.matches(vaxis.Key.page_up, .{})) {
+            _ = app.pageTranscript(.previous);
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_down, .{})) {
+            _ = app.pageTranscript(.next);
+            return true;
+        }
+        if (key.matches(vaxis.Key.home, .{})) {
+            if (app.getBlockNav() or app.isInputEmpty()) {
+                app.jumpTranscriptToTop();
+                return true;
+            }
+        }
+        if (key.matches(vaxis.Key.end, .{})) {
+            if (app.getBlockNav() or app.isInputEmpty()) {
+                app.jumpTranscriptToBottom();
+                return true;
+            }
         }
         if (key.matches(vaxis.Key.down, .{ .shift = true })) {
             app.jumpTranscriptToBottom();
@@ -567,9 +591,13 @@ pub const BlockNav = struct {
 ///
 /// With multiple lanes, Shift+Tab/Shift+Right cycle forward, Shift+Left
 /// cycles back. Plain Tab toggles the currently selected transcript
-/// block (used to copy from the transcript).
+/// block (used to copy from the transcript). Ctrl+Tab / Alt+Tab toggles all blocks.
 pub const LaneSwitch = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.tab, .{ .ctrl = true }) or key.matches(vaxis.Key.tab, .{ .alt = true })) {
+            app.toggleAllTranscriptBlocks();
+            return true;
+        }
         if (app.threadsCount() > 1) {
             if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.right, .{ .shift = true })) {
                 app.cycleLane(1);
