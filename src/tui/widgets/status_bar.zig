@@ -19,14 +19,92 @@ pub const Segment = struct {
     text: []const u8,
     style: vaxis.Style,
     width: u16,
+    gap_before: u16 = 1,
 };
 
-/// The result of `layoutStatusBar`: which segments survive and their combined
-/// width (including the 1-cell gap before the meter, when present).
+/// Priority ranking for extensible status bar segments.
+/// When terminal width shrinks, lower priority segments drop first.
+pub const SegmentPriority = enum(u8) {
+    critical = 0, // Must always remain visible (e.g. status/model indicator, truncated if needed)
+    high = 1, // High importance (e.g. context meter, lane indicator)
+    medium = 2, // Medium importance (e.g. token velocity, git branch, background jobs)
+    low = 3, // Low importance (e.g. session title, cwd path, secondary hints)
+};
+
+pub const BarSegment = struct {
+    id: []const u8 = "",
+    text: []const u8,
+    style: vaxis.Style = .{},
+    priority: SegmentPriority = .medium,
+    gap_before: u16 = 1,
+};
+
+/// The result of `layoutStatusBar` or `layoutSegments`: which segments survive
+/// and their combined width.
 pub const Layout = struct {
     segments: []const Segment,
     total_width: u16,
 };
+
+/// Generalized priority-based status bar segment layout.
+/// Progressively drops lower-priority segments when available columns are constrained.
+pub fn layoutSegments(
+    arena: std.mem.Allocator,
+    available_width: u16,
+    candidates: []const BarSegment,
+) Layout {
+    if (available_width == 0 or candidates.len == 0) {
+        return .{ .segments = &.{}, .total_width = 0 };
+    }
+
+    var priority_ceiling: u8 = @intFromEnum(SegmentPriority.low);
+    while (true) {
+        var active_count: usize = 0;
+        var needed_width: u16 = 0;
+
+        for (candidates) |cand| {
+            if (cand.text.len == 0) continue;
+            if (@intFromEnum(cand.priority) > priority_ceiling) continue;
+            const w: u16 = @intCast(@min(vaxis.gwidth.gwidth(cand.text, .unicode), std.math.maxInt(u16)));
+            if (w == 0) continue;
+            const gap: u16 = if (active_count > 0) cand.gap_before else 0;
+            needed_width += gap + w;
+            active_count += 1;
+        }
+
+        if (needed_width <= available_width) {
+            if (active_count == 0) return .{ .segments = &.{}, .total_width = 0 };
+            const segs = arena.alloc(Segment, active_count) catch return .{ .segments = &.{}, .total_width = 0 };
+            var idx: usize = 0;
+            for (candidates) |cand| {
+                if (cand.text.len == 0) continue;
+                if (@intFromEnum(cand.priority) > priority_ceiling) continue;
+                const w: u16 = @intCast(@min(vaxis.gwidth.gwidth(cand.text, .unicode), std.math.maxInt(u16)));
+                if (w == 0) continue;
+                const gap: u16 = if (idx > 0) cand.gap_before else 0;
+                segs[idx] = .{ .text = cand.text, .style = cand.style, .width = w, .gap_before = gap };
+                idx += 1;
+            }
+            return .{ .segments = segs, .total_width = needed_width };
+        }
+
+        if (priority_ceiling > 0) {
+            priority_ceiling -= 1;
+        } else {
+            // Even critical segments alone exceed available_width:
+            // Truncate the first critical segment to available_width
+            for (candidates) |cand| {
+                if (cand.text.len == 0) continue;
+                if (cand.priority == .critical) {
+                    const segs = arena.alloc(Segment, 1) catch return .{ .segments = &.{}, .total_width = 0 };
+                    segs[0] = .{ .text = cand.text, .style = cand.style, .width = available_width };
+                    return .{ .segments = segs, .total_width = available_width };
+                }
+            }
+            return .{ .segments = &.{}, .total_width = 0 };
+        }
+    }
+}
 
 /// Transparent 1x1 spacer widget: lets the border `─` show through the gap
 /// between the left block and the meter.
@@ -163,6 +241,8 @@ pub const StatusBarWidget = struct {
     velocity_text: []const u8 = "",
     /// Active durable skill names, when the TUI config opts into showing them.
     skill_inventory: []const []const u8 = &.{},
+    /// Custom candidate segments overriding the default layout when non-empty.
+    custom_segments: []const BarSegment = &.{},
 
     pub fn widget(self: *StatusBarWidget) vxfw.Widget {
         return .{
@@ -192,15 +272,18 @@ pub const StatusBarWidget = struct {
             }
             status = inventory.items;
         }
-        const layout = layoutStatusBar(
-            ctx.arena,
-            available_width,
-            self.velocity_text,
-            self.meter_text,
-            self.meter_style orelse p.model_status,
-            status,
-            p.model_status,
-        );
+        const layout = if (self.custom_segments.len > 0)
+            layoutSegments(ctx.arena, available_width, self.custom_segments)
+        else
+            layoutStatusBar(
+                ctx.arena,
+                available_width,
+                self.velocity_text,
+                self.meter_text,
+                self.meter_style orelse p.model_status,
+                status,
+                p.model_status,
+            );
 
         if (layout.segments.len == 0 or layout.total_width == 0) {
             return vxfw.Surface{
@@ -211,60 +294,42 @@ pub const StatusBarWidget = struct {
             };
         }
 
-        var flex_children_buf: [3]vxfw.FlexItem = undefined;
+        const max_flex = layout.segments.len * 2;
+        const flex_children = try ctx.arena.alloc(vxfw.FlexItem, max_flex);
         var child_count: usize = 0;
 
-        var text_widgets: [2]vxfw.Text = undefined;
-        var box_widgets: [2]vxfw.SizedBox = undefined;
-
-        if (layout.segments.len == 1) {
-            text_widgets[0] = .{
-                .text = layout.segments[0].text,
+        for (layout.segments, 0..) |seg, i| {
+            if (i > 0 and seg.gap_before > 0) {
+                if (seg.gap_before == 1) {
+                    flex_children[child_count] = .{ .widget = spacer_widget, .flex = 0 };
+                } else {
+                    const gap_box = try ctx.arena.create(vxfw.SizedBox);
+                    gap_box.* = .{
+                        .child = spacer_widget,
+                        .size = .{ .width = seg.gap_before, .height = 1 },
+                    };
+                    flex_children[child_count] = .{ .widget = gap_box.widget(), .flex = 0 };
+                }
+                child_count += 1;
+            }
+            const text_widget = try ctx.arena.create(vxfw.Text);
+            text_widget.* = .{
+                .text = seg.text,
                 .softwrap = false,
                 .overflow = .ellipsis,
                 .width_basis = .longest_line,
-                .style = layout.segments[0].style,
+                .style = seg.style,
             };
-            box_widgets[0] = .{
-                .child = text_widgets[0].widget(),
-                .size = .{ .width = layout.segments[0].width, .height = 1 },
+            const box_widget = try ctx.arena.create(vxfw.SizedBox);
+            box_widget.* = .{
+                .child = text_widget.widget(),
+                .size = .{ .width = seg.width, .height = 1 },
             };
-            flex_children_buf[0] = .{ .widget = box_widgets[0].widget(), .flex = 0 };
-            child_count = 1;
-        } else if (layout.segments.len == 2) {
-            text_widgets[0] = .{
-                .text = layout.segments[0].text,
-                .softwrap = false,
-                .overflow = .ellipsis,
-                .width_basis = .longest_line,
-                .style = layout.segments[0].style,
-            };
-            box_widgets[0] = .{
-                .child = text_widgets[0].widget(),
-                .size = .{ .width = layout.segments[0].width, .height = 1 },
-            };
-            flex_children_buf[0] = .{ .widget = box_widgets[0].widget(), .flex = 0 };
-
-            flex_children_buf[1] = .{ .widget = spacer_widget, .flex = 0 };
-
-            text_widgets[1] = .{
-                .text = layout.segments[1].text,
-                .softwrap = false,
-                .overflow = .ellipsis,
-                .width_basis = .longest_line,
-                .style = layout.segments[1].style,
-            };
-            box_widgets[1] = .{
-                .child = text_widgets[1].widget(),
-                .size = .{ .width = layout.segments[1].width, .height = 1 },
-            };
-            flex_children_buf[2] = .{ .widget = box_widgets[1].widget(), .flex = 0 };
-
-            child_count = 3;
+            flex_children[child_count] = .{ .widget = box_widget.widget(), .flex = 0 };
+            child_count += 1;
         }
 
-        const flex_children = flex_children_buf[0..child_count];
-        var flex_row: vxfw.FlexRow = .{ .children = flex_children };
+        var flex_row: vxfw.FlexRow = .{ .children = flex_children[0..child_count] };
         const flex_surface = try flex_row.widget().draw(ctx);
 
         const origin_col = (max_width -| 2) -| layout.total_width;
@@ -476,4 +541,45 @@ test "StatusBarWidget renders velocity during thinking activity" {
     const surface = try widget.widget().draw(ctx);
     try std.testing.expectEqual(@as(usize, 1), surface.children.len);
     try std.testing.expect(surface.children[0].surface.size.width > 0);
+}
+
+test "layoutSegments drops segments according to priority when constrained" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const candidates = [_]BarSegment{
+        .{ .id = "lane", .text = "[1/2]", .priority = .high },
+        .{ .id = "status", .text = "claude-3-5", .priority = .critical },
+        .{ .id = "velocity", .text = "⚡ 45", .priority = .medium },
+        .{ .id = "title", .text = "feature-auth", .priority = .low },
+    };
+
+    // Width 50: all 4 fit
+    const full = layoutSegments(arena.allocator(), 50, &candidates);
+    try std.testing.expectEqual(@as(usize, 4), full.segments.len);
+    try std.testing.expectEqualStrings("[1/2]", full.segments[0].text);
+    try std.testing.expectEqualStrings("feature-auth", full.segments[3].text);
+
+    // Width 28: low priority ("feature-auth", len 12) drops first
+    const med = layoutSegments(arena.allocator(), 28, &candidates);
+    try std.testing.expectEqual(@as(usize, 3), med.segments.len);
+    try std.testing.expectEqualStrings("[1/2]", med.segments[0].text);
+    try std.testing.expectEqualStrings("claude-3-5", med.segments[1].text);
+    try std.testing.expectEqualStrings("⚡ 45", med.segments[2].text);
+
+    // Width 20: medium priority ("⚡ 45") drops next
+    const high = layoutSegments(arena.allocator(), 20, &candidates);
+    try std.testing.expectEqual(@as(usize, 2), high.segments.len);
+    try std.testing.expectEqualStrings("[1/2]", high.segments[0].text);
+    try std.testing.expectEqualStrings("claude-3-5", high.segments[1].text);
+
+    // Width 12: high priority drops, only critical ("claude-3-5", len 10) survives
+    const crit = layoutSegments(arena.allocator(), 12, &candidates);
+    try std.testing.expectEqual(@as(usize, 1), crit.segments.len);
+    try std.testing.expectEqualStrings("claude-3-5", crit.segments[0].text);
+
+    // Width 6: critical segment is truncated to available width
+    const trunc = layoutSegments(arena.allocator(), 6, &candidates);
+    try std.testing.expectEqual(@as(usize, 1), trunc.segments.len);
+    try std.testing.expectEqual(@as(u16, 6), trunc.segments[0].width);
 }

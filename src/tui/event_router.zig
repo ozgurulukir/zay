@@ -81,6 +81,14 @@ pub fn captureEvent(
                 ctx.consumeAndRedraw();
             }
         },
+        .focus_in => {
+            app.is_focused = true;
+            ctx.consumeEvent();
+        },
+        .focus_out => {
+            app.is_focused = false;
+            ctx.consumeEvent();
+        },
         else => {},
     }
 }
