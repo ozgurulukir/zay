@@ -529,9 +529,12 @@ pub const MentionPopup = struct {
 /// there. Auto-scroll follows the navigation state.
 pub const BlockNav = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        // Copy selected message block to clipboard via 'y', 'c', or Ctrl+C in block nav.
+        // Copy selected message block or code block to clipboard.
+        // 'c' copies first code block (falling back to message block); 'y' or Ctrl+C copies entire message block.
         if (app.getBlockNav()) {
-            if (key.matches('y', .{}) or key.matches('c', .{}) or key.matches('c', .{ .ctrl = true })) {
+            if (key.matches('c', .{})) {
+                if (try clipboard_helper.copySelectedCodeBlock(app)) return true;
+            } else if (key.matches('y', .{}) or key.matches('c', .{ .ctrl = true })) {
                 if (try clipboard_helper.copySelectedTranscriptBlock(app)) return true;
             }
         }

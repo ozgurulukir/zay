@@ -458,6 +458,19 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         start_col: u16,
     ) void {
+        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "");
+    }
+
+    fn writeTextWithLink(
+        surface: *vxfw.Surface,
+        text: []const u8,
+        style: vaxis.Style,
+        selected: bool,
+        row: u16,
+        ctx: vxfw.DrawContext,
+        start_col: u16,
+        link_url: []const u8,
+    ) void {
         var col = ConversationLayout.left + start_col;
         const col_limit = surface.size.width -| ConversationLayout.right;
         var iter = ctx.graphemeIterator(text);
@@ -467,10 +480,14 @@ pub const MessageWidget = struct {
             const width: u16 = @intCast(ctx.stringWidth(bytes));
             if (width == 0) continue;
             if (col + width > col_limit) return;
-            writeCellOnCard(surface, col, row, .{
+            var cell: vaxis.Cell = .{
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
                 .style = mergedSelectedStyle(style, selected),
-            });
+            };
+            if (link_url.len > 0) {
+                cell.link = .{ .uri = link_url };
+            }
+            writeCellOnCard(surface, col, row, cell);
             col += width;
         }
     }
@@ -544,7 +561,7 @@ fn drawMarkdown(
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
         for (markdown_row.spans) |span| {
-            MessageWidget.writeText(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col);
+            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col, span.link_url);
             start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
         }
         row.* += 1;
@@ -566,6 +583,11 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
         // `.normal ==> p.body`'s fg and read as terminal-default.
         .strong => .{ .bold = true, .fg = p.body.fg },
         .emphasis => .{ .italic = true, .fg = p.body.fg },
+        .link => .{ .fg = p.model_status.fg, .ul_style = .single },
+        .code_keyword => .{ .fg = p.skill.fg, .bold = true },
+        .code_string => .{ .fg = p.tool.fg },
+        .code_comment => .{ .fg = p.thinking_body.fg, .italic = true },
+        .code_number => .{ .fg = p.user.fg },
     };
 }
 
