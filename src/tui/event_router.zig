@@ -29,6 +29,8 @@ const lifecycle = @import("lifecycle.zig");
 
 const command_router = @import("command_router.zig");
 const help_picker = @import("widgets/help_picker.zig");
+const theme_lifecycle = @import("theme_lifecycle.zig");
+const tui_style = @import("style.zig");
 
 /// Top-level event entry, called by vxfw for every event the root receives.
 ///
@@ -67,12 +69,25 @@ pub fn captureEvent(
             app.setPasting(false);
             ctx.consumeEvent();
         },
+        .color_scheme => |scheme| {
+            theme_lifecycle.handleColorSchemeChange(app, scheme);
+            ctx.consumeAndRedraw();
+        },
+        .color_report => |report| {
+            if (report.kind == .bg) {
+                const lum = tui_style.relativeLuminance(report.value);
+                const scheme: vaxis.Color.Scheme = if (lum > 0.5) .light else .dark;
+                theme_lifecycle.handleColorSchemeChange(app, scheme);
+                ctx.consumeAndRedraw();
+            }
+        },
         else => {},
     }
 }
 
 fn routeInit(app: *App, root: *RootWidget, ctx: *vxfw.EventContext) !void {
     try ctx.requestFocus(app.inputWidget());
+    try ctx.addCmd(.{ .query_color = .bg });
     try root.ensureTick(ctx);
     // Warm the diff cache in the background so the first `/diff` opens
     // instantly instead of cold-loading.

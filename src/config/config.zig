@@ -260,6 +260,13 @@ pub const TuiSettings = struct {
     /// REPLACES the default scan of `~/.config/zay/themes/` and
     /// `.zay/themes/`. Owned when parsed from disk.
     custom_themes_dir: ?[]u8 = null,
+    /// Light theme to use when terminal background is light and theme is "auto". Owned.
+    light_theme: ?[]u8 = null,
+    /// Dark theme to use when terminal background is dark and theme is "auto". Owned.
+    dark_theme: ?[]u8 = null,
+    /// Disable color styling, rendering in monochrome mode with text attributes only.
+    no_color: bool = false,
+    no_color_is_set: bool = false,
     /// Highlight matching characters in search pickers.
     fuzzy_highlight: bool = true,
     fuzzy_highlight_is_set: bool = false,
@@ -297,6 +304,14 @@ pub const TuiSettings = struct {
     /// Animation detail level: 'full', 'reduced' (static logo, slow spinner, lower tick rate), or 'off' (stops animation ticks entirely).
     animations: AnimationsMode = .full,
     animations_is_set: bool = false,
+
+    pub fn effectiveLightTheme(self: *const TuiSettings) []const u8 {
+        return self.light_theme orelse "catppuccin_latte";
+    }
+
+    pub fn effectiveDarkTheme(self: *const TuiSettings) []const u8 {
+        return self.dark_theme orelse "default";
+    }
 };
 
 /// Database backend selection for session persistence and roaming sync.
@@ -452,6 +467,8 @@ pub const Config = struct {
         if (self.dynamic_provider_id) |s| gpa.free(s);
         if (self.toast.position) |s| gpa.free(s);
         if (self.tui.custom_themes_dir) |s| gpa.free(s);
+        if (self.tui.light_theme) |s| gpa.free(s);
+        if (self.tui.dark_theme) |s| gpa.free(s);
         if (self.model_selection) |*ms| ms.deinit(gpa);
         self.* = undefined;
     }

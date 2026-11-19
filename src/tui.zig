@@ -222,6 +222,8 @@ pub const App = struct {
     /// `Esc` can restore the exact pre-open look. Set in `openThemePicker`,
     /// cleared on commit (`applyTheme`) or cancel (`closeThemePicker`).
     theme_preview_original: ?tui_style.Theme = null,
+    /// Terminal color scheme (light / dark) detected via query or events.
+    terminal_color_scheme: ?vaxis.Color.Scheme = null,
     /// Process environment map — stored once at startup so cross-project
     /// session resume can reload config (`.zay/config.json`) from the
     /// target project's cwd without re-reading the OS environment.
@@ -436,7 +438,14 @@ pub const App = struct {
         // custom slugs so a config with `"theme": "<custom>"` is applied at
         // startup instead of silently falling back to `default`.
         try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
-        tui_style.setActive(app.theme_registry.resolve(app.cached_config.theme));
+        tui_style.setNoColor(tui_style.isNoColorActive(app.cached_config.tui.no_color));
+        const active_theme = app.theme_registry.resolveWithScheme(
+            app.cached_config.theme,
+            app.terminal_color_scheme,
+            app.cached_config.tui.effectiveLightTheme(),
+            app.cached_config.tui.effectiveDarkTheme(),
+        );
+        tui_style.setActive(active_theme);
         return app;
     }
 
@@ -1411,6 +1420,7 @@ pub fn run(
     if (config.toast.max_visible) |n| toast.global.max_visible = n;
 
     // Install the active color theme before the first frame is drawn.
+    tui_style.setNoColor(tui_style.isNoColorActive(config.tui.no_color));
     tui_style.setActive(tui_style.resolveTheme(config.theme));
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, config_arena, init.environ_map, host_id);

@@ -6,6 +6,7 @@
 //! is UI-thread-only, and every caller below runs on the UI thread.
 
 const std = @import("std");
+const vaxis = @import("vaxis");
 const log = std.log.scoped(.tui);
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
@@ -21,7 +22,12 @@ const App = tui.App;
 /// pre-open look (`revertThemePreview`).
 pub fn openThemePicker(app: *App) void {
     app.setMode(.theme_picker);
-    const active = app.theme_registry.resolve(app.cached_config.theme);
+    const active = app.theme_registry.resolveWithScheme(
+        app.cached_config.theme,
+        app.terminal_color_scheme,
+        app.cached_config.tui.effectiveLightTheme(),
+        app.cached_config.tui.effectiveDarkTheme(),
+    );
     app.theme_preview_original = active;
     const active_name = active.name;
     app.pickers.theme.selection = 0;
@@ -58,6 +64,21 @@ pub fn closeThemePicker(app: *App) void {
     app.setMode(.normal);
 }
 
+/// Refresh theme when terminal color scheme changes or when "auto" theme needs recalculation.
+pub fn handleColorSchemeChange(app: *App, scheme: vaxis.Color.Scheme) void {
+    app.terminal_color_scheme = scheme;
+    const cur_theme = app.cached_config.theme orelse "";
+    if (std.ascii.eqlIgnoreCase(cur_theme, "auto")) {
+        const theme = app.theme_registry.resolveWithScheme(
+            "auto",
+            scheme,
+            app.cached_config.tui.effectiveLightTheme(),
+            app.cached_config.tui.effectiveDarkTheme(),
+        );
+        tui_style.setActive(theme);
+    }
+}
+
 /// Parse a `/theme <name>` argument from the palette value. The leading `/`
 /// is optional (the palette filter in `.command` mode drops it). Returns the
 /// non-empty name token, or null when the value is not a `theme <name>` form:
@@ -91,7 +112,14 @@ pub fn parseThemeArg(filter: []const u8) ?[]const u8 {
 pub fn applyTheme(app: *App, raw_name: []const u8) !void {
     // Registry-aware resolve so custom slugs resolve; unknown names fall back
     // to default. Committing clears the preview snapshot (no revert).
-    const theme = app.theme_registry.resolve(raw_name);
+    const trimmed = std.mem.trim(u8, raw_name, " \t\r\n");
+    const is_auto = std.ascii.eqlIgnoreCase(trimmed, "auto");
+    const theme = app.theme_registry.resolveWithScheme(
+        raw_name,
+        app.terminal_color_scheme,
+        app.cached_config.tui.effectiveLightTheme(),
+        app.cached_config.tui.effectiveDarkTheme(),
+    );
     app.theme_preview_original = null;
     tui_style.setActive(theme);
 
@@ -100,7 +128,7 @@ pub fn applyTheme(app: *App, raw_name: []const u8) !void {
         // The canonical slug is always non-empty, so `serialize` will write it.
         var updates: config_mod.Config = .{};
         defer updates.deinit(app.gpa);
-        updates.theme = try app.gpa.dupe(u8, theme.name);
+        updates.theme = try app.gpa.dupe(u8, if (is_auto) "auto" else theme.name);
 
         var is_project_theme = false;
         if (config_mod.readProject(app.gpa, app.io, rt.cwd)) |proj_cfg| {
@@ -143,8 +171,7 @@ pub fn applyTheme(app: *App, raw_name: []const u8) !void {
     }
 
     // Fallback notification for invalid / unknown / typoed theme names
-    const trimmed = std.mem.trim(u8, raw_name, " \t\r\n");
-    if (!std.ascii.eqlIgnoreCase(trimmed, theme.name)) {
+    if (!is_auto and !std.ascii.eqlIgnoreCase(trimmed, theme.name)) {
         const fallback = std.fmt.allocPrint(app.gpa, "Theme '{s}' not found; using default", .{trimmed}) catch return error.OutOfMemory;
         defer app.gpa.free(fallback);
         _ = app.thread.transcript.append(app.gpa, .notice, "theme", fallback) catch return error.OutOfMemory;
