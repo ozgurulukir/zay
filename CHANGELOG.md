@@ -6,6 +6,15 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.15] - 2026-11-19
+
+### Fixed
+- TUI: transcript paging — PageUp/PageDown/Home/End jump support added, and toggle-all transcript folding (#461); mouse wheel over pickers and overlays, clickable permission buttons, click-to-dismiss overlays, and the new-output jump pill (#462); rich tool approval options (approve once, session whitelist with destructive-command protection, reject, reject-with-reason feedback) (#470).
+- Responsive layout: input box capped at 40% of terminal height on tall screens so large pastes cannot starve transcript panes; responsive overlay sizing and list pickers that grow on tall terminals; drawn overlay height tracked during frame draw for help scroll clamping; single-line warning surface below minimum usable dimensions (#463).
+- Key bindings/hints: single source of truth for key bindings, hints, and help; width-aware hint line formatting keeps critical escape affordances visible on narrow terminals (#464); ranked fuzzy scoring (fzy) integrated into panel widgets and command/theme pickers so name hits outrank descriptions (#465).
+- Markdown/theming: OSC 8 URI sanitization for markdown links and bare URLs; code tokenizer fix and schema corrections; builtin light themes (Catppuccin Latte, Tokyo Night Day) with WCAG contrast >= 4.5:1; luminance classification; terminal background color query via OSC; auto theme adjusts dynamically via color_scheme and color_report events (#466, #467).
+- Terminal title/status bar: owned terminal title stored before setTitle; title control bytes sanitized; segment gap_before honored; prioritized status bar segments (critical/high/medium/low) with progressive layout pruning; dynamic window title `zay — <session> [lane n/m] (<state>)` with debounced OSC setTitle; terminal focus tracking with focus_in/focus_out and system notifications when turns complete or require approval while unfocused (#468, #469).
+- Config/render: settings dirty tracking fixed; notice/success row metrics corrected; animations schema added with AnimationsMode (full/reduced/off); monochrome/colourblind non-color status markers; periodic redraw ticks suspended when idle (#463 settings/config portion).
 ## [0.11.14] - 2026-11-19
 
 ### Fixed
@@ -199,7 +208,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.14...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.15...HEAD
+[0.11.15]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.15
 [0.11.14]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.14
 [0.11.13]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.13
 [0.11.12]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.12
