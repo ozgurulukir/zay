@@ -74,12 +74,35 @@ pub fn secondaryColumn(width: u16) u16 {
     return @min(secondary_column, width / 2);
 }
 
+pub fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) void {
+    if (surface.buffer.len == 0 or surface.size.width == 0 or surface.size.height == 0) return;
+    const p = tui_style.activePalette();
+    const col = surface.size.width -| 1;
+    const max_s = total -| height;
+    if (max_s == 0) return;
+
+    const bar_height: usize = @max(1, @as(usize, height) * @as(usize, height) / @as(usize, total));
+    const max_top = height -| @as(u16, @intCast(bar_height));
+    const top: u16 = @intCast(@as(usize, scroll) * @as(usize, max_top) / @as(usize, max_s));
+
+    var r: u16 = 0;
+    while (r < height and r < surface.size.height) : (r += 1) {
+        const is_thumb = r >= top and r < top + bar_height;
+        const grapheme: []const u8 = if (r == 0) "▲" else if (r == height - 1) "▼" else if (is_thumb) "█" else "│";
+        const style: vaxis.Style = if (is_thumb) p.border_label else p.thinking_body;
+        surface.writeCell(col, r, .{
+            .char = .{ .grapheme = grapheme, .width = 1 },
+            .style = style,
+        });
+    }
+}
+
 pub fn commandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
     try lineAt(surface, row, text, ctx, selected, message.ConversationLayout.left -| 1);
 }
 
 pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
-    if (row >= surface.size.height) return;
+    if (surface.buffer.len == 0 or row >= surface.size.height) return;
     var col: u16 = 0;
     while (col < surface.size.width) : (col += 1) {
         surface.writeCell(col, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
@@ -94,7 +117,7 @@ pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.Draw
 }
 
 pub fn lineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, start_col: u16, active_style: vaxis.Style) !void {
-    if (row >= surface.size.height) return;
+    if (surface.buffer.len == 0 or row >= surface.size.height) return;
     if (start_col >= surface.size.width) return;
     const stable_text = try ctx.arena.dupe(u8, text);
     // A trailing `…` marks an overflow instead of silently dropping the tail.

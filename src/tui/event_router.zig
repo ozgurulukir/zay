@@ -117,21 +117,91 @@ fn routeMouse(
     // Scrolling may bring the logo back into view; the tick stops itself
     // again on the next frame if it didn't.
     try root.ensureTick(ctx);
-    if (app.getMode() == .help) {
-        if (mouse.button == .wheel_up) {
-            app.pickers.help.scrollUp(2);
+    if (mouse.button == .wheel_up or mouse.button == .wheel_down) {
+        if (app.getMode() == .help) {
+            if (mouse.button == .wheel_up) {
+                app.pickers.help.scrollUp(2);
+                ctx.consumeAndRedraw();
+                return;
+            }
+            if (mouse.button == .wheel_down) {
+                app.pickers.help.scrollDown(2, help_picker.bodyRows(app.drawnOverlayHeight()));
+                ctx.consumeAndRedraw();
+                return;
+            }
+        }
+        if (app.permissionPending()) {
+            if (mouse.button == .wheel_up) {
+                if (app.thread.permission_scroll > 0) app.thread.permission_scroll -= 1;
+            } else {
+                app.thread.permission_scroll += 1;
+            }
             ctx.consumeAndRedraw();
             return;
         }
-        if (mouse.button == .wheel_down) {
-            app.pickers.help.scrollDown(2, help_picker.bodyRows(app.drawnOverlayHeight()));
+        if (app.getMode() != .normal and app.getMode() != .diff_viewer) {
+            if (mouse.button == .wheel_up) {
+                _ = try command_router.handleCommandKey(app, .{ .codepoint = vaxis.Key.up });
+            } else {
+                _ = try command_router.handleCommandKey(app, .{ .codepoint = vaxis.Key.down });
+            }
             ctx.consumeAndRedraw();
             return;
         }
+        if (mouse.button == .wheel_up) app.setThreadAutoScroll(false);
+        if (mouse.button == .wheel_down) app.updateMouseAutoScroll();
     }
-    if (mouse.button == .wheel_up) app.setThreadAutoScroll(false);
-    if (mouse.button == .wheel_down) app.updateMouseAutoScroll();
+
     if (mouse.type == .press and mouse.button == .left) {
+        // 1. "↓ new output" pill click
+        if (app.nav.new_output_rect) |rect| {
+            if (rect.contains(mouse.row, mouse.col)) {
+                app.jumpTranscriptToBottom();
+                ctx.consumeAndRedraw();
+                return;
+            }
+        }
+
+        // 2. Permission buttons click
+        if (app.permissionPending() and app.nav.permission_buttons != null) {
+            for (app.nav.permission_buttons.?) |btn| {
+                if (btn.contains(mouse.row, mouse.col)) {
+                    switch (btn.choice) {
+                        .approve => try app.resolvePermission(.approve),
+                        .approve_session => try app.resolvePermission(.approve_session),
+                        .reject => try app.resolvePermission(.reject),
+                        .reject_with_reason => try app.resolvePermission(.{ .reject_with_reason = "Rejected by user: command refused" }),
+                    }
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+            }
+        }
+
+        // 3. Modal overlay dismiss (click outside) or row activation
+        if (app.getMode() != .normal and app.getMode() != .diff_viewer) {
+            if (app.nav.overlay_panel_rect) |rect| {
+                if (!rect.contains(mouse.row, mouse.col)) {
+                    // Cancel repeatedly until returning to .normal (some pickers
+                    // step back to .command on a single cancel) and sync focus (#292).
+                    var guard: u8 = 0;
+                    while (app.getMode() != .normal and guard < 4) : (guard += 1) {
+                        if (!try lifecycle.transitionMode(root, ctx, .cancel)) break;
+                    }
+                    if (app.getMode() != .normal) {
+                        app.setMode(.normal);
+                        try root.syncFocus(ctx);
+                    }
+                    ctx.consumeAndRedraw();
+                    return;
+                } else if (mouse.row >= rect.row + 3 and app.getMode() != .help) {
+                    try root.submit(ctx);
+                    return;
+                }
+            }
+        }
+
+        // 4. Lanes chip click
         if (app.getLanesChipRect()) |rect| {
             if (rect.contains(mouse.row, mouse.col)) {
                 // Leave the fullscreen (`tab`) view. `.grid` opens the 2x2

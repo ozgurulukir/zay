@@ -68,6 +68,13 @@ pub fn shouldRejectUnsafeShell(
     if (verdict != .unsafe) return .{ .allowed = shell_safety.mintClassified(call.arguments) };
     const approved = try observer.approve_unsafe_bash(observer.ctx, call, command);
     if (approved) return .{ .allowed = shell_safety.mintClassified(call.arguments) };
+    if (@hasField(@TypeOf(observer), "rejection_reason")) {
+        if (observer.rejection_reason) |rf| {
+            if (rf(observer.ctx)) |custom_reason| {
+                return .{ .rejected = custom_reason };
+            }
+        }
+    }
     return .{ .rejected = "The tool call was rejected by the user for being unsafe. Try something else." };
 }
 
