@@ -10,6 +10,7 @@ const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
+const tui = @import("../../tui.zig");
 
 /// Which mode's keybindings a help line documents. Rendered as a dim `[tag]`
 /// prefix rather than used to filter — discoverability beats hiding — and
@@ -51,21 +52,29 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "SLASH COMMANDS", .desc = "", .is_header = true },
     .{ .key = "/connect", .desc = "Configure AI provider & API keys" },
     .{ .key = "/model", .desc = "Select LLM model & reasoning effort" },
+    .{ .key = "/mcp", .desc = "Model Context Protocol status & servers" },
+    .{ .key = "/plugins", .desc = "List & manage Lua plugins" },
     .{ .key = "/settings", .desc = "View and edit configuration settings" },
+    .{ .key = "/skills", .desc = "List loaded skills & invocation names" },
     .{ .key = "/new", .desc = "Start a fresh session" },
     .{ .key = "/resume", .desc = "Resume past session from history" },
     .{ .key = "/timeline", .desc = "Interactive session tree browser" },
     .{ .key = "/undo", .desc = "Rewind the last turn and restore its prompt" },
-    .{ .key = "/diff", .desc = "Full-screen git diff viewer & comments" },
-    .{ .key = "/parallel", .desc = "Fork worktree into a new parallel lane" },
-    .{ .key = "/save", .desc = "Commit git-shadow working copy snapshot" },
-    .{ .key = "/lanes", .desc = "Manage & merge parked worktree lanes" },
+    .{ .key = "/clear", .desc = "Clear current transcript view" },
+    .{ .key = "/compact", .desc = "Compact session context history" },
     .{ .key = "/export", .desc = "Export conversation thread as Markdown" },
     .{ .key = "/copy", .desc = "Copy selected transcript message to clipboard" },
     .{ .key = "/paste", .desc = "Paste text from clipboard into prompt" },
+    .{ .key = "/search", .desc = "Search current transcript (Ctrl+F)" },
+    .{ .key = "/diff", .desc = "Full-screen git diff viewer & comments" },
+    .{ .key = "/parallel", .desc = "Fork worktree into a new parallel lane" },
+    .{ .key = "/save", .desc = "Commit git-shadow working copy snapshot" },
+    .{ .key = "/merge", .desc = "Merge lane into target" },
+    .{ .key = "/close", .desc = "Park and close active lane" },
+    .{ .key = "/lanes", .desc = "Manage & merge parked worktree lanes" },
+    .{ .key = "/theme", .desc = "Switch color theme" },
     .{ .key = "/status", .desc = "Show system status & active model details" },
-    .{ .key = "/skills", .desc = "List loaded skills & invocation names" },
-    .{ .key = "/clear", .desc = "Clear current transcript view" },
+    .{ .key = "/database", .desc = "Show session database backend status & schema" },
     .{ .key = "/help", .desc = "Open this quick reference guide" },
     .{ .key = "/exit", .desc = "Quit Zay agent" },
 
@@ -129,6 +138,21 @@ test "help documents every diff-viewer, jobs-modal, and lane binding" {
     }
     for ([_][]const u8{"Ctrl+L"}) |k| {
         try std.testing.expect(indexOfKey(k, .lanes) != null);
+    }
+}
+
+// Guard: every command in tui.commands (except Quit alias) must have a help entry.
+test "help documents every slash command in tui.commands" {
+    for (tui.commands) |cmd| {
+        if (std.mem.eql(u8, cmd.name, "Quit")) continue; // alias of Exit
+        var key_buf: [32]u8 = undefined;
+        key_buf[0] = '/';
+        const raw_name = if (std.mem.eql(u8, cmd.name, "Models")) "model" else cmd.name;
+        for (raw_name, 0..) |ch, ci| {
+            key_buf[1 + ci] = std.ascii.toLower(ch);
+        }
+        const slash_cmd = key_buf[0 .. 1 + raw_name.len];
+        try std.testing.expect(indexOfKey(slash_cmd, .global) != null);
     }
 }
 

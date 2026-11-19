@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+const c = @import("c");
 
 const message = @import("message.zig");
 const tui_style = @import("../style.zig");
@@ -252,11 +253,92 @@ pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, ro
     return start;
 }
 
-/// Greedy left-to-right subsequence match: for each query rune, find its first
-/// occurrence at/after the cursor in `text`. Returns the number of matched byte
-/// offsets written to `positions` (bounded by `positions.len`). Case-insensitive
-/// on ASCII; non-ASCII runes compare by exact codepoint. No gpa allocation.
+/// Score a query against a text using vendored fzy subsequence matching.
+/// Returns score or null if there is no match. Query is case-insensitive on ASCII.
+pub fn fzyScore(query: []const u8, text: []const u8) ?f64 {
+    if (query.len == 0) return 0.0;
+    if (query.len > 256 or text.len > 1024) return null;
+    var q_buf: [257:0]u8 = undefined;
+    var t_buf: [1025:0]u8 = undefined;
+    for (query, 0..) |b, i| {
+        q_buf[i] = std.ascii.toLower(b);
+    }
+    q_buf[query.len] = 0;
+    @memcpy(t_buf[0..text.len], text);
+    t_buf[text.len] = 0;
+
+    const q_ptr: [*:0]const u8 = @ptrCast(&q_buf);
+    const t_ptr: [*:0]const u8 = @ptrCast(&t_buf);
+    if (c.has_match(q_ptr, t_ptr) == 0) return null;
+    return c.match(q_ptr, t_ptr);
+}
+
+/// Compute optimal matching positions in text for query using fzy.
+/// Returns score and fills positions with matched byte offsets.
+pub fn fzyMatchPositions(query: []const u8, text: []const u8, positions: []usize) ?f64 {
+    if (query.len == 0) return 0.0;
+    if (query.len > 256 or text.len > 1024) return null;
+    var q_buf: [257:0]u8 = undefined;
+    var t_buf: [1025:0]u8 = undefined;
+    for (query, 0..) |b, i| {
+        q_buf[i] = std.ascii.toLower(b);
+    }
+    q_buf[query.len] = 0;
+    @memcpy(t_buf[0..text.len], text);
+    t_buf[text.len] = 0;
+
+    const q_ptr: [*:0]const u8 = @ptrCast(&q_buf);
+    const t_ptr: [*:0]const u8 = @ptrCast(&t_buf);
+    if (c.has_match(q_ptr, t_ptr) == 0) return null;
+
+    var c_pos: [1024]usize = undefined;
+    const score = c.match_positions(q_ptr, t_ptr, &c_pos);
+    const n = @min(query.len, positions.len);
+    @memcpy(positions[0..n], c_pos[0..n]);
+    return score;
+}
+
+/// Score a candidate item with both a name and an optional description.
+/// Name matches use ranked fuzzy subsequence matching with a significant bonus (1000.0).
+/// Description matches require a substring match so that randomly scattered letters
+/// across long description sentences do not produce false positive matches.
+pub fn scoreCandidate(query: []const u8, name: []const u8, description: []const u8) ?f64 {
+    if (query.len == 0) return 0.0;
+    const name_score = fzyScore(query, name);
+    const desc_matches = if (description.len > 0) containsIgnoreCase(description, query) else false;
+    const desc_score = if (desc_matches) (fzyScore(query, description) orelse 10.0) else null;
+
+    if (name_score == null and desc_score == null) return null;
+
+    const name_bonus: f64 = 1000.0;
+    if (name_score) |ns| {
+        if (desc_score) |ds| {
+            return ns + name_bonus + (ds * 0.01);
+        }
+        return ns + name_bonus;
+    }
+    return desc_score;
+}
+
+fn isAllAscii(slice: []const u8) bool {
+    for (slice) |b| {
+        if (b >= 0x80) return false;
+    }
+    return true;
+}
+
+/// Subsequence match: uses optimal fzy matching for ASCII text/query, falling back to
+/// greedy rune matching for UTF-8 multi-byte sequences.
 pub fn fuzzyMatchPositions(query: []const u8, text: []const u8, positions: []usize) usize {
+    if (isAllAscii(query) and isAllAscii(text)) {
+        if (fzyMatchPositions(query, text, positions)) |_| {
+            return @min(query.len, positions.len);
+        }
+    }
+    return greedyRunePositions(query, text, positions);
+}
+
+fn greedyRunePositions(query: []const u8, text: []const u8, positions: []usize) usize {
     var matched: usize = 0;
     var text_offset: usize = 0;
     var q: usize = 0;
@@ -707,4 +789,31 @@ test "ViewportWindow.compute degenerate sizes render nothing" {
     const short = ViewportWindow.compute(2, 3, 8);
     try std.testing.expectEqual(@as(u32, 0), short.start_index);
     try std.testing.expectEqual(@as(u32, 3), short.end_index);
+}
+
+test "fzyScore scores matches and respects case-insensitivity" {
+    try std.testing.expect(fzyScore("st", "Status") != null);
+    try std.testing.expect(fzyScore("stg", "Settings") != null);
+    try std.testing.expect(fzyScore("xyz", "Settings") == null);
+    try std.testing.expect(fzyScore("", "Settings").? == 0.0);
+}
+
+test "scoreCandidate awards name bonus so name hits outrank description hits" {
+    const status_score = scoreCandidate("st", "Status", "Show agent runtime & git state").?;
+    const settings_score = scoreCandidate("st", "Settings", "View and edit configuration settings").?;
+    // "Undo" has "st" in description ("...restore its prompt") but not in name ("Undo")
+    const undo_score = scoreCandidate("st", "Undo", "Rewind the last turn and restore its prompt").?;
+
+    try std.testing.expect(status_score > undo_score);
+    try std.testing.expect(settings_score > undo_score);
+
+    // "stg" matches "Settings" on name (high score with name bonus)
+    const stg_settings = scoreCandidate("stg", "Settings", "View and edit configuration settings").?;
+    const stg_status = scoreCandidate("stg", "Status", "Show agent runtime & git state");
+    // "Settings" gets the name bonus, whereas "Status" only matches in description if at all
+    if (stg_status) |st_score| {
+        try std.testing.expect(stg_settings > st_score);
+    }
+    // "xyz" matches neither name nor description
+    try std.testing.expect(scoreCandidate("xyz", "Status", "Show agent runtime & git state") == null);
 }
