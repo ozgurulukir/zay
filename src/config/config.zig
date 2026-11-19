@@ -236,6 +236,12 @@ pub const SplitMode = enum {
     tab,
 };
 
+pub const AnimationsMode = enum {
+    full,
+    reduced,
+    off,
+};
+
 /// TUI appearance, live theme preview, and picker settings.
 ///
 /// Every scalar field carries a paired `<field>_is_set` flag (#447): parse
@@ -288,6 +294,9 @@ pub const TuiSettings = struct {
     /// Context usage fraction that transitions the meter to red alert.
     context_threshold_alert: f64 = 0.85,
     context_threshold_alert_is_set: bool = false,
+    /// Animation detail level: 'full', 'reduced' (static logo, slow spinner, lower tick rate), or 'off' (stops animation ticks entirely).
+    animations: AnimationsMode = .full,
+    animations_is_set: bool = false,
 };
 
 /// Database backend selection for session persistence and roaming sync.

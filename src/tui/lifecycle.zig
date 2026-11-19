@@ -260,7 +260,12 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     advanceBlackholeIfVisible(root, &visible_change);
 
     if (decideShouldTick(root)) {
-        try ctx.tick(RootWidget.drain_tick_ms, root.widget());
+        const tick_interval: u32 = switch (root.app.cached_config.tui.animations) {
+            .full => RootWidget.drain_tick_ms,
+            .reduced => 120,
+            .off => 250,
+        };
+        try ctx.tick(tick_interval, root.widget());
     } else {
         root.app.metrics.loading_tick_active = false;
     }
@@ -324,13 +329,21 @@ fn drainBackgroundAndLanes(root: *RootWidget) !bool {
 
 /// Advance spinner frames when a turn or manual compaction is active.
 fn advanceAnimations(root: *RootWidget, visible_change: *bool) !void {
+    if (root.app.cached_config.tui.animations == .off) {
+        root.spinner_tick_accum = 0;
+        return;
+    }
     const spinner_active = root.app.anyTurnActive() or
         compaction_lifecycle.manualCompactActive(root.app) or
         lane_lifecycle.anyAsyncWorktreeActive(root.app) or
         root.app.at_search == .indexing;
     if (spinner_active) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
-        if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
+        const threshold: u32 = if (root.app.cached_config.tui.animations == .reduced)
+            240 // slow spinner in reduced motion mode
+        else
+            RootWidget.spinner_tick_threshold_ms;
+        if (root.spinner_tick_accum >= threshold) {
             root.spinner_tick_accum = 0;
             root.app.advanceLoadingFrame();
             visible_change.* = true;
@@ -357,6 +370,10 @@ fn scheduleDiffRefreshIfPending(root: *RootWidget, ctx: *vxfw.EventContext) !voi
 
 /// Advance the black-hole intro animation when it is visible.
 fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
+    if (root.app.cached_config.tui.animations != .full) {
+        root.blackhole_tick_accum = 0;
+        return;
+    }
     if (root.app.metrics.blackhole_visible) {
         // Carry the remainder so the average interval tracks ~24 fps even
         // though the host tick (30 ms) is coarser than the frame interval.
@@ -421,7 +438,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
     const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
     const any_job_active = anyJobActive(root.app);
-    const blackhole_visible = root.app.metrics.blackhole_visible;
+    const blackhole_visible = root.app.metrics.blackhole_visible and (root.app.cached_config.tui.animations == .full);
     const diff_refresh_pending = root.diff_refresh_pending;
     const background_active = root.app.backgroundActive();
     const naming_active = root.app.namingActive();
@@ -672,7 +689,12 @@ pub fn ensureTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     if (root.app.metrics.loading_tick_active) return;
     root.app.metrics.loading_tick_active = true;
     root.spinner_tick_accum = 0;
-    try ctx.tick(RootWidget.drain_tick_ms, root.widget());
+    const tick_interval: u32 = switch (root.app.cached_config.tui.animations) {
+        .full => RootWidget.drain_tick_ms,
+        .reduced => 120,
+        .off => 250,
+    };
+    try ctx.tick(tick_interval, root.widget());
 }
 
 /// Submit the current input: enter closes a picker, command runs the

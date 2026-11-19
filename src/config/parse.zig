@@ -385,6 +385,10 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
         target.tui.context_threshold_alert = updates.context_threshold_alert;
         target.tui.context_threshold_alert_is_set = true;
     }
+    if (updates.animations_is_set) {
+        target.tui.animations = updates.animations;
+        target.tui.animations_is_set = true;
+    }
 }
 
 /// Merge context settings: optional fields apply when present; the compaction
@@ -1276,6 +1280,14 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
         if (f >= 0.2 and f <= 0.99) {
             tui.context_threshold_alert = f;
             tui.context_threshold_alert_is_set = true;
+        }
+    }
+    if (stringField(value, "animations")) |s| {
+        if (std.meta.stringToEnum(config_mod.AnimationsMode, s)) |mode| {
+            tui.animations = mode;
+            tui.animations_is_set = true;
+        } else {
+            tui.animations = .full;
         }
     }
     return tui;
@@ -2329,6 +2341,7 @@ fn hasNonDefaultTui(tui: TuiSettings) bool {
     if (tui.velocity_smoothing_alpha_is_set) return true;
     if (tui.context_threshold_warn_is_set) return true;
     if (tui.context_threshold_alert_is_set) return true;
+    if (tui.animations_is_set) return true;
     if (tui.theme_live_preview != default_tui.theme_live_preview) return true;
     if (tui.fuzzy_highlight != default_tui.fuzzy_highlight) return true;
     if (tui.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) return true;
@@ -2341,6 +2354,7 @@ fn hasNonDefaultTui(tui: TuiSettings) bool {
     if (tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) return true;
     if (tui.context_threshold_warn != default_tui.context_threshold_warn) return true;
     if (tui.context_threshold_alert != default_tui.context_threshold_alert) return true;
+    if (tui.animations != default_tui.animations) return true;
     return false;
 }
 
@@ -2403,6 +2417,10 @@ fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     if (tui.context_threshold_alert_is_set or tui.context_threshold_alert != default_tui.context_threshold_alert) {
         try writeKeyNoIndent(writer, "contextThresholdAlert", &wrote_any);
         try writer.print("{d:.2}", .{tui.context_threshold_alert});
+    }
+    if (tui.animations_is_set or tui.animations != default_tui.animations) {
+        try writeKeyNoIndent(writer, "animations", &wrote_any);
+        try std.json.Stringify.value(@tagName(tui.animations), .{}, writer);
     }
     try writer.writeByte('}');
 }
