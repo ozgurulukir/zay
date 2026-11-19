@@ -64,7 +64,7 @@ pub fn hintText(hint: HintInputs) []const u8 {
             .manage => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[M] Merge into current" ++ symbols.separator_dot_padded ++ "[X] Delete" ++ symbols.separator_dot_padded ++ "[ESC] Back",
             .merge_dest => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Merge into" ++ symbols.separator_dot_padded ++ "[ESC] Back",
         },
-        .diff_viewer => "",
+        .diff_viewer => "[ / ] Hunks" ++ symbols.separator_dot_padded ++ "Ctrl+W Comment" ++ symbols.separator_dot_padded ++ "Ctrl+P Files" ++ symbols.separator_dot_padded ++ "Ctrl+S Send" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .help => "[ESC] / [ENTER] Close Help",
         .settings => "Tab Section" ++ symbols.separator_dot_padded ++ "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Toggle/Edit" ++ symbols.separator_dot_padded ++ "Ctrl+S Save" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .mcp => "[Space] Toggle" ++ symbols.separator_dot_padded ++ "Ctrl+R Reconnect" ++ symbols.separator_dot_padded ++ "[ESC] Close",
@@ -91,7 +91,7 @@ test "hintText pins every mode's text" {
     try std.testing.expectEqualStrings("[ENTER] Save" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .save_message }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[M] Merge into current" ++ dot ++ "[X] Delete" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .manage }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Merge into" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .merge_dest }));
-    try std.testing.expectEqualStrings("", hintText(.{ .mode = .diff_viewer }));
+    try std.testing.expectEqualStrings("[ / ] Hunks" ++ dot ++ "Ctrl+W Comment" ++ dot ++ "Ctrl+P Files" ++ dot ++ "Ctrl+S Send" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .diff_viewer }));
     try std.testing.expectEqualStrings("[ESC] / [ENTER] Close Help", hintText(.{ .mode = .help }));
     try std.testing.expectEqualStrings("Tab Section" ++ dot ++ "↑↓ Navigate" ++ dot ++ "[ENTER] Toggle/Edit" ++ dot ++ "Ctrl+S Save" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .settings }));
     try std.testing.expectEqualStrings("[Space] Toggle" ++ dot ++ "Ctrl+R Reconnect" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .mcp }));
@@ -714,7 +714,8 @@ pub const InputWidget = struct {
         const p = tui_style.activePalette();
         const is_pending_quit = self.props.pending_quit;
         const style = if (is_pending_quit) p.warning else p.thinking_body;
-        var hint_text: vxfw.Text = .{ .text = self.props.hint_text, .style = style, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
+        const text_to_draw = formatWidthAwareHint(self.props.hint_text, width, ctx.arena);
+        var hint_text: vxfw.Text = .{ .text = text_to_draw, .style = style, .text_align = .center, .softwrap = false, .overflow = .ellipsis, .width_basis = .parent };
         children[child_index] = .{
             .origin = .{ .row = row, .col = col },
             .surface = try hint_text.widget().draw(ctx.withConstraints(.{ .width = width, .height = 1 }, .{ .width = width, .height = 1 })),
@@ -767,3 +768,74 @@ pub const InputWidget = struct {
         };
     }
 };
+
+/// Format hint text for available width (in display cells). When the full hint fits, returns it verbatim.
+/// When available width is constrained, retains the highest-priority action (such as
+/// [ESC] Cancel / [ESC] Close) and adds additional segments from the left as space allows,
+/// ensuring that critical cancel/escape affordances are never lost behind an ellipsis.
+pub fn formatWidthAwareHint(full_hint: []const u8, available_width: u16, arena: std.mem.Allocator) []const u8 {
+    if (full_hint.len == 0 or available_width == 0) return full_hint;
+    const sep = symbols.separator_dot_padded;
+    const sep_w = gw(sep);
+    if (gw(full_hint) <= available_width) return full_hint;
+
+    var seg_iter = std.mem.splitSequence(u8, full_hint, sep);
+    var count: usize = 0;
+    while (seg_iter.next()) |_| {
+        count += 1;
+    }
+    if (count <= 1) return full_hint;
+
+    var segs: [16][]const u8 = undefined;
+    const num_segs = @min(count, 16);
+    seg_iter = std.mem.splitSequence(u8, full_hint, sep);
+    for (0..num_segs) |i| {
+        segs[i] = seg_iter.next().?;
+    }
+
+    const esc_seg = segs[num_segs - 1];
+    const esc_w = gw(esc_seg);
+    if (esc_w >= available_width) return esc_seg;
+
+    var chosen_count: usize = 0;
+    var current_w: u16 = esc_w;
+    for (0..num_segs - 1) |i| {
+        const added_w = gw(segs[i]) +| sep_w;
+        if (current_w +| added_w <= available_width) {
+            current_w +|= added_w;
+            chosen_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if (chosen_count == 0) return esc_seg;
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(arena);
+    for (0..chosen_count) |i| {
+        result.appendSlice(arena, segs[i]) catch return full_hint;
+        result.appendSlice(arena, sep) catch return full_hint;
+    }
+    result.appendSlice(arena, esc_seg) catch return full_hint;
+    return result.toOwnedSlice(arena) catch full_hint;
+}
+
+test "formatWidthAwareHint prioritizes escape action when space is constrained" {
+    const arena = std.testing.allocator;
+    const dot = symbols.separator_dot_padded;
+    const full = "↑↓ Navigate" ++ dot ++ "[ENTER] Execute" ++ dot ++ "[ESC] Cancel";
+
+    // Fits completely (display cell width of full is 44 cells, though byte length is 52):
+    try std.testing.expectEqualStrings(full, formatWidthAwareHint(full, 44, arena));
+
+    // Constrained width: retains "[ESC] Cancel" and fits leading actions if possible
+    const mid = formatWidthAwareHint(full, 30, arena);
+    defer arena.free(mid);
+    try std.testing.expect(std.mem.endsWith(u8, mid, "[ESC] Cancel"));
+    try std.testing.expect(gw(mid) <= 30);
+
+    // Very narrow width: keeps just "[ESC] Cancel"
+    const narrow = formatWidthAwareHint(full, 15, arena);
+    try std.testing.expectEqualStrings("[ESC] Cancel", narrow);
+}

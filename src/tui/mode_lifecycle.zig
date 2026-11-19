@@ -659,22 +659,41 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
 }
 
 const command_panel = @import("widgets/command_panel.zig");
+const panel = @import("widgets/panel.zig");
 
 pub fn resolveCommand(app: *App, filter: []const u8) ?Command {
-    var selected: ?Command = null;
-    var index: u32 = 0;
-    for (commands) |entry| {
+    const Scored = struct {
+        command: Command,
+        score: f64,
+        idx: usize,
+    };
+    var buf: [commands.len]Scored = undefined;
+    var count: usize = 0;
+
+    for (commands, 0..) |entry, idx| {
         if (!tui.commandVisible(app, entry)) continue;
-        if (!command_panel.matchesCommandFilter(entry.name, entry.description, filter)) continue;
-        if (index == app.nav.command_selection) selected = entry.command;
-        index += 1;
-    }
-    if (selected) |command| return command;
-    if (index == 1) {
-        for (commands) |entry| {
-            if (!tui.commandVisible(app, entry)) continue;
-            if (command_panel.matchesCommandFilter(entry.name, entry.description, filter)) return entry.command;
+        if (panel.scoreCandidate(filter, entry.name, entry.description)) |score| {
+            buf[count] = .{ .command = entry.command, .score = score, .idx = idx };
+            count += 1;
         }
+    }
+
+    if (count == 0) return null;
+    const ranked = buf[0..count];
+
+    const Sorter = struct {
+        fn lessThan(_: void, a: Scored, b: Scored) bool {
+            if (a.score != b.score) return a.score > b.score;
+            return a.idx < b.idx;
+        }
+    };
+    std.mem.sort(Scored, ranked, {}, Sorter.lessThan);
+
+    if (app.nav.command_selection < ranked.len) {
+        return ranked[app.nav.command_selection].command;
+    }
+    if (ranked.len == 1) {
+        return ranked[0].command;
     }
     return null;
 }

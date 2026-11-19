@@ -49,28 +49,41 @@ pub const Content = struct {
         const height = surface.size.height;
         if (height == 0) return;
 
-        // 1. Collect matching command indices.
-        var matching_indices: std.ArrayList(usize) = .empty;
-        defer matching_indices.deinit(ctx.arena);
+        // 1. Collect and score matching command entries.
+        const ScoredEntry = struct {
+            idx: usize,
+            score: f64,
+        };
+        var matching_entries: std.ArrayList(ScoredEntry) = .empty;
+        defer matching_entries.deinit(ctx.arena);
 
         for (self.entries, 0..) |entry, idx| {
-            if (matchesCommandFilter(entry.name, entry.description, self.filter)) {
-                try matching_indices.append(ctx.arena, idx);
+            if (panel.scoreCandidate(self.filter, entry.name, entry.description)) |score| {
+                try matching_entries.append(ctx.arena, .{ .idx = idx, .score = score });
             }
         }
 
-        const total_matches: u32 = @intCast(matching_indices.items.len);
+        const total_matches: u32 = @intCast(matching_entries.items.len);
         if (total_matches == 0) {
             try panel.lineStyledAt(surface, 0, "  No matching commands", ctx, 1, p.thinking_body);
             return;
         }
+
+        // Sort by score descending; stable tie-break on original table order.
+        const Sorter = struct {
+            fn lessThan(_: void, a: ScoredEntry, b: ScoredEntry) bool {
+                if (a.score != b.score) return a.score > b.score;
+                return a.idx < b.idx;
+            }
+        };
+        std.mem.sort(ScoredEntry, matching_entries.items, {}, Sorter.lessThan);
 
         // 2. Viewport window calculation for smooth scrolling.
         const viewport = panel.ViewportWindow.compute(self.selection, total_matches, height);
 
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
-            const entry_idx = matching_indices.items[match_idx];
+            const entry_idx = matching_entries.items[match_idx].idx;
             const entry = self.entries[entry_idx];
             const selected = match_idx == self.selection;
             const screen_row = viewport.screenRow(match_idx);
@@ -91,19 +104,12 @@ pub const Content = struct {
 
 pub fn matchesCommandFilter(name: []const u8, description: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;
-    if (startsWithIgnoreCase(name, filter)) return true;
-    if (panel.containsIgnoreCase(name, filter)) return true;
-    if (panel.containsIgnoreCase(description, filter)) return true;
-    return false;
+    return panel.scoreCandidate(filter, name, description) != null;
 }
 
-fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    return std.ascii.startsWithIgnoreCase(haystack, needle);
-}
-
-test "matchesCommandFilter matches slash prefix and descriptions" {
+test "matchesCommandFilter matches slash prefix, descriptions and fuzzy subsequences" {
     try std.testing.expect(matchesCommandFilter("settings", "View and edit settings", "set"));
     try std.testing.expect(matchesCommandFilter("help", "Show help guide", "guide"));
+    try std.testing.expect(matchesCommandFilter("Settings", "View and edit settings", "stg"));
     try std.testing.expect(!matchesCommandFilter("clear", "Clear transcript", "xyz"));
 }

@@ -50,25 +50,27 @@ pub const Content = struct {
         const height = surface.size.height;
         if (height == 0) return;
 
-        // 1. Collect matching theme indices — same rule `countMatching` uses.
-        var matching_indices: std.ArrayList(usize) = .empty;
-        defer matching_indices.deinit(ctx.arena);
+        // 1. Collect and score matching themes — same rule `countMatching` uses.
+        var matching_themes: std.ArrayList(ScoredTheme) = .empty;
+        defer matching_themes.deinit(ctx.arena);
         for (self.themes, 0..) |theme, idx| {
-            if (matchesTheme(theme, self.filter)) {
-                try matching_indices.append(ctx.arena, idx);
+            if (scoreTheme(theme, self.filter)) |s| {
+                try matching_themes.append(ctx.arena, .{ .idx = idx, .score = s });
             }
         }
 
-        const total_matches: u32 = @intCast(matching_indices.items.len);
+        const total_matches: u32 = @intCast(matching_themes.items.len);
         if (total_matches == 0) {
             try panel.lineStyledAt(surface, 0, "  No matching themes", ctx, 1, p.thinking_body);
             return;
         }
 
+        std.mem.sort(ScoredTheme, matching_themes.items, {}, ScoredTheme.lessThan);
+
         const viewport = panel.ViewportWindow.compute(self.selection, total_matches, height);
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
-            const theme_idx = matching_indices.items[match_idx];
+            const theme_idx = matching_themes.items[match_idx].idx;
             const theme = self.themes[theme_idx];
             const selected = match_idx == self.selection;
             const screen_row = viewport.screenRow(match_idx);
@@ -89,13 +91,26 @@ pub const Content = struct {
     }
 };
 
-/// Whether a theme matches the picker filter. Empty filter matches all;
-/// otherwise a case-insensitive prefix or substring match on the slug — the
-/// same rule `command_panel.matchesCommandFilter` applies to command names.
+const ScoredTheme = struct {
+    idx: usize,
+    score: f64,
+
+    fn lessThan(_: void, a: ScoredTheme, b: ScoredTheme) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.idx < b.idx;
+    }
+};
+
+/// Score a theme against the picker filter. Empty filter matches all with score 0;
+/// otherwise a ranked fuzzy match on the theme slug.
+fn scoreTheme(theme: tui_style.Theme, filter: []const u8) ?f64 {
+    if (filter.len == 0) return 0.0;
+    return panel.fzyScore(filter, theme.name);
+}
+
+/// Whether a theme matches the picker filter.
 fn matchesTheme(theme: tui_style.Theme, filter: []const u8) bool {
-    if (filter.len == 0) return true;
-    if (std.ascii.startsWithIgnoreCase(theme.name, filter)) return true;
-    return panel.containsIgnoreCase(theme.name, filter);
+    return scoreTheme(theme, filter) != null;
 }
 
 /// Count the themes that the picker filter selects. Pure and shared — the
@@ -112,13 +127,20 @@ pub fn countMatching(themes: []const tui_style.Theme, filter: []const u8) u32 {
 /// list, or null when the selection is out of range. The Enter-apply path
 /// resolves this to a concrete theme before submitting.
 pub fn selectedName(themes: []const tui_style.Theme, filter: []const u8, selection: u32) ?[]const u8 {
-    var match_index: u32 = 0;
-    for (themes) |theme| {
-        if (!matchesTheme(theme, filter)) continue;
-        if (match_index == selection) return theme.name;
-        match_index += 1;
+    var buf: [256]ScoredTheme = undefined;
+    var count: usize = 0;
+    for (themes, 0..) |theme, idx| {
+        if (scoreTheme(theme, filter)) |s| {
+            if (count < buf.len) {
+                buf[count] = .{ .idx = idx, .score = s };
+                count += 1;
+            }
+        }
     }
-    return null;
+    if (selection >= count) return null;
+
+    std.mem.sort(ScoredTheme, buf[0..count], {}, ScoredTheme.lessThan);
+    return themes[buf[selection].idx].name;
 }
 
 test "countMatching returns 0 for a filter matching nothing" {
