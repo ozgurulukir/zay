@@ -182,12 +182,20 @@ fn routeMouse(
         if (app.getMode() != .normal and app.getMode() != .diff_viewer) {
             if (app.nav.overlay_panel_rect) |rect| {
                 if (!rect.contains(mouse.row, mouse.col)) {
-                    app.setMode(.normal);
+                    // Cancel repeatedly until returning to .normal (some pickers
+                    // step back to .command on a single cancel) and sync focus (#292).
+                    var guard: u8 = 0;
+                    while (app.getMode() != .normal and guard < 4) : (guard += 1) {
+                        if (!try lifecycle.transitionMode(root, ctx, .cancel)) break;
+                    }
+                    if (app.getMode() != .normal) {
+                        app.setMode(.normal);
+                        try root.syncFocus(ctx);
+                    }
                     ctx.consumeAndRedraw();
                     return;
-                } else if (mouse.row >= rect.row + 3) {
-                    _ = try command_router.handleCommandKey(app, .{ .codepoint = vaxis.Key.enter });
-                    ctx.consumeAndRedraw();
+                } else if (mouse.row >= rect.row + 3 and app.getMode() != .help) {
+                    try root.submit(ctx);
                     return;
                 }
             }

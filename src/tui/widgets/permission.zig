@@ -166,15 +166,16 @@ fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16
         const is_sel = selected == item.choice;
         const style: vaxis.Style = if (is_sel) item.style else p.thinking_body;
         const label = actionLabel(ctx, item.text, is_sel);
-        const label_len: u16 = @intCast(label.len);
+        const label_width: u16 = @intCast(ctx.stringWidth(label));
         panel.lineStyledAt(surface, row, label, ctx, col, style) catch {};
         recorded[i] = .{
             .choice = item.choice,
             .row = base_screen_row + row,
-            .col = col,
-            .width = label_len,
+            // +1 accounts for the outer vxfw.Border's 1-column left frame.
+            .col = col + 1,
+            .width = label_width,
         };
-        col += label_len + 2;
+        col += label_width + 2;
     }
     if (buttons_out) |out| {
         out.* = recorded;

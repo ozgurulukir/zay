@@ -162,15 +162,43 @@ const ApprovalGate = struct {
     lane_id: ?[]const u8 = null,
     last_rejection_reason: ?[]u8 = null,
 
-    pub fn isSessionApproved(self: *ApprovalGate, command: []const u8) bool {
-        if (bash_safety.isDestructiveRule(command)) return false;
+    fn containsShellMetachars(command: []const u8) bool {
+        return std.mem.indexOfAny(u8, command, ";|&`$><\n\r()") != null;
+    }
+
+    fn isSessionApprovalBannedPrefix(prefix: []const u8) bool {
+        const base = if (std.mem.lastIndexOfAny(u8, prefix, "/\\")) |sep|
+            prefix[sep + 1 ..]
+        else
+            prefix;
+        const banned = [_][]const u8{
+            "sh",    "bash",    "zsh",    "fish",    "dash",
+            "ksh",   "csh",     "tcsh",   "pwsh",    "powershell",
+            "cmd",   "cmd.exe", "python", "python3", "node",
+            "perl",  "ruby",    "lua",    "php",     "eval",
+            "exec",  "env",     "sudo",   "doas",    "su",
+            "xargs", "nohup",   "setsid",
+        };
+        for (banned) |b| {
+            if (std.ascii.eqlIgnoreCase(base, b)) return true;
+        }
+        return false;
+    }
+
+    fn extractSessionPrefix(command: []const u8) ?[]const u8 {
+        if (bash_safety.isDestructiveRule(command)) return null;
         const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
+        if (trimmed.len == 0 or containsShellMetachars(trimmed)) return null;
+        const first_ws = std.mem.indexOfAny(u8, trimmed, &std.ascii.whitespace) orelse trimmed.len;
+        const prefix = trimmed[0..first_ws];
+        if (prefix.len == 0 or isSessionApprovalBannedPrefix(prefix)) return null;
+        return prefix;
+    }
+
+    pub fn isSessionApproved(self: *ApprovalGate, command: []const u8) bool {
+        const candidate = extractSessionPrefix(command) orelse return false;
         for (self.session_approvals.items) |prefix| {
-            if (std.mem.startsWith(u8, trimmed, prefix)) {
-                if (trimmed.len == prefix.len or trimmed[prefix.len] == ' ' or trimmed[prefix.len] == '\t') {
-                    return true;
-                }
-            }
+            if (std.mem.eql(u8, candidate, prefix)) return true;
         }
         return false;
     }
@@ -207,11 +235,15 @@ const ApprovalGate = struct {
         switch (decision) {
             .approve => return true,
             .approve_session => {
-                if (!bash_safety.isDestructiveRule(command)) {
-                    const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
-                    const first_space = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
-                    const prefix = trimmed[0..first_space];
-                    if (prefix.len > 0) {
+                if (extractSessionPrefix(command)) |prefix| {
+                    var exists = false;
+                    for (self.session_approvals.items) |existing| {
+                        if (std.mem.eql(u8, existing, prefix)) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
                         const duped = gpa.dupe(u8, prefix) catch null;
                         if (duped) |d| self.session_approvals.append(gpa, d) catch gpa.free(d);
                     }
@@ -289,6 +321,13 @@ pub fn runAgentTurn(agent: *agent_mod.Agent, runtime: ?*runtime_mod.AgentRuntime
 
     agent.cancel_requested = &worker_context.cancel_requested;
     defer agent.cancel_requested = null;
+
+    worker_context.approval.tool_name = "bash";
+    worker_context.approval.cwd = agent.effectiveCwd();
+    defer {
+        worker_context.approval.tool_name = null;
+        worker_context.approval.cwd = null;
+    }
 
     agent.bash_approval = .{
         .ptr = worker_context,
