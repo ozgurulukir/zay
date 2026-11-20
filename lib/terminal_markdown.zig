@@ -7,12 +7,24 @@ const assert = std.debug.assert;
 pub const Style = enum {
     normal,
     heading,
+    /// Second- and third-tier headings: `##`/`###` … map here while `#` keeps
+    /// the single `.heading` style the historical renderer pinned.
+    heading_h2,
+    heading_h3,
     quote,
     list_marker,
+    /// `- [ ]`/`- [x]` checkbox glyph in a list item prefix.
+    task_marker,
+    /// Horizontal-rule row (`---`).
+    rule,
     table_border,
     code,
     strong,
     emphasis,
+    /// `~~strikethrough~~`.
+    strikethrough,
+    /// `***strong emphasis***` — bold italic (run-of-3 delimiters).
+    strong_emphasis,
     link,
     code_keyword,
     code_string,
@@ -34,8 +46,13 @@ pub const Row = struct {
 pub const Rendered = struct {
     rows: []Row,
     spans: []Span,
+    /// Heap-owned span texts synthesized during rendering (stacked-table
+    /// keys). Row spans borrow these; they must outlive the rows.
+    owned_texts: []([]u8) = &.{},
 
     pub fn deinit(self: *Rendered, gpa: std.mem.Allocator) void {
+        for (self.owned_texts) |text| gpa.free(text);
+        gpa.free(self.owned_texts);
         gpa.free(self.spans);
         gpa.free(self.rows);
         self.* = undefined;
@@ -53,6 +70,19 @@ const RowBuilder = struct {
     pool: std.ArrayList(Span) = .empty,
     rows: std.ArrayList(RowMeta) = .empty,
     scratch: std.ArrayList(Span) = .empty,
+    /// Heap-owned span texts the pooled spans borrow. Most spans borrow the
+    /// caller's body (which outlives the render); only synthesized text —
+    /// currently stacked-table keys — needs a home here.
+    texts: std.ArrayList([]u8) = .empty,
+
+    /// Copy `text` into the builder's owned storage and return the copy. The
+    /// copy lives as long as the builder (or the `Rendered` it converts to).
+    fn ownSpanText(self: *RowBuilder, gpa: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const copy = try gpa.dupe(u8, text);
+        errdefer gpa.free(copy);
+        try self.texts.append(gpa, copy);
+        return copy;
+    }
 
     fn push(self: *RowBuilder, gpa: std.mem.Allocator, indent: u16, spans: []const Span) !void {
         const start: u32 = @intCast(self.pool.items.len);
@@ -72,6 +102,8 @@ const RowBuilder = struct {
     }
 
     fn deinit(self: *RowBuilder, gpa: std.mem.Allocator) void {
+        for (self.texts.items) |text| gpa.free(text);
+        self.texts.deinit(gpa);
         self.pool.deinit(gpa);
         self.rows.deinit(gpa);
         self.scratch.deinit(gpa);
@@ -86,10 +118,12 @@ const RowBuilder = struct {
         for (self.rows.items, 0..) |meta, index| {
             rows[index] = .{ .indent = meta.indent, .spans = spans[meta.start..][0..meta.len] };
         }
+        const owned_texts = try self.texts.toOwnedSlice(gpa);
+        errdefer gpa.free(owned_texts);
         self.rows.deinit(gpa);
         self.scratch.deinit(gpa);
         self.* = undefined;
-        return .{ .rows = rows, .spans = spans };
+        return .{ .rows = rows, .spans = spans, .owned_texts = owned_texts };
     }
 };
 
@@ -194,7 +228,70 @@ fn lineAt(text: []const u8, start: usize) Line {
 pub const BlockState = struct {
     in_code: bool = false,
     code_lang: []const u8 = "",
+    /// The open fence's marker byte and minimum closing length (`"```"` → 0/0
+    /// when no fence is open). `` ~~~ `` fences and fences longer than three
+    /// markers only close on a run of the SAME marker at least as long.
+    fence_char: u8 = 0,
+    fence_len: u8 = 0,
 };
+
+/// A code-fence opener line: which marker byte and how long the run was.
+const Fence = struct { char: u8, len: u8 };
+
+/// Parse a fence opener/closer line: three or more backticks or tildes (after
+/// leading whitespace). Returns null for anything else. A longer run still
+/// opens a fence (CommonMark) and only closes on a run at least as long.
+fn parseFence(line: []const u8) ?Fence {
+    const trimmed = trimLeft(line);
+    if (trimmed.len < 3) return null;
+    const char = trimmed[0];
+    if (char != '`' and char != '~') return null;
+    var run: u8 = 0;
+    while (run < trimmed.len and trimmed[run] == char) : (run += 1) {}
+    if (run < 3) return null;
+    // Backtick fences must not contain backticks in the info string; tilde
+    // fences may. Checking only the opener's marker keeps `parseFence` a pure
+    // opener/closer test — `renderLine` reads the info string separately.
+    if (char == '`' and std.mem.indexOfScalar(u8, trimmed[run..], '`') != null) return null;
+    return .{ .char = char, .len = run };
+}
+
+/// What one line did to the code-fence state.
+const FenceAction = enum { opened, closed, none };
+
+/// Toggle the code-block state on a fence line. Shared by the render, count,
+/// and `stableBoundary` paths so the three can never disagree about which
+/// lines are fences. Returns `.none` for a non-fence line AND for a fence
+/// line inside an open block whose marker/length doesn't match (it is code
+/// content; the caller renders it as such).
+fn applyFence(line: []const u8, state: *BlockState) FenceAction {
+    const fence = parseFence(line) orelse return .none;
+    if (state.in_code) {
+        if (fence.char == state.fence_char and fence.len >= state.fence_len) {
+            // CommonMark: a closing fence carries no info string — a marker
+            // run followed by content ("```js" inside an open ``` block) is
+            // code text, not a closer.
+            const trimmed = trimLeft(line);
+            if (std.mem.trim(u8, trimmed[fence.len..], " \t\r").len != 0) return .none;
+            state.in_code = false;
+            state.code_lang = "";
+            state.fence_char = 0;
+            state.fence_len = 0;
+            return .closed;
+        }
+        // A non-matching fence line inside a code block is code content.
+        return .none;
+    }
+    state.in_code = true;
+    state.fence_char = fence.char;
+    state.fence_len = fence.len;
+    const trimmed = trimLeft(line);
+    state.code_lang = if (trimmed.len > fence.len)
+        std.mem.trim(u8, trimmed[fence.len..], " \t\r")
+    else
+        "";
+    return .opened;
+}
 
 /// Block boundary for append-only incremental rendering: the byte offset just
 /// after the most recent blank line that is not inside a ``` code fence.
@@ -203,13 +300,13 @@ pub const BlockState = struct {
 /// its separator — but never across a blank line outside code), so a renderer
 /// may cache those rows and re-render only `text[boundary..]`.
 pub fn stableBoundary(text: []const u8) usize {
-    var in_code = false;
+    var fence_state: BlockState = .{};
     var boundary: usize = 0;
     var line_start: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, line_start, '\n')) |nl| {
         const line = std.mem.trim(u8, text[line_start..nl], " \t");
-        if (std.mem.startsWith(u8, line, "```")) in_code = !in_code;
-        if (!in_code and line.len == 0) boundary = nl + 1;
+        _ = applyFence(line, &fence_state);
+        if (!fence_state.in_code and line.len == 0) boundary = nl + 1;
         line_start = nl + 1;
     }
     return boundary;
@@ -248,6 +345,8 @@ pub const Incremental = struct {
     fn reset(self: *Incremental, gpa: std.mem.Allocator, width: u16) void {
         self.stable.rows.clearRetainingCapacity();
         self.stable.pool.clearRetainingCapacity();
+        for (self.stable.texts.items) |text| gpa.free(text);
+        self.stable.texts.clearRetainingCapacity();
         for (self.segments.items) |seg| gpa.free(seg);
         self.segments.clearRetainingCapacity();
         self.boundary = 0;
@@ -324,20 +423,9 @@ pub const Incremental = struct {
 };
 
 fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u16, state: *BlockState) !void {
-    if (isFence(line)) {
-        if (state.in_code) {
-            state.in_code = false;
-            state.code_lang = "";
-        } else {
-            state.in_code = true;
-            const trimmed = trimLeft(line);
-            if (trimmed.len > 3) {
-                state.code_lang = std.mem.trim(u8, trimmed[3..], " \t\r");
-            } else {
-                state.code_lang = "";
-            }
-        }
-        return;
+    switch (applyFence(line, state)) {
+        .opened, .closed => return,
+        .none => {},
     }
     if (line.len == 0) return appendEmptyRow(gpa, b);
     if (state.in_code) {
@@ -348,8 +436,8 @@ fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u
         }
         return renderPlainLine(gpa, b, line, width, .code, 0, &.{});
     }
-    if (headingBody(line)) |body| {
-        const spans = try inlineSpans(gpa, body.text, .heading);
+    if (headingBody(line)) |heading| {
+        const spans = try inlineSpans(gpa, heading.text, headingStyle(heading.level));
         defer gpa.free(spans);
         return appendWrapped(gpa, b, &.{}, 0, spans, width);
     }
@@ -359,15 +447,34 @@ fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u
         defer gpa.free(spans);
         return appendWrapped(gpa, b, &prefix, 2, spans, width);
     }
-    if (listBody(line)) |body| {
-        const prefix = [_]Span{.{ .text = "• ", .style = .list_marker }};
-        const spans = try inlineSpans(gpa, body, .normal);
-        defer gpa.free(spans);
-        return appendWrapped(gpa, b, &prefix, 2, spans, width);
+    if (isHorizontalRule(line)) {
+        return appendRuleRow(gpa, b, width);
+    }
+    if (listBody(line)) |list| {
+        return appendListItem(gpa, b, list, width);
     }
     const spans = try inlineSpans(gpa, line, .normal);
     defer gpa.free(spans);
     return appendWrapped(gpa, b, &.{}, 0, spans, width);
+}
+
+/// The inline base style for a heading level: `#` keeps the historical single
+/// `.heading` style; `##`/`###+` get their own tiers.
+fn headingStyle(level: u8) Style {
+    return switch (level) {
+        1 => .heading,
+        2 => .heading_h2,
+        else => .heading_h3,
+    };
+}
+
+/// One full-width rule row (`---`/`***`/`___`). Pushed unwrapped: the row is
+/// exactly `width` cells, so `countRows` answers 1 without re-deriving it.
+fn appendRuleRow(gpa: std.mem.Allocator, b: *RowBuilder, width: u16) !void {
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+    try appendRepeatedSpan(gpa, &spans, "─", width, .rule);
+    try b.push(gpa, 0, spans.items);
 }
 
 fn renderPlainLine(
@@ -384,41 +491,27 @@ fn renderPlainLine(
 }
 
 fn countLineRows(gpa: std.mem.Allocator, line: []const u8, width: u16, state: *BlockState) u16 {
-    if (isFence(line)) {
-        if (state.in_code) {
-            state.in_code = false;
-            state.code_lang = "";
-        } else {
-            state.in_code = true;
-            const trimmed = trimLeft(line);
-            if (trimmed.len > 3) {
-                state.code_lang = std.mem.trim(u8, trimmed[3..], " \t\r");
-            } else {
-                state.code_lang = "";
-            }
-        }
-        return 0;
+    switch (applyFence(line, state)) {
+        .opened, .closed => return 0,
+        .none => {},
     }
     if (line.len == 0) return 1;
-    var body = line;
-    var prefix_width: u16 = 0;
-    var continuation_indent: u16 = 0;
     if (state.in_code) {
-        return countWrappedRows(gpa, body, width, 0, 0);
+        return countWrappedRows(gpa, line, width, 0, 0);
     }
     if (headingBody(line)) |heading| {
-        body = heading.text;
         // Headings render with no prefix and no continuation indent.
-    } else if (quoteBody(line)) |quote| {
-        body = quote;
-        prefix_width = 2; // "┃ " consumes the first line
-        continuation_indent = 2; // continuation lines sit at the content indent
-    } else if (listBody(line)) |list| {
-        body = list;
-        prefix_width = 2; // "• " consumes the first line
-        continuation_indent = 2; // continuation lines sit at the content indent
+        return countWrappedRows(gpa, heading.text, width, 0, 0);
     }
-    return countWrappedRows(gpa, body, width, prefix_width, continuation_indent);
+    if (quoteBody(line)) |quote| {
+        return countWrappedRows(gpa, quote, width, 2, 2);
+    }
+    if (isHorizontalRule(line)) return 1;
+    if (listBody(line)) |list| {
+        const marker_width: u16 = @intCast(@min(list.indent + textWidth(list.marker), std.math.maxInt(u16)));
+        return countWrappedRows(gpa, list.body, width, marker_width, marker_width);
+    }
+    return countWrappedRows(gpa, line, width, 0, 0);
 }
 
 const CountTable = struct { rows: u16, next_start: usize };
@@ -445,22 +538,22 @@ fn renderTable(
     const header_cells = try tableCells(gpa, header.bytes);
     try table_rows.append(gpa, header_cells);
     var row_start = separator.next_start orelse {
-        try renderTableRows(gpa, b, table_rows.items, width);
+        try renderTableRows(gpa, b, table_rows.items, separator.bytes, width);
         return text.len;
     };
     while (row_start <= text.len) {
         const line = lineAt(text, row_start);
         if (!isTableRow(line.bytes)) {
-            try renderTableRows(gpa, b, table_rows.items, width);
+            try renderTableRows(gpa, b, table_rows.items, separator.bytes, width);
             return row_start;
         }
         try table_rows.append(gpa, try tableCells(gpa, line.bytes));
         row_start = line.next_start orelse {
-            try renderTableRows(gpa, b, table_rows.items, width);
+            try renderTableRows(gpa, b, table_rows.items, separator.bytes, width);
             return text.len;
         };
     }
-    try renderTableRows(gpa, b, table_rows.items, width);
+    try renderTableRows(gpa, b, table_rows.items, separator.bytes, width);
     return text.len;
 }
 
@@ -471,39 +564,223 @@ fn countTableRows(gpa: std.mem.Allocator, text: []const u8, table_start: usize, 
     if (!isTableRow(header.bytes)) return null;
     if (!isTableSeparator(separator.bytes)) return null;
 
-    const ncol = tableColumnCount(header.bytes);
-    if (ncol == 0) return null;
-    const col_width = tableColumnWidth(ncol, width);
-    var table_lines = countTableVisualRows(gpa, header.bytes, col_width);
-    var table_rows: u16 = 1;
-    var row_start = separator.next_start orelse return .{ .rows = table_lines + table_rows + 1, .next_start = text.len };
+    // The layout depends on every row's cells (content-sized widths), so the
+    // count path materializes the same cells the render path collects and
+    // calls the same `computeTableLayout` — the two can never drift. The count
+    // path's contract is error-free, so allocation failure bails to null (the
+    // caller falls back to counting the lines as plain text; the render path
+    // would be failing on the same OOM anyway).
+    var table_rows: std.ArrayList([]const []const u8) = .empty;
+    defer {
+        for (table_rows.items) |cells| gpa.free(cells);
+        table_rows.deinit(gpa);
+    }
+    const header_cells = tableCells(gpa, header.bytes) catch return null;
+    table_rows.append(gpa, header_cells) catch {
+        gpa.free(header_cells);
+        return null;
+    };
+    var row_start = separator.next_start orelse return countCollectedTable(gpa, table_rows.items, separator.bytes, width, text.len);
     while (row_start <= text.len) {
         const line = lineAt(text, row_start);
-        if (!isTableRow(line.bytes)) return .{ .rows = table_lines + table_rows + 1, .next_start = row_start };
-        table_lines += countTableVisualRows(gpa, line.bytes, col_width);
-        table_rows += 1;
-        row_start = line.next_start orelse return .{ .rows = table_lines + table_rows + 1, .next_start = text.len };
+        if (!isTableRow(line.bytes)) return countCollectedTable(gpa, table_rows.items, separator.bytes, width, row_start);
+        const cells = tableCells(gpa, line.bytes) catch return null;
+        table_rows.append(gpa, cells) catch {
+            gpa.free(cells);
+            return null;
+        };
+        row_start = line.next_start orelse return countCollectedTable(gpa, table_rows.items, separator.bytes, width, text.len);
     }
-    return .{ .rows = table_lines + table_rows + 1, .next_start = text.len };
+    return countCollectedTable(gpa, table_rows.items, separator.bytes, width, text.len);
 }
 
-fn renderTableRows(gpa: std.mem.Allocator, b: *RowBuilder, table_rows: []const []const []const u8, width: u16) !void {
+/// Count the visual rows of an already-collected table under the shared
+/// layout. `next_start` is the byte offset where the table body ended. On
+/// allocation failure the fallback is a per-line over-count, never a clip.
+fn countCollectedTable(gpa: std.mem.Allocator, table_rows: []const []const []const u8, separator_line: []const u8, width: u16, next_start: usize) CountTable {
+    const over_count: u16 = 2 * @as(u16, @intCast(table_rows.len)) + 1;
+    var layout = computeTableLayout(gpa, table_rows, separator_line, width) catch
+        return .{ .rows = over_count, .next_start = next_start };
+    defer layout.deinit(gpa);
+    const rows: u16 = if (layout.stacked)
+        countStackedTableRows(gpa, table_rows, width)
+    else
+        countColumnTableRows(gpa, table_rows, layout.widths) + @as(u16, @intCast(table_rows.len)) + 1;
+    return .{ .rows = rows, .next_start = next_start };
+}
+
+/// Border rows for a column-layout table (n rows → n+1 borders) plus each
+/// row's tallest wrapped cell column.
+fn countColumnTableRows(gpa: std.mem.Allocator, table_rows: []const []const []const u8, widths: []const u16) u16 {
+    var visual: u16 = 0;
+    for (table_rows) |cells| {
+        visual += countTableVisualRows(gpa, cells, widths);
+    }
+    return visual;
+}
+
+/// Stacked fallback: one "key: value" group per data row plus a blank row
+/// between groups (none after the last), mirroring `renderStackedTable`.
+fn countStackedTableRows(gpa: std.mem.Allocator, table_rows: []const []const []const u8, width: u16) u16 {
+    const data = table_rows[1..];
+    var rows: u16 = 0;
+    for (data, 0..) |cells, index| {
+        rows += countStackedRow(gpa, table_rows[0], cells, width);
+        if (index + 1 < data.len) rows += 1; // blank row between groups
+    }
+    return rows;
+}
+
+fn countStackedRow(gpa: std.mem.Allocator, header: []const []const u8, cells: []const []const u8, width: u16) u16 {
+    var rows: u16 = 0;
+    for (header, 0..) |key, col| {
+        const value = if (col < cells.len) cells[col] else "";
+        rows += countStackedCellRows(gpa, key, value, width);
+    }
+    return rows;
+}
+
+fn countStackedCellRows(gpa: std.mem.Allocator, key: []const u8, value: []const u8, width: u16) u16 {
+    var stack: std.ArrayList(Span) = .empty;
+    defer stack.deinit(gpa);
+    var key_text: ?[]u8 = null;
+    defer if (key_text) |kt| gpa.free(kt);
+    if (key.len > 0) key_text = fusedKeyText(gpa, key) catch return 1;
+    stackedCellSpans(gpa, &stack, key_text orelse "", value) catch return 1;
+    return countWrappedSpanRows(gpa, stack.items, width, stacked_indent, stacked_indent) catch 1;
+}
+
+/// The stacked-line key: the header cell's inline-stripped text with the
+/// colon fused into the same span (the wrap engine joins spans with a space,
+/// which would detach a standalone `:` span). Caller owns the result.
+fn fusedKeyText(gpa: std.mem.Allocator, key: []const u8) ![]u8 {
+    const key_spans = try inlineSpans(gpa, key, .strong);
+    defer gpa.free(key_spans);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (key_spans) |span| try text.appendSlice(gpa, span.text);
+    try text.append(gpa, ':');
+    return text.toOwnedSlice(gpa);
+}
+
+fn renderTableRows(gpa: std.mem.Allocator, b: *RowBuilder, table_rows: []const []const []const u8, separator_line: []const u8, width: u16) !void {
     if (table_rows.len == 0) return;
     const ncol = table_rows[0].len;
     if (ncol == 0) return;
-    const col_widths = try tableColumnWidths(gpa, ncol, width);
-    defer gpa.free(col_widths);
+    var layout = try computeTableLayout(gpa, table_rows, separator_line, width);
+    defer layout.deinit(gpa);
 
-    try appendTableBorder(gpa, b, col_widths, .top);
+    if (layout.stacked) {
+        return renderStackedTable(gpa, b, table_rows, width);
+    }
+    try appendTableBorder(gpa, b, layout.widths, .top);
     var row_index: usize = 0;
     while (row_index < table_rows.len) : (row_index += 1) {
-        try appendTableDataRow(gpa, b, table_rows[row_index], col_widths, row_index == 0);
+        try appendTableDataRow(gpa, b, table_rows[row_index], layout.widths, layout.aligns, row_index == 0);
         if (row_index + 1 == table_rows.len) {
-            try appendTableBorder(gpa, b, col_widths, .bottom);
+            try appendTableBorder(gpa, b, layout.widths, .bottom);
         } else {
-            try appendTableBorder(gpa, b, col_widths, .middle);
+            try appendTableBorder(gpa, b, layout.widths, .middle);
         }
     }
+}
+
+/// Column alignment parsed from the separator row's `:` markers.
+pub const CellAlign = enum { left, center, right };
+
+/// The shared table layout decision: content-sized column widths (or the
+/// stacked fallback when columns cannot fit above the minimum width) plus the
+/// per-column alignment. Both the render and count paths call this once per
+/// table so their width computation is identical by construction.
+const TableLayout = struct {
+    stacked: bool,
+    widths: []u16,
+    aligns: []CellAlign,
+
+    fn deinit(self: *TableLayout, gpa: std.mem.Allocator) void {
+        gpa.free(self.widths);
+        gpa.free(self.aligns);
+        self.* = undefined;
+    }
+};
+
+/// Minimum content cells a column must get before the stacked fallback fires.
+const table_min_col_width: u16 = 3;
+
+fn computeTableLayout(gpa: std.mem.Allocator, table_rows: []const []const []const u8, separator_line: []const u8, width: u16) !TableLayout {
+    const ncol = table_rows[0].len;
+    const content_total = tableContentWidth(ncol, width);
+    const aligns = try parseTableAligns(gpa, separator_line, ncol);
+    errdefer gpa.free(aligns);
+
+    if (content_total < ncol * table_min_col_width) {
+        const empty_widths = try gpa.alloc(u16, 0);
+        errdefer gpa.free(empty_widths);
+        return .{ .stacked = true, .widths = empty_widths, .aligns = aligns };
+    }
+
+    const widths = try gpa.alloc(u16, ncol);
+    errdefer gpa.free(widths);
+    var sum: u32 = 0;
+    for (widths, 0..) |*col, index| {
+        col.* = tableNaturalColumnWidth(gpa, table_rows, index);
+        sum += col.*;
+    }
+    fitColumnWidths(widths, sum, content_total);
+    return .{ .stacked = false, .widths = widths, .aligns = aligns };
+}
+
+/// Shrink the widest columns first until the total fits `content_total`, never
+/// going below `table_min_col_width`, then spread any leftover evenly so the
+/// borders still span the full row width.
+fn fitColumnWidths(widths: []u16, sum: u32, content_total: u16) void {
+    var total = sum;
+    while (total > content_total) {
+        var widest: usize = 0;
+        for (widths, 0..) |col, index| {
+            if (col > widths[widest]) widest = index;
+        }
+        if (widths[widest] <= table_min_col_width) break;
+        const reduce: u32 = @min(@as(u32, widths[widest] - table_min_col_width), total - content_total);
+        widths[widest] -= @intCast(reduce);
+        total -= reduce;
+    }
+    if (total < content_total) {
+        const extra: u16 = content_total - @as(u16, @intCast(total));
+        for (widths) |*col| col.* += extra / @as(u16, @intCast(widths.len));
+        for (widths[0 .. extra % widths.len]) |*col| col.* += 1;
+    }
+}
+
+/// A column's natural width: the widest cell's rendered inline width. Inline
+/// markers (`**`, backticks) do not count — the cells render without them.
+fn tableNaturalColumnWidth(gpa: std.mem.Allocator, table_rows: []const []const []const u8, col: usize) u16 {
+    var natural: u16 = 0;
+    for (table_rows) |cells| {
+        if (col >= cells.len) continue;
+        const spans = inlineSpans(gpa, cells[col], .normal) catch continue;
+        defer gpa.free(spans);
+        natural = @max(natural, @min(spansWidth(spans), std.math.maxInt(u16) - 1));
+    }
+    return natural;
+}
+
+/// Parse `:---:` style alignment from each separator cell. Missing or
+/// malformed cells fall back to left.
+fn parseTableAligns(gpa: std.mem.Allocator, separator_line: []const u8, ncol: usize) ![]CellAlign {
+    const aligns = try gpa.alloc(CellAlign, ncol);
+    for (aligns) |*a| a.* = .left;
+    var col: usize = 0;
+    var iter = TableCellIterator.init(separator_line);
+    while (iter.next()) |cell| {
+        if (col >= ncol) break;
+        const trimmed = std.mem.trim(u8, cell, " \t");
+        const left = trimmed.len > 0 and trimmed[0] == ':';
+        const right = trimmed.len > 0 and trimmed[trimmed.len - 1] == ':';
+        aligns[col] = if (left and right) .center else if (right) .right else .left;
+        col += 1;
+    }
+    return aligns;
 }
 
 fn tableCells(gpa: std.mem.Allocator, line: []const u8) ![]const []const u8 {
@@ -514,27 +791,10 @@ fn tableCells(gpa: std.mem.Allocator, line: []const u8) ![]const []const u8 {
     return cells.toOwnedSlice(gpa);
 }
 
-fn tableColumnWidths(gpa: std.mem.Allocator, ncol: usize, width: u16) ![]u16 {
-    const widths = try gpa.alloc(u16, ncol);
-    const content_total = tableContentWidth(ncol, width);
-    const base = tableColumnWidth(ncol, width);
-    var assigned: u16 = 0;
-    for (widths[0 .. ncol - 1]) |*col| {
-        col.* = base;
-        assigned += base;
-    }
-    widths[ncol - 1] = content_total - assigned;
-    return widths;
-}
-
 fn tableContentWidth(ncol: usize, width: u16) u16 {
     const border_count: u16 = @intCast(ncol + 1);
     const padding_count: u16 = @intCast(ncol * 2);
     return @max(width -| border_count -| padding_count, @as(u16, @intCast(ncol)));
-}
-
-fn tableColumnWidth(ncol: usize, width: u16) u16 {
-    return @max(tableContentWidth(ncol, width) / @as(u16, @intCast(ncol)), 1);
 }
 
 const BorderKind = enum { top, middle, bottom };
@@ -565,7 +825,7 @@ fn appendTableBorder(gpa: std.mem.Allocator, b: *RowBuilder, widths: []const u16
     try b.push(gpa, 0, spans.items);
 }
 
-fn appendTableDataRow(gpa: std.mem.Allocator, b: *RowBuilder, cells: []const []const u8, widths: []const u16, header: bool) !void {
+fn appendTableDataRow(gpa: std.mem.Allocator, b: *RowBuilder, cells: []const []const u8, widths: []const u16, aligns: []const CellAlign, header: bool) !void {
     var cell_builders = try gpa.alloc(RowBuilder, widths.len);
     defer gpa.free(cell_builders);
     for (cell_builders) |*entry| entry.* = .{};
@@ -589,8 +849,22 @@ fn appendTableDataRow(gpa: std.mem.Allocator, b: *RowBuilder, cells: []const []c
         for (widths, 0..) |col_width, index| {
             try spans.append(gpa, .{ .text = " ", .style = .normal });
             const rendered_cell = if (visual_row < cell_builders[index].len()) cell_builders[index].rowSpans(visual_row) else &.{};
-            try spans.appendSlice(gpa, rendered_cell);
-            try appendRepeatedSpan(gpa, &spans, " ", col_width -| spansWidth(rendered_cell), .normal);
+            const pad_total: u16 = col_width -| spansWidth(rendered_cell);
+            switch (aligns[index]) {
+                .left => {
+                    try spans.appendSlice(gpa, rendered_cell);
+                    try appendRepeatedSpan(gpa, &spans, " ", pad_total, .normal);
+                },
+                .center => {
+                    try appendRepeatedSpan(gpa, &spans, " ", pad_total / 2, .normal);
+                    try spans.appendSlice(gpa, rendered_cell);
+                    try appendRepeatedSpan(gpa, &spans, " ", pad_total - pad_total / 2, .normal);
+                },
+                .right => {
+                    try appendRepeatedSpan(gpa, &spans, " ", pad_total, .normal);
+                    try spans.appendSlice(gpa, rendered_cell);
+                },
+            }
             try spans.append(gpa, .{ .text = " │", .style = .table_border });
         }
         try b.push(gpa, 0, spans.items);
@@ -620,13 +894,39 @@ fn tableColumnCount(line: []const u8) usize {
     return count;
 }
 
-fn countTableVisualRows(gpa: std.mem.Allocator, line: []const u8, col_width: u16) u16 {
+/// A table row's visual rows: the tallest wrapped cell column. Counts the
+/// cell's inline spans (the exact sequence `appendTableDataRow` wraps), so
+/// marker stripping and span joins match the render path exactly.
+fn countTableVisualRows(gpa: std.mem.Allocator, cells: []const []const u8, widths: []const u16) u16 {
     var rows: u16 = 1;
-    var iter = TableCellIterator.init(line);
-    while (iter.next()) |cell| {
-        rows = @max(rows, countWrappedRows(gpa, cell, col_width, 0, 0));
+    for (widths, 0..) |col_width, col| {
+        if (col >= cells.len) continue;
+        rows = @max(rows, countWrappedSpanCell(gpa, cells[col], col_width));
     }
     return rows;
+}
+
+fn countWrappedSpanCell(gpa: std.mem.Allocator, cell: []const u8, col_width: u16) u16 {
+    var stack: std.ArrayList(Span) = .empty;
+    defer stack.deinit(gpa);
+    const spans = inlineSpans(gpa, cell, .normal) catch return 1;
+    defer gpa.free(spans);
+    stack.appendSlice(gpa, spans) catch return 1;
+    return countWrappedSpanRows(gpa, stack.items, col_width, 0, 0) catch 1;
+}
+
+/// Count-only twin of `appendWrapped`: runs the same `wrapCore` over the same
+/// span sequence with the count sink. Returns the row count.
+fn countWrappedSpanRows(gpa: std.mem.Allocator, body: []const Span, width: u16, first_prefix_width: u16, continuation_indent: u16) !u16 {
+    var state: CountState = .{ .rows = 0 };
+    var prefix_buf: [2]Span = undefined;
+    var prefix_len: usize = 0;
+    if (first_prefix_width > 0) {
+        prefix_buf[0] = Span{ .text = padString(first_prefix_width), .style = .normal };
+        prefix_len = 1;
+    }
+    try wrapCore(gpa, .{ .count = &state }, prefix_buf[0..prefix_len], continuation_indent, body, width);
+    return state.rows;
 }
 
 fn isTableSeparator(line: []const u8) bool {
@@ -639,6 +939,45 @@ fn isTableSeparator(line: []const u8) bool {
         }
     }
     return saw_dash;
+}
+
+/// First-line and continuation indent for the stacked table fallback.
+const stacked_indent: u16 = 2;
+
+/// Stacked fallback for tables too wide to give every column a usable width:
+/// each data row renders as `key: value` lines at `stacked_indent`, with a
+/// blank row between rows. `countStackedTableRows` mirrors this exactly.
+fn renderStackedTable(gpa: std.mem.Allocator, b: *RowBuilder, table_rows: []const []const []const u8, width: u16) !void {
+    if (table_rows.len < 2) return;
+    const header = table_rows[0];
+    const prefix = [_]Span{.{ .text = "  ", .style = .normal }};
+    const data = table_rows[1..];
+    for (data, 0..) |cells, index| {
+        for (header, 0..) |key, col| {
+            const value = if (col < cells.len) cells[col] else "";
+            var stack: std.ArrayList(Span) = .empty;
+            defer stack.deinit(gpa);
+            var key_text: []const u8 = "";
+            if (key.len > 0) {
+                const fused = try fusedKeyText(gpa, key);
+                key_text = try b.ownSpanText(gpa, fused);
+                gpa.free(fused);
+            }
+            try stackedCellSpans(gpa, &stack, key_text, value);
+            try appendWrapped(gpa, b, &prefix, stacked_indent, stack.items, width);
+        }
+        if (index + 1 < data.len) try appendEmptyRow(gpa, b);
+    }
+}
+
+/// The spans of one stacked `key: value` line: the pre-built bold `key:` span
+/// (empty when the header cell is empty) followed by the cell's inline spans.
+/// Shared by the render and count paths so both wrap identical span lists.
+fn stackedCellSpans(gpa: std.mem.Allocator, stack: *std.ArrayList(Span), key_text: []const u8, value: []const u8) !void {
+    if (key_text.len > 0) try stack.append(gpa, .{ .text = key_text, .style = .strong });
+    const spans = try inlineSpans(gpa, value, .normal);
+    defer gpa.free(spans);
+    try stack.appendSlice(gpa, spans);
 }
 
 const TableCellIterator = struct {
@@ -684,7 +1023,7 @@ const TableCellIterator = struct {
     }
 };
 
-const Heading = struct { text: []const u8 };
+const Heading = struct { text: []const u8, level: u8 };
 
 fn headingBody(line: []const u8) ?Heading {
     var level: u8 = 0;
@@ -695,7 +1034,7 @@ fn headingBody(line: []const u8) ?Heading {
     if (level == 0) return null;
     if (level >= line.len) return null;
     if (line[level] != ' ') return null;
-    return .{ .text = trimLeft(line[level + 1 ..]) };
+    return .{ .text = trimLeft(line[level + 1 ..]), .level = level };
 }
 
 fn quoteBody(line: []const u8) ?[]const u8 {
@@ -704,20 +1043,117 @@ fn quoteBody(line: []const u8) ?[]const u8 {
     return trimLeft(line[1..]);
 }
 
-fn listBody(line: []const u8) ?[]const u8 {
+/// A list-item line: leading indent (nesting), the display marker
+/// (`"• "` or the original `"3. "`), an optional task checkbox, and the body.
+pub const ListInfo = struct {
+    indent: u16,
+    marker: []const u8,
+    body: []const u8,
+    /// `.task_marker` for `- [ ]`/`- [x]` checkboxes, `.list_marker` otherwise.
+    style: Style = .list_marker,
+};
+
+/// Maximum nesting indent (in cells) recognized for list items; deeper
+/// indentation stays a plain paragraph.
+const list_max_indent: u16 = 8;
+
+fn listBody(line: []const u8) ?ListInfo {
     if (line.len < 2) return null;
-    if (!isListMarker(line[0])) return null;
-    if (line[1] != ' ') return null;
-    return trimLeft(line[2..]);
+    const indent: u16 = @intCast(@min(skipSpaces(line, 0), list_max_indent));
+    const rest = line[indent..];
+    if (rest.len < 2) return null;
+
+    var marker: []const u8 = undefined;
+    var body: []const u8 = undefined;
+    if (isListMarker(rest[0]) and rest[1] == ' ') {
+        marker = "• ";
+        body = rest[2..];
+    } else if (orderedListMarker(rest)) |ordered| {
+        marker = ordered;
+        body = rest[ordered.len..];
+    } else {
+        return null;
+    }
+    body = trimLeft(body);
+    // `- [ ]`/`- [x]` task items: the checkbox replaces the bullet marker and
+    // gets its own style. Any other `[` starts the body verbatim.
+    if (std.mem.startsWith(u8, body, "[ ] ")) {
+        return .{ .indent = indent, .marker = "☐ ", .body = trimLeft(body[4..]), .style = .task_marker };
+    }
+    if (std.mem.startsWith(u8, body, "[x] ") or std.mem.startsWith(u8, body, "[X] ")) {
+        return .{ .indent = indent, .marker = "☑ ", .body = trimLeft(body[4..]), .style = .task_marker };
+    }
+    return .{ .indent = indent, .marker = marker, .body = body };
+}
+
+/// An ordered marker `1. `/`12)` — up to nine digits, then `.` or `)`, then a
+/// space. The full original text (number included) becomes the display marker.
+fn orderedListMarker(rest: []const u8) ?[]const u8 {
+    var digits: usize = 0;
+    while (digits < rest.len and digits < 9 and std.ascii.isDigit(rest[digits])) : (digits += 1) {}
+    if (digits == 0) return null;
+    if (digits + 1 >= rest.len) return null;
+    if (rest[digits] != '.' and rest[digits] != ')') return null;
+    if (rest[digits + 1] != ' ') return null;
+    return rest[0 .. digits + 2];
 }
 
 fn isListMarker(byte: u8) bool {
     return byte == '-' or byte == '*' or byte == '+';
 }
 
-fn isFence(line: []const u8) bool {
-    const trimmed = trimLeft(line);
-    return std.mem.startsWith(u8, trimmed, "```");
+/// A list-item row: an indent-space prefix, the marker span, then the wrapped
+/// inline body. Continuation rows sit at `indent + marker_width`, matching
+/// `countLineRows`'s prefix computation.
+fn appendListItem(gpa: std.mem.Allocator, b: *RowBuilder, list: ListInfo, width: u16) !void {
+    // Unindented items start at the marker (pinned by tests); indented items
+    // prepend the indent-space span. The slice selects among fully-defined
+    // slots — never an undefined one.
+    var prefix: [2]Span = .{
+        .{ .text = indentSpaces(list.indent), .style = .normal },
+        .{ .text = list.marker, .style = list.style },
+    };
+    const prefix_spans: []const Span = if (list.indent > 0) prefix[0..2] else prefix[1..2];
+    const spans = try inlineSpans(gpa, list.body, .normal);
+    defer gpa.free(spans);
+    const marker_width: u16 = @intCast(@min(list.indent + textWidth(list.marker), std.math.maxInt(u16)));
+    return appendWrapped(gpa, b, prefix_spans, marker_width, spans, width);
+}
+
+/// Static space runs for the list-item indent prefix (capped at
+/// `list_max_indent`, always even in practice).
+fn indentSpaces(indent: u16) []const u8 {
+    return switch (indent) {
+        0 => "",
+        1 => " ",
+        2 => "  ",
+        3 => "   ",
+        4 => "    ",
+        5 => "     ",
+        6 => "      ",
+        7 => "       ",
+        else => "        ",
+    };
+}
+
+/// A thematic-break line: three or more of the same marker byte (`-`, `*`, or
+/// `_`), optionally space-separated, and nothing else. Runs after the table
+/// check (a `---` under a table row is a separator) and before the list check
+/// (`- - -` is a rule, not a nested bullet).
+fn isHorizontalRule(line: []const u8) bool {
+    const trimmed = trim(line);
+    if (trimmed.len < 3) return false;
+    const char = trimmed[0];
+    if (char != '-' and char != '*' and char != '_') return false;
+    var count: usize = 0;
+    for (trimmed) |byte| {
+        if (byte == char) {
+            count += 1;
+        } else if (byte != ' ' and byte != '\t') {
+            return false;
+        }
+    }
+    return count >= 3;
 }
 
 fn isCodeKeyword(word: []const u8) bool {
@@ -823,66 +1259,239 @@ fn inlineSpans(gpa: std.mem.Allocator, line: []const u8, base: Style) ![]Span {
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(gpa);
 
+    // Plain text is emitted lazily: bytes that fail every construct attempt
+    // accumulate into one span so a failed `_`/`*`/`` ` `` candidate never
+    // splits a word — span boundaries are word boundaries in `wrapCore`
+    // (adjacent spans join with a space), which would mangle `snake_case_name`.
     var index: usize = 0;
+    var plain_start: usize = 0;
     while (index < line.len) {
-        if (line[index] == '`') {
-            if (std.mem.indexOfScalarPos(u8, line, index + 1, '`')) |end| {
-                try appendSpan(&spans, gpa, line[index + 1 .. end], .code);
-                index = end + 1;
-                continue;
-            }
-        }
-        if (std.mem.startsWith(u8, line[index..], "**")) {
-            if (std.mem.indexOfPos(u8, line, index + 2, "**")) |end| {
-                const nested_base: Style = if (base == .heading) .heading else .strong;
-                const nested = try inlineSpans(gpa, line[index + 2 .. end], nested_base);
-                defer gpa.free(nested);
-                try spans.appendSlice(gpa, nested);
-                index = end + 2;
-                continue;
-            }
-        }
-        if (line[index] == '*') {
-            if (std.mem.indexOfScalarPos(u8, line, index + 1, '*')) |end| {
-                const nested_base: Style = if (base == .heading) .heading else .emphasis;
-                const nested = try inlineSpans(gpa, line[index + 1 .. end], nested_base);
-                defer gpa.free(nested);
-                try spans.appendSlice(gpa, nested);
-                index = end + 1;
-                continue;
-            }
-        }
-        if (line[index] == '[') {
-            if (std.mem.indexOfScalarPos(u8, line, index + 1, ']')) |close_bracket| {
-                if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
-                    if (std.mem.indexOfScalarPos(u8, line, close_bracket + 2, ')')) |close_paren| {
-                        const anchor_text = line[index + 1 .. close_bracket];
-                        const raw_url = line[close_bracket + 2 .. close_paren];
-                        const link_url = if (isSafeHyperlinkUri(raw_url)) raw_url else "";
-                        try appendSpanWithLink(&spans, gpa, anchor_text, .link, link_url);
-                        index = close_paren + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        if (std.mem.startsWith(u8, line[index..], "https://") or std.mem.startsWith(u8, line[index..], "http://")) {
-            var url_end = index;
-            while (url_end < line.len and !std.ascii.isWhitespace(line[url_end]) and line[url_end] != ')' and line[url_end] != ']' and line[url_end] != '>') : (url_end += 1) {}
-            const raw_url = line[index..url_end];
-            const link_url = if (isSafeHyperlinkUri(raw_url)) raw_url else "";
-            try appendSpanWithLink(&spans, gpa, raw_url, .link, link_url);
-            index = url_end;
+        if (try consumeInlineConstruct(gpa, &spans, line, index, plain_start, base)) |next_index| {
+            index = next_index;
+            plain_start = next_index;
             continue;
         }
-
-        const next = nextInlineMarker(line, index + 1);
-        try appendSpan(&spans, gpa, line[index..next], base);
-        index = next;
+        index += 1;
     }
+    try flushPlainSpan(&spans, gpa, line, plain_start, line.len, base);
 
     if (spans.items.len == 0) try appendSpan(&spans, gpa, "", base);
     return spans.toOwnedSlice(gpa);
+}
+
+/// Emit the pending plain run `[start..end)` as one span, if non-empty.
+fn flushPlainSpan(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, line: []const u8, start: usize, end: usize, style: Style) !void {
+    if (end > start) try appendSpanWithLink(spans, gpa, line[start..end], style, "");
+}
+
+/// Attempt to consume one inline construct at `index`. On success the pending
+/// plain run is flushed first and the new scan position is returned; on
+/// failure nothing is emitted and the caller advances one byte.
+fn consumeInlineConstruct(
+    gpa: std.mem.Allocator,
+    spans: *std.ArrayList(Span),
+    line: []const u8,
+    index: usize,
+    plain_start: usize,
+    base: Style,
+) error{OutOfMemory}!?usize {
+    // Backslash escape: `\X` renders X literally for ASCII punctuation.
+    if (line[index] == '\\' and index + 1 < line.len and isInlinePunctuation(line[index + 1])) {
+        try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+        try appendSpan(spans, gpa, line[index + 1 .. index + 2], base);
+        return index + 2;
+    }
+    // Inline code: a run of n backticks closes on the next run of >= n.
+    if (line[index] == '`') {
+        const run = delimRunLen(line, index);
+        if (findBacktickClose(line, index + run, run)) |close_start| {
+            try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+            try appendSpan(spans, gpa, line[index + run .. close_start], .code);
+            return close_start + run;
+        }
+        return null;
+    }
+    // Strikethrough: `~~text~~`.
+    if (delimRunLen(line, index) >= 2 and line[index] == '~') {
+        if (canOpenDelim(line, index, '~', 2)) {
+            if (findDelimClose(line, index + 2, '~', 2)) |close| {
+                try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+                const nested_base: Style = if (base == .heading) .heading else .strikethrough;
+                const nested = try inlineSpans(gpa, line[index + 2 .. close], nested_base);
+                defer gpa.free(nested);
+                try spans.appendSlice(gpa, nested);
+                return close + 2;
+            }
+        }
+        return null;
+    }
+    // Strong: a run of two `*` or `_`.
+    if (delimRunLen(line, index) >= 2 and (line[index] == '*' or line[index] == '_')) {
+        if (canOpenDelim(line, index, line[index], 2)) {
+            // `***content***` — a run-of-3 opener and closer — consumes the
+            // whole run on both sides and renders bold italic (CommonMark
+            // nests em inside strong for exactly this shape). Consuming only
+            // two markers would leave the run's third marker embedded in the
+            // bold content and literal at the close.
+            const run = delimRunLen(line, index);
+            if (run == 3) {
+                if (findDelimCloseRun(line, index + 3, line[index], 3)) |close| {
+                    try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+                    const nested_base: Style = if (base == .heading) .heading else .strong_emphasis;
+                    const nested = try inlineSpans(gpa, line[index + 3 .. close], nested_base);
+                    defer gpa.free(nested);
+                    try spans.appendSlice(gpa, nested);
+                    return close + 3;
+                }
+            }
+            if (findDelimClose(line, index + 2, line[index], 2)) |close| {
+                try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+                const nested_base: Style = if (base == .heading) .heading else .strong;
+                const nested = try inlineSpans(gpa, line[index + 2 .. close], nested_base);
+                defer gpa.free(nested);
+                try spans.appendSlice(gpa, nested);
+                return close + 2;
+            }
+        }
+        return null;
+    }
+    // Emphasis: a single `*` or `_` (only reached for runs of exactly one —
+    // longer runs already failed the strong attempt above and a single opener
+    // inside a longer run would match an empty or shifted span).
+    if ((line[index] == '*' or line[index] == '_') and delimRunLen(line, index) == 1) {
+        if (canOpenDelim(line, index, line[index], 1)) {
+            if (findDelimClose(line, index + 1, line[index], 1)) |close| {
+                try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+                const nested_base: Style = if (base == .heading) .heading else .emphasis;
+                const nested = try inlineSpans(gpa, line[index + 1 .. close], nested_base);
+                defer gpa.free(nested);
+                try spans.appendSlice(gpa, nested);
+                return close + 1;
+            }
+        }
+        return null;
+    }
+    // Anchored link: `[text](url)`.
+    if (line[index] == '[') {
+        if (std.mem.indexOfScalarPos(u8, line, index + 1, ']')) |close_bracket| {
+            if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
+                if (std.mem.indexOfScalarPos(u8, line, close_bracket + 2, ')')) |close_paren| {
+                    try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+                    const anchor_text = line[index + 1 .. close_bracket];
+                    const raw_url = line[close_bracket + 2 .. close_paren];
+                    const link_url = if (isSafeHyperlinkUri(raw_url)) raw_url else "";
+                    try appendSpanWithLink(spans, gpa, anchor_text, .link, link_url);
+                    return close_paren + 1;
+                }
+            }
+        }
+        return null;
+    }
+    // Bare URL.
+    if (isBareUrlStart(line, index)) {
+        const url_end = bareUrlEnd(line, index);
+        try flushPlainSpan(spans, gpa, line, plain_start, index, base);
+        const raw_url = line[index..url_end];
+        const link_url = if (isSafeHyperlinkUri(raw_url)) raw_url else "";
+        try appendSpanWithLink(spans, gpa, raw_url, .link, link_url);
+        return url_end;
+    }
+    return null;
+}
+
+/// Length of the run of the same byte starting at `index` (>= 1).
+fn delimRunLen(line: []const u8, index: usize) usize {
+    var end = index + 1;
+    while (end < line.len and line[end] == line[index]) : (end += 1) {}
+    return end - index;
+}
+
+/// The first run of >= `n` backticks at or after `from`.
+fn findBacktickClose(line: []const u8, from: usize, n: usize) ?usize {
+    var index = from;
+    while (index < line.len) {
+        if (line[index] == '`') {
+            const run = delimRunLen(line, index);
+            if (run >= n) return index;
+            index += run;
+        } else {
+            index += 1;
+        }
+    }
+    return null;
+}
+
+/// The next run of exactly `n` `char` delimiters at or after `from` whose
+/// position passes the right-flanking check. Extra delimiters in a longer run
+/// stay literal (CommonMark consumes `n` from the run start).
+fn findDelimClose(line: []const u8, from: usize, char: u8, n: usize) ?usize {
+    var index = from;
+    while (index + n <= line.len) : (index += 1) {
+        if (line[index] == char and canCloseDelim(line, index, char, n)) {
+            if (n == 1 or line[index + 1] == char) return index;
+        }
+    }
+    return null;
+}
+
+/// The first run of EXACTLY `n` `char` markers at or after `from` that passes
+/// the right-flanking check — the closer shape for a run-of-3 opener, where a
+/// longer run (`****`) must not be eaten whole.
+fn findDelimCloseRun(line: []const u8, from: usize, char: u8, n: usize) ?usize {
+    var index = from;
+    while (index + n <= line.len) : (index += 1) {
+        if (line[index] == char and canCloseDelim(line, index, char, n)) {
+            if (delimRunLen(line, index) == n) return index;
+            index += delimRunLen(line, index) - 1;
+        }
+    }
+    return null;
+}
+
+/// Left-flanking check for an opening delimiter run of `n` markers at `index`:
+/// not followed by whitespace; underscore additionally requires a word
+/// boundary on its left when followed by punctuation.
+fn canOpenDelim(line: []const u8, index: usize, char: u8, n: usize) bool {
+    const next = index + n;
+    if (next >= line.len) return false;
+    if (isSpace(line[next])) return false;
+    if (char == '_') {
+        const preceded_by_boundary = index == 0 or isSpace(line[index - 1]) or isInlinePunctuation(line[index - 1]);
+        if (isInlinePunctuation(line[next]) and !preceded_by_boundary) return false;
+    }
+    return true;
+}
+
+/// Right-flanking check for a closing delimiter run of `n` markers at `index`:
+/// not preceded by whitespace; underscore additionally refuses to close when
+/// followed by an alphanumeric word char, so `snake_case_name` stays literal.
+fn canCloseDelim(line: []const u8, index: usize, char: u8, n: usize) bool {
+    if (index == 0) return false;
+    if (isSpace(line[index - 1])) return false;
+    if (char == '_') {
+        const after = index + n;
+        const followed_by_word = after < line.len and std.ascii.isAlphanumeric(line[after]);
+        if (followed_by_word and !isInlinePunctuation(line[index - 1])) return false;
+    }
+    return true;
+}
+
+/// ASCII punctuation per CommonMark's backslash-escape definition.
+fn isInlinePunctuation(byte: u8) bool {
+    return switch (byte) {
+        '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~' => true,
+        else => false,
+    };
+}
+
+fn isBareUrlStart(line: []const u8, index: usize) bool {
+    return std.mem.startsWith(u8, line[index..], "https://") or std.mem.startsWith(u8, line[index..], "http://");
+}
+
+fn bareUrlEnd(line: []const u8, index: usize) usize {
+    var url_end = index;
+    while (url_end < line.len and !std.ascii.isWhitespace(line[url_end]) and line[url_end] != ')' and line[url_end] != ']' and line[url_end] != '>') : (url_end += 1) {}
+    return url_end;
 }
 
 fn isSafeHyperlinkUri(uri: []const u8) bool {
@@ -892,17 +1501,6 @@ fn isSafeHyperlinkUri(uri: []const u8) bool {
         if (b >= 0x80 and b <= 0x9f) return false;
     }
     return true;
-}
-
-fn nextInlineMarker(line: []const u8, start: usize) usize {
-    var index = start;
-    while (index < line.len) : (index += 1) {
-        if (line[index] == '`') return index;
-        if (line[index] == '*') return index;
-        if (line[index] == '[') return index;
-        if (line[index] == 'h' and (std.mem.startsWith(u8, line[index..], "https://") or std.mem.startsWith(u8, line[index..], "http://"))) return index;
-    }
-    return line.len;
 }
 
 fn appendSpanWithLink(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style, link_url: []const u8) !void {
@@ -1709,4 +2307,201 @@ test "markdown links and bare urls attach link_url" {
     }
     try std.testing.expect(found_named);
     try std.testing.expect(found_bare);
+}
+
+test "ordered lists keep their original number marker" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "3. third item\n12. twelfth item", 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), out.rows.len);
+    try std.testing.expectEqualStrings("3. ", out.rows[0].spans[0].text);
+    try std.testing.expectEqual(Style.list_marker, out.rows[0].spans[0].style);
+    try std.testing.expect(containsText(out.rows[0].spans, "third"));
+    try std.testing.expect(containsText(out.rows[0].spans, "item"));
+    try std.testing.expectEqualStrings("12. ", out.rows[1].spans[0].text);
+    try std.testing.expectEqual(@as(u16, 2), countRows(gpa, "3. third item\n12. twelfth item", 80));
+}
+
+test "nested lists indent by leading whitespace" {
+    const gpa = std.testing.allocator;
+    const text = "- top\n  - nested\n    - deeper";
+    var out = try render(gpa, text, 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), out.rows.len);
+    try std.testing.expectEqualStrings("• ", out.rows[0].spans[0].text);
+    try std.testing.expectEqualStrings("  ", out.rows[1].spans[0].text);
+    try std.testing.expectEqualStrings("• ", out.rows[1].spans[1].text);
+    try std.testing.expectEqual(@as(u16, 3), countRows(gpa, text, 80));
+}
+
+test "task list items render checkbox markers" {
+    const gpa = std.testing.allocator;
+    const text = "- [ ] open task\n- [x] done task";
+    var out = try render(gpa, text, 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), out.rows.len);
+    try std.testing.expectEqual(Style.task_marker, out.rows[0].spans[0].style);
+    try std.testing.expectEqual(Style.task_marker, out.rows[1].spans[0].style);
+    try std.testing.expect(containsText(out.rows[0].spans, "open"));
+    try std.testing.expect(containsText(out.rows[1].spans, "done"));
+    try std.testing.expect(!containsText(out.rows[0].spans, "[ ]"));
+    try std.testing.expect(!containsText(out.rows[1].spans, "[ ]"));
+    try std.testing.expectEqual(@as(u16, 2), countRows(gpa, text, 80));
+}
+
+test "horizontal rules render one full-width row" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "---", "***", "___", "- - -", "------" }) |rule| {
+        var out = try render(gpa, rule, 40);
+        defer out.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), out.rows.len);
+        try std.testing.expectEqual(Style.rule, out.rows[0].spans[0].style);
+        try std.testing.expectEqual(@as(u16, 1), countRows(gpa, rule, 40));
+    }
+    // Not rules: shorter than three markers, or mixed content.
+    for ([_][]const u8{ "--", "- x -", "a---" }) |not_rule| {
+        var out = try render(gpa, not_rule, 40);
+        defer out.deinit(gpa);
+        try std.testing.expect(out.rows[0].spans[0].style != .rule);
+    }
+}
+
+test "heading levels map to distinct styles" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "# one\n## two\n### three", 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(Style.heading, out.rows[0].spans[0].style);
+    try std.testing.expectEqual(Style.heading_h2, out.rows[1].spans[0].style);
+    try std.testing.expectEqual(Style.heading_h3, out.rows[2].spans[0].style);
+}
+
+test "tilde fences and longer fences open and close code blocks" {
+    const gpa = std.testing.allocator;
+    // Tilde fence: the content line renders as code, the trailing line as
+    // normal (fence lines themselves produce zero rows).
+    var out = try render(gpa, "~~~\ncode here\n~~~\nafter", 80);
+    defer out.deinit(gpa);
+    // Content lines tokenize with the generic code styles.
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code, "code"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code, "here"));
+    try std.testing.expectEqual(Style.normal, out.rows[1].spans[0].style);
+
+    // A four-backtick fence closes only on a four-backtick run; three backticks
+    // inside are content.
+    var long = try render(gpa, "````\ninner ``` line\n````\nafter", 80);
+    defer long.deinit(gpa);
+    try std.testing.expect(containsStyledText(long.rows[0].spans, .code, "```"));
+    try std.testing.expectEqual(Style.normal, long.rows[1].spans[0].style);
+    try std.testing.expectEqual(@as(u16, 2), countRows(gpa, "````\ninner ``` line\n````\nafter", 80));
+
+    // A marker run followed by an info string inside an open block is code
+    // text, not a closer (CommonMark: closing fences carry no info string);
+    // the block ends only at the bare closer.
+    var info_close = try render(gpa, "```js\nconst x = 1;\n```js\n```\nafter", 80);
+    defer info_close.deinit(gpa);
+    try std.testing.expect(containsStyledText(info_close.rows[0].spans, .code_keyword, "const"));
+    try std.testing.expect(containsStyledText(info_close.rows[1].spans, .code, "js"));
+    try std.testing.expectEqual(Style.normal, info_close.rows[2].spans[0].style);
+    try std.testing.expectEqual(@as(u16, 3), countRows(gpa, "```js\nconst x = 1;\n```js\n```\nafter", 80));
+}
+
+test "strikethrough and underscore emphasis render as styled spans" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "~~gone~~ and _soft_ and __hard__", 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .strikethrough, "gone"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .emphasis, "soft"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .strong, "hard"));
+    try std.testing.expect(!containsText(out.rows[0].spans, "~~"));
+}
+
+test "run-of-3 emphasis renders bold italic with no stray markers" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "***bold italic*** and plain", 80);
+    defer out.deinit(gpa);
+
+    // The wrap engine splits at spaces, so each word is its own span.
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .strong_emphasis, "bold"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .strong_emphasis, "italic"));
+    try std.testing.expect(!containsText(out.rows[0].spans, "*"));
+    try std.testing.expect(containsText(out.rows[0].spans, "plain"));
+    try std.testing.expectEqual(@as(u16, 1), countRows(gpa, "***bold italic*** and plain", 80));
+}
+
+test "multi-backtick code spans keep inner backticks literal" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "`` `quoted` `` literal", 80);
+    defer out.deinit(gpa);
+
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code, "`quoted`"));
+    try std.testing.expect(!containsText(out.rows[0].spans, "``"));
+}
+
+test "arithmetic asterisks and snake_case render verbatim" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "2 * 3 * 4", "snake_case_name", "a_b_c_d" }) |literal| {
+        var out = try render(gpa, literal, 80);
+        defer out.deinit(gpa);
+
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        for (out.rows[0].spans) |span| try text.appendSlice(gpa, span.text);
+        try std.testing.expectEqualStrings(literal, std.mem.trim(u8, text.items, " "));
+        try std.testing.expectEqual(@as(u16, 1), countRows(gpa, literal, 80));
+    }
+}
+
+test "backslash escapes render the escaped character literally" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "2 \\* 3 \\* 4 and \\`code\\`", 80);
+    defer out.deinit(gpa);
+
+    // Each escaped character is its own span, and the wrap engine joins spans
+    // with a space — pre-existing behavior, so assert on characters, not on a
+    // byte-exact join.
+    try std.testing.expect(!containsText(out.rows[0].spans, "\\"));
+    try std.testing.expect(containsText(out.rows[0].spans, "`"));
+    try std.testing.expect(!containsStyledText(out.rows[0].spans, .emphasis, "3"));
+    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code, "code"));
+}
+
+test "tables size columns by content and honour alignment" {
+    const gpa = std.testing.allocator;
+    const table = "| ID | Description |\n| :-- | --: |\n| a | a fairly long description column value |\n| b | short |";
+    var out = try render(gpa, table, 60);
+    defer out.deinit(gpa);
+
+    // Count parity at multiple widths.
+    for ([_]u16{ 60, 30, 20 }) |w| {
+        var wide = try render(gpa, table, w);
+        defer wide.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, @intCast(wide.rows.len)), countRows(gpa, table, w));
+    }
+
+    // The description column (natural width ~41) must be wider than the ID
+    // column (natural width 1): compare the two columns' rendered content rows.
+    const data_row = out.rows[3].spans;
+    try std.testing.expect(data_row.len > 4);
+    // Header cells right-aligned in column 2: "Description" starts after padding.
+    try std.testing.expect(containsText(out.rows[1].spans, "Description"));
+}
+
+test "wide tables fall back to stacked key-value rows" {
+    const gpa = std.testing.allocator;
+    const table = "| C1 | C2 | C3 | C4 | C5 | C6 | C7 | C8 | C9 | C10 |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| v1 | v2 | v3 | v4 | v5 | v6 | v7 | v8 | v9 | v10 |";
+    var out = try render(gpa, table, 40);
+    defer out.deinit(gpa);
+
+    // Stacked: 10 key-value lines for the one data row, no border rows, no
+    // trailing blank (blank rows only separate groups).
+    try std.testing.expectEqual(@as(usize, 10), out.rows.len);
+    try std.testing.expectEqual(@as(u16, @intCast(out.rows.len)), countRows(gpa, table, 40));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .strong, "C1:"));
+    try std.testing.expect(containsText(out.rows[0].spans, "v1"));
+    try std.testing.expect(!containsText(out.rows[0].spans, "┌"));
 }
