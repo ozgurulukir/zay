@@ -15,14 +15,12 @@ const tool_policy = @import("tool_policy.zig");
 
 const assert = std.debug.assert;
 
-pub const loading_spinners = [12][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping", "Hailing the machine god", "Tokenmaxxing", "Uploading consciousness", "Brain dancing", "Resisting psychosis", "Wait a minute...", "beep... boop...", "Uhhh" };
-
 pub const TurnView = struct {
     agent_index: ?u32 = null,
     thinking_index: ?u32 = null,
-    /// Chosen when the turn starts. The spinner itself is synthetic and is
-    /// drawn outside the transcript while `activity == .awaiting_model`.
-    loading_word_index: u8 = 0,
+    /// Monotonic milliseconds when the current turn started (set by `reset`);
+    /// drives the elapsed-time segment of the loading row.
+    started_ms: i64 = 0,
     activity: Activity = .idle,
     tool_seen_in_response: bool = false,
     pending_redraw: bool = false,
@@ -44,8 +42,8 @@ pub const TurnView = struct {
     pub fn reset(self: *TurnView, io: std.Io) void {
         self.agent_index = null;
         self.thinking_index = null;
-        self.loading_word_index = chooseLoadingWordIndex(io);
         self.activity = .idle;
+        self.started_ms = std.Io.Clock.now(.awake, io).toMilliseconds();
         self.tool_seen_in_response = false;
         self.pending_redraw = false;
         self.tool_indexes.clearRetainingCapacity();
@@ -76,6 +74,38 @@ pub const TurnView = struct {
         }
     }
 
+    /// Human label for the current turn phase — the loading row's first
+    /// segment (issue #485: the row should say what is happening, not just
+    /// spin).
+    pub fn activityLabel(activity: Activity) []const u8 {
+        return switch (activity) {
+            .idle => "Working",
+            .awaiting_model => "Contacting model",
+            .thinking => "Thinking",
+            .writing_response => "Generating",
+            .calling_tools => "Running tools",
+        };
+    }
+
+    /// The informative loading row: "<phase> · <elapsed> · esc to cancel".
+    /// Pure; the caller supplies elapsed milliseconds read from `started_ms`
+    /// at props-build time, so the value refreshes with the existing tick
+    /// cadence and draw stays side-effect free.
+    pub fn formatProgressLabel(buf: []u8, activity: Activity, elapsed_ms: i64) []const u8 {
+        const seconds: i64 = @divTrunc(@max(elapsed_ms, 0), 1000);
+        if (seconds >= 60) {
+            return std.fmt.bufPrint(buf, "{s} · {d}m{d:0>2}s · esc to cancel", .{
+                activityLabel(activity),
+                @divTrunc(seconds, 60),
+                @as(u64, @intCast(@mod(seconds, 60))),
+            }) catch "Working";
+        }
+        return std.fmt.bufPrint(buf, "{s} · {d}s · esc to cancel", .{
+            activityLabel(activity),
+            @as(u64, @intCast(seconds)),
+        }) catch "Working";
+    }
+
     pub fn awaitingOutput(self: *const TurnView) bool {
         return self.activity == .awaiting_model;
     }
@@ -83,7 +113,6 @@ pub const TurnView = struct {
     /// Begin waiting for the next chunk of model output. The spinner is drawn
     /// outside the transcript; no transcript mutation.
     pub fn awaitModel(self: *TurnView) void {
-        assert(self.loading_word_index < loading_spinners.len);
         self.activity = .awaiting_model;
     }
 
@@ -492,7 +521,7 @@ pub const TurnView = struct {
         const is_diff = tool.display_kind == .diff;
         const render: transcript_mod.Render = if (is_diff) .diff else policy.render;
         try transcript.updateToolExpanded(gpa, index, tool.display_label, tool.display_expanded_label);
-        try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed, render);
+        try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed, render, tool.duration_ms, tool.exit_code);
         const expand = policy.expand_by_default or is_diff;
         transcript.setExpanded(index, expand);
         selectGeneratedMessage(transcript, index);
@@ -597,18 +626,6 @@ fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
 fn toolTitleMatchesText(title: []const u8, text: []const u8) bool {
     const prefix = "🛠  ";
     return std.mem.startsWith(u8, title, prefix) and std.mem.eql(u8, title[prefix.len..], text);
-}
-
-pub fn chooseLoadingWordIndex(io: std.Io) u8 {
-    assert(loading_spinners.len > 0);
-    // Note: @mod(nanoseconds, len) has a slight bias when 1e9 % len != 0
-    // (indices 0..(1e9 % len - 1) are marginally more likely). Negligible for
-    // visual variety at len=12 (bias ~4e-9). If len changes or uniformity
-    // becomes required, use a rejection-sampled range or seed from a wider
-    // clock field.
-    const timestamp: std.Io.Timestamp = .now(io, .awake);
-    const index = @mod(timestamp.nanoseconds, loading_spinners.len);
-    return @intCast(index);
 }
 
 test "skill tool invocation renders skill row on both Windows and POSIX" {
@@ -797,4 +814,21 @@ test "length cut appends an output notice row for both variants" {
     try std.testing.expectEqual(transcript_mod.MessageKind.notice, transcript.messages.items[1].mirror().kind);
     try std.testing.expectEqualStrings("output", transcript.messages.items[1].mirror().title);
     try std.testing.expectEqualStrings("model output hit the token limit — turn ended early; send a message to continue", transcript.messages.items[1].mirror().body);
+}
+
+test "formatProgressLabel shows phase, elapsed, and cancel hint" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Contacting model · 14s · esc to cancel",
+        TurnView.formatProgressLabel(&buf, .awaiting_model, 14_000),
+    );
+    try std.testing.expectEqualStrings(
+        "Running tools · 1m05s · esc to cancel",
+        TurnView.formatProgressLabel(&buf, .calling_tools, 65_000),
+    );
+    // Negative (clock skew) clamps to zero.
+    try std.testing.expectEqualStrings(
+        "Working · 0s · esc to cancel",
+        TurnView.formatProgressLabel(&buf, .idle, -5),
+    );
 }

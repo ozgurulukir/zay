@@ -22,6 +22,10 @@ pub const Match = struct {
     message_index: u32,
     role: []const u8,
     snippet: []const u8,
+    /// Byte range of the first query hit inside the message body (issue #484
+    /// highlight + scroll-to-match). Zero-width when unavailable.
+    start: usize = 0,
+    end: usize = 0,
 };
 
 pub const State = struct {
@@ -30,17 +34,28 @@ pub const State = struct {
     /// True when the palette filter is empty (the overlay shows a usage hint
     /// rather than a "No matching messages" row).
     filter_empty: bool = true,
+    /// The active query, kept alive after accept so the transcript draw path
+    /// can highlight the matched text until the next open/clear (issue #484).
+    /// Owned.
+    query: ?[]u8 = null,
 
-    pub fn reset(self: *State, gpa: std.mem.Allocator) void {
+    /// Clear the match list. `keep_query` preserves the highlight query across
+    /// the accept jump; a fresh open or close clears it.
+    pub fn reset(self: *State, gpa: std.mem.Allocator, keep_query: bool) void {
         self.freeSnippets(gpa);
         self.matches.clearRetainingCapacity();
         self.selection = 0;
         self.filter_empty = true;
+        if (!keep_query) {
+            if (self.query) |q| gpa.free(q);
+            self.query = null;
+        }
     }
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.freeSnippets(gpa);
         self.matches.deinit(gpa);
+        if (self.query) |q| gpa.free(q);
         self.* = undefined;
     }
 

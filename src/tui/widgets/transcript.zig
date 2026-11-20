@@ -39,6 +39,7 @@ pub const TranscriptWidget = struct {
     /// The active input has text — the splash yields its rows while typing.
     /// Computed at the construction site (INV-WIDGET-1 scalar).
     splash_suppressed: bool = false,
+    search_query: ?[]const u8 = null,
     /// Write-back: hit-test geometry for the "↓ new output" pill.
     new_output_rect_out: ?*?app_state.ChipRect = null,
 
@@ -69,6 +70,7 @@ pub const TranscriptWidget = struct {
             .splash_fills_viewport = splash_fills,
             .splash_viewport_height = self.thread.transcript_view_height,
             .splash_suppressed = self.splash_suppressed,
+            .search_query = self.search_query,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
         self.thread.transcript_list.item_count = @intCast(messages.len);
@@ -200,6 +202,7 @@ pub const MessageListBuilder = struct {
     splash_fills_viewport: bool = false,
     splash_viewport_height: u16 = 0,
     splash_suppressed: bool = false,
+    search_query: ?[]const u8 = null,
 
     pub fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
         _ = cursor;
@@ -216,6 +219,7 @@ pub const MessageListBuilder = struct {
             .splash_fills_viewport = self.splash_fills_viewport,
             .splash_viewport_height = self.splash_viewport_height,
             .splash_suppressed = self.splash_suppressed,
+            .search_query = self.search_query,
         };
         return body.widget();
     }

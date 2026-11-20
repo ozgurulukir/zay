@@ -109,7 +109,7 @@ pub fn cancelMode(app: *App) !bool {
         return true;
     }
     if (app.mode == .search) {
-        app.pickers.search.reset(app.gpa);
+        app.pickers.search.reset(app.gpa, false);
         app.setMode(.normal);
         return true;
     }

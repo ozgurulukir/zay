@@ -26,6 +26,7 @@ const diff_viewer_overlay = @import("diff_viewer_overlay.zig");
 const tui_status = @import("status.zig");
 const tx_widget = @import("widgets/transcript.zig");
 const loading = @import("widgets/loading.zig");
+const turn_view_mod = @import("turn_view.zig");
 const input_mod = @import("widgets/input.zig");
 const permission = @import("widgets/permission.zig");
 const background_jobs = @import("widgets/background_jobs.zig");
@@ -182,6 +183,7 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
         // Only the pane whose lane owns the shared input yields its splash;
         // sibling lanes keep theirs until their own first prompt.
         .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
+        .search_query = app.pickers.search.query,
         .title = title,
         .state_glyph = state_glyph,
         .ws_marker = ws_marker,
@@ -536,11 +538,18 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
         .blackhole_visible = &app.metrics.blackhole_visible,
         .splash_suppressed = app.inputs.input.buf.realLength() > 0,
+        .search_query = app.pickers.search.query,
         .new_output_rect_out = &app.nav.new_output_rect,
     };
+    var progress_buf: [128]u8 = undefined;
+    const progress_label: []const u8 = try ctx.arena.dupe(u8, turn_view_mod.TurnView.formatProgressLabel(
+        &progress_buf,
+        app.thread.turn_view.activity,
+        std.Io.Clock.now(.awake, app.getIo()).toMilliseconds() - app.thread.turn_view.started_ms,
+    ));
     var loading_view: loading.LoadingWidget = .{
         .awaiting_output = app.thread.turn_view.awaitingOutput(),
-        .word_index = app.thread.turn_view.loading_word_index,
+        .label = progress_label,
         .loading_frame = app.metrics.loading_frame,
     };
     var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
