@@ -83,6 +83,23 @@ pub fn copySelectedTranscriptBlock(app: *App) !bool {
     const text = mirror.body;
     if (text.len == 0) return false;
 
+    // A within-body selection (issue #487) copies just the selected logical
+    // bytes — unwrapped source text, no card margins or bar glyphs.
+    if (app.thread.transcript.body_selection) |selection| {
+        if (selection.message_index == selected_idx) {
+            const range = selection.range();
+            if (range[1] > range[0] and range[1] <= text.len) {
+                clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text[range[0]..range[1]]);
+                var sel_buf: [64]u8 = undefined;
+                const count = try std.fmt.bufPrint(&sel_buf, "{d}", .{range[1] - range[0]});
+                var notice_buf: [96]u8 = undefined;
+                const notice = std.fmt.bufPrint(&notice_buf, "Copied {s} selected bytes", .{count}) catch "Copied selection";
+                _ = try app.thread.transcript.append(app.gpa, .info, "clipboard", notice);
+                return true;
+            }
+        }
+    }
+
     clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
 
     var notice_buf: [256]u8 = undefined;

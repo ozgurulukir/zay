@@ -307,6 +307,24 @@ pub fn pushPromptHistory(self: *Thread, gpa: std.mem.Allocator, text: []const u8
 
 pub const HistoryDirection = enum { up, down };
 
+/// Reverse-i-search over the prompt history (issue #486): the most recent
+/// entry containing `filter` at or before `prompt_history_index`. Reuses
+/// `prompt_history_index` so Ctrl+Up/Down continue from the hit;
+/// `pushPromptHistory` resets it. `filter` may be empty (any entry).
+pub fn searchPromptHistoryBackward(self: *Thread, filter: []const u8) ?[]const u8 {
+    if (self.prompt_history.items.len == 0) return null;
+    var i: usize = self.prompt_history_index orelse self.prompt_history.items.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = self.prompt_history.items[i];
+        if (filter.len == 0 or std.mem.indexOf(u8, entry, filter) != null) {
+            self.prompt_history_index = i;
+            return entry;
+        }
+    }
+    return null;
+}
+
 pub fn navigatePromptHistory(self: *Thread, direction: HistoryDirection) ?[]const u8 {
     if (self.prompt_history.items.len == 0) return null;
     const len = self.prompt_history.items.len;
@@ -386,4 +404,25 @@ test "prompt history navigation cycles through saved prompts" {
     try std.testing.expectEqualStrings("first prompt", thread.navigatePromptHistory(.up).?);
     try std.testing.expectEqualStrings("second prompt", thread.navigatePromptHistory(.down).?);
     try std.testing.expectEqualStrings("", thread.navigatePromptHistory(.down).?);
+}
+
+test "searchPromptHistoryBackward filters by the current prompt text" {
+    const gpa = std.testing.allocator;
+    var thread: Thread = .{};
+    defer thread.deinit(gpa);
+
+    try thread.pushPromptHistory(gpa, "zig build test");
+    try thread.pushPromptHistory(gpa, "git status");
+    try thread.pushPromptHistory(gpa, "zig build test-plugin");
+
+    // Empty filter recalls the most recent entry.
+    try std.testing.expectEqual(@as(usize, 3), thread.prompt_history.items.len);
+    try std.testing.expectEqualStrings("zig build test-plugin", thread.searchPromptHistoryBackward("").?);
+    // Filtered repeats walk further back (reverse-i-search): the next older
+    // entry containing the filter — "git status" is skipped as a non-match.
+    try std.testing.expectEqualStrings("zig build test", thread.searchPromptHistoryBackward("zig").?);
+    // Exhausted matches return null (the index stays on the last hit).
+    try std.testing.expect(thread.searchPromptHistoryBackward("zig") == null);
+    // A non-matching filter from a fresh position finds nothing.
+    try std.testing.expect(thread.searchPromptHistoryBackward("nomatch") == null);
 }

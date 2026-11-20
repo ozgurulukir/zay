@@ -39,6 +39,7 @@ const BoundedList = @import("tui/bounded_list.zig").BoundedList;
 /// Maximum concurrent lanes (driver + 3 parallel workers).
 pub const max_threads: u32 = 4;
 const tui_metrics = @import("tui/metrics.zig");
+const input_undo = @import("tui/input_undo.zig");
 const tui_layout = @import("tui/layout.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
@@ -243,6 +244,8 @@ pub const App = struct {
     /// Visual feedback state (loading spinner, black-hole intro, diff
     /// cache, git label) lives in MetricsState.
     metrics: app_state.MetricsState = .{},
+    /// Prompt undo/redo snapshots (issue #486), diffed on the UI tick.
+    input_undo: input_undo.InputUndo = .{},
     list_widgets: app_state.ListWidgets = .{},
     /// What the `Mode.lanes` overlay is doing: managing parked worktrees
     /// (`/lanes`, M/X) or choosing a merge destination (`/merge`, Enter).

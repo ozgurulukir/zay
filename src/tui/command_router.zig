@@ -36,6 +36,7 @@ const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
 const plugin_store_job = @import("plugin_store_job.zig");
 const plugin_store = @import("../plugin_store.zig");
+const transcript_mod = @import("../transcript.zig");
 const log = std.log.scoped(.tui);
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
@@ -490,6 +491,19 @@ pub const Transcript = struct {
         if (key.matches(vaxis.Key.down, .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .alt = true })) {
             if (try app.navigatePromptHistory(.down)) return true;
         }
+        // Reverse-i-search (issue #486): Ctrl+R recalls the most recent
+        // history entry containing the current prompt text; repeat presses
+        // walk further back (prompt_history_index carries the position).
+        if (key.matches('r', .{ .ctrl = true })) {
+            const filter = try app.peekInput();
+            defer app.gpa.free(filter);
+            if (app.thread.searchPromptHistoryBackward(filter)) |entry| {
+                app.clearInput();
+                try app.inputs.input.insertSliceAtCursor(entry);
+                return true;
+            }
+            return false;
+        }
         // R2.8a: @-mention popup owns up/down while active.
         if (try MentionPopup.handle(app, key)) return true;
         // R2.8b: block navigation owns shift+down and plain up/down.
@@ -540,6 +554,21 @@ pub const BlockNav = struct {
             if (key.matches('a', .{})) {
                 app.toggleAllTranscriptBlocks();
                 return true;
+            }
+            // Shift+arrows extend a within-body selection over the selected
+            // message (issue #487); 'y' then copies just the selection.
+            const selection_direction: ?transcript_mod.BodySelectionStep = if (key.matches(vaxis.Key.left, .{ .shift = true }))
+                .left
+            else if (key.matches(vaxis.Key.right, .{ .shift = true }))
+                .right
+            else if (key.matches(vaxis.Key.up, .{ .shift = true }))
+                .up
+            else if (key.matches(vaxis.Key.down, .{ .shift = true }))
+                .down
+            else
+                null;
+            if (selection_direction) |direction| {
+                return app.thread.transcript.extendBodySelection(direction);
             }
         }
         if (key.matches(vaxis.Key.page_up, .{})) {

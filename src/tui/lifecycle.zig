@@ -44,6 +44,7 @@ const max_threads = tui.max_threads;
 /// Called once at clean exit (or when switching to a new `initRuntime` session).
 pub fn deinitApp(self: *App) void {
     log.info("shutdown.app.begin", .{});
+    self.input_undo.deinit(self.gpa);
     std.debug.assert(self.threads.len() > 0);
     std.debug.assert(self.threads.len() <= max_threads);
 
@@ -232,6 +233,9 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
 
     var visible_change = try serviceGitLabelRefresh(root.app);
     visible_change = try drainAgentEvents(root, ctx) or visible_change;
+    // Prompt undo snapshots (issue #486): diff the buffer on the tick so no
+    // edit path needs interception.
+    visible_change = root.app.input_undo.observe(root.app, std.Io.Clock.now(.awake, root.app.getIo()).toMilliseconds()) or visible_change;
     // Converge interrupted turns whose async teardown finished (after events,
     // so the worker's terminal event drives the machine's own transition when
     // it wins the race; the drain then only checkpoints and restarts).
