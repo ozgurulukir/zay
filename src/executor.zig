@@ -73,6 +73,11 @@ pub const ToolResult = struct {
     stderr: ?[]u8,
     /// Human channel — overrides body styling to red at draw time.
     failed: bool,
+    /// Human channel — wall time the call took (0 = unknown); displayed in
+    /// the collapsed tool title (issue #488).
+    duration_ms: u32 = 0,
+    /// Human channel — process exit code (0 for success or non-shell tools).
+    exit_code: u8 = 0,
     /// The tool completed an asynchronous handoff; do not ask the model for
     /// another response in this turn.
     end_turn: bool = false,
@@ -144,6 +149,8 @@ pub const ToolResult = struct {
         /// Copied by value.
         display_kind: tools.DisplayKind = .text,
         failed: bool = false,
+        duration_ms: u32 = 0,
+        exit_code: u8 = 0,
         end_turn: bool = false,
     };
 
@@ -171,6 +178,8 @@ pub const ToolResult = struct {
             .display_kind = spec.display_kind,
             .stderr = stderr,
             .failed = spec.failed,
+            .duration_ms = spec.duration_ms,
+            .exit_code = spec.exit_code,
             .end_turn = spec.end_turn,
         };
     }
@@ -430,6 +439,7 @@ pub const ExecutorService = struct {
     /// path (MCP tools are materialized as `Tool` records by
     /// `mcp/registry_bridge.zig` and synced into the registry on connect).
     fn dispatchCall(self: *ExecutorService, call: ai.ToolCall, classified: ?executor_safety.ClassifiedCommand) !ToolResult {
+        const started_ms: i64 = std.Io.Clock.now(.awake, self.io).toMilliseconds();
         // Registry-dispatched tools can't receive the gate's mint as a
         // parameter (the fixed `Tool.run` signature), so it travels through
         // the tool context for the duration of this dispatch and is cleared
@@ -494,6 +504,8 @@ pub const ExecutorService = struct {
                 .text, .none => .text,
             },
             .failed = output.code != 0,
+            .duration_ms = @intCast(@min(@max(std.Io.Clock.now(.awake, self.io).toMilliseconds() - started_ms, 0), std.math.maxInt(u32))),
+            .exit_code = output.code,
             .end_turn = output.end_turn,
         });
     }

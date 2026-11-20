@@ -1545,20 +1545,9 @@ test "with animations off spinner does not advance even during active turn" {
     try std.testing.expectEqual(@as(u32, 0), root.spinner_tick_accum);
 }
 
-test "chooseLoadingWordIndex returns a valid spinner index" {
-    const index = turn_view_mod.chooseLoadingWordIndex(std.testing.io);
-    try std.testing.expect(index < turn_view_mod.loading_spinners.len);
-}
-
-test "spawn path assigns the spinner word before awaitModel" {
-    // A fresh lane's turn view defaults to the first word (index 0); the spawn
-    // path (`startTurnForLane`) assigns a fresh one via `chooseLoadingWordIndex`
-    // before `awaitModel`, so every spawned lane doesn't show "Firing Neurons".
+test "spawn path arms awaitModel on the turn view" {
     var lane: Thread = .{};
-    const chosen = turn_view_mod.chooseLoadingWordIndex(std.testing.io);
-    lane.turn_view.loading_word_index = chosen;
     lane.turn_view.awaitModel();
-    try std.testing.expect(lane.turn_view.loading_word_index < turn_view_mod.loading_spinners.len);
     try std.testing.expect(lane.turn_view.awaitingOutput());
 }
 
@@ -4007,7 +3996,7 @@ test "collapsed tool messages render no body text" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "printf hello");
-    try transcript.finishTool(gpa, index, "hello", null, false, .plain);
+    try transcript.finishTool(gpa, index, "hello", null, false, .plain, 0, 0);
 
     try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
     try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[index], 80));
@@ -4164,7 +4153,7 @@ test "search matches are case-insensitive substrings over user, agent, and tool 
     _ = try app.thread.transcript.append(gpa, .user, "you", "Fix the flaky SESSION resume");
     _ = try app.thread.transcript.append(gpa, .agent, "agent", "I will look at the session code");
     const tool = try app.thread.transcript.startTool(gpa, "grep session");
-    try app.thread.transcript.finishTool(gpa, tool, "output line\nmore output", null, false, .plain);
+    try app.thread.transcript.finishTool(gpa, tool, "output line\nmore output", null, false, .plain, 0, 0);
 
     // Empty query → hint state, no matches.
     try search_lifecycle.rebuildMatches(&app, "");

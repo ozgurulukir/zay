@@ -11,15 +11,13 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui_message = @import("message.zig");
-const tui_turn_view = @import("../turn_view.zig");
-
-const loading_spinners = tui_turn_view.loading_spinners;
-
 pub const LoadingWidget = struct {
     /// True while the lane's turn is streaming — the spinner only draws then.
     awaiting_output: bool,
-    /// Current spinner word (`turn_view.loading_word_index`).
-    word_index: u8,
+    /// The informative progress label built at props time
+    /// ("<phase> · <elapsed> · esc to cancel", `turn_view.formatProgressLabel`)
+    /// — replaces the bare spinner word (issue #485).
+    label: []const u8,
     /// Animation frame counter (`metrics.loading_frame`).
     loading_frame: u8,
 
@@ -40,8 +38,7 @@ pub const LoadingWidget = struct {
         });
         if (height > 0 and self.awaiting_output) {
             var row: u16 = if (height > 1) 1 else 0;
-            const word = loading_spinners[self.word_index];
-            tui_message.MessageWidget.drawLoading(&surface, word, self.loading_frame, &row, ctx);
+            tui_message.MessageWidget.drawLoading(&surface, self.label, self.loading_frame, &row, ctx);
         }
         return surface;
     }

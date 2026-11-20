@@ -87,8 +87,36 @@ pub const ToolView = struct {
     /// `expanded_title` is kept intact because `toolDisplayMatches` compares it,
     /// so this is what draw/metrics display when expanded.
     expanded_title_formatted: ?[]u8 = null,
+    /// Wall time the finished call took (0 = unknown, e.g. resumed sessions).
+    duration_ms: u32 = 0,
+    /// Process exit code carried by shell-type tools (0 for success/other).
+    exit_code: u8 = 0,
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
+    /// The collapsed-title suffix for a finished tool: " · 1.2s" (duration
+    /// when known) and " · exit 2" for non-zero exit codes. Draw
+    /// (message.zig drawToolTitle) and the row counter (metrics toolTitleRows)
+    /// both route through `titledWithSuffix`, so wrap-width math can never
+    /// diverge between the two.
+    pub fn titleSuffix(self: *const ToolView, buf: []u8) ?[]const u8 {
+        if (self.running) return null;
+        if (self.duration_ms == 0 and (self.exit_code == 0 or !self.failed)) return null;
+        var duration_buf: [24]u8 = undefined;
+        const duration = formatToolDuration(&duration_buf, self.duration_ms);
+        if (self.failed and self.exit_code != 0) {
+            return std.fmt.bufPrint(buf, " · exit {d} · {s}", .{ self.exit_code, duration }) catch null;
+        }
+        return std.fmt.bufPrint(buf, " · {s}", .{duration}) catch null;
+    }
+
+    /// `base` with `titleSuffix` appended; returns `base` unchanged when no
+    /// suffix applies or the buffer is too small (both consumers share the
+    /// fallback, so the texts stay identical).
+    pub fn titledWithSuffix(self: *const ToolView, buf: []u8, base: []const u8) []const u8 {
+        var suffix_buf: [48]u8 = undefined;
+        const suffix = self.titleSuffix(&suffix_buf) orelse return base;
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ base, suffix }) catch base;
+    }
 };
 
 /// One entry in the conversation transcript. Variants make illegal
@@ -523,12 +551,16 @@ pub const Transcript = struct {
         stderr_body: ?[]const u8,
         failed: bool,
         render: Render,
+        duration_ms: u32,
+        exit_code: u8,
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.* == .tool);
         const t = &message.tool;
         t.running = false;
+        t.duration_ms = duration_ms;
+        t.exit_code = exit_code;
         // Display normalization at the ingestion boundary: tabs expand, ANSI
         // sequences and controls are cleaned, so draw, row counting, and the
         // persisted parts all see the same bytes.
@@ -705,6 +737,23 @@ fn payloadToMessage(kind: MessageKind, payload: Basic) !Message {
     };
 }
 
+/// Compact wall-time label: "890ms", "1.2s", "1m05s", "12m". Falls back to
+/// "0s" for unknown (0) durations.
+pub fn formatToolDuration(buf: []u8, duration_ms: u32) []const u8 {
+    if (duration_ms == 0) return "0s";
+    if (duration_ms < 1000) return std.fmt.bufPrint(buf, "{d}ms", .{duration_ms}) catch "0s";
+    const seconds: u64 = duration_ms / 1000;
+    if (seconds < 60) {
+        const tenths: u64 = (duration_ms % 1000) / 100;
+        if (tenths == 0) return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "0s";
+        return std.fmt.bufPrint(buf, "{d}.{d}s", .{ seconds, tenths }) catch "0s";
+    }
+    const minutes: u64 = seconds / 60;
+    const rem: u64 = seconds % 60;
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ minutes, rem }) catch "0s";
+    return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ minutes / 60, minutes % 60 }) catch "0s";
+}
+
 fn appendOwned(gpa: std.mem.Allocator, target: *[]u8, suffix: []const u8) !void {
     if (suffix.len == 0) return;
     // `realloc` grows the buffer in place when the allocator's size class has
@@ -799,7 +848,7 @@ test "consecutive tools remain separate messages" {
     defer transcript.deinit(gpa);
 
     const first = try transcript.startTool(gpa, "ls");
-    try transcript.finishTool(gpa, first, "ls\n", null, false, .plain);
+    try transcript.finishTool(gpa, first, "ls\n", null, false, .plain, 0, 0);
     const second = try transcript.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
@@ -828,7 +877,7 @@ test "finishTool builds a json part and sets render" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "curl");
-    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain);
+    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain, 0, 0);
     const t = &transcript.messages.items[index].tool;
     try std.testing.expectEqual(Render.plain, t.render);
     try std.testing.expectEqual(@as(usize, 1), t.parts.len);
@@ -843,7 +892,7 @@ test "diff render yields a single diff part" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "git diff");
-    try transcript.finishTool(gpa, index, "+ added\n- removed", null, false, .diff);
+    try transcript.finishTool(gpa, index, "+ added\n- removed", null, false, .diff, 0, 0);
     const t = &transcript.messages.items[index].tool;
     try std.testing.expectEqual(Render.diff, t.render);
     try std.testing.expectEqual(@as(usize, 1), t.parts.len);
@@ -918,4 +967,36 @@ test "toggleAll expands and collapses all tool and thinking blocks" {
     transcript.toggleAll();
     try std.testing.expect(!transcript.messages.items[0].tool.expanded);
     try std.testing.expect(!transcript.messages.items[1].thinking.expanded);
+}
+
+test "formatToolDuration formats compact labels" {
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("0s", formatToolDuration(&buf, 0));
+    try std.testing.expectEqualStrings("890ms", formatToolDuration(&buf, 890));
+    try std.testing.expectEqualStrings("1.2s", formatToolDuration(&buf, 1200));
+    try std.testing.expectEqualStrings("2s", formatToolDuration(&buf, 2000));
+    try std.testing.expectEqualStrings("1m05s", formatToolDuration(&buf, 65_000));
+    try std.testing.expectEqualStrings("1h05m", formatToolDuration(&buf, 3_900_000));
+}
+
+test "tool title suffix shows duration and non-zero exit" {
+    const title = try std.testing.allocator.dupe(u8, "bash");
+    const body = try std.testing.allocator.dupe(u8, "");
+    defer std.testing.allocator.free(title);
+    defer std.testing.allocator.free(body);
+    var view: ToolView = .{ .title = title, .body = body };
+    var buf: [128]u8 = undefined;
+
+    // Running tools and unknown durations carry no suffix.
+    try std.testing.expectEqual(@as(?[]const u8, null), view.titleSuffix(&buf));
+    view.running = false;
+    try std.testing.expectEqual(@as(?[]const u8, null), view.titleSuffix(&buf));
+
+    view.duration_ms = 1200;
+    try std.testing.expectEqualStrings(" · 1.2s", view.titleSuffix(&buf).?);
+    try std.testing.expectEqualStrings("bash · 1.2s", view.titledWithSuffix(&buf, "bash"));
+
+    view.failed = true;
+    view.exit_code = 2;
+    try std.testing.expectEqualStrings(" · exit 2 · 1.2s", view.titleSuffix(&buf).?);
 }

@@ -145,6 +145,8 @@ pub fn emitToolCallFinished(
     display_kind: tools.DisplayKind,
     stderr: ?[]const u8,
     failed: bool,
+    duration_ms: u32,
+    exit_code: u8,
 ) !void {
     var transferred = false;
     const owned_id = try self.gpa.dupe(u8, call_id);
@@ -184,6 +186,8 @@ pub fn emitToolCallFinished(
             .display_kind = display_kind,
             .stderr = owned_stderr,
             .failed = failed,
+            .duration_ms = duration_ms,
+            .exit_code = exit_code,
         },
     });
 }
@@ -250,6 +254,8 @@ fn ExecutorBridge(comptime L: type) type {
                 result.display_kind,
                 result.stderr,
                 result.failed,
+                result.duration_ms,
+                result.exit_code,
             );
             ctx.tool_index += 1;
         }
@@ -411,6 +417,8 @@ test "emitToolCallFinished transfers ownership to listener and cleans up on erro
         .text,
         "stderr output",
         false,
+        0,
+        0,
     );
     try std.testing.expectError(error.SimulatedListenerFailure, err);
 }

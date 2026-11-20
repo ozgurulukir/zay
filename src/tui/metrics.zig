@@ -61,9 +61,9 @@ pub fn messageContentRows(message: *transcript_mod.Message, width: u16) u16 {
             1,
         .status => 1,
         .tool => |m| if (m.expanded)
-            toolTitleRows(toolMessageTitle(m), width) + toolBodyRows(m, width)
+            toolTitleRowsForView(m, width) + toolBodyRows(m, width)
         else
-            toolTitleRows(toolMessageTitle(m), width),
+            toolTitleRowsForView(m, width),
     };
 }
 
@@ -83,6 +83,16 @@ fn agentContentRows(message: *transcript_mod.Message, m: transcript_mod.Basic, w
 pub fn toolTitleRows(title: []const u8, width: u16) u16 {
     const indent: u16 = 3;
     return textRows(toolCommandTitle(title), width -| indent);
+}
+
+/// Row count for a tool's collapsed title including the duration/exit suffix
+/// — the same text `drawToolTitle` renders (both call `titledWithSuffix`).
+pub fn toolTitleRowsForView(message: transcript_mod.ToolView, width: u16) u16 {
+    var buf: [256]u8 = undefined;
+    const base = toolCommandTitle(toolMessageTitle(message));
+    const title = message.titledWithSuffix(&buf, base);
+    const indent: u16 = 3;
+    return textRows(title, width -| indent);
 }
 
 fn toolMessageTitle(message: transcript_mod.ToolView) []const u8 {
@@ -180,7 +190,7 @@ test "toolBodyRows equals the sum over parts text rows" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "curl");
-    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain);
+    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain, 0, 0);
     transcript.messages.items[index].tool.expanded = true;
     const t = transcript.messages.items[index].tool;
 

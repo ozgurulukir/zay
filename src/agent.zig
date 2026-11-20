@@ -367,6 +367,12 @@ pub const Agent = struct {
             display_kind: tools.DisplayKind = .text,
             stderr: ?[]const u8 = null,
             failed: bool = false,
+            /// Wall time the call took (0 = unknown); displayed in the
+            /// collapsed tool title (issue #488). Flat scalars — no deinit
+            /// impact.
+            duration_ms: u32 = 0,
+            /// Process exit code (0 for success or non-shell tools).
+            exit_code: u8 = 0,
         };
 
         pub fn deinit(self: *Event, gpa: std.mem.Allocator) void {
@@ -709,7 +715,7 @@ test "stream callbacks do not double-free when the listener returns an error" {
     // emitToolDelta emits directly (no coalescing), so it propagates the
     // listener's error without double-freeing the owned name/arguments.
     try std.testing.expectError(error.TestFailure, tool_batch.emitToolDelta(Listener, &agent, context.listener, 0, "name", "args"));
-    try std.testing.expectError(error.TestFailure, tool_batch.emitToolCallFinished(Listener, &agent, context.listener, 0, "id", "name", "label", null, "body", .text, null, false));
+    try std.testing.expectError(error.TestFailure, tool_batch.emitToolCallFinished(Listener, &agent, context.listener, 0, "id", "name", "label", null, "body", .text, null, false, 0, 0));
 }
 
 test "run gates the request on the limiter and releases on the error path" {
