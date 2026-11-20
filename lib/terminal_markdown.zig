@@ -30,6 +30,16 @@ pub const Style = enum {
     code_string,
     code_comment,
     code_number,
+    /// Type-like identifiers (capitalized, or a language primitive).
+    code_type,
+    /// Call-position identifiers (`name(`).
+    code_function,
+    /// ALL_CAPS / true-false-null-style literals.
+    code_constant,
+    /// diff-mode `+` lines.
+    code_added,
+    /// diff-mode `-` lines.
+    code_removed,
 };
 
 pub const Span = struct {
@@ -228,11 +238,18 @@ fn lineAt(text: []const u8, start: usize) Line {
 pub const BlockState = struct {
     in_code: bool = false,
     code_lang: []const u8 = "",
-    /// The open fence's marker byte and minimum closing length (`"```"` → 0/0
-    /// when no fence is open). `` ~~~ `` fences and fences longer than three
-    /// markers only close on a run of the SAME marker at least as long.
+    /// The open fence's marker byte and minimum closing length (a "```" opener
+    /// leaves these 0/0 when no fence is open). Tilde fences and fences longer
+    /// than three markers only close on a run of the SAME marker at least as
+    /// long.
     fence_char: u8 = 0,
     fence_len: u8 = 0,
+    /// Tokenizer state inside the open code block: block comment
+    /// (slash-star, HTML angle-bracket comment) and multi-line string (triple
+    /// quote, Lua double bracket) carry across lines so both render paths
+    /// highlight consistently.
+    code_block_comment: bool = false,
+    code_block_string: bool = false,
 };
 
 /// A code-fence opener line: which marker byte and how long the run was.
@@ -277,6 +294,8 @@ fn applyFence(line: []const u8, state: *BlockState) FenceAction {
             state.code_lang = "";
             state.fence_char = 0;
             state.fence_len = 0;
+            state.code_block_comment = false;
+            state.code_block_string = false;
             return .closed;
         }
         // A non-matching fence line inside a code block is code content.
@@ -285,6 +304,8 @@ fn applyFence(line: []const u8, state: *BlockState) FenceAction {
     state.in_code = true;
     state.fence_char = fence.char;
     state.fence_len = fence.len;
+    state.code_block_comment = false;
+    state.code_block_string = false;
     const trimmed = trimLeft(line);
     state.code_lang = if (trimmed.len > fence.len)
         std.mem.trim(u8, trimmed[fence.len..], " \t\r")
@@ -429,7 +450,7 @@ fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u
     }
     if (line.len == 0) return appendEmptyRow(gpa, b);
     if (state.in_code) {
-        const spans = tokenizeCodeLine(gpa, line, state.code_lang) catch null;
+        const spans = tokenizeCodeLine(gpa, line, state.code_lang, state) catch null;
         if (spans) |s| {
             defer gpa.free(s);
             return appendWrapped(gpa, b, &.{}, 0, s, width);
@@ -1156,50 +1177,214 @@ fn isHorizontalRule(line: []const u8) bool {
     return count >= 3;
 }
 
-fn isCodeKeyword(word: []const u8) bool {
-    const keywords = [_][]const u8{
-        "pub",        "fn",        "const",    "var",     "return",      "if",       "else",   "while",     "for",    "switch",
-        "case",       "break",     "continue", "try",     "catch",       "orelse",   "struct", "enum",      "union",  "errdefer",
-        "defer",      "comptime",  "inline",   "test",    "unreachable", "error",    "export", "extern",    "align",  "async",
-        "await",      "suspend",   "resume",   "anytype", "anyerror",    "def",      "class",  "import",    "from",   "as",
-        "with",       "except",    "finally",  "lambda",  "pass",        "yield",    "raise",  "elif",      "then",   "fi",
-        "do",         "done",      "esac",     "local",   "let",         "function", "throw",  "interface", "type",   "extends",
-        "implements", "mut",       "impl",     "use",     "match",       "mod",      "trait",  "where",     "static", "void",
-        "int",        "char",      "bool",     "true",    "false",       "null",     "nil",    "None",      "self",   "this",
-        "new",        "undefined",
+/// Code-block highlight modes selected by the fence info string. Unknown
+/// languages fall back to a conservative generic mode that only highlights
+/// near-universal keywords, so words like `type`/`use`/`match` stay plain.
+const CodeMode = enum { generic, zig, python, shell, json, sql, lua, diff, html, rust, go, c, js };
+
+fn codeModeFor(lang: []const u8) CodeMode {
+    const aliases = [_]struct { mode: CodeMode, names: []const []const u8 }{
+        .{ .mode = .zig, .names = &.{ "zig", "zst" } },
+        .{ .mode = .python, .names = &.{ "python", "py", "py3" } },
+        .{ .mode = .shell, .names = &.{ "bash", "sh", "shell", "zsh", "console" } },
+        .{ .mode = .json, .names = &.{"json"} },
+        .{ .mode = .sql, .names = &.{ "sql", "postgres", "postgresql", "mysql", "sqlite" } },
+        .{ .mode = .lua, .names = &.{"lua"} },
+        .{ .mode = .diff, .names = &.{ "diff", "patch" } },
+        .{ .mode = .html, .names = &.{ "html", "xml" } },
+        .{ .mode = .rust, .names = &.{ "rust", "rs" } },
+        .{ .mode = .go, .names = &.{"go"} },
+        .{ .mode = .c, .names = &.{ "c", "h", "cpp", "hpp" } },
+        .{ .mode = .js, .names = &.{ "js", "ts", "javascript", "typescript", "jsx", "tsx" } },
     };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, word, kw)) return true;
+    for (aliases) |entry| {
+        for (entry.names) |name| {
+            if (std.ascii.eqlIgnoreCase(lang, name)) return entry.mode;
+        }
     }
-    return false;
+    return .generic;
 }
 
-fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8) ![]Span {
+/// Per-language keyword tables and comment syntax. A language absent here
+/// (and not aliased to a mode) uses the conservative `generic` table.
+const LangConfig = struct {
+    keywords: []const []const u8,
+    hash_comment: bool = false,
+    dash_comment: bool = false,
+    slash_comment: bool = false,
+    block_comment: bool = false,
+    /// Keyword matching is case-insensitive (SQL).
+    case_insensitive: bool = false,
+    /// Multi-line string delimiter (Lua `[[`).
+    multi_line_string: ?[]const u8 = null,
+};
+
+fn langConfig(mode: CodeMode) LangConfig {
+    return switch (mode) {
+        .zig => .{
+            .keywords = &.{
+                "pub",   "fn",       "const",    "var",     "return",      "if",     "else",   "while",  "for",   "switch",
+                "case",  "break",    "continue", "try",     "catch",       "orelse", "struct", "enum",   "union", "errdefer",
+                "defer", "comptime", "inline",   "test",    "unreachable", "error",  "export", "extern", "align", "async",
+                "await", "suspend",  "resume",   "anytype", "anyerror",    "type",   "void",   "bool",   "usize", "u8",
+                "u16",   "u32",      "u64",      "i8",      "i16",         "i32",    "i64",    "f32",    "f64",
+            },
+            .slash_comment = true,
+            .block_comment = false,
+        },
+        .python => .{
+            .keywords = &.{
+                "def",   "class", "import", "from", "as",  "with", "except", "finally", "lambda", "pass",
+                "yield", "raise", "elif",   "try",  "if",  "else", "while",  "for",     "return", "True",
+                "False", "None",  "and",    "or",   "not", "in",   "is",     "global",  "assert", "del",
+                "async", "await", "self",
+            },
+            .hash_comment = true,
+        },
+        .shell => .{
+            .keywords = &.{
+                "if",    "then",     "else",  "elif",   "fi",   "do",   "done",   "esac",   "for", "while",
+                "case",  "function", "local", "export", "echo", "exit", "return", "source", "set", "unset",
+                "until", "in",       "shift", "trap",
+            },
+            .hash_comment = true,
+        },
+        .json => .{
+            .keywords = &.{ "true", "false", "null" },
+        },
+        .sql => .{
+            .keywords = &.{
+                "select",  "from",       "where",    "insert", "into",  "update", "delete", "set",    "values",  "join",
+                "left",    "right",      "inner",    "outer",  "on",    "group",  "order",  "having", "limit",   "offset",
+                "union",   "all",        "as",       "and",    "or",    "not",    "null",   "is",     "in",      "between",
+                "like",    "exists",     "create",   "table",  "alter", "drop",   "index",  "view",   "primary", "key",
+                "foreign", "references", "distinct", "count",  "sum",   "avg",    "min",    "max",    "case",    "when",
+                "then",    "else",       "end",
+            },
+            .dash_comment = true,
+            .case_insensitive = true,
+        },
+        .lua => .{
+            .keywords = &.{
+                "local",  "function", "end",    "if",    "then", "else", "elseif", "for", "while", "do",
+                "return", "break",    "repeat", "until", "nil",  "true", "false",  "and", "or",    "not",
+                "in",     "goto",
+            },
+            .dash_comment = true,
+            .multi_line_string = "[[",
+        },
+        .diff, .html, .generic => .{
+            // Conservative fallback: only near-universal words highlight.
+            .keywords = &.{ "true", "false", "null", "nil", "None", "self", "this", "return", "if", "else", "for", "while" },
+            .slash_comment = true,
+        },
+        .rust => .{
+            .keywords = &.{
+                "fn",    "let",  "mut",   "const", "struct", "enum", "impl",   "trait", "use",      "pub",
+                "match", "if",   "else",  "while", "for",    "loop", "return", "break", "continue", "where",
+                "dyn",   "ref",  "move",  "async", "await",  "type", "as",     "in",    "mod",      "crate",
+                "self",  "Self", "super",
+            },
+            .slash_comment = true,
+            .block_comment = true,
+        },
+        .go => .{
+            .keywords = &.{
+                "func",   "var",    "const",       "type",  "struct", "interface", "map",    "chan",  "go",       "defer",
+                "if",     "else",   "for",         "range", "switch", "case",      "return", "break", "continue", "package",
+                "import", "select", "fallthrough", "goto",
+            },
+            .slash_comment = true,
+            .block_comment = true,
+        },
+        .c => .{
+            .keywords = &.{
+                "int",   "char", "float",   "double", "void",   "long",  "short",    "signed", "unsigned", "struct",
+                "union", "enum", "typedef", "static", "extern", "const", "volatile", "return", "if",       "else",
+                "while", "do",   "for",     "switch", "case",   "break", "continue", "goto",   "sizeof",   "inline",
+            },
+            .slash_comment = true,
+            .block_comment = true,
+        },
+        .js => .{
+            .keywords = &.{
+                "function", "var",    "let",        "const", "return", "if",      "else",  "while", "for",     "switch",
+                "case",     "break",  "continue",   "try",   "catch",  "finally", "throw", "class", "extends", "new",
+                "this",     "typeof", "instanceof", "in",    "of",     "async",   "await", "yield", "import",  "export",
+                "default",  "delete", "void",
+            },
+            .slash_comment = true,
+            .block_comment = true,
+        },
+    };
+}
+
+/// Highlight one code-block line for its language, carrying multi-line token
+/// state (block comments, Lua bracket strings, HTML comments) in `state`. The
+/// count path never tokenizes, so highlighting is row-count-neutral.
+fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8, state: *BlockState) ![]Span {
+    const mode = codeModeFor(lang);
+    if (mode == .json) return tokenizeJsonLine(gpa, line);
+    if (mode == .diff) return tokenizeDiffLine(gpa, line);
+    if (mode == .html) return tokenizeHtmlLine(gpa, line, state);
+
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(gpa);
-
     if (line.len == 0) return spans.toOwnedSlice(gpa);
 
-    const is_hash_comment_lang = blk: {
-        if (std.ascii.eqlIgnoreCase(lang, "python") or std.ascii.eqlIgnoreCase(lang, "py")) break :blk true;
-        if (std.ascii.eqlIgnoreCase(lang, "bash") or std.ascii.eqlIgnoreCase(lang, "sh")) break :blk true;
-        if (std.ascii.eqlIgnoreCase(lang, "yaml") or std.ascii.eqlIgnoreCase(lang, "yml")) break :blk true;
-        if (std.ascii.eqlIgnoreCase(lang, "toml")) break :blk true;
-        break :blk false;
-    };
+    const config = langConfig(mode);
 
     var i: usize = 0;
     while (i < line.len) {
-        // Comments:
-        if (is_hash_comment_lang and line[i] == '#') {
-            try appendSpan(&spans, gpa, line[i..], .code_comment);
-            break;
-        } else if (!is_hash_comment_lang and i + 1 < line.len and line[i] == '/' and line[i + 1] == '/') {
+        // Continuing a multi-line string (Lua brackets).
+        if (state.code_block_string) {
+            const end = std.mem.indexOf(u8, line[i..], "]]") orelse line.len;
+            const close_found = end < line.len - i;
+            const stop = i + end + (if (close_found) @as(usize, 2) else 0);
+            try appendSpan(&spans, gpa, line[i..stop], .code_string);
+            i = stop;
+            if (close_found) state.code_block_string = false;
+            continue;
+        }
+        // Continuing a block comment (slash-star).
+        if (state.code_block_comment) {
+            const end = std.mem.indexOf(u8, line[i..], "*/") orelse line.len;
+            const close_found = end < line.len - i;
+            const stop = i + end + (if (close_found) @as(usize, 2) else 0);
+            try appendSpan(&spans, gpa, line[i..stop], .code_comment);
+            i = stop;
+            if (close_found) state.code_block_comment = false;
+            continue;
+        }
+
+        // Comments: rest-of-line and block openers.
+        if ((config.hash_comment and line[i] == '#') or
+            (config.dash_comment and i + 1 < line.len and line[i] == '-' and line[i + 1] == '-') or
+            (config.slash_comment and i + 1 < line.len and line[i] == '/' and line[i + 1] == '/'))
+        {
             try appendSpan(&spans, gpa, line[i..], .code_comment);
             break;
         }
+        if (config.block_comment and i + 1 < line.len and line[i] == '/' and line[i + 1] == '*') {
+            const end = std.mem.indexOf(u8, line[i..], "*/") orelse line.len;
+            const close_found = end < line.len - i;
+            const stop = i + end + (if (close_found) @as(usize, 2) else 0);
+            try appendSpan(&spans, gpa, line[i..stop], .code_comment);
+            i = stop;
+            if (!close_found) state.code_block_comment = true;
+            continue;
+        }
 
-        // Strings:
+        // Strings: `"`, `'`, and Lua's bracket string.
+        if (config.multi_line_string != null and std.mem.startsWith(u8, line[i..], config.multi_line_string.?)) {
+            const end = std.mem.indexOf(u8, line[i + 2 ..], "]]") orelse line.len - i - 2;
+            const close_found = end < line.len - i - 2;
+            const stop = i + 2 + end + (if (close_found) @as(usize, 2) else 0);
+            try appendSpan(&spans, gpa, line[i..stop], .code_string);
+            i = stop;
+            if (!close_found) state.code_block_string = true;
+            continue;
+        }
         if (line[i] == '"' or line[i] == '\'') {
             const quote = line[i];
             var end = i + 1;
@@ -1219,13 +1404,13 @@ fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8) 
             continue;
         }
 
-        // Identifiers & keywords:
+        // Identifiers & keywords, with semantic fallbacks for the rest:
+        // call position -> function, ALL_CAPS -> constant, capitalized -> type.
         if (std.ascii.isAlphabetic(line[i]) or line[i] == '_') {
             var end = i + 1;
             while (end < line.len and (std.ascii.isAlphanumeric(line[end]) or line[end] == '_')) : (end += 1) {}
             const word = line[i..end];
-            const style: Style = if (isCodeKeyword(word)) .code_keyword else .code;
-            try appendSpan(&spans, gpa, word, style);
+            try appendSpan(&spans, gpa, word, identifierStyle(config, word, line, end));
             i = end;
             continue;
         }
@@ -1244,13 +1429,161 @@ fn tokenizeCodeLine(gpa: std.mem.Allocator, line: []const u8, lang: []const u8) 
         var end = i + 1;
         while (end < line.len) {
             const c = line[end];
-            if ((is_hash_comment_lang and c == '#') or (!is_hash_comment_lang and c == '/' and end + 1 < line.len and line[end + 1] == '/') or c == '"' or c == '\'' or std.ascii.isAlphanumeric(c) or c == '_') break;
+            if (c == '"' or c == '\'' or std.ascii.isAlphanumeric(c) or c == '_' or
+                (config.hash_comment and c == '#') or
+                (config.dash_comment and c == '-' and end + 1 < line.len and line[end + 1] == '-') or
+                (config.slash_comment and c == '/' and end + 1 < line.len and line[end + 1] == '/')) break;
             end += 1;
         }
         try appendSpan(&spans, gpa, line[i..end], .code);
         i = end;
     }
 
+    if (spans.items.len == 0) try appendSpan(&spans, gpa, "", .code);
+    return spans.toOwnedSlice(gpa);
+}
+
+/// Style for an identifier: keyword table first, then semantic heuristics —
+/// call position -> function, ALL_CAPS with an underscore -> constant (before
+/// the capitalized check, which would classify STATE_MAX as a type),
+/// capitalized -> type.
+fn identifierStyle(config: LangConfig, word: []const u8, line: []const u8, word_end: usize) Style {
+    for (config.keywords) |kw| {
+        const matched = if (config.case_insensitive)
+            std.ascii.eqlIgnoreCase(word, kw)
+        else
+            std.mem.eql(u8, word, kw);
+        if (matched) return .code_keyword;
+    }
+    if (word_end < line.len and line[word_end] == '(') return .code_function;
+    var all_caps = true;
+    for (word) |byte| {
+        if (std.ascii.isAlphabetic(byte) and std.ascii.isLower(byte)) all_caps = false;
+    }
+    if (all_caps and std.mem.indexOfScalar(u8, word, '_') != null) return .code_constant;
+    if (std.ascii.isUpper(word[0])) return .code_type;
+    return .code;
+}
+
+/// JSON code blocks: same token taxonomy as the tool-parts JSON view
+/// (punctuation/key/string/number/boolean/null) so both read alike.
+fn tokenizeJsonLine(gpa: std.mem.Allocator, line: []const u8) ![]Span {
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(gpa);
+    if (line.len == 0) return spans.toOwnedSlice(gpa);
+
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '"') {
+            var end = i + 1;
+            while (end < line.len) {
+                if (line[end] == '\\') {
+                    end = @min(end + 2, line.len);
+                    continue;
+                }
+                if (line[end] == '"') {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            // A string followed by a colon is a key.
+            var after = end;
+            while (after < line.len and std.ascii.isWhitespace(line[after])) after += 1;
+            const kind: Style = if (after < line.len and line[after] == ':') .code_function else .code_string;
+            try appendSpan(&spans, gpa, line[i..end], kind);
+            i = end;
+            continue;
+        }
+        if (std.ascii.isDigit(line[i]) or (line[i] == '-' and i + 1 < line.len and std.ascii.isDigit(line[i + 1]))) {
+            var end = i + 1;
+            while (end < line.len and (std.ascii.isDigit(line[end]) or line[end] == '.' or line[end] == 'e' or line[end] == 'E' or line[end] == '-' or line[end] == '+')) : (end += 1) {}
+            try appendSpan(&spans, gpa, line[i..end], .code_number);
+            i = end;
+            continue;
+        }
+        var literal_matched = false;
+        for ([_][]const u8{ "true", "false", "null" }) |literal| {
+            if (std.mem.startsWith(u8, line[i..], literal)) {
+                try appendSpan(&spans, gpa, literal, .code_constant);
+                i += literal.len;
+                literal_matched = true;
+                break;
+            }
+        }
+        if (!literal_matched) {
+            try appendSpan(&spans, gpa, line[i .. i + 1], .code);
+            i += 1;
+        }
+    }
+    if (spans.items.len == 0) try appendSpan(&spans, gpa, "", .code);
+    return spans.toOwnedSlice(gpa);
+}
+
+/// diff/patch blocks: whole-line coloring keyed on the line prefix.
+fn tokenizeDiffLine(gpa: std.mem.Allocator, line: []const u8) ![]Span {
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+    const style: Style = blk: {
+        if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) break :blk .code_comment;
+        if (std.mem.startsWith(u8, line, "@@")) break :blk .code_number;
+        if (std.mem.startsWith(u8, line, "+")) break :blk .code_added;
+        if (std.mem.startsWith(u8, line, "-")) break :blk .code_removed;
+        break :blk .code;
+    };
+    try appendSpan(&spans, gpa, line, style);
+    return spans.toOwnedSlice(gpa);
+}
+
+/// HTML/XML blocks: comments (carried across lines), tag names,
+/// and attribute-value strings.
+fn tokenizeHtmlLine(gpa: std.mem.Allocator, line: []const u8, state: *BlockState) ![]Span {
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(gpa);
+    if (line.len == 0) return spans.toOwnedSlice(gpa);
+
+    var i: usize = 0;
+    while (i < line.len) {
+        if (state.code_block_comment) {
+            const end = std.mem.indexOf(u8, line[i..], "-->") orelse line.len;
+            const close_found = end < line.len - i;
+            const stop = i + end + (if (close_found) @as(usize, 3) else 0);
+            try appendSpan(&spans, gpa, line[i..stop], .code_comment);
+            i = stop;
+            if (close_found) state.code_block_comment = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line[i..], "<!--")) {
+            const end = std.mem.indexOf(u8, line[i + 4 ..], "-->") orelse line.len - i - 4;
+            const close_found = end < line.len - i - 4;
+            const stop = i + 4 + end + (if (close_found) @as(usize, 3) else 0);
+            try appendSpan(&spans, gpa, line[i..stop], .code_comment);
+            i = stop;
+            if (!close_found) state.code_block_comment = true;
+            continue;
+        }
+        if (line[i] == '"') {
+            var end = i + 1;
+            while (end < line.len and line[end] != '"') : (end += 1) {}
+            end = @min(end + 1, line.len);
+            try appendSpan(&spans, gpa, line[i..end], .code_string);
+            i = end;
+            continue;
+        }
+        if (line[i] == '<') {
+            // Tag name up to whitespace / `>` / `/`.
+            var end = i + 1;
+            while (end < line.len and line[end] != ' ' and line[end] != '>' and line[end] != '/' and line[end] != '\t') : (end += 1) {}
+            try appendSpan(&spans, gpa, line[i .. i + 1], .code);
+            if (end > i + 1) try appendSpan(&spans, gpa, line[i + 1 .. end], .code_keyword);
+            i = end;
+            continue;
+        }
+        var end = i + 1;
+        while (end < line.len and line[end] != '"' and line[end] != '<') : (end += 1) {}
+        try appendSpan(&spans, gpa, line[i..end], .code);
+        i = end;
+    }
     if (spans.items.len == 0) try appendSpan(&spans, gpa, "", .code);
     return spans.toOwnedSlice(gpa);
 }
@@ -1491,16 +1824,43 @@ fn isBareUrlStart(line: []const u8, index: usize) bool {
 fn bareUrlEnd(line: []const u8, index: usize) usize {
     var url_end = index;
     while (url_end < line.len and !std.ascii.isWhitespace(line[url_end]) and line[url_end] != ')' and line[url_end] != ']' and line[url_end] != '>') : (url_end += 1) {}
+    // Trailing sentence punctuation is not part of the URL (a bare link to
+    // "https://x.test/a." does not include the final dot).
+    while (url_end > index and isTrailingUrlPunctuation(line[url_end - 1])) : (url_end -= 1) {}
     return url_end;
 }
 
+/// A hyperlink URI is emitted as an OSC 8 cell link only when it uses an
+/// allow-listed scheme and carries no control bytes. `javascript:`/`data:`/
+/// custom-scheme URIs from model output render as styled plain text instead of
+/// clickable links. `file:` is deliberately not allow-listed: verifying "an
+/// existing local path" needs filesystem access this pure leaf module must not
+/// perform, so file URIs render unlinked (the safe default).
 fn isSafeHyperlinkUri(uri: []const u8) bool {
     if (uri.len == 0 or uri.len > 2048) return false;
     for (uri) |b| {
         if (b < 0x20 or b == 0x7f) return false;
         if (b >= 0x80 and b <= 0x9f) return false;
     }
-    return true;
+    return allowedHyperlinkScheme(uri);
+}
+
+/// Case-insensitive scheme allow-list: `http:`, `https:`, `mailto:` (a scheme
+/// is `<name>:`; relative destinations have none and are not linked).
+fn allowedHyperlinkScheme(uri: []const u8) bool {
+    const schemes = [_][]const u8{ "http:", "https:", "mailto:" };
+    for (schemes) |scheme| {
+        if (uri.len >= scheme.len and std.ascii.eqlIgnoreCase(uri[0..scheme.len], scheme)) return true;
+    }
+    return false;
+}
+
+/// Sentence punctuation that is not part of a bare URL when it trails one.
+fn isTrailingUrlPunctuation(byte: u8) bool {
+    return switch (byte) {
+        '.', ',', ':', ';', '!', '?', '\'', '"', '*', '_', '~' => true,
+        else => false,
+    };
 }
 
 fn appendSpanWithLink(spans: *std.ArrayList(Span), gpa: std.mem.Allocator, text: []const u8, style: Style, link_url: []const u8) !void {
@@ -2504,4 +2864,128 @@ test "wide tables fall back to stacked key-value rows" {
     try std.testing.expect(containsStyledText(out.rows[0].spans, .strong, "C1:"));
     try std.testing.expect(containsText(out.rows[0].spans, "v1"));
     try std.testing.expect(!containsText(out.rows[0].spans, "┌"));
+}
+
+test "highlighting differs by language for the same token" {
+    const gpa = std.testing.allocator;
+    // `type` is a Zig keyword; in Python it is an ordinary identifier.
+    var zig_out = try render(gpa, "```zig\nconst T = type;\n```", 80);
+    defer zig_out.deinit(gpa);
+    try std.testing.expect(containsStyledText(zig_out.rows[0].spans, .code_keyword, "type"));
+
+    var py_out = try render(gpa, "```python\ndef use_type(): pass\n```", 80);
+    defer py_out.deinit(gpa);
+    try std.testing.expect(containsStyledText(py_out.rows[0].spans, .code_keyword, "def"));
+    try std.testing.expect(!containsStyledText(py_out.rows[0].spans, .code_keyword, "type"));
+}
+
+test "unknown languages fall back without mis-highlighting common words" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "```txt\nuse match type void\n```", 80);
+    defer out.deinit(gpa);
+    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code_keyword, "match"));
+    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code_keyword, "use"));
+    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code_keyword, "type"));
+}
+
+test "identifiers get semantic styles by shape and call position" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "```zig\nMyType.doThing(STATE_MAX)\n```", 80);
+    defer out.deinit(gpa);
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_type, "MyType"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_function, "doThing"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_constant, "STATE_MAX"));
+}
+
+test "block comments carry highlighting state across lines" {
+    const gpa = std.testing.allocator;
+    const body = "```rust\n/* first line\nstill comment\nend */\nfn after()\n```";
+    var out = try render(gpa, body, 80);
+    defer out.deinit(gpa);
+    // Rows 0-2 are the comment lines, row 3 the fn line (fence rows emit none).
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_comment, "/*"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "still"));
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_comment, "*/"));
+    try std.testing.expect(containsText(out.rows[2].spans, "end"));
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_keyword, "fn"));
+
+    // The same body through the incremental renderer must produce identical
+    // spans — the multi-line state lives in BlockState on both paths.
+    var inc: Incremental = .{};
+    defer inc.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const got = try inc.rows(gpa, arena.allocator(), body, 80);
+    try expectRowsEqual(out.rows, got);
+}
+
+test "diff blocks color added and removed lines" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "```diff\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old line\n+new line\n```", 80);
+    defer out.deinit(gpa);
+    // The wrap engine splits lines into word spans; assert per token.
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_comment, "---"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_comment, "a/file"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "+++"));
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_number, "@@"));
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_removed, "-old"));
+    try std.testing.expect(containsStyledText(out.rows[4].spans, .code_added, "+new"));
+}
+
+test "json blocks highlight keys, literals, and numbers" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "```json\n{\"ok\": true, \"n\": 42}\n```", 80);
+    defer out.deinit(gpa);
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_function, "\"ok\""));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_constant, "true"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_number, "42"));
+}
+
+test "sql keywords match case-insensitively" {
+    const gpa = std.testing.allocator;
+    var out = try render(gpa, "```sql\nselect count(*) from users;\n```", 80);
+    defer out.deinit(gpa);
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "select"));
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "from"));
+}
+
+test "disallowed schemes render as styled text without a link" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "[click](javascript:alert(1))", "[doc](file:///etc/passwd)", "[x](data:text/plain,hi)" }) |text| {
+        var out = try render(gpa, text, 80);
+        defer out.deinit(gpa);
+        for (out.rows[0].spans) |span| {
+            if (span.style == .link) {
+                try std.testing.expectEqualStrings("", span.link_url);
+            }
+        }
+    }
+    // Allowed schemes keep their destination (case-insensitive match).
+    var ok = try render(gpa, "[site](HTTPS://example.com)", 80);
+    defer ok.deinit(gpa);
+    var linked = false;
+    for (ok.rows[0].spans) |span| {
+        if (std.mem.eql(u8, span.text, "site")) {
+            try std.testing.expectEqualStrings("HTTPS://example.com", span.link_url);
+            linked = true;
+        }
+    }
+    try std.testing.expect(linked);
+}
+
+test "bare urls exclude trailing sentence punctuation" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "see https://x.test/a. and go", "at https://x.test/b, then", "ask https://x.test/c?q! ok" }) |text| {
+        var out = try render(gpa, text, 80);
+        defer out.deinit(gpa);
+        var found = false;
+        for (out.rows[0].spans) |span| {
+            if (span.link_url.len > 0) {
+                try std.testing.expect(isTrailingUrlPunctuation(span.link_url[span.link_url.len - 1]) == false);
+                try std.testing.expect(std.mem.startsWith(u8, span.link_url, "https://x.test/"));
+                found = true;
+            }
+        }
+        try std.testing.expect(found);
+    }
 }
