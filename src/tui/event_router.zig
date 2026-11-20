@@ -327,6 +327,18 @@ fn routeKey(
         ctx.consumeAndRedraw();
         return;
     }
+    // Prompt undo/redo (issue #486): only when the prompt is focused, i.e.
+    // normal mode — overlays have their own text fields with no undo history.
+    if (app.getMode() == .normal and key.matches('z', .{ .ctrl = true })) {
+        app.clearPendingQuitAt();
+        if (app.input_undo.undo(app)) ctx.consumeAndRedraw();
+        return;
+    }
+    if (app.getMode() == .normal and key.matches('y', .{ .ctrl = true })) {
+        app.clearPendingQuitAt();
+        if (app.input_undo.redoStep(app)) ctx.consumeAndRedraw();
+        return;
+    }
     if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
         app.clearPendingQuitAt();
         // Ctrl+L cycles the focused worker lane in `.dual`; in `.grid`/`.tab`

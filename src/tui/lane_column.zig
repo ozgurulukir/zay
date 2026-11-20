@@ -34,6 +34,7 @@ pub const LaneColumnProps = struct {
     blackhole_visible: *bool,
     splash_suppressed: bool,
     search_query: ?[]const u8 = null,
+    body_selection: ?@import("../transcript.zig").BodySelection = null,
     title: []const u8,
     state_glyph: []const u8,
     ws_marker: []const u8,
@@ -61,6 +62,7 @@ pub fn drawLaneColumn(ctx: vxfw.DrawContext, props: *const LaneColumnProps) std.
         .blackhole_visible = props.blackhole_visible,
         .splash_suppressed = props.splash_suppressed,
         .search_query = props.search_query,
+        .body_selection = props.body_selection,
     };
     const label_text = try laneLabel(ctx.arena, props.active, props.state_glyph, props.title, props.ws_marker);
     var border: vxfw.Border = .{
