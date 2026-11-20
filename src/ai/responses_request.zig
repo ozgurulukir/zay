@@ -24,50 +24,61 @@ pub fn writeRequestPayload(
     messages: []const ai.MessageView,
     tools_json: []const u8,
 ) !void {
-    try out.writeAll("{\"model\":");
-    try wire_json.writeString(out, gpa, config.model);
-    try out.writeAll(",\"input\":[");
-    var written: u32 = 0;
+    var jw: std.json.Stringify = .{ .writer = out, .options = .{} };
+    try jw.beginObject();
+    try jw.objectField("model");
+    try wire_json.writeStringValue(&jw, gpa, config.model);
+    try jw.objectField("input");
+    try jw.beginArray();
     for (messages) |*view| {
         if (config.system_prompt.len > 0 and view.message().* == .system) continue;
-        if (written > 0) try out.writeByte(',');
         try writeInputMessage(
-            out,
+            &jw,
             view.message().*,
             gpa,
             responses_config.log_name,
             responses_config.scrub_encrypted_reasoning,
         );
-        written += 1;
     }
-    try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
+    try jw.endArray();
+    try jw.objectField("stream");
+    try jw.write(true);
+    try jw.objectField("store");
+    try jw.write(false);
+    try jw.objectField("tools");
+    // `tools_json` is a pre-serialized JSON array — stream it as a raw value.
+    try jw.beginWriteRaw();
     try out.writeAll(tools_json);
+    jw.endWriteRaw();
     // `tool_choice` accompanies a non-empty tools array, mirroring the
     // chat-completions path (openai_request.writeRequestPayload): several
     // Responses endpoints reject the pair when the array is empty.
     if (!std.mem.eql(u8, tools_json, "[]")) {
-        try out.writeAll(",\"tool_choice\":\"auto\"");
+        try jw.objectField("tool_choice");
+        try jw.write("auto");
     }
     if (config.system_prompt.len > 0) {
-        try out.writeAll(",\"instructions\":");
-        try wire_json.writeString(out, gpa, config.system_prompt);
+        try jw.objectField("instructions");
+        try wire_json.writeStringValue(&jw, gpa, config.system_prompt);
     }
     if (config.session_id.len > 0 and !config.disable_prompt_cache) {
-        try out.writeAll(",\"prompt_cache_key\":");
-        try wire_json.writeString(out, gpa, config.session_id);
+        try jw.objectField("prompt_cache_key");
+        try wire_json.writeStringValue(&jw, gpa, config.session_id);
     }
     if (responses_config.text_verbosity) |verbosity| {
-        try out.writeAll(",\"text\":{\"verbosity\":");
-        try wire_json.writeString(out, gpa, verbosity);
-        try out.writeByte('}');
+        try jw.objectField("text");
+        try jw.beginObject();
+        try jw.objectField("verbosity");
+        try wire_json.writeStringValue(&jw, gpa, verbosity);
+        try jw.endObject();
     }
     if (responses_config.parallel_tool_calls) |enabled| {
-        try out.writeAll(",\"parallel_tool_calls\":");
-        try std.json.Stringify.value(enabled, .{}, out);
+        try jw.objectField("parallel_tool_calls");
+        try jw.write(enabled);
     }
     if (config.reasoning) |value| {
-        try out.writeAll(",\"reasoning\":{");
-        var wrote = false;
+        try jw.objectField("reasoning");
+        try jw.beginObject();
         if (value.effort) |effort| {
             // Clip Ollama-incompatible effort values for the minimal dialect,
             // mirroring the chat-completions path (model_compat.wireEffortLabel).
@@ -77,50 +88,57 @@ pub fn writeRequestPayload(
             // semantics unexpectedly.
             const wire_label = model_compat.resolveEffortLabel(config.model, config.wire_dialect, effort);
             if (wire_label) |label| {
-                try out.writeAll("\"effort\":");
-                try std.json.Stringify.value(label, .{}, out);
-                wrote = true;
+                try jw.objectField("effort");
+                try jw.write(label);
             }
         }
         if (value.summary) |summary| {
-            if (wrote) try out.writeByte(',');
-            try out.writeAll("\"summary\":");
-            try std.json.Stringify.value(summary.label(), .{}, out);
+            try jw.objectField("summary");
+            try jw.write(summary.label());
         }
+        try jw.endObject();
         // When effort is `.default` and summary is null, this object is empty
         // ("reasoning":{}). With include_encrypted_reasoning=false (Codex) the
         // include array is omitted — the reasoning object itself (effort and
         // summary) is still sent, only the encrypted blob is never requested.
         if (responses_config.include_encrypted_reasoning) {
-            try out.writeAll("},\"include\":[\"reasoning.encrypted_content\"]");
-        } else {
-            try out.writeByte('}');
+            try jw.objectField("include");
+            try jw.beginArray();
+            try jw.write("reasoning.encrypted_content");
+            try jw.endArray();
         }
     }
-    try out.writeByte('}');
+    try jw.endObject();
 }
 
 fn writeInputMessage(
-    out: *std.Io.Writer,
+    jw: *std.json.Stringify,
     message: ai.ChatMessage,
     gpa: std.mem.Allocator,
     log_name: []const u8,
     scrub_encrypted_reasoning: bool,
 ) !void {
     switch (message) {
-        .assistant => return writeAssistantItems(out, message, gpa, log_name, scrub_encrypted_reasoning),
-        .tool => return writeToolOutput(out, gpa, message),
+        .assistant => return writeAssistantItems(jw, message, gpa, log_name, scrub_encrypted_reasoning),
+        .tool => return writeToolOutput(jw, gpa, message),
         .system => {
-            try out.writeAll("{\"type\":\"message\",\"role\":\"system\",\"content\":");
-            try writeInputContent(out, gpa, message.system.content);
-            try out.writeByte('}');
+            try writeRoleMessage(jw, gpa, "system", message.system.content);
         },
         .user => {
-            try out.writeAll("{\"type\":\"message\",\"role\":\"user\",\"content\":");
-            try writeInputContent(out, gpa, message.user.content);
-            try out.writeByte('}');
+            try writeRoleMessage(jw, gpa, "user", message.user.content);
         },
     }
+}
+
+fn writeRoleMessage(jw: *std.json.Stringify, gpa: std.mem.Allocator, role: []const u8, content: []const ai.ContentBlock) !void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("message");
+    try jw.objectField("role");
+    try jw.write(role);
+    try jw.objectField("content");
+    try writeInputContent(jw, gpa, content);
+    try jw.endObject();
 }
 
 /// Copy `json` with any top-level `"encrypted_content"` field removed.
@@ -148,30 +166,26 @@ fn scrubEncryptedContentOrError(
     // mutating a copied ArrayHashMap corrupts state shared with the original.
     var buf: std.Io.Writer.Allocating = .init(gpa);
     errdefer buf.deinit();
-    const w = &buf.writer;
-    try w.writeByte('{');
+    var jw: std.json.Stringify = .{ .writer = &buf.writer, .options = .{} };
+    try jw.beginObject();
     var it = obj.iterator();
-    var first = true;
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "encrypted_content")) continue;
-        if (!first) try w.writeAll(",");
-        first = false;
-        try std.json.Stringify.value(entry.key_ptr.*, .{}, w);
-        try w.writeByte(':');
-        try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+        try jw.objectField(entry.key_ptr.*);
+        try jw.write(entry.value_ptr.*);
     }
-    try w.writeByte('}');
+    try jw.endObject();
     return try buf.toOwnedSlice();
 }
 
 fn writeAssistantItems(
-    out: *std.Io.Writer,
+    jw: *std.json.Stringify,
     message: ai.ChatMessage,
     gpa: std.mem.Allocator,
     log_name: []const u8,
     scrub_encrypted_reasoning: bool,
 ) !void {
-    var first = true;
+    var wrote_any = false;
     const blocks = message.assistant.content;
     var index: usize = 0;
     while (index < blocks.len) {
@@ -186,35 +200,68 @@ fn writeAssistantItems(
                 }
             }
         }
-        if (!first) try out.writeByte(',');
-        first = false;
+        wrote_any = true;
         switch (block) {
-            .text, .refusal => try writeTextItem(out, gpa, blocks[index..end]),
+            .text, .refusal => try writeTextItem(jw, gpa, blocks[index..end]),
             .reasoning => |reasoning| {
                 if (reasoning.responses_item_json) |json| {
                     if (scrub_encrypted_reasoning) {
                         if (scrubEncryptedContent(gpa, json)) |clean| {
                             defer gpa.free(clean);
                             log.info("responses.replay.scrubbed_encrypted_content client={s}", .{log_name});
-                            try out.writeAll(clean);
+                            try writeRawJson(jw, clean);
                         } else {
-                            try out.writeAll(json);
+                            try writeRawJson(jw, json);
                         }
                     } else {
-                        try out.writeAll(json);
+                        try writeRawJson(jw, json);
                     }
                 } else {
-                    try out.writeAll("{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":");
-                    try wire_json.writeString(out, gpa, reasoning.text);
-                    try out.writeAll("}]}");
+                    try jw.beginObject();
+                    try jw.objectField("type");
+                    try jw.write("reasoning");
+                    try jw.objectField("summary");
+                    try jw.beginArray();
+                    try jw.beginObject();
+                    try jw.objectField("type");
+                    try jw.write("summary_text");
+                    try jw.objectField("text");
+                    try wire_json.writeStringValue(jw, gpa, reasoning.text);
+                    try jw.endObject();
+                    try jw.endArray();
+                    try jw.endObject();
                 }
             },
-            .tool_call => |call| try writeFunctionCall(out, gpa, call),
-            .image => try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}"),
+            .tool_call => |call| try writeFunctionCall(jw, gpa, call),
+            .image => try writeAssistantMessageWithRawContent(jw, "[]"),
         }
         index = end;
     }
-    if (first) try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"\"}");
+    if (!wrote_any) try writeAssistantMessageWithRawContent(jw, "\"\"");
+}
+
+/// Write the `{"type":"message","role":"assistant","content":…}` replay
+/// placeholder; `content_json` is the raw JSON value for `content` (`"\"\""`
+/// for the no-items fallback, `"[]"` for a bare image block).
+fn writeAssistantMessageWithRawContent(jw: *std.json.Stringify, content_json: []const u8) !void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("message");
+    try jw.objectField("role");
+    try jw.write("assistant");
+    try jw.objectField("content");
+    try jw.beginWriteRaw();
+    try jw.writer.writeAll(content_json);
+    jw.endWriteRaw();
+    try jw.endObject();
+}
+
+/// Write pre-serialized JSON bytes as one complete value inside the builder's
+/// current container (replayed reasoning items carry stored item JSON).
+fn writeRawJson(jw: *std.json.Stringify, json: []const u8) !void {
+    try jw.beginWriteRaw();
+    try jw.writer.writeAll(json);
+    jw.endWriteRaw();
 }
 
 fn textBlock(block: ai.ContentBlock) ?ai.TextBlock {
@@ -224,90 +271,113 @@ fn textBlock(block: ai.ContentBlock) ?ai.TextBlock {
     };
 }
 
-fn writeTextItem(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+fn writeTextItem(jw: *std.json.Stringify, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
     const text = textBlock(blocks[0]).?;
-    try out.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\"");
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("message");
+    try jw.objectField("role");
+    try jw.write("assistant");
+    try jw.objectField("status");
+    try jw.write("completed");
     if (text.responses_item_id) |id| {
-        try out.writeAll(",\"id\":");
-        try wire_json.writeString(out, gpa, id);
+        try jw.objectField("id");
+        try wire_json.writeStringValue(jw, gpa, id);
     }
     if (text.responses_phase) |phase| {
-        try out.writeAll(",\"phase\":");
-        try wire_json.writeString(out, gpa, phase);
+        try jw.objectField("phase");
+        try wire_json.writeStringValue(jw, gpa, phase);
     }
-    try out.writeAll(",\"content\":[");
-    var first = true;
+    try jw.objectField("content");
+    try jw.beginArray();
     for (blocks) |block| {
         const part = textBlock(block).?;
         // Message-added events create a text placeholder before the part kind is known.
         if (block == .text and part.text.len == 0 and blocks.len > 1) continue;
-        if (!first) try out.writeByte(',');
-        first = false;
         if (block == .refusal) {
-            try out.writeAll("{\"type\":\"refusal\",\"refusal\":");
-            try wire_json.writeString(out, gpa, part.text);
-            try out.writeByte('}');
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("refusal");
+            try jw.objectField("refusal");
+            try wire_json.writeStringValue(jw, gpa, part.text);
+            try jw.endObject();
         } else {
-            try out.writeAll("{\"type\":\"output_text\",\"text\":");
-            try wire_json.writeString(out, gpa, part.text);
-            try out.writeAll(",\"annotations\":[]}");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("output_text");
+            try jw.objectField("text");
+            try wire_json.writeStringValue(jw, gpa, part.text);
+            try jw.objectField("annotations");
+            try jw.beginArray();
+            try jw.endArray();
+            try jw.endObject();
         }
     }
-    try out.writeAll("]}");
+    try jw.endArray();
+    try jw.endObject();
 }
 
-fn writeFunctionCall(out: *std.Io.Writer, gpa: std.mem.Allocator, call: ai.ToolCall) !void {
-    try out.writeAll("{\"type\":\"function_call\",\"call_id\":");
-    try wire_json.writeString(out, gpa, call.call_id.slice());
+fn writeFunctionCall(jw: *std.json.Stringify, gpa: std.mem.Allocator, call: ai.ToolCall) !void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("function_call");
+    try jw.objectField("call_id");
+    try wire_json.writeStringValue(jw, gpa, call.call_id.slice());
     if (call.responses_item_id) |id| {
-        try out.writeAll(",\"id\":");
-        try wire_json.writeString(out, gpa, id);
+        try jw.objectField("id");
+        try wire_json.writeStringValue(jw, gpa, id);
     }
-    try out.writeAll(",\"name\":");
-    try wire_json.writeString(out, gpa, call.name);
-    try out.writeAll(",\"arguments\":");
+    try jw.objectField("name");
+    try wire_json.writeStringValue(jw, gpa, call.name);
+    try jw.objectField("arguments");
     const args = tool_call_args.sanitizeToolArguments(call.arguments);
-    try wire_json.writeString(out, gpa, args);
-    try out.writeByte('}');
+    try wire_json.writeStringValue(jw, gpa, args);
+    try jw.endObject();
 }
 
-fn writeToolOutput(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
-    try out.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-    try wire_json.writeString(out, gpa, message.tool.call_id.slice());
-    try out.writeAll(",\"output\":");
-    try wire_json.writeString(out, gpa, message.text());
-    try out.writeByte('}');
+fn writeToolOutput(jw: *std.json.Stringify, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("function_call_output");
+    try jw.objectField("call_id");
+    try wire_json.writeStringValue(jw, gpa, message.tool.call_id.slice());
+    try jw.objectField("output");
+    try wire_json.writeStringValue(jw, gpa, message.text());
+    try jw.endObject();
 }
 
-fn writeInputContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
-    try out.writeByte('[');
-    var count: u32 = 0;
+fn writeInputContent(jw: *std.json.Stringify, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+    try jw.beginArray();
     for (blocks) |block| {
         switch (block) {
             .text, .refusal => |text| {
-                if (count > 0) try out.writeByte(',');
-                try out.writeAll("{\"type\":\"input_text\",\"text\":");
-                try wire_json.writeString(out, gpa, text.text);
-                try out.writeByte('}');
-                count += 1;
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("input_text");
+                try jw.objectField("text");
+                try wire_json.writeStringValue(jw, gpa, text.text);
+                try jw.endObject();
             },
             .image => |image| {
-                if (count > 0) try out.writeByte(',');
-                try out.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":");
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("input_image");
+                try jw.objectField("detail");
+                try jw.write("auto");
+                try jw.objectField("image_url");
                 var data_uri: std.Io.Writer.Allocating = .init(gpa);
                 defer data_uri.deinit();
                 try data_uri.writer.writeAll("data:");
                 try data_uri.writer.writeAll(image.mime_type);
                 try data_uri.writer.writeAll(";base64,");
                 try data_uri.writer.writeAll(image.data_base64);
-                try wire_json.writeString(out, gpa, data_uri.written());
-                try out.writeByte('}');
-                count += 1;
+                try wire_json.writeStringValue(jw, gpa, data_uri.written());
+                try jw.endObject();
             },
             .reasoning, .tool_call => {},
         }
     }
-    try out.writeByte(']');
+    try jw.endArray();
 }
 
 test "assistant replay groups refusal and prose by item identity" {
@@ -321,9 +391,12 @@ test "assistant replay groups refusal and prose by item identity" {
         blocks[1].text.text = @constCast(prose);
         var payload: std.Io.Writer.Allocating = .init(gpa);
         defer payload.deinit();
-        try payload.writer.writeByte('[');
-        try writeAssistantItems(&payload.writer, .{ .assistant = .{ .content = &blocks } }, gpa, "test", false);
-        try payload.writer.writeByte(']');
+        // `writeAssistantItems` emits one item per replay group — mirror the
+        // production call site, which always runs inside the `input` array.
+        var jw: std.json.Stringify = .{ .writer = &payload.writer, .options = .{} };
+        try jw.beginArray();
+        try writeAssistantItems(&jw, .{ .assistant = .{ .content = &blocks } }, gpa, "test", false);
+        try jw.endArray();
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload.written(), .{});
         defer parsed.deinit();
         const items = parsed.value.array.items;
@@ -783,7 +856,10 @@ test "assistant classification replays commentary and final answer phases as mes
     const message: ai.ChatMessage = .{ .assistant = .{ .content = &blocks } };
     var buffer: std.Io.Writer.Allocating = .init(gpa);
     defer buffer.deinit();
-    try writeAssistantItems(&buffer.writer, message, gpa, "test", false);
+    var jw: std.json.Stringify = .{ .writer = &buffer.writer, .options = .{} };
+    try jw.beginArray();
+    try writeAssistantItems(&jw, message, gpa, "test", false);
+    try jw.endArray();
     try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "\"phase\":\"commentary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "\"phase\":\"final_answer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "\"type\":\"reasoning\"") == null);
