@@ -487,6 +487,10 @@ pub const Palette = struct {
     diff_inline_add: vaxis.Style,
     // Newly centralized stray literals:
     markdown_heading: vaxis.Style,
+    markdown_heading_h2: vaxis.Style,
+    markdown_heading_h3: vaxis.Style,
+    markdown_task_marker: vaxis.Style,
+    markdown_rule: vaxis.Style,
     settings_active_tab: vaxis.Style,
     permission_approve: vaxis.Style,
 };
@@ -539,6 +543,13 @@ pub fn buildPalette(theme: Theme) Palette {
         .diff_inline_add = .{ .fg = .{ .rgb = theme.success_green }, .bg = .{ .rgb = theme.faint_add_bg } },
 
         .markdown_heading = .{ .bold = true, .fg = .{ .rgb = theme.markdown_heading } },
+        // Heading tiers reuse existing theme colors so every built-in theme
+        // distinguishes them without new theme fields: h1 keeps the dedicated
+        // heading color (bold), h2 the accent, h3 the muted body tone.
+        .markdown_heading_h2 = .{ .bold = true, .fg = .{ .rgb = theme.accent_orange } },
+        .markdown_heading_h3 = .{ .italic = true, .fg = .{ .rgb = theme.muted_gray } },
+        .markdown_task_marker = .{ .fg = .{ .rgb = theme.thinking_blue } },
+        .markdown_rule = .{ .dim = true, .fg = .{ .rgb = theme.muted_gray } },
         .settings_active_tab = .{ .fg = .{ .rgb = theme.accent_orange }, .ul_style = .single, .bold = true },
         .permission_approve = .{ .fg = .{ .rgb = theme.success_green }, .bold = true },
     };
@@ -628,6 +639,10 @@ pub fn buildMonochromePalette() Palette {
         .diff_inline_add = .{ .bold = true, .reverse = true },
 
         .markdown_heading = .{ .bold = true, .ul_style = .single },
+        .markdown_heading_h2 = .{ .bold = true, .ul_style = .single },
+        .markdown_heading_h3 = .{ .italic = true, .dim = true },
+        .markdown_task_marker = .{ .bold = true },
+        .markdown_rule = .{ .dim = true },
         .settings_active_tab = .{ .bold = true, .ul_style = .single },
         .permission_approve = .{ .bold = true },
     };
