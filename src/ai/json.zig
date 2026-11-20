@@ -45,6 +45,20 @@ pub fn writeString(out: *std.Io.Writer, gpa: std.mem.Allocator, text: []const u8
     try std.json.Stringify.value(repaired[0..output_index], .{}, out);
 }
 
+/// Write `text` as the next JSON value of a `std.json.Stringify` builder,
+/// with the same invalid-UTF-8 repair as `writeString`.
+///
+/// The builder's `write` encodes an invalid `[]const u8` as an array of byte
+/// integers (see `writeString`), so possibly-untrusted text must go through
+/// this helper instead. `beginWriteRaw`/`endWriteRaw` hand the builder's
+/// punctuation state machine a complete quoted string while the bytes go
+/// straight to the underlying writer.
+pub fn writeStringValue(jw: *std.json.Stringify, gpa: std.mem.Allocator, text: []const u8) !void {
+    try jw.beginWriteRaw();
+    try writeString(jw.writer, gpa, text);
+    jw.endWriteRaw();
+}
+
 test "writeString repairs invalid UTF-8 without emitting a byte array" {
     const gpa = std.testing.allocator;
     var output: std.Io.Writer.Allocating = .init(gpa);
