@@ -21,45 +21,45 @@ const isQwenModel = model_compat.isQwenModel;
 const normalizeMessagesForQwen = model_compat.normalizeMessagesForQwen;
 const deinitNormalizedMessages = model_compat.deinitNormalizedMessages;
 
-fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
-    try out.writeAll("{\"role\":");
+fn writeMessage(jw: *std.json.Stringify, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
+    try jw.beginObject();
+    try jw.objectField("role");
     const role_label: []const u8 = switch (message) {
         .system => "system",
         .user => "user",
         .assistant => "assistant",
         .tool => "tool",
     };
-    try std.json.Stringify.value(role_label, .{}, out);
+    try jw.write(role_label);
     // Cache control is now emitted at the top level (writeRequestPayload),
     // not per-message. OpenRouter's top-level `cache_control` auto-marks the
     // last cacheable block, superseding the old system-message-only approach.
-    try out.writeAll(",\"content\":");
+    try jw.objectField("content");
     switch (message) {
-        .user => try writeUserContent(out, gpa, message.user.content),
-        inline .system, .assistant, .tool => |m| try writeTextContent(out, gpa, m.content),
+        .user => try writeUserContent(jw, gpa, message.user.content),
+        inline .system, .assistant, .tool => |m| try writeTextContent(jw, gpa, m.content),
     }
     if (message == .tool) {
-        try out.writeAll(",\"tool_call_id\":");
-        try wire_json.writeString(out, gpa, message.tool.call_id.slice());
+        try jw.objectField("tool_call_id");
+        try wire_json.writeStringValue(jw, gpa, message.tool.call_id.slice());
     }
     if (message == .assistant) {
         var wrote_calls = false;
         for (message.assistant.content) |block| {
             if (block != .tool_call) continue;
             if (!wrote_calls) {
-                try out.writeAll(",\"tool_calls\":[");
+                try jw.objectField("tool_calls");
+                try jw.beginArray();
                 wrote_calls = true;
-            } else {
-                try out.writeByte(',');
             }
-            try writeToolCall(out, gpa, block.tool_call);
+            try writeToolCall(jw, gpa, block.tool_call);
         }
-        if (wrote_calls) try out.writeByte(']');
+        if (wrote_calls) try jw.endArray();
     }
-    try out.writeByte('}');
+    try jw.endObject();
 }
 
-fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+fn writeTextContent(jw: *std.json.Stringify, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     for (blocks) |block| {
@@ -68,49 +68,59 @@ fn writeTextContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
             .reasoning, .image, .tool_call => {},
         }
     }
-    try wire_json.writeString(out, gpa, aw.written());
+    try wire_json.writeStringValue(jw, gpa, aw.written());
 }
 
-fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
-    try out.writeByte('[');
-    var count: u32 = 0;
+fn writeUserContent(jw: *std.json.Stringify, gpa: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+    try jw.beginArray();
     for (blocks) |block| {
         switch (block) {
             .text, .refusal => |text| {
-                if (count > 0) try out.writeByte(',');
-                try out.writeAll("{\"type\":\"text\",\"text\":");
-                try wire_json.writeString(out, gpa, text.text);
-                try out.writeByte('}');
-                count += 1;
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("text");
+                try jw.objectField("text");
+                try wire_json.writeStringValue(jw, gpa, text.text);
+                try jw.endObject();
             },
             .image => |image| {
-                if (count > 0) try out.writeByte(',');
-                try out.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("image_url");
+                try jw.objectField("image_url");
+                try jw.beginObject();
+                try jw.objectField("url");
                 var data_uri: std.Io.Writer.Allocating = .init(gpa);
                 defer data_uri.deinit();
                 try data_uri.writer.writeAll("data:");
                 try data_uri.writer.writeAll(image.mime_type);
                 try data_uri.writer.writeAll(";base64,");
                 try data_uri.writer.writeAll(image.data_base64);
-                try wire_json.writeString(out, gpa, data_uri.written());
-                try out.writeAll("}}");
-                count += 1;
+                try wire_json.writeStringValue(jw, gpa, data_uri.written());
+                try jw.endObject();
+                try jw.endObject();
             },
             .reasoning, .tool_call => {},
         }
     }
-    try out.writeByte(']');
+    try jw.endArray();
 }
 
-fn writeToolCall(out: *std.Io.Writer, gpa: std.mem.Allocator, tool_call: ai.ToolCall) !void {
-    try out.writeAll("{\"id\":");
-    try wire_json.writeString(out, gpa, tool_call.call_id.slice());
-    try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
-    try wire_json.writeString(out, gpa, tool_call.name);
-    try out.writeAll(",\"arguments\":");
+fn writeToolCall(jw: *std.json.Stringify, gpa: std.mem.Allocator, tool_call: ai.ToolCall) !void {
+    try jw.beginObject();
+    try jw.objectField("id");
+    try wire_json.writeStringValue(jw, gpa, tool_call.call_id.slice());
+    try jw.objectField("type");
+    try jw.write("function");
+    try jw.objectField("function");
+    try jw.beginObject();
+    try jw.objectField("name");
+    try wire_json.writeStringValue(jw, gpa, tool_call.name);
+    try jw.objectField("arguments");
     const args = tool_call_args.sanitizeToolArguments(tool_call.arguments);
-    try wire_json.writeString(out, gpa, args);
-    try out.writeAll("}}");
+    try wire_json.writeStringValue(jw, gpa, args);
+    try jw.endObject();
+    try jw.endObject();
 }
 
 /// Options for the chat-completions request body — what a caller must know
@@ -206,22 +216,30 @@ pub fn writePayload(
         deinitNormalizedMessages(gpa, normalized, rebuilt);
     };
 
-    try out.writeAll("{\"model\":");
-    try wire_json.writeString(out, gpa, model);
-    try out.writeAll(",\"messages\":[");
-    for (effective_messages, 0..) |*view, index| {
-        if (index > 0) try out.writeByte(',');
-        try writeMessage(out, gpa, view.message().*);
+    var jw: std.json.Stringify = .{ .writer = out, .options = .{} };
+    try jw.beginObject();
+    try jw.objectField("model");
+    try wire_json.writeStringValue(&jw, gpa, model);
+    try jw.objectField("messages");
+    try jw.beginArray();
+    for (effective_messages) |*view| {
+        try writeMessage(&jw, gpa, view.message().*);
     }
+    try jw.endArray();
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
     // carry no token counts. Some OpenAI-compatible servers ignore it, so the
     // parser treats usage as optional. OpenRouter marks `include_usage` as
     // deprecated ("Full usage details are always included"), so it is omitted
     // for that dialect to avoid noise.
-    try out.writeAll("],\"stream\":true");
+    try jw.objectField("stream");
+    try jw.write(true);
     if (dialect != .openrouter) {
-        try out.writeAll(",\"stream_options\":{\"include_usage\":true}");
+        try jw.objectField("stream_options");
+        try jw.beginObject();
+        try jw.objectField("include_usage");
+        try jw.write(true);
+        try jw.endObject();
     }
     // OpenAI reasoning models (o-series, gpt-5) ignore the legacy `max_tokens`
     // field; the openai-compatible provider maps it to `max_completion_tokens`
@@ -230,18 +248,23 @@ pub fn writePayload(
     // universally-supported field.
     if (max_output_tokens) |mot| {
         if (dialect == .openai and is_reasoning_model) {
-            try out.writeAll(",\"max_completion_tokens\":");
+            try jw.objectField("max_completion_tokens");
         } else {
-            try out.writeAll(",\"max_tokens\":");
+            try jw.objectField("max_tokens");
         }
-        try out.print("{d}", .{mot});
+        try jw.print("{d}", .{mot});
     }
     if (!std.mem.eql(u8, tools_json, "[]")) {
-        try out.writeAll(",\"tools\":");
+        try jw.objectField("tools");
+        // `tools_json` is a pre-serialized JSON array — stream it as a raw value.
+        try jw.beginWriteRaw();
         try out.writeAll(tools_json);
-        try out.writeAll(",\"tool_choice\":\"auto\"");
+        jw.endWriteRaw();
+        try jw.objectField("tool_choice");
+        try jw.write("auto");
         if (opts.parallel_tool_calls) |ptc| {
-            try out.writeAll(if (ptc) ",\"parallel_tool_calls\":true" else ",\"parallel_tool_calls\":false");
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(ptc);
         }
     } else {
         log.warn("openai_compatible: sending request with NO tools (tools_json is empty) model={s}", .{model});
@@ -253,15 +276,19 @@ pub fn writePayload(
     // classic `prompt_cache_key` hint. Minimal/dashscope send neither.
     if (!disable_prompt_cache) {
         if (dialect.allowsTopLevelCacheControl()) {
-            try out.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+            try jw.objectField("cache_control");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("ephemeral");
+            try jw.endObject();
         }
         if (session_id.len > 0) {
             if (dialect.usesNativeSessionId()) {
-                try out.writeAll(",\"session_id\":");
-                try wire_json.writeString(out, gpa, session_id);
+                try jw.objectField("session_id");
+                try wire_json.writeStringValue(&jw, gpa, session_id);
             } else if (dialect.allowsPromptCacheKey()) {
-                try out.writeAll(",\"prompt_cache_key\":");
-                try wire_json.writeString(out, gpa, session_id);
+                try jw.objectField("prompt_cache_key");
+                try wire_json.writeStringValue(&jw, gpa, session_id);
             }
         }
     }
@@ -274,27 +301,23 @@ pub fn writePayload(
     // DashScope controls thinking via a top-level boolean, independent of effort.
     if (dialect.usesEnableThinking()) {
         if (effort) |value| {
-            if (value == .none) {
-                try out.writeAll(",\"enable_thinking\":false}");
-            } else if (value == .default) {
+            try jw.objectField("enable_thinking");
+            try jw.write(value != .none);
+            if (value != .none and value != .default) {
+                // Clip unsupported effort levels (high/max/minimal → medium/low)
+                // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
                 // `.default` means "don't override the model's own behaviour" —
                 // and runinfra's DashScope-hosted Qwen rejects
                 // `reasoning_effort:"default"` with HTTP 400 (upstream_error).
                 // Live-verified: `enable_thinking:true` WITHOUT the effort
                 // field streams thinking + the final message cleanly (200).
-                // Sending the raw "default" label is invalid there. Keep the
-                // thinking boolean, omit the effort field entirely.
-                try out.writeAll(",\"enable_thinking\":true}");
-            } else {
-                // Clip unsupported effort levels (high/max/minimal → medium/low)
-                // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
-                try out.writeAll(",\"enable_thinking\":true,\"reasoning_effort\":\"");
-                try out.writeAll(model_compat.resolveEffortLabel(model, dialect, value) orelse value.label());
-                try out.writeAll("\"}");
+                // Sending the raw "default" label is invalid there, so it is
+                // omitted entirely.
+                try jw.objectField("reasoning_effort");
+                try jw.write(model_compat.resolveEffortLabel(model, dialect, value) orelse value.label());
             }
-        } else {
-            try out.writeByte('}');
         }
+        try jw.endObject();
         return;
     }
 
@@ -306,25 +329,20 @@ pub fn writePayload(
         const resolved_effort = if (effort) |e| model_compat.resolveEffortLabel(model, dialect, e) else null;
         const has_effort = resolved_effort != null;
         const has_summary = summary != null and summary.? != .auto;
-        if (!has_effort and !has_summary) {
-            try out.writeByte('}');
-            return;
+        if (has_effort or has_summary) {
+            try jw.objectField("reasoning");
+            try jw.beginObject();
+            if (resolved_effort) |label| {
+                try jw.objectField("effort");
+                try jw.write(label);
+            }
+            if (has_summary) {
+                try jw.objectField("summary");
+                try jw.write(summary.?.label());
+            }
+            try jw.endObject();
         }
-        try out.writeAll(",\"reasoning\":{");
-        var wrote = false;
-        if (resolved_effort) |label| {
-            try out.writeAll("\"effort\":\"");
-            try out.writeAll(label);
-            try out.writeByte('"');
-            wrote = true;
-        }
-        if (has_summary) {
-            if (wrote) try out.writeByte(',');
-            try out.writeAll("\"summary\":\"");
-            try out.writeAll(summary.?.label());
-            try out.writeByte('"');
-        }
-        try out.writeAll("}}");
+        try jw.endObject();
         return;
     }
 
@@ -333,12 +351,10 @@ pub fn writePayload(
     // target rejects are clipped by `wireEffortLabel` (see comment there).
     const wire_label = model_compat.resolveEffortLabel(model, dialect, effort orelse .default);
     if (wire_label) |label| {
-        try out.writeAll(",\"reasoning_effort\":\"");
-        try out.writeAll(label);
-        try out.writeAll("\"}");
-    } else {
-        try out.writeByte('}');
+        try jw.objectField("reasoning_effort");
+        try jw.write(label);
     }
+    try jw.endObject();
 }
 
 test "writeRequestPayload disables thinking for reasoning effort none" {
