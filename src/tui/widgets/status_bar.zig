@@ -7,6 +7,7 @@
 //! width).
 
 const std = @import("std");
+const text_fit = @import("../text_fit.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -65,7 +66,7 @@ pub fn layoutSegments(
         for (candidates) |cand| {
             if (cand.text.len == 0) continue;
             if (@intFromEnum(cand.priority) > priority_ceiling) continue;
-            const w: u16 = @intCast(@min(vaxis.gwidth.gwidth(cand.text, .unicode), std.math.maxInt(u16)));
+            const w: u16 = @intCast(@min(text_fit.measure(cand.text), std.math.maxInt(u16)));
             if (w == 0) continue;
             const gap: u16 = if (active_count > 0) cand.gap_before else 0;
             needed_width += gap + w;
@@ -79,7 +80,7 @@ pub fn layoutSegments(
             for (candidates) |cand| {
                 if (cand.text.len == 0) continue;
                 if (@intFromEnum(cand.priority) > priority_ceiling) continue;
-                const w: u16 = @intCast(@min(vaxis.gwidth.gwidth(cand.text, .unicode), std.math.maxInt(u16)));
+                const w: u16 = @intCast(@min(text_fit.measure(cand.text), std.math.maxInt(u16)));
                 if (w == 0) continue;
                 const gap: u16 = if (idx > 0) cand.gap_before else 0;
                 segs[idx] = .{ .text = cand.text, .style = cand.style, .width = w, .gap_before = gap };
@@ -143,9 +144,9 @@ pub fn layoutStatusBar(
         return .{ .segments = &.{}, .total_width = 0 };
     }
 
-    const status_width: u16 = @intCast(@min(vaxis.gwidth.gwidth(status_text, .unicode), std.math.maxInt(u16)));
-    const meter_width: u16 = @intCast(@min(vaxis.gwidth.gwidth(meter_text, .unicode), std.math.maxInt(u16)));
-    const velocity_width: u16 = @intCast(@min(vaxis.gwidth.gwidth(velocity_text, .unicode), std.math.maxInt(u16)));
+    const status_width: u16 = @intCast(@min(text_fit.measure(status_text), std.math.maxInt(u16)));
+    const meter_width: u16 = @intCast(@min(text_fit.measure(meter_text), std.math.maxInt(u16)));
+    const velocity_width: u16 = @intCast(@min(text_fit.measure(velocity_text), std.math.maxInt(u16)));
 
     const has_velocity = velocity_text.len > 0 and velocity_width > 0;
     const has_status = status_text.len > 0 and status_width > 0;

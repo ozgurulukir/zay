@@ -183,6 +183,126 @@ pub fn stripAnsi(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
     return out.toOwnedSlice(gpa);
 }
 
+/// Normalize untrusted text for terminal display (SSOT for transcript
+/// ingestion and input paste). Unlike `stripAnsi` — which cleans MODEL
+/// observations and handles CSI only — this is the DISPLAY contract:
+/// - ESC[...final (CSI) and ESC]...(BEL or ESC\\ terminated) sequences are
+///   removed, so colorized tool output renders clean;
+/// - a lone ESC is dropped; an unterminated sequence drops the rest of the
+///   input rather than panic;
+/// - tabs expand to the next 4-column stop (per line), so tab-indented tool
+///   output and TSV columns align without the draw path doing width math;
+/// - CRLF folds to LF and lone CR is dropped;
+/// - other C0 controls and DEL become a visible `?` placeholder. Bytes in the
+///   C1 range are left untouched — in valid UTF-8 they are continuation
+///   bytes, and rewriting them would corrupt multibyte characters.
+/// Always returns a fresh buffer (never an input slice), like `stripAnsi`.
+pub fn normalizeDisplayText(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    const tab_width: usize = 4;
+    var column: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        if (byte == 0x1b) {
+            if (i + 1 < text.len and text[i + 1] == '[') {
+                // CSI: params (0x30..0x3f) + intermediates (0x20..0x2f) until a
+                // final byte (0x40..0x7e). Unterminated -> drop the rest.
+                var j = i + 2;
+                while (j < text.len and !(text[j] >= 0x40 and text[j] <= 0x7e)) j += 1;
+                i = if (j < text.len) j + 1 else text.len;
+            } else if (i + 1 < text.len and text[i + 1] == ']') {
+                // OSC: BEL or ESC-backslash terminated.
+                var j = i + 2;
+                while (j < text.len) {
+                    if (text[j] == 0x07) break;
+                    if (text[j] == 0x1b and j + 1 < text.len and text[j + 1] == '\\') break;
+                    j += 1;
+                }
+                i = if (j < text.len) j + (if (text[j] == 0x07) @as(usize, 1) else 2) else text.len;
+            } else {
+                i += 1; // lone ESC: drop.
+            }
+            column += 0;
+            continue;
+        }
+        if (byte == '\t') {
+            const spaces = tab_width - (column % tab_width);
+            try out.appendNTimes(gpa, ' ', spaces);
+            column += spaces;
+            i += 1;
+            continue;
+        }
+        if (byte == '\n') {
+            try out.append(gpa, '\n');
+            column = 0;
+            i += 1;
+            continue;
+        }
+        if (byte == '\r') {
+            // A lone CR is dropped; for CRLF the CR is skipped and the next
+            // iteration emits the LF itself.
+            if (i + 1 < text.len and text[i + 1] == '\n') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f) {
+            try out.append(gpa, '?');
+            column += 1;
+            i += 1;
+            continue;
+        }
+        try out.append(gpa, byte);
+        column += 1;
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "normalizeDisplayText expands tabs to 4-column stops" {
+    const gpa = std.testing.allocator;
+    const stops = try normalizeDisplayText(gpa, "a\tb\tc");
+    defer gpa.free(stops);
+    try std.testing.expectEqualStrings("a   b   c", stops);
+
+    const partial = try normalizeDisplayText(gpa, "abc\t");
+    defer gpa.free(partial);
+    try std.testing.expectEqualStrings("abc ", partial);
+}
+
+test "normalizeDisplayText strips CSI and OSC sequences and lone ESC" {
+    const gpa = std.testing.allocator;
+    const colored = try normalizeDisplayText(gpa, "\x1b[31mred\x1b[0m plain\x1b]0;title\x07 tail");
+    defer gpa.free(colored);
+    try std.testing.expectEqualStrings("red plain tail", colored);
+
+    const osc_link = try normalizeDisplayText(gpa, "\x1b]8;;https://x\x1b\\link\x1b[");
+    defer gpa.free(osc_link);
+    try std.testing.expectEqualStrings("link", osc_link);
+
+    const lone = try normalizeDisplayText(gpa, "a\x1bb");
+    defer gpa.free(lone);
+    try std.testing.expectEqualStrings("ab", lone);
+}
+
+test "normalizeDisplayText folds CRLF and replaces controls" {
+    const gpa = std.testing.allocator;
+    const controls = try normalizeDisplayText(gpa, "a\r\nb\rc\x00d\x7f");
+    defer gpa.free(controls);
+    try std.testing.expectEqualStrings("a\nbc?d?", controls);
+
+    // UTF-8 continuation bytes in the C1 range are never rewritten. The tab
+    // expands by byte-column (col 6 -> next 4-stop adds two spaces).
+    const utf8 = try normalizeDisplayText(gpa, "h\xc3\xa9llo\t-");
+    defer gpa.free(utf8);
+    try std.testing.expectEqualStrings("h\xc3\xa9llo  -", utf8);
+}
+
 test "pruneToolText returns a fresh dupe when text fits the cap" {
     const gpa = std.testing.allocator;
     const text = "hello world";
