@@ -485,7 +485,12 @@ pub const MessageWidget = struct {
                 .style = mergedSelectedStyle(style, selected),
             };
             if (link_url.len > 0) {
-                cell.link = .{ .uri = link_url };
+                // A stable per-URI OSC 8 `id` lets terminals treat fragments of
+                // one link wrapped across rows (or split by style spans) as a
+                // single hover/click region. Arena-owned: cells are written
+                // within the frame, same lifetime as the span texts above.
+                const link_id = std.fmt.allocPrint(ctx.arena, "id={x}", .{std.hash.Wyhash.hash(0, link_url)}) catch "";
+                cell.link = .{ .uri = link_url, .params = link_id };
             }
             writeCellOnCard(surface, col, row, cell);
             col += width;
@@ -594,6 +599,11 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
         .code_string => .{ .fg = p.tool.fg },
         .code_comment => .{ .fg = p.thinking_body.fg, .italic = true },
         .code_number => .{ .fg = p.user.fg },
+        .code_type => p.markdown_code_type,
+        .code_function => p.markdown_code_function,
+        .code_constant => p.markdown_code_constant,
+        .code_added => p.tool,
+        .code_removed => p.tool_failed,
     };
 }
 
