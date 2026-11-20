@@ -184,6 +184,7 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
         // sibling lanes keep theirs until their own first prompt.
         .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
         .search_query = app.pickers.search.query,
+        .body_selection = lane.transcript.body_selection,
         .title = title,
         .state_glyph = state_glyph,
         .ws_marker = ws_marker,

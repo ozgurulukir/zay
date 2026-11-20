@@ -40,6 +40,7 @@ pub const TranscriptWidget = struct {
     /// Computed at the construction site (INV-WIDGET-1 scalar).
     splash_suppressed: bool = false,
     search_query: ?[]const u8 = null,
+    body_selection: ?transcript_mod.BodySelection = null,
     /// Write-back: hit-test geometry for the "↓ new output" pill.
     new_output_rect_out: ?*?app_state.ChipRect = null,
 
@@ -71,6 +72,7 @@ pub const TranscriptWidget = struct {
             .splash_viewport_height = self.thread.transcript_view_height,
             .splash_suppressed = self.splash_suppressed,
             .search_query = self.search_query,
+            .body_selection = self.thread.transcript.body_selection,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
         self.thread.transcript_list.item_count = @intCast(messages.len);
@@ -203,6 +205,7 @@ pub const MessageListBuilder = struct {
     splash_viewport_height: u16 = 0,
     splash_suppressed: bool = false,
     search_query: ?[]const u8 = null,
+    body_selection: ?transcript_mod.BodySelection = null,
 
     pub fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
         _ = cursor;
@@ -220,6 +223,11 @@ pub const MessageListBuilder = struct {
             .splash_viewport_height = self.splash_viewport_height,
             .splash_suppressed = self.splash_suppressed,
             .search_query = self.search_query,
+            .selection_range = selection_range: {
+                const selection = self.body_selection orelse break :selection_range null;
+                if (selection.message_index != idx) break :selection_range null;
+                break :selection_range selection.range();
+            },
         };
         return body.widget();
     }

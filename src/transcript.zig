@@ -253,9 +253,31 @@ pub const Message = union(enum) {
     }
 };
 
+/// A within-body text selection over the currently selected message
+/// (issue #487): `[anchor, focus)` byte offsets in the message's logical
+/// body. Cleared when the transcript selection moves (`select` to another
+/// message, `moveSelection`); draw/copy paths clip stale ranges against the
+/// live body length.
+/// Direction keys for `extendBodySelection`.
+pub const BodySelectionStep = enum { left, right, up, down };
+
+pub const BodySelection = struct {
+    message_index: u32,
+    anchor: usize,
+    focus: usize,
+
+    pub fn range(self: BodySelection) [2]usize {
+        const lo = @min(self.anchor, self.focus);
+        const hi = @max(self.anchor, self.focus);
+        return .{ lo, hi };
+    }
+};
+
 pub const Transcript = struct {
     messages: std.ArrayList(Message) = .empty,
     selected: ?u32 = null,
+    /// Shift-arrow selection over the selected message's body (issue #487).
+    body_selection: ?BodySelection = null,
 
     pub fn deinit(self: *Transcript, gpa: std.mem.Allocator) void {
         for (self.messages.items) |*message| {
@@ -422,9 +444,47 @@ pub const Transcript = struct {
     }
 
     pub fn select(self: *Transcript, index: u32) void {
+        if (self.selected) |current| {
+            if (current != index) self.body_selection = null;
+        }
         assert(index < self.messages.items.len);
         assert(self.messages.items[index].kind().selectable());
         self.selected = index;
+    }
+
+    /// Start or extend the within-body selection by one grapheme in
+    /// `direction` (issue #487). A fresh selection anchors at the body start
+    /// (right) or end (left); vertical moves step whole lines. Returns true
+    /// when the selection changed.
+    pub fn extendBodySelection(self: *Transcript, direction: BodySelectionStep) bool {
+        const index = self.selected orelse return false;
+        if (index >= self.messages.items.len) return false;
+        const body = self.messages.items[index].bodyPtr().*;
+        if (body.len == 0) return false;
+
+        const sel = self.body_selection orelse BodySelection{
+            .message_index = index,
+            .anchor = if (direction == .left) body.len else 0,
+            .focus = if (direction == .left) body.len else 0,
+        };
+        if (sel.message_index != index) {
+            // Stale selection from another message: restart at the edge.
+            self.body_selection = .{
+                .message_index = index,
+                .anchor = if (direction == .left) body.len else 0,
+                .focus = if (direction == .left) body.len else 0,
+            };
+            return self.extendBodySelection(direction);
+        }
+        const moved_focus: usize = switch (direction) {
+            .right => @min(nextCodepointBoundary(body, sel.focus), body.len),
+            .left => prevCodepointBoundary(body, sel.focus),
+            .up => prevLineBoundary(body, sel.focus),
+            .down => nextLineBoundary(body, sel.focus),
+        };
+        if (moved_focus == sel.focus) return false;
+        self.body_selection = .{ .message_index = index, .anchor = sel.anchor, .focus = moved_focus };
+        return true;
     }
 
     pub fn selectFirst(self: *Transcript) void {
@@ -610,6 +670,7 @@ pub const Transcript = struct {
     }
 
     pub fn moveSelection(self: *Transcript, direction: enum { previous, next }) void {
+        self.body_selection = null;
         if (self.messages.items.len == 0) {
             self.selected = null;
             return;
@@ -752,6 +813,40 @@ pub fn formatToolDuration(buf: []u8, duration_ms: u32) []const u8 {
     const rem: u64 = seconds % 60;
     if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ minutes, rem }) catch "0s";
     return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ minutes / 60, minutes % 60 }) catch "0s";
+}
+
+/// Byte offset of the next boundary after `offset` (or `text.len`). Steps by
+/// UTF-8 code point — combining-mark clusters move per-mark, which is
+/// acceptable for a transient selection overlay.
+fn nextCodepointBoundary(text: []const u8, offset: usize) usize {
+    if (offset >= text.len) return text.len;
+    var next = offset + 1;
+    while (next < text.len and (text[next] & 0xC0) == 0x80) : (next += 1) {}
+    return next;
+}
+
+/// Byte offset of the previous boundary before `offset` (or 0).
+fn prevCodepointBoundary(text: []const u8, offset: usize) usize {
+    if (offset == 0) return 0;
+    var candidate = offset - 1;
+    while (candidate > 0 and (text[candidate] & 0xC0) == 0x80) : (candidate -= 1) {}
+    return candidate;
+}
+
+/// Byte offset of the start of the previous line. From a line start, moves
+/// to the start of the line ABOVE (the newline ending it is excluded from
+/// the search); from mid-line, to the current line's start.
+fn prevLineBoundary(text: []const u8, offset: usize) usize {
+    var limit = @min(offset, text.len);
+    if (limit > 0 and text[limit - 1] == '\n') limit -= 1;
+    const newline = std.mem.lastIndexOfScalar(u8, text[0..limit], '\n') orelse return 0;
+    return newline + 1;
+}
+
+/// Byte offset just past the current line's `\n` (or `text.len`).
+fn nextLineBoundary(text: []const u8, offset: usize) usize {
+    const newline = std.mem.indexOfScalarPos(u8, text, @min(offset, text.len), '\n') orelse return text.len;
+    return newline + 1;
 }
 
 fn appendOwned(gpa: std.mem.Allocator, target: *[]u8, suffix: []const u8) !void {
@@ -999,4 +1094,55 @@ test "tool title suffix shows duration and non-zero exit" {
     view.failed = true;
     view.exit_code = 2;
     try std.testing.expectEqualStrings(" · exit 2 · 1.2s", view.titleSuffix(&buf).?);
+}
+
+test "body selection extends by code point and line and clears on navigation" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .agent, "agent", "first line\nsecond line");
+    transcript.select(index);
+
+    // Shift+Right: anchor at 0, focus advances by one code point.
+    try std.testing.expect(transcript.extendBodySelection(.right));
+    const selection = transcript.body_selection.?;
+    try std.testing.expectEqual(@as(usize, 0), selection.anchor);
+    try std.testing.expectEqual(@as(usize, 1), selection.focus);
+
+    // CJK moves two bytes per step.
+    try std.testing.expect(transcript.extendBodySelection(.right));
+    var selection2 = transcript.body_selection.?;
+    try std.testing.expectEqual(@as(usize, 2), selection2.range()[1]);
+
+    // Shift+Down jumps to the next line start; Shift+Up returns to 0.
+    try std.testing.expect(transcript.extendBodySelection(.down));
+    const selection3 = transcript.body_selection.?;
+    try std.testing.expectEqual(@as(usize, "first line\n".len), selection3.range()[1]);
+    try std.testing.expect(transcript.extendBodySelection(.up));
+    try std.testing.expectEqual(@as(usize, 0), transcript.body_selection.?.range()[1]);
+
+    // Navigating away clears the selection.
+    transcript.moveSelection(.next);
+    try std.testing.expect(transcript.body_selection == null);
+}
+
+test "extendBodySelection anchors from the end when stepping left" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .user, "user", "tail");
+    transcript.select(index);
+    try std.testing.expect(transcript.extendBodySelection(.left));
+    const selection = transcript.body_selection.?;
+    try std.testing.expectEqual(@as(usize, "tail".len), selection.anchor);
+    try std.testing.expectEqual(@as(usize, "tail".len - 1), selection.focus);
+    try std.testing.expectEqualStrings("l", bodySlice(transcript, index, selection));
+}
+
+fn bodySlice(transcript: Transcript, index: u32, selection: BodySelection) []const u8 {
+    const range = selection.range();
+    const body = transcript.messages.items[index].bodyPtr().*;
+    return body[range[0]..range[1]];
 }
