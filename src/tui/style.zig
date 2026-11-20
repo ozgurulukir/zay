@@ -491,6 +491,9 @@ pub const Palette = struct {
     markdown_heading_h3: vaxis.Style,
     markdown_task_marker: vaxis.Style,
     markdown_rule: vaxis.Style,
+    markdown_code_type: vaxis.Style,
+    markdown_code_function: vaxis.Style,
+    markdown_code_constant: vaxis.Style,
     settings_active_tab: vaxis.Style,
     permission_approve: vaxis.Style,
 };
@@ -550,6 +553,11 @@ pub fn buildPalette(theme: Theme) Palette {
         .markdown_heading_h3 = .{ .italic = true, .fg = .{ .rgb = theme.muted_gray } },
         .markdown_task_marker = .{ .fg = .{ .rgb = theme.thinking_blue } },
         .markdown_rule = .{ .dim = true, .fg = .{ .rgb = theme.muted_gray } },
+        // Semantic code token tiers: italic code-blue types, accent-orange
+        // calls, amber constants — all from existing theme colors.
+        .markdown_code_type = .{ .italic = true, .fg = .{ .rgb = theme.code_blue } },
+        .markdown_code_function = .{ .fg = .{ .rgb = theme.accent_orange } },
+        .markdown_code_constant = .{ .bold = true, .fg = .{ .rgb = theme.amber_yellow } },
         .settings_active_tab = .{ .fg = .{ .rgb = theme.accent_orange }, .ul_style = .single, .bold = true },
         .permission_approve = .{ .fg = .{ .rgb = theme.success_green }, .bold = true },
     };
@@ -643,6 +651,9 @@ pub fn buildMonochromePalette() Palette {
         .markdown_heading_h3 = .{ .italic = true, .dim = true },
         .markdown_task_marker = .{ .bold = true },
         .markdown_rule = .{ .dim = true },
+        .markdown_code_type = .{ .italic = true },
+        .markdown_code_function = .{ .bold = true },
+        .markdown_code_constant = .{ .bold = true, .italic = true },
         .settings_active_tab = .{ .bold = true, .ul_style = .single },
         .permission_approve = .{ .bold = true },
     };
