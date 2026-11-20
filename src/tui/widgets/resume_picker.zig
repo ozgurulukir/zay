@@ -6,6 +6,7 @@ const session_mod = @import("../../session.zig");
 const app_state = @import("../app_state.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
+const text_fit = @import("../text_fit.zig");
 const tui_style = @import("../style.zig");
 const tui_status = @import("../status.zig");
 const tree_art = @import("tree_art.zig");
@@ -673,21 +674,12 @@ test "session tree counts project rows and folds children" {
     try std.testing.expect(selectedSummary(&summaries, "", &.{}, 1, .project) != null);
 }
 
+/// Ellipsized row label via the shared fitter (`text_fit.truncateEnd`).
+/// Semantics moved with the helper: the marker is now a single-cell "…"
+/// instead of the old three-dot "..." — one more character of the value
+/// survives, and the row width math below uses the same fitter.
 fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) ![]const u8 {
     if (width == 0) return ctx.arena.dupe(u8, "");
-    if (ctx.stringWidth(text) <= width) return ctx.arena.dupe(u8, text);
-    if (width <= 3) return ctx.arena.dupe(u8, "...");
-
-    var out: std.ArrayList(u8) = .empty;
-    var used: usize = 0;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const grapheme_width = ctx.stringWidth(bytes);
-        if (used + grapheme_width + 3 > width) break;
-        try out.appendSlice(ctx.arena, bytes);
-        used += grapheme_width;
-    }
-    try out.appendSlice(ctx.arena, "...");
-    return out.toOwnedSlice(ctx.arena);
+    const fit = try text_fit.truncateEnd(ctx.arena, text, @intCast(width));
+    return fit.text;
 }

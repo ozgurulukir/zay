@@ -6,6 +6,7 @@ const std = @import("std");
 const tui = @import("../tui.zig");
 const clipboard_mod = @import("../clipboard.zig");
 const mode_lifecycle = @import("mode_lifecycle.zig");
+const tools_common = @import("../tools/common.zig");
 
 const App = tui.App;
 
@@ -17,22 +18,18 @@ const App = tui.App;
 /// there, paste does not).
 pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     if (text.len == 0) return;
-    // The prompt is a multiline field: keep embedded newlines (that is the
-    // whole point of multiline paste), folding CR to LF so Windows CRLF
-    // clipboards don't inject raw carriage returns into the buffer. Every
-    // other target is single-line — trim line endings so a multiline
-    // clipboard can't leak newlines into a filter field.
+    // The prompt is a multiline field: paste goes through the shared display
+    // normalizer (tools_common.normalizeDisplayText) so CRLF folds to LF,
+    // tabs expand to predictable column stops, and escape/control bytes from
+    // the clipboard never reach the input buffer — cursor math in the input
+    // widget stays correct without per-tab width handling. Every other target
+    // is single-line — trim line endings so a multiline clipboard can't leak
+    // newlines into a filter field.
     var normalized: ?[]u8 = null;
     const clean_text: []const u8 = if (app.getMode() == .normal) blk: {
-        const buf = try app.gpa.alloc(u8, text.len);
-        var out_len: usize = 0;
-        for (text, 0..) |byte, index| {
-            if (byte == '\r' and index + 1 < text.len and text[index + 1] == '\n') continue;
-            buf[out_len] = if (byte == '\r') '\n' else byte;
-            out_len += 1;
-        }
+        const buf = try tools_common.normalizeDisplayText(app.gpa, text);
         normalized = buf;
-        break :blk buf[0..out_len];
+        break :blk buf;
     } else std.mem.trim(u8, text, "\r\n");
     defer if (normalized) |buf| app.gpa.free(buf);
     if (clean_text.len == 0) return;

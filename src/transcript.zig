@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const parts_mod = @import("tools/parts.zig");
+const tools_common = @import("tools/common.zig");
 const terminal_markdown = @import("terminal_markdown");
 
 const assert = std.debug.assert;
@@ -336,7 +337,8 @@ pub const Transcript = struct {
         assert(title.len > 0);
         const owned_title = try gpa.dupe(u8, title);
         errdefer gpa.free(owned_title);
-        const owned_body = try gpa.dupe(u8, body);
+        // Display normalization at the ingestion boundary (see finishTool).
+        const owned_body = try tools_common.normalizeDisplayText(gpa, body);
         errdefer gpa.free(owned_body);
         // Resume bodies are the LLM observation; JSON detection still applies.
         // Build before appending so an OOM here leaves nothing half-constructed,
@@ -527,10 +529,15 @@ pub const Transcript = struct {
         assert(message.* == .tool);
         const t = &message.tool;
         t.running = false;
-        try appendOwned(gpa, &t.body, body);
+        // Display normalization at the ingestion boundary: tabs expand, ANSI
+        // sequences and controls are cleaned, so draw, row counting, and the
+        // persisted parts all see the same bytes.
+        const cleaned = try tools_common.normalizeDisplayText(gpa, body);
+        defer gpa.free(cleaned);
+        try appendOwned(gpa, &t.body, cleaned);
         if (stderr_body) |stderr| {
             assert(stderr.len > 0);
-            const owned = try gpa.dupe(u8, stderr);
+            const owned = try tools_common.normalizeDisplayText(gpa, stderr);
             if (t.stderr) |existing| gpa.free(existing);
             t.stderr = owned;
         }
