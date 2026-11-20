@@ -41,7 +41,7 @@ pub const ConversationLayout = struct {
     }
 
     pub fn contentWidth(width: u16) u16 {
-        return width -| left -| right;
+        return tui_metrics.effectiveContentWidth(width, tui_metrics.readable_measure_max);
     }
 };
 
