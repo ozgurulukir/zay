@@ -573,8 +573,12 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
     return switch (style) {
         .normal => p.body,
         .heading => p.markdown_heading,
+        .heading_h2 => p.markdown_heading_h2,
+        .heading_h3 => p.markdown_heading_h3,
         .quote => p.thinking_body,
         .list_marker => p.body,
+        .task_marker => p.markdown_task_marker,
+        .rule => p.markdown_rule,
         .table_border => p.thinking_body,
         .code => p.markdown_code,
         // Copy body fg, keep the attribute. No `.bg` is set: like every palette
@@ -583,6 +587,8 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
         // `.normal ==> p.body`'s fg and read as terminal-default.
         .strong => .{ .bold = true, .fg = p.body.fg },
         .emphasis => .{ .italic = true, .fg = p.body.fg },
+        .strong_emphasis => .{ .bold = true, .italic = true, .fg = p.body.fg },
+        .strikethrough => .{ .strikethrough = true, .fg = p.body.fg },
         .link => .{ .fg = p.model_status.fg, .ul_style = .single },
         .code_keyword => .{ .fg = p.skill.fg, .bold = true },
         .code_string => .{ .fg = p.tool.fg },
