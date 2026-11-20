@@ -279,6 +279,11 @@ pub const TuiSettings = struct {
     /// Minimum terminal column width required to trigger split layout.
     min_split_width: u16 = 140,
     min_split_width_is_set: bool = false,
+    /// Readable-measure cap for transcript content (issue #489): 0 fills the
+    /// terminal width; a positive value caps prose/markdown at that many
+    /// columns. Applied once at startup (`metrics.readable_measure_max`).
+    max_content_width: u16 = 0,
+    max_content_width_is_set: bool = false,
     /// Render a high-contrast accent border around the focused split column.
     highlight_focused_border: bool = true,
     highlight_focused_border_is_set: bool = false,

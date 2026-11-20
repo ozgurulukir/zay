@@ -19,6 +19,29 @@ const CountingAllocator = @import("counting_allocator").CountingAllocator;
 /// size for a single active message.
 pub const render_cache_max_bytes: usize = 256 * 1024;
 
+/// Readable-measure cap for transcript content (issue #489): 0 fills the
+/// terminal width (historical behavior); any positive value caps prose and
+/// markdown at that many columns. Set ONCE at startup from
+/// `config.tui.max_content_width` (mirroring `tui_style.active`'s
+/// set-once-at-startup pattern) so every consumer of
+/// `ConversationLayout.contentWidth` — draw, row counting, and scroll
+/// navigation — applies the same cap by construction and the row cache never
+/// desyncs from the render.
+pub var readable_measure_max: u16 = 0;
+
+/// The transcript content width at `width` columns under the cap. With the
+/// cap at 0 this is exactly the historical `width -| left -| right`.
+pub fn effectiveContentWidth(width: u16, max_content_width: u16) u16 {
+    const content = width -| content_margin_left -| content_margin_right;
+    if (max_content_width == 0) return content;
+    return @min(content, max_content_width);
+}
+
+/// ConversationLayout's fixed margins, mirrored here because the metrics
+/// layer receives content widths from it and cannot import a widget module.
+const content_margin_left: u16 = 2;
+const content_margin_right: u16 = 2;
+
 pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
     const cache = message.rowCachePtr();
     if (cache.valid and cache.width == width) {
@@ -279,4 +302,14 @@ test "incremental streaming render is far cheaper than full re-render" {
     }
 
     try std.testing.expect(inc_total * 8 < full_total);
+}
+
+test "effectiveContentWidth caps content under the readable-measure setting" {
+    // Cap disabled: historical width - margins (saturating at narrow widths).
+    try std.testing.expectEqual(@as(u16, 76), effectiveContentWidth(80, 0));
+    try std.testing.expectEqual(@as(u16, 0), effectiveContentWidth(4, 0));
+    // Cap enabled: never exceeds the cap, and never the unclamped content.
+    try std.testing.expectEqual(@as(u16, 60), effectiveContentWidth(80, 60));
+    try std.testing.expectEqual(@as(u16, 30), effectiveContentWidth(34, 60));
+    try std.testing.expectEqual(@as(u16, 0), effectiveContentWidth(4, 60));
 }

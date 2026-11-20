@@ -456,6 +456,13 @@
           "default": 140,
           "description": "Minimum terminal column width required to trigger split layout."
         },
+        "maxContentWidth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500,
+          "default": 0,
+          "description": "Readable-measure cap for transcript content; 0 fills the terminal width."
+        },
         "highlightFocusedBorder": {
           "type": "boolean",
           "default": true,
