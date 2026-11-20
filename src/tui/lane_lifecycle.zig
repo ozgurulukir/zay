@@ -16,7 +16,6 @@ const lane_recovery = @import("lanes/recovery.zig");
 const turn_lifecycle = @import("turn_lifecycle.zig");
 const lifecycle = @import("lifecycle.zig");
 const mode_lifecycle = @import("mode_lifecycle.zig");
-const turn_view_mod = @import("turn_view.zig");
 const queue_mod = @import("queue.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
@@ -1944,7 +1943,6 @@ test "I1: a freshly spawned lane resets turn bookkeeping via resetTurnState" {
     }
     try std.testing.expectEqual(@as(u32, 0), lane.turn_tool_calls);
     try std.testing.expect(lane.turn_failed == null);
-    try std.testing.expect(lane.turn_view.loading_word_index < turn_view_mod.loading_spinners.len);
     try std.testing.expect(lane.turn.state == .active);
 }
 

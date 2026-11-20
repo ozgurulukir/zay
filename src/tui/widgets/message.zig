@@ -65,6 +65,10 @@ pub const MessageWidget = struct {
     /// The user started typing — the splash yields its rows as a blank card.
     /// Same height, so ListView scroll math never shifts mid-typing.
     splash_suppressed: bool = false,
+    /// Active transcript-search query, highlighted at draw time (issue #484).
+    /// Null outside a search and after closing one; INV-WIDGET-1 keeps it a
+    /// borrowed slice built at props time.
+    search_query: ?[]const u8 = null,
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -98,39 +102,89 @@ pub const MessageWidget = struct {
         return @min(requested_height, max_height);
     }
 
+    /// Maximum highlighted matches per body (a long body stops highlighting
+    /// after this many hits).
+    const max_search_spans: usize = 32;
+
+    /// All case-insensitive `query` hits in `text` as byte-offset style spans
+    /// (the same overlay model `drawWrappedStyled` already renders), or null
+    /// when there is no query or no hit. Arena-owned.
+    fn findMatchSpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8) ?[]StyleSpan {
+        const q = query orelse return null;
+        if (q.len == 0 or q.len > text.len) return null;
+        var spans: std.ArrayList(StyleSpan) = .empty;
+        var i: usize = 0;
+        while (i + q.len <= text.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(text[i .. i + q.len], q)) {
+                spans.append(arena, .{ .start = i, .end = i + q.len, .style = searchMatchStyle() }) catch return null;
+                i += q.len - 1;
+            }
+            if (spans.items.len >= max_search_spans) break;
+        }
+        if (spans.items.len == 0) return null;
+        return spans.toOwnedSlice(arena) catch null;
+    }
+
+    /// The search-hit overlay: bold body text over the selection background
+    /// (or reverse video in no-color mode).
+    fn searchMatchStyle() vaxis.Style {
+        return tui_style.onSelectionBg(.{ .bold = true }, true);
+    }
+
+    /// Draw a plain body, overlaying search-hit styles when a query is active
+    /// (issue #484). Falls back to plain `drawWrapped` otherwise — including
+    /// the left bar, which the highlighted path omits (transient mode).
+    fn drawBodyText(
+        surface: *vxfw.Surface,
+        text: []const u8,
+        style: vaxis.Style,
+        selected: bool,
+        row: *u16,
+        ctx: vxfw.DrawContext,
+        indent: u16,
+        bar_style: ?vaxis.Style,
+        query: ?[]const u8,
+    ) void {
+        if (findMatchSpans(ctx.arena, text, query)) |spans| {
+            drawWrappedStyled(surface, text, spans, style, "", selected, row, ctx, indent);
+            return;
+        }
+        drawWrapped(surface, text, style, selected, row, ctx, indent, bar_style);
+    }
+
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const p = tui_style.activePalette();
         const styled_as_selected = self.selected or !self.message.kind().dimmable();
         var row: u16 = ConversationLayout.top;
         switch (self.message.*) {
-            .user => |m| drawWrapped(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user),
+            .user => |m| drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query),
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .skill => |m| {
-                drawWrapped(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill);
+                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query);
                 if (m.expanded and m.body.len > 0) {
-                    drawWrapped(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null);
+                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query);
                 }
             },
             .notice => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ")) "" else "! ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawWrapped(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice);
+                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query);
             },
             .success => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "✓ ")) "" else "✓ ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawWrapped(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool);
+                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query);
             },
-            .info => |m| drawWrapped(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info),
+            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
                 const title_style = if (m.failed) p.tool_failed else p.tool;
                 try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, &row, ctx);
-                if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx);
+                if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx, self.search_query);
             },
             .thinking => |m| {
                 drawLine(surface, m.title, p.thinking_label, styled_as_selected, &row, ctx, 2, p.thinking_bar);
-                if (m.expanded) drawWrapped(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar);
+                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query);
             },
             .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx),
         }
@@ -167,7 +221,10 @@ pub const MessageWidget = struct {
             message.expanded_title_formatted orelse message.expanded_title orelse message.title
         else
             message.title;
-        const command = toolCommandTitle(chosen);
+        // Duration/exit suffix (issue #488): appended identically in the row
+        // counter (metrics.toolTitleRowsForView) so wrap math matches.
+        var suffix_buf: [256]u8 = undefined;
+        const command = message.titledWithSuffix(&suffix_buf, toolCommandTitle(chosen));
         const prefix = if (message.running) loading_frames[loading_frame % loading_frames.len] else toolIcon(command);
         const failed = !message.running and message.failed;
         const has_formatted = message.expanded and message.expanded_title_formatted != null;
@@ -458,7 +515,7 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         start_col: u16,
     ) void {
-        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "");
+        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "", null);
     }
 
     fn writeTextWithLink(
@@ -470,6 +527,7 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         start_col: u16,
         link_url: []const u8,
+        hl: ?StyleSpan,
     ) void {
         var col = ConversationLayout.left + start_col;
         const col_limit = surface.size.width -| ConversationLayout.right;
@@ -484,6 +542,14 @@ pub const MessageWidget = struct {
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
                 .style = mergedSelectedStyle(style, selected),
             };
+            // Search-hit overlay (issue #484): `hl` is a byte range relative
+            // to `text`; graphemes inside it draw with the match style.
+            if (hl) |range| {
+                const offset = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
+                if (offset >= range.start and offset < range.end) {
+                    cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg }, selected);
+                }
+            }
             if (link_url.len > 0) {
                 // A stable per-URI OSC 8 `id` lets terminals treat fragments of
                 // one link wrapped across rows (or split by style spans) as a
@@ -562,11 +628,30 @@ fn drawMarkdown(
         };
     };
 
+    // Search-hit ranges over the body (issue #484). Markdown spans borrow the
+    // body bytes, so a span's absolute offset is `span.text.ptr - body.ptr`;
+    // owned-text spans (stacked table keys) fall outside the body bounds and
+    // simply never highlight.
+    const match_spans: ?[]StyleSpan = MessageWidget.findMatchSpans(ctx.arena, text, self.search_query);
     for (rows) |markdown_row| {
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
         for (markdown_row.spans) |span| {
-            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col, span.link_url);
+            const span_offset = @intFromPtr(span.text.ptr) -| @intFromPtr(text.ptr);
+            const borrowed = span_offset < text.len and span_offset + span.text.len <= text.len;
+            var relative_hl: ?StyleSpan = null;
+            if (match_spans) |all| {
+                for (all) |range| {
+                    if (!borrowed) break;
+                    const lo = @max(range.start, span_offset);
+                    const hi = @min(range.end, span_offset + span.text.len);
+                    if (lo < hi) {
+                        relative_hl = .{ .start = lo - span_offset, .end = hi - span_offset, .style = MessageWidget.searchMatchStyle() };
+                        break;
+                    }
+                }
+            }
+            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col, span.link_url, relative_hl);
             start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
         }
         row.* += 1;
@@ -613,6 +698,7 @@ fn drawToolBody(
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
+    query: ?[]const u8,
 ) !void {
     const p = tui_style.activePalette();
     // Prefer the structured parts; fall back to body + render only when there
@@ -620,7 +706,7 @@ fn drawToolBody(
     if (message.parts.len > 0) {
         for (message.parts) |part| {
             switch (part.kind) {
-                .text => MessageWidget.drawWrapped(surface, part.text, p.thinking_body, selected, row, ctx, 0, null),
+                .text => MessageWidget.drawBodyText(surface, part.text, p.thinking_body, selected, row, ctx, 0, null, query),
                 .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx),
                 .json => drawJson(surface, part, selected, row, ctx),
             }
@@ -632,7 +718,7 @@ fn drawToolBody(
         }
     }
     if (message.stderr) |stderr| {
-        MessageWidget.drawWrapped(surface, stderr, p.tool_failed, selected, row, ctx, 0, null);
+        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query);
     }
 }
 
@@ -878,7 +964,7 @@ test "failed tool title renders a non-color ✗ marker" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "pwd");
-    try transcript.finishTool(gpa, index, "", null, true, .plain);
+    try transcript.finishTool(gpa, index, "", null, true, .plain, 0, 0);
     transcript.messages.items[index].tool.expanded = false;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -990,7 +1076,7 @@ test "failed formatted tool title shifts name/args spans after the marker" {
 
     const index = try transcript.startTool(gpa, "List files");
     try transcript.updateToolExpanded(gpa, index, "List files", "List files --all");
-    try transcript.finishTool(gpa, index, "", null, true, .plain);
+    try transcript.finishTool(gpa, index, "", null, true, .plain, 0, 0);
     transcript.messages.items[index].tool.expanded = true;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1024,7 +1110,7 @@ test "drawJson highlights a key with the accent style" {
     defer transcript.deinit(gpa);
 
     const index = try transcript.startTool(gpa, "curl");
-    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain);
+    try transcript.finishTool(gpa, index, "{\"a\":1}", null, false, .plain, 0, 0);
     transcript.messages.items[index].tool.expanded = true;
 
     var arena = std.heap.ArenaAllocator.init(gpa);

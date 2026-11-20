@@ -75,7 +75,6 @@ const MessageWidget = tui_message.MessageWidget;
 const mergedSelectedStyle = tui_style.mergedSelectedStyle;
 const messageRowsCached = tui_metrics.messageRowsCached;
 
-const loading_spinners = tui_turn_view.loading_spinners;
 const loading_frame_ms = tui_message.loading_frame_ms;
 const command_prefix: u8 = '/';
 const long_message_scroll_step_rows: u16 = 3;
