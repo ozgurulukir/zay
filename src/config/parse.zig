@@ -78,6 +78,11 @@ const retry_base_delay_ms_max: u32 = 8000;
 /// field keeps its default), matching the toast-setting convention.
 const min_split_width_min: u16 = 80;
 const min_split_width_max: u16 = 500;
+
+/// Accepted band for `maxContentWidth` (0 disables the cap); out-of-band
+/// values are dropped, matching the minSplitWidth convention.
+const max_content_width_min: u16 = 40;
+const max_content_width_max: u16 = 500;
 /// Max length for `systemPrompt` (schema `maxLength: 10000`). Longer values
 /// are dropped with a diagnostic — a silently-truncated prompt would change
 /// semantics, so the field never clamps. Public: the settings editor's
@@ -1266,6 +1271,14 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
             tui.min_split_width_is_set = true;
         }
     }
+    // Readable-measure cap (issue #489): 0 disables (fills the terminal),
+    // otherwise a positive column count.
+    if (u32field(value, "maxContentWidth")) |v| {
+        if (v == 0 or (v >= max_content_width_min and v <= max_content_width_max)) {
+            tui.max_content_width = @intCast(v);
+            tui.max_content_width_is_set = true;
+        }
+    }
     if (boolField(value, "highlightFocusedBorder")) |b| {
         tui.highlight_focused_border = b;
         tui.highlight_focused_border_is_set = true;
@@ -2422,6 +2435,10 @@ fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     if (tui.min_split_width_is_set or tui.min_split_width != default_tui.min_split_width) {
         try writeKeyNoIndent(writer, "minSplitWidth", &wrote_any);
         try writer.print("{d}", .{tui.min_split_width});
+    }
+    if (tui.max_content_width_is_set or tui.max_content_width != default_tui.max_content_width) {
+        try writeKeyNoIndent(writer, "maxContentWidth", &wrote_any);
+        try writer.print("{d}", .{tui.max_content_width});
     }
     if (tui.highlight_focused_border_is_set or tui.highlight_focused_border != default_tui.highlight_focused_border) {
         try writeKeyNoIndent(writer, "highlightFocusedBorder", &wrote_any);
@@ -4892,15 +4909,16 @@ test "mergeLayers: a higher layer restores the compaction auto default" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\"keepRecentToolTurns\":4") != null);
 }
 
-test "parseTui round-trips all nine layout + telemetry fields" {
+test "parseTui round-trips all ten layout + telemetry fields" {
     const json =
-        \\{"splitMode":"grid","minSplitWidth":200,"highlightFocusedBorder":false,"showTokenVelocity":false,"showContextMeter":false,"showSkillInventory":true,"velocitySmoothingAlpha":0.6,"contextThresholdWarn":0.5,"contextThresholdAlert":0.9}
+        \\{"splitMode":"grid","minSplitWidth":200,"maxContentWidth":100,"highlightFocusedBorder":false,"showTokenVelocity":false,"showContextMeter":false,"showSkillInventory":true,"velocitySmoothingAlpha":0.6,"contextThresholdWarn":0.5,"contextThresholdAlert":0.9}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const tui = try parseTui(std.testing.allocator, parsed.value);
     try std.testing.expectEqual(SplitMode.grid, tui.split_mode);
     try std.testing.expectEqual(@as(u16, 200), tui.min_split_width);
+    try std.testing.expectEqual(@as(u16, 100), tui.max_content_width);
     try std.testing.expect(!tui.highlight_focused_border);
     try std.testing.expect(!tui.show_token_velocity);
     try std.testing.expect(!tui.show_context_meter);
@@ -4908,6 +4926,13 @@ test "parseTui round-trips all nine layout + telemetry fields" {
     try std.testing.expectEqual(@as(f64, 0.6), tui.velocity_smoothing_alpha);
     try std.testing.expectEqual(@as(f64, 0.5), tui.context_threshold_warn);
     try std.testing.expectEqual(@as(f64, 0.9), tui.context_threshold_alert);
+
+    // Serialize writes the parsed value back out (the setting must survive a
+    // config round-trip, not just a parse).
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeTui(&out.writer, tui);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"maxContentWidth\":100") != null);
 }
 
 test "parseTui drops out-of-range layout + telemetry values" {
