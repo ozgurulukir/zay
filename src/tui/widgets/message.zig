@@ -783,7 +783,7 @@ fn drawToolBody(
     if (message.group_items.len > 0) {
         var buf: [256]u8 = undefined;
         for (message.group_items) |item| {
-            const item_text = tui_metrics.formatGroupItemRow(&buf, item);
+            const item_text = try ctx.arena.dupe(u8, tui_metrics.formatGroupItemRow(&buf, item));
             const item_style = if (item.failed) p.tool_failed else p.thinking_body;
             MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, selection);
         }
@@ -822,7 +822,8 @@ fn drawToolTextSegment(
     const p = tui_style.activePalette();
     if (tui_metrics.splitToolBodyHeadTail(text, expanded_in_place)) |ht| {
         var fbuf: [96]u8 = undefined;
-        const footer = tui_metrics.formatTruncationFooter(&fbuf, ht.omitted_lines);
+        const formatted_footer = tui_metrics.formatTruncationFooter(&fbuf, ht.omitted_lines);
+        const footer = ctx.arena.dupe(u8, formatted_footer) catch "… more lines · Enter to expand in place";
         drawToolStyledText(surface, ht.head, render, selected, row, ctx, query, selection);
         MessageWidget.drawWrapped(surface, footer, .{ .fg = p.thinking_body.fg, .dim = true }, selected, row, ctx, 0, null);
         drawToolStyledText(surface, ht.tail, render, selected, row, ctx, query, selection);
@@ -870,7 +871,7 @@ fn drawToolStyledText(
         spans[idx] = ov;
         idx += 1;
     }
-    drawWrappedStyled(surface, text, spans[0..idx], p.thinking_body, "", selected, row, ctx, 0);
+    drawWrappedStyled(surface, text, spans[0..idx], p.thinking_body, "", null, selected, row, ctx, 0);
 }
 
 /// A byte-span into some text plus the vaxis style to draw those bytes with.

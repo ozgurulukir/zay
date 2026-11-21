@@ -725,18 +725,20 @@ pub const Transcript = struct {
                 if (first_item.stderr) |s| gpa.free(s);
             }
             const items = try gpa.alloc(GroupItem, 2);
+            errdefer gpa.free(items);
+            const new_title = try std.fmt.allocPrint(gpa, "{s} · 2 calls", .{prev_name});
             items[0] = first_item;
             items[1] = cur_item;
-            const new_title = try std.fmt.allocPrint(gpa, "{s} · 2 calls", .{prev_name});
             gpa.free(prev.title);
             prev.title = new_title;
             prev.group_items = items;
         } else {
             const old_len = prev.group_items.len;
+            const new_title = try std.fmt.allocPrint(gpa, "{s} · {d} calls", .{ prev_name, old_len + 1 });
+            errdefer gpa.free(new_title);
             const new_items = try gpa.realloc(prev.group_items, old_len + 1);
             new_items[old_len] = cur_item;
             prev.group_items = new_items;
-            const new_title = try std.fmt.allocPrint(gpa, "{s} · {d} calls", .{ prev_name, new_items.len });
             gpa.free(prev.title);
             prev.title = new_title;
         }
