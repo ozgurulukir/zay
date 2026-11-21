@@ -61,7 +61,7 @@ The `theme` field selects a runtime color theme for the TUI at startup. The buil
 
 | Field   | Type     | Description                                                                                           |
 | ------- | -------- | ----------------------------------------------------------------------------------------------------- |
-| `theme` | `string` | `default` (classic look), `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), `gruvbox_dark` (Gruvbox Dark), `okabe_ito` (Okabe–Ito color-vision-deficiency-friendly palette). Unknown or empty names fall back to `default` at resolve time; absent = `default`. |
+| `theme` | `string` | `default` (classic look), `cappuccino` (Catppuccin Mocha), `tokyo_night` (Tokyo Night), `dracula` (Dracula), `nord` (Nord), `gruvbox_dark` (Gruvbox Dark), `okabe_ito` (Okabe–Ito color-vision-deficiency-friendly palette), `catppuccin_latte` (Catppuccin Latte), and `tokyo_night_day` (Tokyo Night Day). Unknown or empty names fall back to `default` at resolve time; absent = `default`. |
 
 When changing themes dynamically in the TUI via `/theme <name>` or the interactive `/theme` picker:
 - If the active project configuration (`<cwd>/.zay/config.json`) defines a `theme`, the new choice persists to the project configuration via `mergeAndWriteProject`.
@@ -95,6 +95,12 @@ The `tui` object also controls the multi-lane split layout and the status-bar to
 | `tui.velocitySmoothingAlpha` | `number`  | `0.35`  | Exponential-moving-average smoothing coefficient for the token velocity gauge. Accepted range `[0.05, 1.0]`; out-of-band values are dropped at parse and the default is used.                                                                                                                                                     |
 | `tui.contextThresholdWarn`   | `number`  | `0.70`  | Context usage fraction that transitions the meter to amber warning. Accepted range `[0.1, 0.9]`; out-of-band values are dropped at parse and the default is used.                                                                                                                                                                |
 | `tui.contextThresholdAlert`  | `number`  | `0.85`  | Context usage fraction that transitions the meter to red alert. Accepted range `[0.2, 0.99]`; out-of-band values are dropped at parse and the default is used.                                                                                                                                                                   |
+
+| `tui.maxContentWidth` | `integer` | `0` | Readable-measure cap for transcript content (issue #489): `0` fills the terminal width; a positive value caps prose/markdown at that many columns. Applied once at startup. 
+| `tui.noColor` | `boolean` | `false` | Disable color styling, rendering in monochrome mode with text attributes only. 
+| `tui.animations` | `string` | `full` | Animation detail level: `full`, `reduced` (static logo, slow spinner, lower tick rate), or `off` (stops animation ticks entirely). 
+| `tui.lightTheme` | `string` | _(none)_ | Light theme used when terminal background is light and theme is `auto`; defaults to `catppuccin_latte` when unset. 
+| `tui.darkTheme` | `string` | _(none)_ | Dark theme used when terminal background is dark and theme is `auto`; defaults to `default` when unset. 
 
 **Keybindings:**
 
