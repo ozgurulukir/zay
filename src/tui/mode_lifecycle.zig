@@ -627,6 +627,7 @@ pub fn submitMode(app: *App) !bool {
             if (app.pickers.links.selectedUrl()) |url| {
                 try clipboard_helper.copyTextWithNotice(app, url, "Copied link URL");
             }
+            app.pickers.links.reset(app.gpa);
             app.setMode(.normal);
             return true;
         },
