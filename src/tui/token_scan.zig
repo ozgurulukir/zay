@@ -17,51 +17,86 @@ pub const Token = struct {
     kind: DiagnosticKind,
 };
 
-/// Scan `text` for `path[:line[:col]]` tokens (e.g. `src/a.zig:10`,
-/// `./b/c.py:3:7`). Requires at least one `/` (or `./` / `../`) before `:line`
-/// so bare `host:8080` or `error:1` are not misclassified as file paths.
-pub fn scanPathLineTokens(alloc: std.mem.Allocator, text: []const u8, max_tokens: usize) ![]Token {
-    var out: std.ArrayList(Token) = .empty;
+pub const PathLineToken = struct {
+    start: usize,
+    end: usize,
+    path_end: usize,
+    line: u32,
+    col: ?u32 = null,
+};
+
+fn isTokenChar(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or b == '/' or b == '\\' or b == '.' or b == '_' or b == '-' or b == ':';
+}
+
+fn isPathChar(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or b == '/' or b == '\\' or b == '.' or b == '_' or b == '-';
+}
+
+/// Scan `text` for `path:line[:col]` references such as `src/a.zig:10` or
+/// `./b/c.py:3:7`. Requires at least one `/`, `\`, or `.` in the path portion
+/// so bare `host:8080` or `error:1` are not misclassified. Bounded to `max_tokens`.
+pub fn scanPathLineTokens(alloc: std.mem.Allocator, text: []const u8, max_tokens: usize) ![]PathLineToken {
+    var out: std.ArrayList(PathLineToken) = .empty;
     errdefer out.deinit(alloc);
 
     var i: usize = 0;
     while (i < text.len and out.items.len < max_tokens) {
-        if (!isPathStart(text, i)) {
+        if (!isTokenChar(text[i])) {
             i += 1;
             continue;
         }
-        const start = i;
-        var j = i;
-        var has_slash = false;
-        while (j < text.len and isPathChar(text[j])) : (j += 1) {
-            if (text[j] == '/') has_slash = true;
+        const tok_start = i;
+        while (i < text.len and isTokenChar(text[i])) : (i += 1) {}
+        var tok_end = i;
+        while (tok_end > tok_start and (text[tok_end - 1] == '.' or text[tok_end - 1] == ':')) {
+            tok_end -= 1;
         }
-        if (has_slash and j < text.len and text[j] == ':') {
-            var k = j + 1;
-            const line_start = k;
-            while (k < text.len and std.ascii.isDigit(text[k])) : (k += 1) {}
-            if (k > line_start) {
-                if (k < text.len and text[k] == ':') {
-                    const col_colon = k;
-                    var m = k + 1;
-                    const col_start = m;
-                    while (m < text.len and std.ascii.isDigit(text[m])) : (m += 1) {}
-                    if (m > col_start) {
-                        k = m;
-                    } else {
-                        k = col_colon;
-                    }
-                }
-                if (k == text.len or !isPathTailBoundary(text[k])) {
-                    try out.append(alloc, .{ .start = start, .end = k, .kind = .path_line });
-                    i = k;
-                    continue;
-                }
-            }
+        const tok = text[tok_start..tok_end];
+        if (tok.len < 4) continue;
+        if (std.mem.indexOf(u8, tok, "://") != null) continue;
+
+        if (parsePathLine(tok)) |parsed| {
+            try out.append(alloc, .{
+                .start = tok_start,
+                .end = tok_end,
+                .path_end = tok_start + parsed.path_len,
+                .line = parsed.line,
+                .col = parsed.col,
+            });
         }
-        i = @max(j, i + 1);
     }
     return out.toOwnedSlice(alloc);
+}
+
+const Parsed = struct {
+    path_len: usize,
+    line: u32,
+    col: ?u32,
+};
+
+fn parsePathLine(tok: []const u8) ?Parsed {
+    const first_colon = std.mem.indexOfScalar(u8, tok, ':') orelse return null;
+    if (first_colon == 0 or first_colon + 1 >= tok.len) return null;
+    const path = tok[0..first_colon];
+    if (std.mem.indexOfAny(u8, path, "/\\") == null) return null;
+    for (path) |b| {
+        if (!isPathChar(b)) return null;
+    }
+    const rest = tok[first_colon + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, ':')) |second_colon| {
+        if (second_colon == 0 or second_colon + 1 >= rest.len) return null;
+        const line_str = rest[0..second_colon];
+        const col_str = rest[second_colon + 1 ..];
+        const line = std.fmt.parseInt(u32, line_str, 10) catch return null;
+        const col = std.fmt.parseInt(u32, col_str, 10) catch return null;
+        if (line == 0) return null;
+        return .{ .path_len = first_colon, .line = line, .col = col };
+    } else {
+        const line = std.fmt.parseInt(u32, rest, 10) catch return null;
+        if (line == 0) return null;
+        return .{ .path_len = first_colon, .line = line, .col = null };
+    }
 }
 
 /// Scan `text` for shell diagnostic prefixes (`error:`, `warning:`, `FAIL`,
@@ -93,7 +128,9 @@ pub fn scanShellDiagnostics(alloc: std.mem.Allocator, text: []const u8, max_toke
     if (out.items.len < max_tokens) {
         const paths = try scanPathLineTokens(alloc, text, max_tokens - out.items.len);
         defer alloc.free(paths);
-        try out.appendSlice(alloc, paths);
+        for (paths) |pt| {
+            try out.append(alloc, .{ .start = pt.start, .end = pt.end, .kind = .path_line });
+        }
     }
     return out.toOwnedSlice(alloc);
 }
@@ -109,33 +146,19 @@ fn startsWithWord(haystack: []const u8, word: []const u8) bool {
     return !std.ascii.isAlphanumeric(haystack[word.len]) and haystack[word.len] != '_';
 }
 
-fn isPathStart(text: []const u8, idx: usize) bool {
-    if (idx > 0 and !isDelimiter(text[idx - 1])) return false;
-    const ch = text[idx];
-    return std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '/' or ch == '_' or ch == '-';
-}
-
-fn isDelimiter(ch: u8) bool {
-    return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '(' or ch == '[' or ch == '\'' or ch == '"' or ch == '`';
-}
-
-fn isPathChar(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '.' or ch == '_' or ch == '-';
-}
-
-fn isPathTailBoundary(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_';
-}
-
-test "scanPathLineTokens matches relative and nested path:line[:col] tokens" {
-    const gpa = std.testing.allocator;
-    const text = "see src/a.zig:10 and ./b/c.py:3:7, not host:8080";
-    const tokens = try scanPathLineTokens(gpa, text, 16);
-    defer gpa.free(tokens);
+test "scanPathLineTokens recognizes path:line and path:line:col" {
+    const text = "See src/a.zig:10 and ./b/c.py:3:7, ignore https://example.com:8080/a and host:8080";
+    const tokens = try scanPathLineTokens(std.testing.allocator, text, 16);
+    defer std.testing.allocator.free(tokens);
 
     try std.testing.expectEqual(@as(usize, 2), tokens.len);
     try std.testing.expectEqualStrings("src/a.zig:10", text[tokens[0].start..tokens[0].end]);
+    try std.testing.expectEqual(@as(u32, 10), tokens[0].line);
+    try std.testing.expect(tokens[0].col == null);
+
     try std.testing.expectEqualStrings("./b/c.py:3:7", text[tokens[1].start..tokens[1].end]);
+    try std.testing.expectEqual(@as(u32, 3), tokens[1].line);
+    try std.testing.expectEqual(@as(?u32, 7), tokens[1].col);
 }
 
 test "scanShellDiagnostics detects error, warning, FAIL, panic and path:line" {

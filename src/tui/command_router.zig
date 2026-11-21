@@ -587,8 +587,12 @@ pub const BlockNav = struct {
         if (app.getBlockNav()) {
             if (key.matches('c', .{})) {
                 if (try clipboard_helper.copySelectedCodeBlock(app)) return true;
+            } else if (key.matches('y', .{ .shift = true }) or key.matches('Y', .{})) {
+                if (try clipboard_helper.copySelectedTranscriptBlockAsMarkdown(app)) return true;
             } else if (key.matches('y', .{}) or key.matches('c', .{ .ctrl = true })) {
                 if (try clipboard_helper.copySelectedTranscriptBlock(app)) return true;
+            } else if (key.matches('p', .{})) {
+                if (try clipboard_helper.copyFirstPathToken(app)) return true;
             }
             if (key.matches('a', .{})) {
                 app.toggleAllTranscriptBlocks();
