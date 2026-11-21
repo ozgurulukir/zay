@@ -15,7 +15,7 @@ const entries = [_]struct { name: []const u8, policy: Policy }{
     // have a builtin — so a hardcoded `"bash"` here would leave an orphan on
     // Windows and a hardcoded `"pwsh"` an orphan on POSIX. One entry matching
     // the one selected shell is the only correct form.
-    .{ .name = tools_mod.shell_tool.name, .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = tools_mod.shell_tool.name, .policy = .{ .expand_by_default = false, .render = .shell } },
     .{ .name = "lane", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "background", .policy = .{ .expand_by_default = false, .render = .plain } },
     .{ .name = "skill", .policy = .{ .expand_by_default = false, .render = .plain } },

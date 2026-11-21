@@ -9,8 +9,19 @@ const assert = std.debug.assert;
 /// How a tool's display body should be drawn in the TUI.
 ///   - `.plain`: single muted-gray body.
 ///   - `.diff`: per-line diff styling with `+` green, `-` red, others gray.
+///   - `.shell`: highlights diagnostic prefixes and `path:line[:col]` tokens.
 /// Failure overrides everything to red at draw time.
-pub const Render = enum { plain, diff };
+pub const Render = enum { plain, diff, shell };
+
+pub const GroupItem = struct {
+    title: []u8,
+    body: []u8,
+    stderr: ?[]u8 = null,
+    failed: bool = false,
+    render: Render = .plain,
+    duration_ms: u32 = 0,
+    exit_code: u8 = 0,
+};
 
 /// Tag of a transcript message. Kept as a separate enum (not the union
 /// tag directly) so non-Message sites can name a kind without depending
@@ -93,6 +104,10 @@ pub const ToolView = struct {
     duration_ms: u32 = 0,
     /// Process exit code carried by shell-type tools (0 for success/other).
     exit_code: u8 = 0,
+    /// When true, long tool output renders in full instead of head+tail (#499).
+    body_expanded_in_place: bool = false,
+    /// Consecutive same-tool collapsed calls merged into one group (#500).
+    group_items: []GroupItem = &.{},
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
     /// The collapsed-title suffix for a finished tool: " · 1.2s" (duration
@@ -212,6 +227,12 @@ pub const Message = union(enum) {
                 if (t.expanded_title_formatted) |f| gpa.free(f);
                 for (t.parts) |*part| part.deinit(gpa);
                 if (t.parts.len > 0) gpa.free(t.parts); // M5: guard the empty-slice free
+                for (t.group_items) |*item| {
+                    gpa.free(item.title);
+                    gpa.free(item.body);
+                    if (item.stderr) |s| gpa.free(s);
+                }
+                if (t.group_items.len > 0) gpa.free(t.group_items);
                 t.render_inc.deinit(gpa);
             },
         }
@@ -656,6 +677,80 @@ pub const Transcript = struct {
         message.invalidateRowCache();
     }
 
+    /// Merge `index` into `index - 1` when both are finished, collapsed,
+    /// same-tool, same-outcome calls (#500). Returns the merged index or null.
+    pub fn mergeConsecutiveTool(self: *Transcript, gpa: std.mem.Allocator, index: u32) !?u32 {
+        if (index == 0 or index + 1 != self.messages.items.len) return null;
+        const prev_msg = &self.messages.items[index - 1];
+        const cur_msg = &self.messages.items[index];
+        if (prev_msg.* != .tool or cur_msg.* != .tool) return null;
+        const prev = &prev_msg.tool;
+        const cur = &cur_msg.tool;
+        if (prev.running or cur.running) return null;
+        if (prev.expanded or cur.expanded) return null;
+        if (prev.failed != cur.failed) return null;
+
+        const prev_name = toolGroupBaseName(prev.title);
+        const cur_name = toolGroupBaseName(cur.title);
+        if (prev_name.len == 0 or !std.mem.eql(u8, prev_name, cur_name)) return null;
+
+        const cur_item: GroupItem = .{
+            .title = try gpa.dupe(u8, cur.title),
+            .body = try gpa.dupe(u8, cur.body),
+            .stderr = if (cur.stderr) |s| try gpa.dupe(u8, s) else null,
+            .failed = cur.failed,
+            .render = cur.render,
+            .duration_ms = cur.duration_ms,
+            .exit_code = cur.exit_code,
+        };
+        errdefer {
+            gpa.free(cur_item.title);
+            gpa.free(cur_item.body);
+            if (cur_item.stderr) |s| gpa.free(s);
+        }
+
+        if (prev.group_items.len == 0) {
+            const first_item: GroupItem = .{
+                .title = try gpa.dupe(u8, prev.title),
+                .body = try gpa.dupe(u8, prev.body),
+                .stderr = if (prev.stderr) |s| try gpa.dupe(u8, s) else null,
+                .failed = prev.failed,
+                .render = prev.render,
+                .duration_ms = prev.duration_ms,
+                .exit_code = prev.exit_code,
+            };
+            errdefer {
+                gpa.free(first_item.title);
+                gpa.free(first_item.body);
+                if (first_item.stderr) |s| gpa.free(s);
+            }
+            const items = try gpa.alloc(GroupItem, 2);
+            items[0] = first_item;
+            items[1] = cur_item;
+            const new_title = try std.fmt.allocPrint(gpa, "{s} · 2 calls", .{prev_name});
+            gpa.free(prev.title);
+            prev.title = new_title;
+            prev.group_items = items;
+        } else {
+            const old_len = prev.group_items.len;
+            const new_items = try gpa.realloc(prev.group_items, old_len + 1);
+            new_items[old_len] = cur_item;
+            prev.group_items = new_items;
+            const new_title = try std.fmt.allocPrint(gpa, "{s} · {d} calls", .{ prev_name, new_items.len });
+            gpa.free(prev.title);
+            prev.title = new_title;
+        }
+        prev.duration_ms +|= cur.duration_ms;
+
+        var removed = self.messages.pop().?;
+        removed.deinit(gpa);
+        prev_msg.invalidateRowCache();
+        if (self.selected) |sel| {
+            if (sel >= self.messages.items.len) self.selected = index - 1;
+        }
+        return index - 1;
+    }
+
     pub fn finishSkill(
         self: *Transcript,
         gpa: std.mem.Allocator,
@@ -812,6 +907,14 @@ fn payloadToMessage(kind: MessageKind, payload: Basic) !Message {
 
 /// Compact wall-time label: "890ms", "1.2s", "1m05s", "12m". Falls back to
 /// "0s" for unknown (0) durations.
+pub fn toolGroupBaseName(title: []const u8) []const u8 {
+    const prefix = "🛠  ";
+    const trimmed = if (std.mem.startsWith(u8, title, prefix)) title[prefix.len..] else title;
+    const before_dot = if (std.mem.indexOf(u8, trimmed, " · ")) |dot_idx| trimmed[0..dot_idx] else trimmed;
+    const end = std.mem.indexOfAny(u8, before_dot, " \t(") orelse before_dot.len;
+    return before_dot[0..end];
+}
+
 pub fn formatToolDuration(buf: []u8, duration_ms: u32) []const u8 {
     if (duration_ms == 0) return "0s";
     if (duration_ms < 1000) return std.fmt.bufPrint(buf, "{d}ms", .{duration_ms}) catch "0s";
@@ -1157,4 +1260,26 @@ fn bodySlice(transcript: Transcript, index: u32, selection: BodySelection) []con
     const range = selection.range();
     const body = transcript.messages.items[index].bodyPtr().*;
     return body[range[0]..range[1]];
+}
+
+test "mergeConsecutiveTool groups consecutive collapsed same-tool same-outcome calls" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const idx0 = try transcript.startTool(gpa, "bash ls");
+    try transcript.finishTool(gpa, idx0, "ok", null, false, .shell, 100, 0);
+    transcript.setExpanded(idx0, false);
+
+    const idx1 = try transcript.startTool(gpa, "bash pwd");
+    try transcript.finishTool(gpa, idx1, "/tmp", null, false, .shell, 200, 0);
+    transcript.setExpanded(idx1, false);
+
+    const merged = try transcript.mergeConsecutiveTool(gpa, idx1);
+    try std.testing.expectEqual(@as(?u32, idx0), merged);
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    const tv = transcript.messages.items[0].tool;
+    try std.testing.expectEqual(@as(usize, 2), tv.group_items.len);
+    try std.testing.expectEqual(@as(u32, 300), tv.duration_ms);
+    try std.testing.expect(std.mem.indexOf(u8, tv.title, "2 calls") != null);
 }

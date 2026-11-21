@@ -140,15 +140,107 @@ fn toolMessageTitle(message: transcript_mod.ToolView) []const u8 {
     return message.title;
 }
 
+pub const tool_head_lines: usize = 8;
+pub const tool_tail_lines: usize = 15;
+pub const tool_line_budget: usize = tool_head_lines + tool_tail_lines + 1;
+
+pub const HeadTailView = struct {
+    head: []const u8,
+    omitted_lines: usize,
+    tail: []const u8,
+};
+
+/// Split long tool output into head + tail when it exceeds `tool_line_budget`
+/// and `expanded_in_place` is false (#499). Shared by `toolBodyRows` and
+/// `drawToolBody` so row counting and rendering never drift.
+pub fn splitToolBodyHeadTail(text: []const u8, expanded_in_place: bool) ?HeadTailView {
+    if (expanded_in_place or text.len == 0) return null;
+    var total_lines: usize = 1;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\n') total_lines += 1;
+    }
+    if (total_lines <= tool_line_budget) return null;
+
+    var head_end: usize = 0;
+    var seen: usize = 0;
+    while (head_end < text.len) : (head_end += 1) {
+        if (text[head_end] == '\n') {
+            seen += 1;
+            if (seen == tool_head_lines) break;
+        }
+    }
+
+    const tail_target = total_lines - tool_tail_lines;
+    var tail_start: usize = 0;
+    seen = 0;
+    while (tail_start < text.len) : (tail_start += 1) {
+        if (text[tail_start] == '\n') {
+            seen += 1;
+            if (seen == tail_target) {
+                tail_start += 1;
+                break;
+            }
+        }
+    }
+
+    const omitted = total_lines -| (tool_head_lines + tool_tail_lines);
+    if (omitted == 0 or head_end >= tail_start) return null;
+    return .{
+        .head = text[0..head_end],
+        .omitted_lines = omitted,
+        .tail = text[tail_start..],
+    };
+}
+
+pub fn formatTruncationFooter(buf: []u8, omitted_lines: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "… {d} more lines · Enter to expand in place", .{omitted_lines}) catch "… more lines · Enter to expand in place";
+}
+
+pub fn formatGroupItemRow(buf: []u8, item: transcript_mod.GroupItem) []const u8 {
+    const marker: []const u8 = if (item.failed) "✗ " else "✓ ";
+    const base = toolCommandTitle(item.title);
+    if (item.duration_ms > 0) {
+        var dur_buf: [24]u8 = undefined;
+        const dur = transcript_mod.formatToolDuration(&dur_buf, item.duration_ms);
+        if (item.failed and item.exit_code != 0) {
+            return std.fmt.bufPrint(buf, "{s}{s} · exit {d} · {s}", .{ marker, base, item.exit_code, dur }) catch base;
+        }
+        return std.fmt.bufPrint(buf, "{s}{s} · {s}", .{ marker, base, dur }) catch base;
+    }
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ marker, base }) catch base;
+}
+
 pub fn toolBodyRows(message: transcript_mod.ToolView, width: u16) u16 {
+    if (message.group_items.len > 0) {
+        var rows: u16 = 0;
+        var buf: [256]u8 = undefined;
+        for (message.group_items) |item| {
+            rows += textRows(formatGroupItemRow(&buf, item), width);
+        }
+        return rows;
+    }
     var rows: u16 = 0;
-    // Prefer the structured parts; fall back to the raw body when there are no
-    // parts (mirrors `drawToolBody`). `.diff` and `.json` count identically to
-    // `.text` — same wrapping.
     if (message.parts.len > 0) {
-        for (message.parts) |part| rows += textRows(part.text, width);
+        for (message.parts) |part| {
+            if (splitToolBodyHeadTail(part.text, message.body_expanded_in_place)) |ht| {
+                var fbuf: [96]u8 = undefined;
+                rows += textRows(ht.head, width);
+                rows += textRows(formatTruncationFooter(&fbuf, ht.omitted_lines), width);
+                rows += textRows(ht.tail, width);
+            } else {
+                rows += textRows(part.text, width);
+            }
+        }
     } else if (message.body.len > 0) {
-        rows += textRows(message.body, width);
+        if (splitToolBodyHeadTail(message.body, message.body_expanded_in_place)) |ht| {
+            var fbuf: [96]u8 = undefined;
+            rows += textRows(ht.head, width);
+            rows += textRows(formatTruncationFooter(&fbuf, ht.omitted_lines), width);
+            rows += textRows(ht.tail, width);
+        } else {
+            rows += textRows(message.body, width);
+        }
     }
     if (message.stderr) |stderr| rows += textRows(stderr, width);
     return rows;
@@ -290,4 +382,23 @@ test "effectiveContentWidth caps content under the readable-measure setting" {
     try std.testing.expectEqual(@as(u16, 60), effectiveContentWidth(80, 60));
     try std.testing.expectEqual(@as(u16, 30), effectiveContentWidth(34, 60));
     try std.testing.expectEqual(@as(u16, 0), effectiveContentWidth(4, 60));
+}
+
+test "splitToolBodyHeadTail truncates long output and expands in place" {
+    const long_output = "line\n" ** 50; // 51 lines (50 newlines)
+    const ht = splitToolBodyHeadTail(long_output, false).?;
+    try std.testing.expectEqual(@as(usize, 51 - tool_head_lines - tool_tail_lines), ht.omitted_lines);
+    try std.testing.expect(splitToolBodyHeadTail(long_output, true) == null);
+
+    var tv: transcript_mod.ToolView = .{
+        .title = @constCast("bash"),
+        .body = @constCast(long_output),
+        .expanded = true,
+        .running = false,
+    };
+    const collapsed_rows = toolBodyRows(tv, 80);
+    try std.testing.expectEqual(@as(u16, tool_line_budget), collapsed_rows);
+    tv.body_expanded_in_place = true;
+    const expanded_rows = toolBodyRows(tv, 80);
+    try std.testing.expectEqual(@as(u16, 51), expanded_rows);
 }

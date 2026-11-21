@@ -7,6 +7,7 @@ const transcript_mod = @import("../../transcript.zig");
 const parts_mod = @import("../../tools/parts.zig");
 const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
+const token_scan = @import("../token_scan.zig");
 const blackhole = @import("../blackhole.zig");
 
 const log = std.log.scoped(.message_widget);
@@ -779,25 +780,97 @@ fn drawToolBody(
     selection: ?[2]usize,
 ) !void {
     const p = tui_style.activePalette();
-    // Prefer the structured parts; fall back to body + render only when there
-    // are no parts (tests, direct ToolView construction).
+    if (message.group_items.len > 0) {
+        var buf: [256]u8 = undefined;
+        for (message.group_items) |item| {
+            const item_text = tui_metrics.formatGroupItemRow(&buf, item);
+            const item_style = if (item.failed) p.tool_failed else p.thinking_body;
+            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, selection);
+        }
+        return;
+    }
     if (message.parts.len > 0) {
         for (message.parts) |part| {
             switch (part.kind) {
-                .text => MessageWidget.drawBodyText(surface, part.text, p.thinking_body, selected, row, ctx, 0, null, query, selection),
+                .text => drawToolTextSegment(surface, part.text, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection),
                 .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx),
                 .json => drawJson(surface, part, selected, row, ctx),
             }
         }
     } else if (message.body.len > 0) {
         switch (message.render) {
-            .plain => MessageWidget.drawWrapped(surface, message.body, p.thinking_body, selected, row, ctx, 0, null),
+            .plain, .shell => drawToolTextSegment(surface, message.body, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection),
             .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx),
         }
     }
     if (message.stderr) |stderr| {
         MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, selection);
     }
+}
+
+fn drawToolTextSegment(
+    surface: *vxfw.Surface,
+    text: []const u8,
+    render: transcript_mod.Render,
+    expanded_in_place: bool,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+    query: ?[]const u8,
+    selection: ?[2]usize,
+) void {
+    const p = tui_style.activePalette();
+    if (tui_metrics.splitToolBodyHeadTail(text, expanded_in_place)) |ht| {
+        var fbuf: [96]u8 = undefined;
+        const footer = tui_metrics.formatTruncationFooter(&fbuf, ht.omitted_lines);
+        drawToolStyledText(surface, ht.head, render, selected, row, ctx, query, selection);
+        MessageWidget.drawWrapped(surface, footer, .{ .fg = p.thinking_body.fg, .dim = true }, selected, row, ctx, 0, null);
+        drawToolStyledText(surface, ht.tail, render, selected, row, ctx, query, selection);
+        return;
+    }
+    drawToolStyledText(surface, text, render, selected, row, ctx, query, selection);
+}
+
+fn drawToolStyledText(
+    surface: *vxfw.Surface,
+    text: []const u8,
+    render: transcript_mod.Render,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+    query: ?[]const u8,
+    selection: ?[2]usize,
+) void {
+    const p = tui_style.activePalette();
+    if (render != .shell) {
+        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, selection);
+        return;
+    }
+    const tokens = token_scan.scanShellDiagnostics(ctx.arena, text, 64) catch &.{};
+    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, selection) orelse &.{};
+    if (tokens.len == 0 and overlays.len == 0) {
+        MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null);
+        return;
+    }
+    const spans = ctx.arena.alloc(StyleSpan, tokens.len + overlays.len) catch {
+        MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null);
+        return;
+    };
+    var idx: usize = 0;
+    for (tokens) |tok| {
+        const tok_style: vaxis.Style = switch (tok.kind) {
+            .err => .{ .fg = p.tool_failed.fg, .bold = true },
+            .warn => .{ .fg = p.notice.fg, .bold = true },
+            .path_line => .{ .fg = p.model_status.fg, .bold = true, .ul_style = .single },
+        };
+        spans[idx] = .{ .start = tok.start, .end = tok.end, .style = tok_style };
+        idx += 1;
+    }
+    for (overlays) |ov| {
+        spans[idx] = ov;
+        idx += 1;
+    }
+    drawWrappedStyled(surface, text, spans[0..idx], p.thinking_body, "", selected, row, ctx, 0);
 }
 
 /// A byte-span into some text plus the vaxis style to draw those bytes with.

@@ -603,6 +603,18 @@ pub const BlockNav = struct {
                     }
                 }
             }
+            if (isEnterKey(key)) {
+                if (app.thread.transcript.selected) |sel| {
+                    if (sel < app.thread.transcript.messages.items.len and app.thread.transcript.messages.items[sel] == .tool) {
+                        const msg = &app.thread.transcript.messages.items[sel];
+                        if (msg.tool.expanded) {
+                            msg.tool.body_expanded_in_place = !msg.tool.body_expanded_in_place;
+                            msg.invalidateRowCache();
+                            return true;
+                        }
+                    }
+                }
+            }
             // Shift+arrows extend a within-body selection over the selected
             // message (issue #487); 'y' then copies just the selection.
             const selection_direction: ?transcript_mod.BodySelectionStep = if (key.matches(vaxis.Key.left, .{ .shift = true }))
