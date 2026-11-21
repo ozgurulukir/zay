@@ -18,6 +18,7 @@ pub const Style = enum {
     /// Horizontal-rule row (`---`).
     rule,
     table_border,
+    code_border,
     code,
     strong,
     emphasis,
@@ -191,6 +192,7 @@ fn renderInto(
         const line = lineAt(text, line_start);
         if (!state.in_code) {
             if (try renderTable(gpa, b, text, line_start, width)) |next_start| {
+                state.list_continuation_indent = 0;
                 if (next_start >= text.len) break;
                 line_start = next_start;
                 continue;
@@ -212,6 +214,7 @@ pub fn countRows(gpa: std.mem.Allocator, text: []const u8, width: u16) u16 {
         const line = lineAt(text, line_start);
         if (!state.in_code) {
             if (countTableRows(gpa, text, line_start, width)) |table| {
+                state.list_continuation_indent = 0;
                 rows += table.rows;
                 if (table.next_start >= text.len) break;
                 line_start = table.next_start;
@@ -250,6 +253,9 @@ pub const BlockState = struct {
     /// highlight consistently.
     code_block_comment: bool = false,
     code_block_string: bool = false,
+    /// Continuation indent from a preceding list item for lazy continuation
+    /// lines; cleared on any blank line, fence, heading, quote, rule, or table.
+    list_continuation_indent: u16 = 0,
 };
 
 /// A code-fence opener line: which marker byte and how long the run was.
@@ -445,37 +451,57 @@ pub const Incremental = struct {
 
 fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u16, state: *BlockState) !void {
     switch (applyFence(line, state)) {
-        .opened, .closed => return,
+        .opened => {
+            state.list_continuation_indent = 0;
+            return appendCodeHeader(gpa, b, state.code_lang, width);
+        },
+        .closed => {
+            state.list_continuation_indent = 0;
+            return appendCodeFooter(gpa, b, width);
+        },
         .none => {},
     }
-    if (line.len == 0) return appendEmptyRow(gpa, b);
+    if (line.len == 0) {
+        if (!state.in_code) state.list_continuation_indent = 0;
+        return appendEmptyRow(gpa, b);
+    }
     if (state.in_code) {
+        const prefix = [_]Span{.{ .text = "│ ", .style = .code_border }};
         const spans = tokenizeCodeLine(gpa, line, state.code_lang, state) catch null;
         if (spans) |s| {
             defer gpa.free(s);
-            return appendWrapped(gpa, b, &.{}, 0, s, width);
+            return appendWrapped(gpa, b, &prefix, 2, s, width);
         }
-        return renderPlainLine(gpa, b, line, width, .code, 0, &.{});
+        return renderPlainLine(gpa, b, line, width, .code, 2, &prefix);
     }
     if (headingBody(line)) |heading| {
+        state.list_continuation_indent = 0;
         const spans = try inlineSpans(gpa, heading.text, headingStyle(heading.level));
         defer gpa.free(spans);
         return appendWrapped(gpa, b, &.{}, 0, spans, width);
     }
     if (quoteBody(line)) |body| {
+        state.list_continuation_indent = 0;
         const prefix = [_]Span{.{ .text = "┃ ", .style = .quote }};
         const spans = try inlineSpans(gpa, body, .quote);
         defer gpa.free(spans);
         return appendWrapped(gpa, b, &prefix, 2, spans, width);
     }
     if (isHorizontalRule(line)) {
+        state.list_continuation_indent = 0;
         return appendRuleRow(gpa, b, width);
     }
     if (listBody(line)) |list| {
+        const marker_width: u16 = @intCast(@min(list.indent + textWidth(list.marker), std.math.maxInt(u16)));
+        state.list_continuation_indent = @min(marker_width, 8);
         return appendListItem(gpa, b, list, width);
     }
     const spans = try inlineSpans(gpa, line, .normal);
     defer gpa.free(spans);
+    if (state.list_continuation_indent > 0) {
+        const prefix = [_]Span{.{ .text = indentSpaces(state.list_continuation_indent), .style = .normal }};
+        return appendWrapped(gpa, b, &prefix, state.list_continuation_indent, spans, width);
+    }
     return appendWrapped(gpa, b, &.{}, 0, spans, width);
 }
 
@@ -487,6 +513,52 @@ fn headingStyle(level: u8) Style {
         2 => .heading_h2,
         else => .heading_h3,
     };
+}
+
+/// Opening header row for a fenced code block: `╭─ lang ───` (or `╭───` when
+/// no language tag is present), bounded to `width`.
+fn appendCodeHeader(gpa: std.mem.Allocator, b: *RowBuilder, code_lang: []const u8, width: u16) !void {
+    if (width == 0) return b.push(gpa, 0, &.{});
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+    if (code_lang.len > 0 and width >= 6) {
+        try spans.append(gpa, .{ .text = "╭─ ", .style = .code_border });
+        const max_lang_w = width -| 4;
+        const lang_w = textWidth(code_lang);
+        const owned_lang = try b.ownSpanText(gpa, if (lang_w <= max_lang_w) code_lang else clipToWidth(code_lang, max_lang_w));
+        try spans.append(gpa, .{ .text = owned_lang, .style = .code_border });
+        try spans.append(gpa, .{ .text = " ", .style = .code_border });
+        const used: u16 = 4 + textWidth(owned_lang);
+        try appendRepeatedSpan(gpa, &spans, "─", width -| used, .code_border);
+    } else {
+        try spans.append(gpa, .{ .text = "╭", .style = .code_border });
+        try appendRepeatedSpan(gpa, &spans, "─", width -| 1, .code_border);
+    }
+    try b.push(gpa, 0, spans.items);
+}
+
+/// Closing footer row for a fenced code block: `╰───`, bounded to `width`.
+fn appendCodeFooter(gpa: std.mem.Allocator, b: *RowBuilder, width: u16) !void {
+    if (width == 0) return b.push(gpa, 0, &.{});
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+    try spans.append(gpa, .{ .text = "╰", .style = .code_border });
+    try appendRepeatedSpan(gpa, &spans, "─", width -| 1, .code_border);
+    try b.push(gpa, 0, spans.items);
+}
+
+fn clipToWidth(text: []const u8, max_width: u16) []const u8 {
+    var used: u16 = 0;
+    var end: usize = 0;
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const w = textWidth(bytes);
+        if (used + w > max_width) break;
+        used += w;
+        end += bytes.len;
+    }
+    return text[0..end];
 }
 
 /// One full-width rule row (`---`/`***`/`___`). Pushed unwrapped: the row is
@@ -513,26 +585,39 @@ fn renderPlainLine(
 
 fn countLineRows(gpa: std.mem.Allocator, line: []const u8, width: u16, state: *BlockState) u16 {
     switch (applyFence(line, state)) {
-        .opened, .closed => return 0,
+        .opened, .closed => {
+            state.list_continuation_indent = 0;
+            return 1;
+        },
         .none => {},
     }
-    if (line.len == 0) return 1;
+    if (line.len == 0) {
+        if (!state.in_code) state.list_continuation_indent = 0;
+        return 1;
+    }
     if (state.in_code) {
-        return countWrappedRows(gpa, line, width, 0, 0);
+        return countWrappedRows(gpa, line, width, 2, 2);
     }
     if (headingBody(line)) |heading| {
+        state.list_continuation_indent = 0;
         // Headings render with no prefix and no continuation indent.
         return countWrappedRows(gpa, heading.text, width, 0, 0);
     }
     if (quoteBody(line)) |quote| {
+        state.list_continuation_indent = 0;
         return countWrappedRows(gpa, quote, width, 2, 2);
     }
-    if (isHorizontalRule(line)) return 1;
+    if (isHorizontalRule(line)) {
+        state.list_continuation_indent = 0;
+        return 1;
+    }
     if (listBody(line)) |list| {
         const marker_width: u16 = @intCast(@min(list.indent + textWidth(list.marker), std.math.maxInt(u16)));
+        state.list_continuation_indent = @min(marker_width, 8);
         return countWrappedRows(gpa, list.body, width, marker_width, marker_width);
     }
-    return countWrappedRows(gpa, line, width, 0, 0);
+    const ind = state.list_continuation_indent;
+    return countWrappedRows(gpa, line, width, ind, ind);
 }
 
 const CountTable = struct { rows: u16, next_start: usize };
@@ -2630,18 +2715,21 @@ test "code blocks highlight syntax tokens" {
     var out = try render(gpa, code, 80);
     defer out.deinit(gpa);
 
-    try std.testing.expect(out.rows.len >= 5);
-    // Line 0: pub (keyword), fn (keyword)
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "pub"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "fn"));
-    // Line 1: // comment tokens
-    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "//"));
-    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "comment"));
-    // Line 2: const (keyword), 42 (number)
-    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_keyword, "const"));
-    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_number, "42"));
-    // Line 3: "hello" (string)
-    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_string, "\"hello\""));
+    try std.testing.expect(out.rows.len >= 7);
+    // Row 0 is the fenced header ("╭─ zig ─..."), rows 1..4 are code, last row is footer.
+    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_border, "zig"));
+    // Line 1: pub (keyword), fn (keyword)
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_keyword, "pub"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_keyword, "fn"));
+    // Line 2: // comment tokens
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_comment, "//"));
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_comment, "comment"));
+    // Line 3: const (keyword), 42 (number)
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_keyword, "const"));
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_number, "42"));
+    // Line 4: "hello" (string)
+    try std.testing.expect(containsStyledText(out.rows[4].spans, .code_string, "\"hello\""));
+    try std.testing.expect(containsStyledText(out.rows[out.rows.len - 1].spans, .code_border, "╰"));
 }
 
 test "markdown links and bare urls attach link_url" {
@@ -2741,32 +2829,31 @@ test "heading levels map to distinct styles" {
 
 test "tilde fences and longer fences open and close code blocks" {
     const gpa = std.testing.allocator;
-    // Tilde fence: the content line renders as code, the trailing line as
-    // normal (fence lines themselves produce zero rows).
+    // Tilde fence: row 0 = header, row 1 = code, row 2 = footer, row 3 = normal.
     var out = try render(gpa, "~~~\ncode here\n~~~\nafter", 80);
     defer out.deinit(gpa);
     // Content lines tokenize with the generic code styles.
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code, "code"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code, "here"));
-    try std.testing.expectEqual(Style.normal, out.rows[1].spans[0].style);
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code, "code"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code, "here"));
+    try std.testing.expectEqual(Style.normal, out.rows[3].spans[0].style);
 
     // A four-backtick fence closes only on a four-backtick run; three backticks
     // inside are content.
     var long = try render(gpa, "````\ninner ``` line\n````\nafter", 80);
     defer long.deinit(gpa);
-    try std.testing.expect(containsStyledText(long.rows[0].spans, .code, "```"));
-    try std.testing.expectEqual(Style.normal, long.rows[1].spans[0].style);
-    try std.testing.expectEqual(@as(u16, 2), countRows(gpa, "````\ninner ``` line\n````\nafter", 80));
+    try std.testing.expect(containsStyledText(long.rows[1].spans, .code, "```"));
+    try std.testing.expectEqual(Style.normal, long.rows[3].spans[0].style);
+    try std.testing.expectEqual(@as(u16, 4), countRows(gpa, "````\ninner ``` line\n````\nafter", 80));
 
     // A marker run followed by an info string inside an open block is code
     // text, not a closer (CommonMark: closing fences carry no info string);
     // the block ends only at the bare closer.
     var info_close = try render(gpa, "```js\nconst x = 1;\n```js\n```\nafter", 80);
     defer info_close.deinit(gpa);
-    try std.testing.expect(containsStyledText(info_close.rows[0].spans, .code_keyword, "const"));
-    try std.testing.expect(containsStyledText(info_close.rows[1].spans, .code, "js"));
-    try std.testing.expectEqual(Style.normal, info_close.rows[2].spans[0].style);
-    try std.testing.expectEqual(@as(u16, 3), countRows(gpa, "```js\nconst x = 1;\n```js\n```\nafter", 80));
+    try std.testing.expect(containsStyledText(info_close.rows[1].spans, .code_keyword, "const"));
+    try std.testing.expect(containsStyledText(info_close.rows[2].spans, .code, "js"));
+    try std.testing.expectEqual(Style.normal, info_close.rows[4].spans[0].style);
+    try std.testing.expectEqual(@as(u16, 5), countRows(gpa, "```js\nconst x = 1;\n```js\n```\nafter", 80));
 }
 
 test "strikethrough and underscore emphasis render as styled spans" {
@@ -2871,30 +2958,30 @@ test "highlighting differs by language for the same token" {
     // `type` is a Zig keyword; in Python it is an ordinary identifier.
     var zig_out = try render(gpa, "```zig\nconst T = type;\n```", 80);
     defer zig_out.deinit(gpa);
-    try std.testing.expect(containsStyledText(zig_out.rows[0].spans, .code_keyword, "type"));
+    try std.testing.expect(containsStyledText(zig_out.rows[1].spans, .code_keyword, "type"));
 
     var py_out = try render(gpa, "```python\ndef use_type(): pass\n```", 80);
     defer py_out.deinit(gpa);
-    try std.testing.expect(containsStyledText(py_out.rows[0].spans, .code_keyword, "def"));
-    try std.testing.expect(!containsStyledText(py_out.rows[0].spans, .code_keyword, "type"));
+    try std.testing.expect(containsStyledText(py_out.rows[1].spans, .code_keyword, "def"));
+    try std.testing.expect(!containsStyledText(py_out.rows[1].spans, .code_keyword, "type"));
 }
 
 test "unknown languages fall back without mis-highlighting common words" {
     const gpa = std.testing.allocator;
     var out = try render(gpa, "```txt\nuse match type void\n```", 80);
     defer out.deinit(gpa);
-    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code_keyword, "match"));
-    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code_keyword, "use"));
-    try std.testing.expect(!containsStyledText(out.rows[0].spans, .code_keyword, "type"));
+    try std.testing.expect(!containsStyledText(out.rows[1].spans, .code_keyword, "match"));
+    try std.testing.expect(!containsStyledText(out.rows[1].spans, .code_keyword, "use"));
+    try std.testing.expect(!containsStyledText(out.rows[1].spans, .code_keyword, "type"));
 }
 
 test "identifiers get semantic styles by shape and call position" {
     const gpa = std.testing.allocator;
     var out = try render(gpa, "```zig\nMyType.doThing(STATE_MAX)\n```", 80);
     defer out.deinit(gpa);
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_type, "MyType"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_function, "doThing"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_constant, "STATE_MAX"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_type, "MyType"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_function, "doThing"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_constant, "STATE_MAX"));
 }
 
 test "block comments carry highlighting state across lines" {
@@ -2902,12 +2989,12 @@ test "block comments carry highlighting state across lines" {
     const body = "```rust\n/* first line\nstill comment\nend */\nfn after()\n```";
     var out = try render(gpa, body, 80);
     defer out.deinit(gpa);
-    // Rows 0-2 are the comment lines, row 3 the fn line (fence rows emit none).
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_comment, "/*"));
-    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "still"));
-    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_comment, "*/"));
-    try std.testing.expect(containsText(out.rows[2].spans, "end"));
-    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_keyword, "fn"));
+    // Row 0 = header, rows 1-3 = comment lines, row 4 = fn line, row 5 = footer.
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "/*"));
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_comment, "still"));
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_comment, "*/"));
+    try std.testing.expect(containsText(out.rows[3].spans, "end"));
+    try std.testing.expect(containsStyledText(out.rows[4].spans, .code_keyword, "fn"));
 
     // The same body through the incremental renderer must produce identical
     // spans — the multi-line state lives in BlockState on both paths.
@@ -2923,30 +3010,30 @@ test "diff blocks color added and removed lines" {
     const gpa = std.testing.allocator;
     var out = try render(gpa, "```diff\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old line\n+new line\n```", 80);
     defer out.deinit(gpa);
-    // The wrap engine splits lines into word spans; assert per token.
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_comment, "---"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_comment, "a/file"));
-    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "+++"));
-    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_number, "@@"));
-    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_removed, "-old"));
-    try std.testing.expect(containsStyledText(out.rows[4].spans, .code_added, "+new"));
+    // Row 0 = header; rows 1-5 = diff lines.
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "---"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_comment, "a/file"));
+    try std.testing.expect(containsStyledText(out.rows[2].spans, .code_comment, "+++"));
+    try std.testing.expect(containsStyledText(out.rows[3].spans, .code_number, "@@"));
+    try std.testing.expect(containsStyledText(out.rows[4].spans, .code_removed, "-old"));
+    try std.testing.expect(containsStyledText(out.rows[5].spans, .code_added, "+new"));
 }
 
 test "json blocks highlight keys, literals, and numbers" {
     const gpa = std.testing.allocator;
     var out = try render(gpa, "```json\n{\"ok\": true, \"n\": 42}\n```", 80);
     defer out.deinit(gpa);
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_function, "\"ok\""));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_constant, "true"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_number, "42"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_function, "\"ok\""));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_constant, "true"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_number, "42"));
 }
 
 test "sql keywords match case-insensitively" {
     const gpa = std.testing.allocator;
     var out = try render(gpa, "```sql\nselect count(*) from users;\n```", 80);
     defer out.deinit(gpa);
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "select"));
-    try std.testing.expect(containsStyledText(out.rows[0].spans, .code_keyword, "from"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_keyword, "select"));
+    try std.testing.expect(containsStyledText(out.rows[1].spans, .code_keyword, "from"));
 }
 
 test "disallowed schemes render as styled text without a link" {
@@ -2987,5 +3074,50 @@ test "bare urls exclude trailing sentence punctuation" {
             }
         }
         try std.testing.expect(found);
+    }
+}
+
+test "fenced code blocks emit header/footer and countRows matches render" {
+    const gpa = std.testing.allocator;
+    const with_lang = "```zig\nconst x = 1;\n```";
+    var out1 = try render(gpa, with_lang, 30);
+    defer out1.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), out1.rows.len);
+    try std.testing.expectEqual(out1.rows.len, countRows(gpa, with_lang, 30));
+    try std.testing.expect(containsStyledText(out1.rows[0].spans, .code_border, "zig"));
+    try std.testing.expect(containsStyledText(out1.rows[1].spans, .code_border, "│ "));
+    try std.testing.expect(containsStyledText(out1.rows[2].spans, .code_border, "╰"));
+
+    const no_lang = "```\nplain code\n```";
+    var out2 = try render(gpa, no_lang, 30);
+    defer out2.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), out2.rows.len);
+    try std.testing.expectEqual(out2.rows.len, countRows(gpa, no_lang, 30));
+    try std.testing.expect(containsStyledText(out2.rows[0].spans, .code_border, "╭"));
+}
+
+test "list items support lazy continuation lines with countRows and incremental parity" {
+    const gpa = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "- item one\ncontinued here",
+        "1. ordered\ncontinued ordered",
+        "- [x] done\ncontinued task",
+        "  - nested\ncontinued nested",
+    };
+    for (inputs) |text| {
+        var out = try render(gpa, text, 40);
+        defer out.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), out.rows.len);
+        try std.testing.expectEqual(@as(u16, 2), countRows(gpa, text, 40));
+        try std.testing.expect(out.rows[1].spans.len > 0);
+        // Continuation line is indented past column 0.
+        try std.testing.expect(out.rows[1].spans[0].text[0] == ' ');
+
+        var inc: Incremental = .{};
+        defer inc.deinit(gpa);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const got = try inc.rows(gpa, arena.allocator(), text, 40);
+        try expectRowsEqual(out.rows, got);
     }
 }
