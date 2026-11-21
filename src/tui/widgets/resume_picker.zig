@@ -58,7 +58,7 @@ pub const Content = struct {
         const detail: ?[]const u8 = detail: {
             if (self.selection >= self.summaries.len or height < 2) break :detail null;
             const s = self.summaries[self.selection];
-            const label = if (s.title.len > 0) s.title else s.cwd;
+            const label = if (s.title) |t| (if (t.len > 0) t else s.cwd) else s.cwd;
             if (panel.isTruncated(label, width -| 20)) break :detail label;
             break :detail null;
         };

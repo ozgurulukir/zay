@@ -44,6 +44,8 @@ pub const State = struct {
         for (rendered.rows) |row| {
             for (row.spans) |span| {
                 if (span.link_url.len == 0) continue;
+                const trimmed_text = std.mem.trim(u8, span.text, " \t");
+                if (trimmed_text.len == 0) continue;
                 var existing_idx: ?usize = null;
                 for (self.items.items, 0..) |item, i| {
                     if (std.mem.eql(u8, item.url, span.link_url)) {
@@ -52,16 +54,21 @@ pub const State = struct {
                     }
                 }
                 if (existing_idx) |idx| {
-                    // Append to label if the same link wrapped across spans.
                     const cur = self.items.items[idx].label;
-                    if (!std.mem.eql(u8, cur, span.text) and span.text.len > 0) {
-                        const joined = try std.fmt.allocPrint(gpa, "{s} {s}", .{ cur, span.text });
-                        gpa.free(cur);
-                        self.items.items[idx].label = joined;
+                    if (!std.mem.eql(u8, cur, trimmed_text) and !std.mem.eql(u8, trimmed_text, span.link_url)) {
+                        if (std.mem.eql(u8, cur, span.link_url)) {
+                            const replaced = try gpa.dupe(u8, trimmed_text);
+                            gpa.free(cur);
+                            self.items.items[idx].label = replaced;
+                        } else {
+                            const joined = try std.fmt.allocPrint(gpa, "{s} {s}", .{ cur, trimmed_text });
+                            gpa.free(cur);
+                            self.items.items[idx].label = joined;
+                        }
                     }
                     continue;
                 }
-                const label = try gpa.dupe(u8, span.text);
+                const label = try gpa.dupe(u8, trimmed_text);
                 errdefer gpa.free(label);
                 const url = try gpa.dupe(u8, span.link_url);
                 errdefer gpa.free(url);

@@ -661,7 +661,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         // search box is still empty; once a query is active it stays part of it.
         .search => app.inputs.palette.buf.realLength() == 0,
         // Settings has its own navigation: '/' is not a command shortcut there.
-        .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp, .plugins => false,
+        .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp, .plugins, .link_picker => false,
     };
 }
 
