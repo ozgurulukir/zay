@@ -151,8 +151,13 @@ pub const MessageWidget = struct {
 
     /// Combined byte-offset overlays for a body: search hits (issue #484),
     /// active cycled hit (#502), plus Shift-arrow selection (issue #487).
-    fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, selection: ?[2]usize) ?[]StyleSpan {
+    fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, active_range: ?[2]usize, selection: ?[2]usize) ?[]StyleSpan {
         var spans: std.ArrayList(StyleSpan) = .empty;
+        if (active_range) |range| {
+            if (range[1] > range[0] and range[1] <= text.len) {
+                spans.append(arena, .{ .start = range[0], .end = range[1], .style = activeSearchMatchStyle() }) catch {};
+            }
+        }
         if (findMatchSpans(arena, text, query)) |matches| {
             spans.appendSlice(arena, matches) catch {};
         }
@@ -179,9 +184,10 @@ pub const MessageWidget = struct {
         indent: u16,
         bar_style: ?vaxis.Style,
         query: ?[]const u8,
+        active_range: ?[2]usize,
         selection: ?[2]usize,
     ) void {
-        if (overlaySpans(ctx.arena, text, query, selection)) |spans| {
+        if (overlaySpans(ctx.arena, text, query, active_range, selection)) |spans| {
             drawWrappedStyled(surface, text, spans, style, "", bar_style, selected, row, ctx, indent);
             return;
         }
@@ -209,26 +215,26 @@ pub const MessageWidget = struct {
                     anchor_style.dim = true;
                     drawLine(surface, anchor, anchor_style, styled_as_selected, &row, ctx, 2, null);
                 }
-                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.selection_range);
+                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.active_search_range, self.selection_range);
             },
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .skill => |m| {
-                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, self.selection_range);
+                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, null, self.selection_range);
                 if (m.expanded and m.body.len > 0) {
-                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query, self.selection_range);
+                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query, self.active_search_range, self.selection_range);
                 }
             },
             .notice => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ")) "" else "! ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.selection_range);
+                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.active_search_range, self.selection_range);
             },
             .success => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "✓ ")) "" else "✓ ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.selection_range);
+                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.active_search_range, self.selection_range);
             },
-            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.selection_range),
+            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.active_search_range, self.selection_range),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
                 const title_style = if (m.failed) p.tool_failed else p.tool;
@@ -237,7 +243,7 @@ pub const MessageWidget = struct {
             },
             .thinking => |m| {
                 drawLine(surface, m.title, p.thinking_label, styled_as_selected, &row, ctx, 2, p.thinking_bar);
-                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query, self.selection_range);
+                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query, self.active_search_range, self.selection_range);
             },
             .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx),
         }
@@ -605,7 +611,7 @@ pub const MessageWidget = struct {
                 const offset = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
                 for (hls) |range| {
                     if (offset >= range.start and offset < range.end) {
-                        cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg }, selected);
+                        cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg, .reverse = range.style.reverse }, selected);
                         break;
                     }
                 }
@@ -714,7 +720,7 @@ fn drawMarkdown(
     // body bytes, so a span's absolute offset is `span.text.ptr - body.ptr`;
     // owned-text spans (stacked table keys) fall outside the body bounds and
     // simply never highlight.
-    const match_spans: ?[]StyleSpan = MessageWidget.overlaySpans(ctx.arena, text, self.search_query, self.selection_range);
+    const match_spans: ?[]StyleSpan = MessageWidget.overlaySpans(ctx.arena, text, self.search_query, self.active_search_range, self.selection_range);
     for (rows) |markdown_row| {
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
@@ -794,7 +800,7 @@ fn drawToolBody(
         for (message.group_items) |item| {
             const item_text = try ctx.arena.dupe(u8, tui_metrics.formatGroupItemRow(&buf, item));
             const item_style = if (item.failed) p.tool_failed else p.thinking_body;
-            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, selection);
+            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, null, selection);
         }
         return;
     }
@@ -813,7 +819,7 @@ fn drawToolBody(
         }
     }
     if (message.stderr) |stderr| {
-        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, selection);
+        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, null, selection);
     }
 }
 
@@ -853,11 +859,11 @@ fn drawToolStyledText(
 ) void {
     const p = tui_style.activePalette();
     if (render != .shell) {
-        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, selection);
+        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, null, selection);
         return;
     }
     const tokens = token_scan.scanShellDiagnostics(ctx.arena, text, 64) catch &.{};
-    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, selection) orelse &.{};
+    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, null, selection) orelse &.{};
     if (tokens.len == 0 and overlays.len == 0) {
         MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null);
         return;
