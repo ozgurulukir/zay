@@ -81,8 +81,42 @@ pub fn padTo(alloc: std.mem.Allocator, text: []const u8, width: u16) ![]const u8
     return out;
 }
 
+/// Byte offset into `text` of the longest suffix whose display width is at most
+/// `max_cols`, never splitting a grapheme. Walks graphemes from the front,
+/// dropping them until the remaining tail fits.
+pub fn tailStart(text: []const u8, max_cols: u16) usize {
+    const total = measure(text);
+    if (total <= max_cols) return 0;
+    if (max_cols == 0) return text.len;
+    var end: usize = 0;
+    var dropped: u16 = 0;
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        const width = measure(bytes);
+        const remaining = total -| dropped -| width;
+        end += bytes.len;
+        dropped += width;
+        if (remaining <= max_cols) return end;
+    }
+    return text.len;
+}
+
+/// Cut `text` to at most `max_width` cells, keeping the suffix and prepending
+/// `"…"` when it does not fit.
+pub fn truncateStart(alloc: std.mem.Allocator, text: []const u8, max_width: u16) !Truncation {
+    if (measure(text) <= max_width) return .{ .text = text, .truncated = false };
+    const ellipsis = "…";
+    const keep = max_width -| measure(ellipsis);
+    const start = tailStart(text, keep);
+    return .{
+        .text = try std.fmt.allocPrint(alloc, "{s}{s}", .{ ellipsis, text[start..] }),
+        .truncated = true,
+    };
+}
+
 /// Byte offset of the longest prefix of `text` whose display width fits
-/// `max_width` cells (grapheme-aware). Shared by both truncate helpers.
+/// `max_width` cells (grapheme-aware). Shared by truncate helpers.
 fn graphemeCut(text: []const u8, max_width: u16) []const u8 {
     var used: u16 = 0;
     var end: usize = 0;
@@ -95,6 +129,73 @@ fn graphemeCut(text: []const u8, max_width: u16) []const u8 {
         end += bytes.len;
     }
     return text[0..end];
+}
+
+pub fn isLinearWhitespace(bytes: []const u8) bool {
+    return std.mem.eql(u8, bytes, " ") or std.mem.eql(u8, bytes, "\t");
+}
+
+pub fn skipLinearWhitespace(line: []const u8, start: usize) usize {
+    var index = start;
+    while (index < line.len) {
+        const len = std.unicode.utf8ByteSequenceLength(line[index]) catch return index;
+        if (index + len > line.len) return index;
+        if (!isLinearWhitespace(line[index .. index + len])) return index;
+        index += len;
+    }
+    return index;
+}
+
+/// Return the byte end of the next soft-wrapped visual row of `line` starting
+/// at `start` within `max_width` terminal cells (grapheme-aware).
+pub fn wrappedLineEnd(line: []const u8, start: usize, max_width: u16) usize {
+    std.debug.assert(start < line.len);
+    std.debug.assert(max_width > 0);
+    var iter = vaxis.unicode.graphemeIterator(line[start..]);
+    var col: u16 = 0;
+    var index = start;
+    var last_break: ?usize = null;
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(line[start..]);
+        const grapheme_start = index;
+        const grapheme_width = measure(bytes);
+        if (col +| grapheme_width > max_width) {
+            return last_break orelse if (grapheme_start > start) grapheme_start else grapheme_start + bytes.len;
+        }
+        index += bytes.len;
+        if (isLinearWhitespace(bytes)) last_break = grapheme_start;
+        col +|= grapheme_width;
+    }
+    return line.len;
+}
+
+/// Number of visual rows a single newline-free `line` occupies at `max_width`.
+pub fn wrappedLineRows(line: []const u8, max_width: u16) u16 {
+    if (line.len == 0) return 1;
+    const width = @max(max_width, 1);
+    var rows: u16 = 0;
+    var start: usize = 0;
+    while (start < line.len) {
+        const end = wrappedLineEnd(line, start, width);
+        rows +|= 1;
+        start = skipLinearWhitespace(line, end);
+    }
+    return rows;
+}
+
+/// Number of visual rows `text` (which may contain `\n`) occupies at `width`.
+pub fn textRows(text: []const u8, width: u16) u16 {
+    if (text.len == 0) return 1;
+    const row_width = @max(width, 1);
+    var rows: u16 = 0;
+    var line_start: usize = 0;
+    while (line_start <= text.len) {
+        const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
+        rows +|= wrappedLineRows(text[line_start..line_end], row_width);
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
+    }
+    return rows;
 }
 
 test "measure counts display width, not bytes" {
@@ -171,4 +272,28 @@ test "padTo pads with spaces to the exact width" {
     try std.testing.expectEqualStrings("toolong", overflow);
     const wide = try padTo(a, "日", 4);
     try std.testing.expectEqualStrings("日  ", wide);
+}
+
+test "truncateStart keeps the suffix with a leading ellipsis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fits = try truncateStart(a, "short", 10);
+    try std.testing.expectEqualStrings("short", fits.text);
+    try std.testing.expect(!fits.truncated);
+
+    const cut = try truncateStart(a, "very/long/path/file.zig", 10);
+    try std.testing.expect(cut.truncated);
+    try std.testing.expect(std.mem.startsWith(u8, cut.text, "…"));
+    try std.testing.expect(std.mem.endsWith(u8, cut.text, "file.zig"));
+    try std.testing.expect(measure(cut.text) <= 10);
+}
+
+test "wrappedLineEnd and textRows handle multi-byte and wide graphemes" {
+    try std.testing.expectEqual(@as(usize, 5), wrappedLineEnd("hello world", 0, 8));
+    try std.testing.expectEqual(@as(usize, 6), skipLinearWhitespace("hello world", 5));
+    try std.testing.expectEqual(@as(u16, 1), textRows("éééé", 4));
+    try std.testing.expectEqual(@as(u16, 2), textRows("日本語", 4));
+    try std.testing.expectEqual(@as(u16, 2), textRows("🦎🦎", 3));
 }
