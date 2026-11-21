@@ -91,18 +91,21 @@ pub const TurnView = struct {
     /// Pure; the caller supplies elapsed milliseconds read from `started_ms`
     /// at props-build time, so the value refreshes with the existing tick
     /// cadence and draw stays side-effect free.
-    pub fn formatProgressLabel(buf: []u8, activity: Activity, elapsed_ms: i64) []const u8 {
+    pub fn formatProgressLabel(buf: []u8, activity: Activity, elapsed_ms: i64, stalled: bool) []const u8 {
         const seconds: i64 = @divTrunc(@max(elapsed_ms, 0), 1000);
+        const stall_tag: []const u8 = if (stalled and activity != .idle) " · stalled" else "";
         if (seconds >= 60) {
-            return std.fmt.bufPrint(buf, "{s} · {d}m{d:0>2}s · esc to cancel", .{
+            return std.fmt.bufPrint(buf, "{s} · {d}m{d:0>2}s{s} · esc to cancel", .{
                 activityLabel(activity),
                 @divTrunc(seconds, 60),
                 @as(u64, @intCast(@mod(seconds, 60))),
+                stall_tag,
             }) catch "Working";
         }
-        return std.fmt.bufPrint(buf, "{s} · {d}s · esc to cancel", .{
+        return std.fmt.bufPrint(buf, "{s} · {d}s{s} · esc to cancel", .{
             activityLabel(activity),
             @as(u64, @intCast(seconds)),
+            stall_tag,
         }) catch "Working";
     }
 
@@ -829,15 +832,19 @@ test "formatProgressLabel shows phase, elapsed, and cancel hint" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings(
         "Contacting model · 14s · esc to cancel",
-        TurnView.formatProgressLabel(&buf, .awaiting_model, 14_000),
+        TurnView.formatProgressLabel(&buf, .awaiting_model, 14_000, false),
     );
     try std.testing.expectEqualStrings(
         "Running tools · 1m05s · esc to cancel",
-        TurnView.formatProgressLabel(&buf, .calling_tools, 65_000),
+        TurnView.formatProgressLabel(&buf, .calling_tools, 65_000, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Generating · 20s · stalled · esc to cancel",
+        TurnView.formatProgressLabel(&buf, .{ .writing_response = 0 }, 20_000, true),
     );
     // Negative (clock skew) clamps to zero.
     try std.testing.expectEqualStrings(
         "Working · 0s · esc to cancel",
-        TurnView.formatProgressLabel(&buf, .idle, -5),
+        TurnView.formatProgressLabel(&buf, .idle, -5, false),
     );
 }

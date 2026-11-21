@@ -75,6 +75,11 @@ pub const MessageWidget = struct {
     /// Null outside a search and after closing one; INV-WIDGET-1 keeps it a
     /// borrowed slice built at props time.
     search_query: ?[]const u8 = null,
+    /// Active search hit `[start, end)` when this message holds the currently
+    /// cycled match (#502), rendered more prominently than passive hits.
+    active_search_range: ?[2]usize = null,
+    /// Monotonic timestamp (ms) for running-tool elapsed display (#503).
+    now_ms: i64 = 0,
     /// Shift-arrow body selection (issue #487), resolved per message by the
     /// list builder; `[min, max)` byte range into this message's body.
     selection_range: ?[2]usize = null,
@@ -140,9 +145,12 @@ pub const MessageWidget = struct {
         return tui_style.onSelectionBg(.{ .bold = true }, true);
     }
 
-    /// Combined byte-offset overlays for a body: search hits (issue #484)
-    /// plus the Shift-arrow selection (issue #487). Null when neither is
-    /// active for this text.
+    fn activeSearchMatchStyle() vaxis.Style {
+        return tui_style.onSelectionBg(.{ .bold = true, .reverse = true }, true);
+    }
+
+    /// Combined byte-offset overlays for a body: search hits (issue #484),
+    /// active cycled hit (#502), plus Shift-arrow selection (issue #487).
     fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, selection: ?[2]usize) ?[]StyleSpan {
         var spans: std.ArrayList(StyleSpan) = .empty;
         if (findMatchSpans(arena, text, query)) |matches| {
@@ -224,7 +232,7 @@ pub const MessageWidget = struct {
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
                 const title_style = if (m.failed) p.tool_failed else p.tool;
-                try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, &row, ctx);
+                try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, self.now_ms, &row, ctx);
                 if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx, self.search_query, self.selection_range);
             },
             .thinking => |m| {
@@ -256,6 +264,7 @@ pub const MessageWidget = struct {
         style: vaxis.Style,
         selected: bool,
         loading_frame: u8,
+        now_ms: i64,
         row: *u16,
         ctx: vxfw.DrawContext,
     ) !void {
@@ -271,7 +280,7 @@ pub const MessageWidget = struct {
         // Arena-allocated because `surface` cells borrow slices from `command`
         // until `vx.render` finishes after `drawToolTitle` returns.
         const suffix_buf = try ctx.arena.alloc(u8, 256);
-        const command = message.titledWithSuffix(suffix_buf, toolCommandTitle(chosen));
+        const command = message.titledWithSuffixAt(suffix_buf, toolCommandTitle(chosen), now_ms);
         const prefix = if (message.running) loading_frames[loading_frame % loading_frames.len] else toolIcon(command);
         const failed = !message.running and message.failed;
         const has_formatted = message.expanded and message.expanded_title_formatted != null;
@@ -1065,15 +1074,25 @@ fn drawWrappedDiff(
         const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         const line = text[line_start..line_end];
         const style = diffLineStyle(line);
-        MessageWidget.drawWrappedHardLine(surface, line, style, selected, row, ctx, 0, null, width);
+        const expanded = expandDiffTabs(ctx.arena, line) catch line;
+        MessageWidget.drawWrappedHardLine(surface, expanded, style, selected, row, ctx, 0, null, width);
         if (line_end == text.len) break;
         line_start = line_end + 1;
     }
 }
 
+fn expandDiffTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, line, '\t') == null) return line;
+    return std.mem.replaceOwned(u8, arena, line, "\t", "    ");
+}
+
 fn diffLineStyle(line: []const u8) vaxis.Style {
     const p = tui_style.activePalette();
     if (line.len == 0) return p.thinking_body;
+    if (std.mem.startsWith(u8, line, "@@")) return p.diff_hunk;
+    if (std.mem.startsWith(u8, line, "diff --git ") or std.mem.startsWith(u8, line, "--- ") or std.mem.startsWith(u8, line, "+++ ")) {
+        return p.diff_file_header;
+    }
     return switch (line[0]) {
         '+' => p.tool,
         '-' => p.tool_failed,

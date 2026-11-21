@@ -45,10 +45,14 @@ const App = tui.App;
 /// the input buffer halves (also reused for the layout row count).
 fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u8) input_mod.InputProps {
     const rt = app.liveRuntime();
-    const status_text: []const u8 = if (tui_status.modelStatus(rt, app.cached_config)) |status|
+    var status_text: []const u8 = if (tui_status.modelStatus(rt, app.cached_config)) |status|
         tui_status.formatModelStatus(arena, status) catch "no model"
     else
         "no model";
+    var hit_buf: [32]u8 = undefined;
+    if (app.pickers.search.hitCounterText(&hit_buf)) |counter| {
+        status_text = std.fmt.allocPrint(arena, "{s} · search {s}", .{ status_text, counter }) catch status_text;
+    }
 
     const tui_cfg = app.cached_config.tui;
     const p = tui_style.activePalette();
@@ -530,7 +534,9 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     app.nav.lanes_chip_rect = null;
     app.nav.new_output_rect = null;
 
+    const now_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
     const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+    const active_hit = app.pickers.search.activeHit();
     var transcript_view: tx_widget.TranscriptWidget = .{
         .thread = app.thread,
         .gpa = app.gpa,
@@ -540,13 +546,18 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .blackhole_visible = &app.metrics.blackhole_visible,
         .splash_suppressed = app.inputs.input.buf.realLength() > 0,
         .search_query = app.pickers.search.query,
+        .active_search_hit = if (active_hit) |h| .{ .message_index = h.message_index, .start = h.start, .end = h.end } else null,
+        .now_ms = now_ms,
+        .body_selection = app.thread.transcript.body_selection,
         .new_output_rect_out = &app.nav.new_output_rect,
     };
+    const stalled = app.thread.last_activity_ms > 0 and (now_ms - app.thread.last_activity_ms >= 15_000);
     var progress_buf: [128]u8 = undefined;
     const progress_label: []const u8 = try ctx.arena.dupe(u8, turn_view_mod.TurnView.formatProgressLabel(
         &progress_buf,
         app.thread.turn_view.activity,
-        std.Io.Clock.now(.awake, app.getIo()).toMilliseconds() - app.thread.turn_view.started_ms,
+        now_ms - app.thread.turn_view.started_ms,
+        stalled,
     ));
     var loading_view: loading.LoadingWidget = .{
         .awaiting_output = app.thread.turn_view.awaitingOutput(),

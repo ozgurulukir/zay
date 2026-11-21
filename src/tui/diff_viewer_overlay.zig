@@ -76,7 +76,14 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
         else
             "no model";
         if (status_text.len > 0 or app.metrics.git_label.len > 0) {
-            const label = std.fmt.allocPrint(ctx.arena, " {s} · {s} ", .{ status_text, app.metrics.git_label }) catch "";
+            var mode_buf: [24]u8 = undefined;
+            const view_tag: []const u8 = if (app.diff.wrap)
+                " · [wrap]"
+            else if (app.diff.h_scroll > 0)
+                std.fmt.bufPrint(&mode_buf, " · col +{d}", .{app.diff.h_scroll}) catch ""
+            else
+                "";
+            const label = std.fmt.allocPrint(ctx.arena, " {s} · {s}{s} ", .{ status_text, app.metrics.git_label, view_tag }) catch "";
             _ = panel.writeBorderTextEndingAt(&surface, ctx, h -| 1, w -| 1, label, p.model_status);
         }
     }

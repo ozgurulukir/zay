@@ -28,8 +28,18 @@ pub const Match = struct {
     end: usize = 0,
 };
 
+pub const Hit = struct {
+    message_index: u32,
+    start: usize,
+    end: usize,
+};
+
+pub const max_hits: usize = 512;
+
 pub const State = struct {
     matches: std.ArrayList(Match) = .empty,
+    hits: std.ArrayList(Hit) = .empty,
+    active_hit: usize = 0,
     selection: u32 = 0,
     /// True when the palette filter is empty (the overlay shows a usage hint
     /// rather than a "No matching messages" row).
@@ -39,14 +49,16 @@ pub const State = struct {
     /// Owned.
     query: ?[]u8 = null,
 
-    /// Clear the match list. `keep_query` preserves the highlight query across
-    /// the accept jump; a fresh open or close clears it.
+    /// Clear the match list. `keep_query` preserves the highlight query and
+    /// hit-cycling state across the accept jump; a fresh open or close clears it.
     pub fn reset(self: *State, gpa: std.mem.Allocator, keep_query: bool) void {
         self.freeSnippets(gpa);
         self.matches.clearRetainingCapacity();
         self.selection = 0;
         self.filter_empty = true;
         if (!keep_query) {
+            self.hits.clearRetainingCapacity();
+            self.active_hit = 0;
             if (self.query) |q| gpa.free(q);
             self.query = null;
         }
@@ -55,8 +67,31 @@ pub const State = struct {
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.freeSnippets(gpa);
         self.matches.deinit(gpa);
+        self.hits.deinit(gpa);
         if (self.query) |q| gpa.free(q);
         self.* = undefined;
+    }
+
+    pub fn cycleHit(self: *State, forward: bool) ?Hit {
+        const len = self.hits.items.len;
+        if (len == 0) return null;
+        if (forward) {
+            self.active_hit = (self.active_hit + 1) % len;
+        } else {
+            self.active_hit = if (self.active_hit == 0) len - 1 else self.active_hit - 1;
+        }
+        return self.hits.items[self.active_hit];
+    }
+
+    pub fn activeHit(self: *const State) ?Hit {
+        if (self.active_hit >= self.hits.items.len) return null;
+        return self.hits.items[self.active_hit];
+    }
+
+    pub fn hitCounterText(self: *const State, buf: []u8) ?[]const u8 {
+        if (self.hits.items.len == 0) return null;
+        const current = @min(self.active_hit + 1, self.hits.items.len);
+        return std.fmt.bufPrint(buf, "{d}/{d}", .{ current, self.hits.items.len }) catch null;
     }
 
     fn freeSnippets(self: *State, gpa: std.mem.Allocator) void {
@@ -170,4 +205,29 @@ test "search content shows a usage hint when the filter is empty" {
     const surface = try content.widget().draw(ctx);
     var buf: [128]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, panel.readRow(&surface, 0, &buf), "Type to search") != null);
+}
+
+test "State.cycleHit wraps at both ends and formats n/m counter" {
+    const gpa = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(gpa);
+
+    try state.hits.append(gpa, .{ .message_index = 0, .start = 1, .end = 4 });
+    try state.hits.append(gpa, .{ .message_index = 2, .start = 5, .end = 8 });
+    try state.hits.append(gpa, .{ .message_index = 2, .start = 10, .end = 13 });
+
+    var cbuf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1/3", state.hitCounterText(&cbuf).?);
+
+    const h1 = state.cycleHit(true).?;
+    try std.testing.expectEqual(@as(u32, 2), h1.message_index);
+    try std.testing.expectEqualStrings("2/3", state.hitCounterText(&cbuf).?);
+
+    const h2 = state.cycleHit(true).?;
+    try std.testing.expectEqual(@as(usize, 10), h2.start);
+    const h_wrap_fwd = state.cycleHit(true).?;
+    try std.testing.expectEqual(@as(u32, 0), h_wrap_fwd.message_index);
+
+    const h_wrap_back = state.cycleHit(false).?;
+    try std.testing.expectEqual(@as(usize, 10), h_wrap_back.start);
 }

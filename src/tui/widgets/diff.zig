@@ -154,8 +154,24 @@ fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *diff_viewe
         return;
     }
 
-    const content = expandTabs(ctx.arena, line.text) catch line.text;
+    const expanded = expandTabs(ctx.arena, line.text) catch line.text;
+    const content = sliceFromDisplayCol(expanded, state.h_scroll);
     panel.lineStyledAt(surface, row, content, ctx, diff_content_col, style) catch {};
+}
+
+fn sliceFromDisplayCol(text: []const u8, start_col: u16) []const u8 {
+    if (start_col == 0 or text.len == 0) return text;
+    var col: u16 = 0;
+    var byte_idx: usize = 0;
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        if (col >= start_col) break;
+        const bytes = grapheme.bytes(text);
+        const w = vaxis.gwidth.gwidth(bytes, .unicode);
+        col +|= w;
+        byte_idx += bytes.len;
+    }
+    return text[byte_idx..];
 }
 
 /// Render a hunk header (`@@ -a,b +c,d @@`) with the `-` (deletion) range in red

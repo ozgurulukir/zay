@@ -430,6 +430,21 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         ctx.consumeAndRedraw();
         return;
     }
+    if (key.matches('w', .{})) {
+        app.diff.toggleWrap();
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+        app.diff.scrollLeft(8);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+        app.diff.scrollRight(8);
+        ctx.consumeAndRedraw();
+        return;
+    }
     if (key.matches(vaxis.Key.up, .{ .shift = true })) {
         app.diff.extendSelection(-1);
         ctx.consumeAndRedraw();

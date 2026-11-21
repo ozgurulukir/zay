@@ -38,6 +38,7 @@ const links_picker = @import("widgets/links_picker.zig");
 const plugin_store_job = @import("plugin_store_job.zig");
 const plugin_store = @import("../plugin_store.zig");
 const transcript_mod = @import("../transcript.zig");
+const search_lifecycle = @import("search_lifecycle.zig");
 const log = std.log.scoped(.tui);
 const previousIndex = tui.previousIndex;
 const nextIndex = tui.nextIndex;
@@ -613,6 +614,14 @@ pub const BlockNav = struct {
                             return true;
                         }
                     }
+                }
+            }
+            if (app.pickers.search.hits.items.len > 0) {
+                if (key.matches('n', .{})) {
+                    return search_lifecycle.cycleSearchMatch(app, true);
+                }
+                if (key.matches('N', .{ .shift = true }) or key.matches('n', .{ .shift = true })) {
+                    return search_lifecycle.cycleSearchMatch(app, false);
                 }
             }
             // Shift+arrows extend a within-body selection over the selected
