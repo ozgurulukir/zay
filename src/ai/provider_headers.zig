@@ -6,8 +6,8 @@
 //!
 //!   1. the header spec type (`Header` / `HeaderValue`),
 //!   2. the merge policy (`build`): provider-required auto headers (OpenCode
-//!      Zen routing, OpenRouter attribution) overlaid with user-configured
-//!      headers, user winning on name collision,
+//!      routing for Zen + Go, OpenRouter attribution) overlaid with
+//!      user-configured headers, user winning on name collision,
 //!   3. the materializer (`HeaderSet`): a zero-allocation stack-buffer
 //!      builder that resolves specs into wire headers per request.
 //!
@@ -22,12 +22,16 @@ const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
 
-/// OpenCode Zen endpoints (`https://opencode.ai/zen/v1`, `/zen/go/v1`, …)
-/// require a stable per-conversation routing header as of 2026-09-05.
-/// Substring detection covers the builtin `opencode_zen` provider, the
-/// models.dev dynamic ids `opencode`/`opencode-go`, and hand-written custom
-/// providers — mirroring the `WireDialect.resolve` URL heuristics.
+/// OpenCode endpoints require a stable per-conversation routing header: Zen
+/// (`https://opencode.ai/zen/v1`, `/zen/go/v1`, …) since 2026-09-05 and Go
+/// (`https://opencode.ai/inference/go/openai/v1`, …), which rejects requests
+/// missing it with HTTP 400. Substring detection covers the builtin
+/// `opencode_zen` provider, the models.dev dynamic ids `opencode`/
+/// `opencode-go`, the `opencode-go` base URL in the vendored catalog, and
+/// hand-written custom providers — mirroring the `WireDialect.resolve` URL
+/// heuristics.
 pub const zen_url_marker = "opencode.ai/zen";
+pub const go_url_marker = "opencode.ai/inference/go";
 pub const zen_session_header = "x-opencode-session";
 pub const zen_client_header = "x-opencode-client";
 pub const zen_client_value = "zay";
@@ -81,12 +85,18 @@ pub const ValueContext = struct {
     account_id: []const u8 = "",
 };
 
-/// True when the base URL points at OpenCode Zen. The two-clause match
-/// rejects lookalike suffixes (`…/zenith`) while accepting a bare
-/// `…/zen` with no trailing slash.
-pub fn isZenBaseUrl(base_url: []const u8) bool {
-    return std.mem.indexOf(u8, base_url, zen_url_marker ++ "/") != null or
-        std.mem.endsWith(u8, base_url, zen_url_marker);
+/// True when the base URL points at an OpenCode endpoint (Zen or Go) that
+/// requires the `x-opencode-session` routing header. The two-clause match
+/// rejects lookalike suffixes (`…/zenith`, `…/gopher`) while accepting a
+/// bare marker with no trailing slash.
+pub fn isOpenCodeBaseUrl(base_url: []const u8) bool {
+    return matchesUrlMarker(base_url, zen_url_marker) or
+        matchesUrlMarker(base_url, go_url_marker);
+}
+
+fn matchesUrlMarker(base_url: []const u8, comptime marker: []const u8) bool {
+    return std.mem.indexOf(u8, base_url, marker ++ "/") != null or
+        std.mem.endsWith(u8, base_url, marker);
 }
 
 /// Merge provider-required auto headers with user-configured headers.
@@ -253,7 +263,7 @@ pub fn isValidHeaderValue(value: []const u8) bool {
 
 fn appendAutoHeaders(buffer: *[max_auto_headers]Header, base_url: []const u8, dialect: ai.WireDialect) usize {
     var count: usize = 0;
-    if (isZenBaseUrl(base_url)) {
+    if (isOpenCodeBaseUrl(base_url)) {
         buffer[count] = .{ .name = zen_session_header, .value = .session_id };
         count += 1;
         buffer[count] = .{ .name = zen_client_header, .value = .{ .literal = zen_client_value } };
@@ -289,20 +299,35 @@ fn indexOfName(headers: []const Header, name: []const u8) ?usize {
     return null;
 }
 
-test "isZenBaseUrl matches zen endpoints and rejects lookalikes" {
-    try std.testing.expect(isZenBaseUrl("https://opencode.ai/zen/v1"));
-    try std.testing.expect(isZenBaseUrl("https://opencode.ai/zen/go/v1"));
-    try std.testing.expect(isZenBaseUrl("https://opencode.ai/zen"));
-    try std.testing.expect(isZenBaseUrl("https://opencode.ai/zen/"));
-    try std.testing.expect(!isZenBaseUrl("https://opencode.ai/zenith/v1"));
-    try std.testing.expect(!isZenBaseUrl("https://api.openai.com/v1"));
-    try std.testing.expect(!isZenBaseUrl("https://openrouter.ai/api"));
-    try std.testing.expect(!isZenBaseUrl(""));
+test "isOpenCodeBaseUrl matches zen and go endpoints and rejects lookalikes" {
+    try std.testing.expect(isOpenCodeBaseUrl("https://opencode.ai/zen/v1"));
+    try std.testing.expect(isOpenCodeBaseUrl("https://opencode.ai/zen/go/v1"));
+    try std.testing.expect(isOpenCodeBaseUrl("https://opencode.ai/zen"));
+    try std.testing.expect(isOpenCodeBaseUrl("https://opencode.ai/zen/"));
+    try std.testing.expect(isOpenCodeBaseUrl("https://opencode.ai/inference/go"));
+    try std.testing.expect(isOpenCodeBaseUrl("https://opencode.ai/inference/go/openai/v1"));
+    try std.testing.expect(!isOpenCodeBaseUrl("https://opencode.ai/zenith/v1"));
+    try std.testing.expect(!isOpenCodeBaseUrl("https://opencode.ai/inference/gopher/v1"));
+    try std.testing.expect(!isOpenCodeBaseUrl("https://api.openai.com/v1"));
+    try std.testing.expect(!isOpenCodeBaseUrl("https://openrouter.ai/api"));
+    try std.testing.expect(!isOpenCodeBaseUrl(""));
 }
 
 test "build emits the zen pair for zen URLs regardless of dialect" {
     const gpa = std.testing.allocator;
     const specs = try build(gpa, "https://opencode.ai/zen/v1", .minimal, &.{});
+    defer freeHeaders(gpa, specs);
+
+    try std.testing.expectEqual(@as(usize, 2), specs.len);
+    try std.testing.expectEqualStrings(zen_session_header, specs[0].name);
+    try std.testing.expect(specs[0].value == .session_id);
+    try std.testing.expectEqualStrings(zen_client_header, specs[1].name);
+    try std.testing.expectEqualStrings(zen_client_value, specs[1].value.literal);
+}
+
+test "build emits the routing pair for an opencode-go base url" {
+    const gpa = std.testing.allocator;
+    const specs = try build(gpa, "https://opencode.ai/inference/go/openai/v1", .minimal, &.{});
     defer freeHeaders(gpa, specs);
 
     try std.testing.expectEqual(@as(usize, 2), specs.len);

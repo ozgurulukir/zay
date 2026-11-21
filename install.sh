@@ -130,8 +130,8 @@ chmod +x "$INSTALL_DIR/$BIN_NAME"
 # https://models.dev/api.json at runtime. An unverified seed is never installed.
 API_PREFIX_DIR="$(dirname "$INSTALL_DIR")"
 API_TEMP="$TEMP_DIR/api.json"
-if curl -fLs "$BASE_URL/api.json" -o "$API_TEMP"; then
-  if curl -fLs "$BASE_URL/api.json.sha256" -o "$TEMP_DIR/api.json.sha256"; then
+if curl -fLs --connect-timeout 30 --max-time 300 "$BASE_URL/api.json" -o "$API_TEMP"; then
+  if curl -fLs --connect-timeout 30 --max-time 300 "$BASE_URL/api.json.sha256" -o "$TEMP_DIR/api.json.sha256"; then
     if (cd "$TEMP_DIR" && sha256sum -c api.json.sha256 --status >/dev/null 2>&1) || (cd "$TEMP_DIR" && shasum -a 256 -c api.json.sha256 --status >/dev/null 2>&1); then
       mkdir -p "$API_PREFIX_DIR/share/zay"
       mv "$API_TEMP" "$API_PREFIX_DIR/share/zay/api.json"

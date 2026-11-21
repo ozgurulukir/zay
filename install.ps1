@@ -111,14 +111,14 @@ try {
     $TempApiPath = Join-Path $TempDir "api.json"
     $TempApiShaPath = Join-Path $TempDir "api.json.sha256"
     try {
-        Invoke-WebRequest -Uri "$BaseUrl/api.json" -OutFile $TempApiPath -UseBasicParsing
+        Invoke-WebRequest -Uri "$BaseUrl/api.json" -OutFile $TempApiPath -UseBasicParsing -TimeoutSec 300
     } catch {
         Write-Host "Warning: api.json (offline registry seed) not downloaded ($($_.Exception.Message))" -ForegroundColor Yellow
     }
     if (Test-Path $TempApiPath) {
         $SeedVerified = $false
         try {
-            Invoke-WebRequest -Uri "$BaseUrl/api.json.sha256" -OutFile $TempApiShaPath -UseBasicParsing
+            Invoke-WebRequest -Uri "$BaseUrl/api.json.sha256" -OutFile $TempApiShaPath -UseBasicParsing -TimeoutSec 300
             $SeedExpected = (Get-Content $TempApiShaPath).Split(" ")[0].Trim()
             $SeedActual = (Get-FileHash -Path $TempApiPath -Algorithm SHA256).Hash.ToLower()
             if ($SeedExpected -and ($SeedExpected.ToLower() -eq $SeedActual)) {
