@@ -184,11 +184,7 @@ const OverlayInner = struct {
         const ih: u16 = ctx.max.height orelse 0;
 
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
-        const empty_cell = vaxis.Cell{
-            .char = .{ .grapheme = " ", .width = 1 },
-            .style = .{},
-        };
-        @memset(surface.buffer, empty_cell);
+        panel.fillBackground(&surface);
 
         // The provider setup form, the settings panel, and the help modal host
         // their own headers/navigation, so they skip the shared search row
