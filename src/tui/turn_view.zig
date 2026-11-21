@@ -524,7 +524,16 @@ pub const TurnView = struct {
         try transcript.finishTool(gpa, index, tool.display_body, tool.stderr, tool.failed, render, tool.duration_ms, tool.exit_code);
         const expand = policy.expand_by_default or is_diff;
         transcript.setExpanded(index, expand);
-        selectGeneratedMessage(transcript, index);
+        var final_index = index;
+        if (!expand) {
+            if (try transcript.mergeConsecutiveTool(gpa, index)) |merged_index| {
+                if (tool.index < self.tool_indexes.items.len) {
+                    self.tool_indexes.items[tool.index] = merged_index;
+                }
+                final_index = merged_index;
+            }
+        }
+        selectGeneratedMessage(transcript, final_index);
         self.tool_seen_in_response = true;
         self.agent_index = null;
         return existing_index == null or was_running or visible_before or expand != was_expanded;
