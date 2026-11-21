@@ -23,9 +23,19 @@ const vxfw = vaxis.vxfw;
 
 const tui_style = @import("style.zig");
 const text_fit = @import("text_fit.zig");
+const panel = @import("widgets/panel.zig");
 
 /// Severity of a toast; drives its accent color.
 pub const Level = enum { info, success, warn, err };
+
+pub fn levelIcon(level: Level) []const u8 {
+    return switch (level) {
+        .info => "ℹ",
+        .success => "✓",
+        .warn => "⚠",
+        .err => "✗",
+    };
+}
 
 /// A single toast. Fixed inline message buffer — no heap allocation on the
 /// push path (worker threads).
@@ -192,12 +202,8 @@ pub const Widget = struct {
             &.{},
         );
 
-        // Pre-fill surface with empty space cells to ensure no uninitialized memory.
-        const empty_cell = vaxis.Cell{
-            .char = .{ .grapheme = " ", .width = 1 },
-            .style = .{},
-        };
-        @memset(surface.buffer, empty_cell);
+        // Pre-fill surface with opaque themed background so underlying transcript cells don't bleed through.
+        panel.fillBackground(&surface);
 
         var row: u16 = 0;
         const p = tui_style.activePalette();
@@ -219,6 +225,12 @@ pub const Widget = struct {
             while (c < box_width - 1) : (c += 1) {
                 surface.writeCell(c, top_row, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
             }
+            if (box_width >= 7) {
+                const icon = levelIcon(item.level);
+                surface.writeCell(2, top_row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
+                surface.writeCell(3, top_row, .{ .char = .{ .grapheme = icon, .width = 1 }, .style = style });
+                surface.writeCell(4, top_row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
+            }
 
             // Side borders.
             var r: u16 = top_row + 1;
@@ -236,6 +248,18 @@ pub const Widget = struct {
             c = 1;
             while (c < box_width - 1) : (c += 1) {
                 surface.writeCell(c, bottom_row, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
+            }
+            // Show subtle Esc dismiss hint on the newest (bottom-most) toast.
+            if (i + 1 == visible and box_width >= 9) {
+                const dismiss_hint = " Esc ";
+                const hint_col: u16 = box_width - 2 - @as(u16, @intCast(dismiss_hint.len));
+                const hint_style: vaxis.Style = .{ .fg = style.fg, .bg = p.background.bg, .dim = true };
+                for (dismiss_hint, 0..) |_, hi| {
+                    surface.writeCell(hint_col + @as(u16, @intCast(hi)), bottom_row, .{
+                        .char = .{ .grapheme = dismiss_hint[hi .. hi + 1], .width = 1 },
+                        .style = hint_style,
+                    });
+                }
             }
 
             row += 2 + rows;
@@ -482,19 +506,24 @@ test "Widget.draw renders initialized bordered surface" {
     try std.testing.expect(surface.size.height == 3); // 1 top border + 1 content row + 1 bottom border
     try std.testing.expect(surface.buffer.len == 30 * 3);
 
-    // Verify top border corners
+    // Verify top border corners and semantic icon
     try std.testing.expectEqualStrings("╭", surface.buffer[0].char.grapheme);
     try std.testing.expectEqualStrings("╮", surface.buffer[29].char.grapheme);
     try std.testing.expectEqualStrings("─", surface.buffer[1].char.grapheme);
+    try std.testing.expectEqualStrings("ℹ", surface.buffer[3].char.grapheme);
 
-    // Verify content row side borders
+    // Verify content row side borders and opaque themed background
     try std.testing.expectEqualStrings("│", surface.buffer[30].char.grapheme);
     try std.testing.expectEqualStrings("│", surface.buffer[59].char.grapheme);
+    try std.testing.expectEqual(tui_style.activePalette().background.bg, surface.buffer[58].style.bg);
 
-    // Verify bottom border corners
+    // Verify bottom border corners and Esc dismiss hint
     try std.testing.expectEqualStrings("╰", surface.buffer[60].char.grapheme);
     try std.testing.expectEqualStrings("╯", surface.buffer[89].char.grapheme);
     try std.testing.expectEqualStrings("─", surface.buffer[61].char.grapheme);
+    try std.testing.expectEqualStrings("E", surface.buffer[60 + 24].char.grapheme);
+    try std.testing.expectEqualStrings("s", surface.buffer[60 + 25].char.grapheme);
+    try std.testing.expectEqualStrings("c", surface.buffer[60 + 26].char.grapheme);
 }
 
 test "Widget.draw truncates long toast with ellipsis and preserves borders" {

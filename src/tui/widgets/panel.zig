@@ -110,6 +110,17 @@ pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
     }
 }
 
+/// Pre-fill an entire modal/floating surface with the active palette's opaque
+/// background color so underlying transcript cells never bleed through.
+pub fn fillBackground(surface: *vxfw.Surface) void {
+    if (surface.buffer.len == 0) return;
+    const p = tui_style.activePalette();
+    @memset(surface.buffer, .{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = p.background,
+    });
+}
+
 pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
     const p = tui_style.activePalette();
     if (selected) fillRow(surface, row, p.selected);

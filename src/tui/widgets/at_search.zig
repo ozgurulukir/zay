@@ -73,6 +73,7 @@ const Body = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
+        panel.fillBackground(&surface);
 
         const content = self.content;
         if (content.results.len == 0) {
@@ -150,7 +151,7 @@ test "rendersNotice_whenResultsEmptyAndNoticePresent" {
     const inner_surface = outer_surface.children[0].surface;
 
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("! Search index building", panel.readRow(&inner_surface, 1, &buf));
+    try std.testing.expectEqualStrings("! Search index building", std.mem.trimEnd(u8, panel.readRow(&inner_surface, 1, &buf), " "));
 }
 
 test "panelHeight reserves a row for the notice" {
@@ -179,5 +180,5 @@ test "rendersNotice_whenResultsPresentAndNoticePresent" {
 
     // Row 0 and 1 have results, row 2 has the notice.
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("! Search error: timeout", panel.readRow(&inner_surface, 2, &buf));
+    try std.testing.expectEqualStrings("! Search error: timeout", std.mem.trimEnd(u8, panel.readRow(&inner_surface, 2, &buf), " "));
 }

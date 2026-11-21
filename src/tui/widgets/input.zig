@@ -552,30 +552,21 @@ pub const InputWidget = struct {
         };
         child_index += 1;
 
-        if (layout.show_hint) {
-            const padding_x: u16 = @min(@as(u16, 1), layout.max_width);
-            const inner_width = layout.max_width -| (padding_x * 2);
-            try self.drawInputHint(ctx, children, child_index, layout.base_row, padding_x, inner_width);
-            child_index += 1;
-        }
-
-        if (layout.show_diff) {
-            try self.drawDiffCounts(ctx, children, child_index, layout.base_row, layout.max_width);
-            child_index += 1;
-        }
-
         // Lay the two bottom-left pills out left-to-right: pink lanes chip first,
         // then the blue background-jobs badge shifted past it when both show.
-        var lanes_width: u16 = 0;
+        // Measure them before placing the hint so the hint shifts right and
+        // shrinks to the remaining budget without overlapping either pill or diff counts.
+        var left_reserved: u16 = 0;
         if (layout.show_lanes) {
             const lanes_surface = try self.drawLanesBadge(ctx, layout.max_width -| 2);
-            lanes_width = lanes_surface.size.width;
+            const lanes_width = lanes_surface.size.width;
             children[child_index] = .{
                 .origin = .{ .row = layout.base_row, .col = 1 },
                 .surface = lanes_surface,
                 .z_index = 2,
             };
             child_index += 1;
+            left_reserved +|= lanes_width + 1;
             if (self.props.chip_rect_out) |out| {
                 out.* = .{
                     .row = self.props.input_surface_row + layout.base_row,
@@ -586,12 +577,30 @@ pub const InputWidget = struct {
         }
 
         if (layout.show_badge) {
-            const badge_col: u16 = if (layout.show_lanes) 1 + lanes_width + 1 else 1;
+            const badge_col: u16 = 1 + left_reserved;
+            const badge_surface = try self.drawBackgroundBadge(ctx, layout.max_width -| badge_col -| 1);
             children[child_index] = .{
                 .origin = .{ .row = layout.base_row, .col = badge_col },
-                .surface = try self.drawBackgroundBadge(ctx, layout.max_width -| badge_col -| 1),
+                .surface = badge_surface,
                 .z_index = 2,
             };
+            child_index += 1;
+            left_reserved +|= badge_surface.size.width + 1;
+        }
+
+        var right_reserved: u16 = 0;
+        if (layout.show_diff) {
+            try self.drawDiffCounts(ctx, children, child_index, layout.base_row, layout.max_width);
+            right_reserved = children[child_index].surface.size.width +| 2;
+            child_index += 1;
+        }
+
+        if (layout.show_hint) {
+            const padding_x: u16 = @min(@as(u16, 1), layout.max_width);
+            const hint_col: u16 = @max(padding_x, 1 + left_reserved);
+            const right_limit: u16 = (layout.max_width -| padding_x) -| right_reserved;
+            const hint_width: u16 = right_limit -| hint_col;
+            try self.drawInputHint(ctx, children, child_index, layout.base_row, hint_col, hint_width);
             child_index += 1;
         }
 
@@ -664,7 +673,35 @@ pub const InputWidget = struct {
             }
         }
 
-        const child_count: usize = if (git_surface != null) 3 else 2;
+        const input_width = max_width -| 4;
+        const total_lines = wrappedTextRows(ctx, self.props.input_text, input_width);
+        var overflow_surface: ?vxfw.Surface = null;
+        if (total_lines > text_rows and max_width >= 8) {
+            const cursor_pos = wrappedTextPositionAt(ctx, self.props.input_text, self.props.input_cursor, input_width);
+            const first_visible = firstVisibleLine(cursor_pos.row, total_lines, text_rows);
+            const above = first_visible;
+            const below = total_lines -| (first_visible + text_rows);
+            const ov_text = if (above > 0 and below > 0)
+                try std.fmt.allocPrint(ctx.arena, " ↑{d} ↓{d} ", .{ above, below })
+            else if (above > 0)
+                try std.fmt.allocPrint(ctx.arena, " ↑{d} ", .{above})
+            else
+                try std.fmt.allocPrint(ctx.arena, " ↓{d} ", .{below});
+            const max_ov_w = if (git_surface != null) git_origin_col -| 2 else max_width -| 4;
+            if (max_ov_w > 0) {
+                var ov_w: vxfw.Text = .{
+                    .text = ov_text,
+                    .softwrap = false,
+                    .overflow = .ellipsis,
+                    .width_basis = .longest_line,
+                    .style = .{ .fg = p.thinking_body.fg, .dim = true },
+                };
+                const surf = try ov_w.widget().draw(ctx.withConstraints(.{ .width = 0, .height = 1 }, .{ .width = max_ov_w, .height = 1 }));
+                if (surf.size.width > 0) overflow_surface = surf;
+            }
+        }
+
+        const child_count: usize = 2 + @as(usize, @intFromBool(git_surface != null)) + @as(usize, @intFromBool(overflow_surface != null));
         const children = try ctx.arena.alloc(vxfw.SubSurface, child_count);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -676,9 +713,18 @@ pub const InputWidget = struct {
             .surface = status_surface,
             .z_index = 1,
         };
+        var idx: usize = 2;
         if (git_surface) |surf| {
-            children[2] = .{
+            children[idx] = .{
                 .origin = .{ .row = bottom, .col = git_origin_col },
+                .surface = surf,
+                .z_index = 1,
+            };
+            idx += 1;
+        }
+        if (overflow_surface) |surf| {
+            children[idx] = .{
+                .origin = .{ .row = bottom, .col = 2 },
                 .surface = surf,
                 .z_index = 1,
             };
@@ -838,4 +884,99 @@ test "formatWidthAwareHint prioritizes escape action when space is constrained" 
     // Very narrow width: keeps just "[ESC] Cancel"
     const narrow = formatWidthAwareHint(full, 15, arena);
     try std.testing.expectEqualStrings("[ESC] Cancel", narrow);
+}
+
+test "InputWidget shifts hint past left pills and reserves right diff counts" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var text_field: vxfw.TextField = .init(gpa);
+    defer text_field.deinit();
+    var wrap_width: u16 = 0;
+    var widget: InputWidget = .{
+        .props = .{
+            .input_field = &text_field,
+            .input_text = "",
+            .input_cursor = 0,
+            .input_wrap_width = &wrap_width,
+            .hint_text = "Type prompt · [ESC] Cancel",
+            .diff_counts = .{ .additions = 10, .deletions = 2 },
+            .background_jobs = 2,
+            .show_lanes_chip = true,
+            .lanes_count = 3,
+        },
+    };
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 80, .height = 4 },
+        .max = .{ .width = 80, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try widget.widget().draw(ctx);
+
+    var lanes_end: u16 = 0;
+    var badge_end: u16 = 0;
+    var hint_start: u16 = 0;
+    var hint_end: u16 = 0;
+    var diff_start: u16 = 80;
+    for (surface.children) |child| {
+        if (child.origin.row != 3) continue;
+        const col: u16 = @intCast(@max(0, child.origin.col));
+        if (child.z_index == 2 and col == 1) {
+            lanes_end = col + child.surface.size.width;
+        } else if (child.z_index == 2 and col > 1) {
+            badge_end = col + child.surface.size.width;
+        } else if (child.z_index == 0) {
+            hint_start = col;
+            hint_end = col + child.surface.size.width;
+        } else if (child.z_index == 1) {
+            diff_start = col;
+        }
+    }
+    try std.testing.expect(lanes_end > 1);
+    try std.testing.expect(badge_end > lanes_end);
+    try std.testing.expect(hint_start > badge_end);
+    try std.testing.expect(hint_end < diff_start);
+}
+
+test "InputWidget draws overflow indicator when multi-line prompt exceeds viewport" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var text_field: vxfw.TextField = .init(gpa);
+    defer text_field.deinit();
+    var wrap_width: u16 = 0;
+    const text = "line1\nline2\nline3\nline4\nline5";
+    var widget: InputWidget = .{
+        .props = .{
+            .input_field = &text_field,
+            .input_text = text,
+            .input_cursor = 0,
+            .input_wrap_width = &wrap_width,
+        },
+    };
+
+    // Height 4 gives 2 visible text rows (4 - 2 border rows) for 5 lines of text.
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 40, .height = 4 },
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try widget.widget().draw(ctx);
+    // Border surface is the child at origin (0, 0) with z_index 0; overflow indicator is on row 3, col 2.
+    var found_overflow = false;
+    for (surface.children) |child| {
+        if (child.origin.row == 0 and child.origin.col == 0 and child.z_index == 0) {
+            for (child.surface.children) |bc| {
+                if (bc.origin.row == 3 and bc.origin.col == 2) {
+                    found_overflow = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_overflow);
 }

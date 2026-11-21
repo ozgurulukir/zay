@@ -31,6 +31,7 @@ const command_router = @import("command_router.zig");
 const help_picker = @import("widgets/help_picker.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const tui_style = @import("style.zig");
+const toast = @import("toast.zig");
 
 /// Top-level event entry, called by vxfw for every event the root receives.
 ///
@@ -554,6 +555,11 @@ fn handleEscapeSequence(
         app.thread.transcript.selected = null;
         app.setThreadAutoScroll(true);
         try root.syncFocus(ctx);
+        ctx.consumeAndRedraw();
+        return;
+    }
+    if (toast.global.hasToasts()) {
+        toast.global.dismiss();
         ctx.consumeAndRedraw();
         return;
     }
