@@ -245,8 +245,10 @@ pub const MessageWidget = struct {
             message.title;
         // Duration/exit suffix (issue #488): appended identically in the row
         // counter (metrics.toolTitleRowsForView) so wrap math matches.
-        var suffix_buf: [256]u8 = undefined;
-        const command = message.titledWithSuffix(&suffix_buf, toolCommandTitle(chosen));
+        // Arena-allocated because `surface` cells borrow slices from `command`
+        // until `vx.render` finishes after `drawToolTitle` returns.
+        const suffix_buf = try ctx.arena.alloc(u8, 256);
+        const command = message.titledWithSuffix(suffix_buf, toolCommandTitle(chosen));
         const prefix = if (message.running) loading_frames[loading_frame % loading_frames.len] else toolIcon(command);
         const failed = !message.running and message.failed;
         const has_formatted = message.expanded and message.expanded_title_formatted != null;
@@ -362,10 +364,10 @@ pub const MessageWidget = struct {
 
     fn toolIcon(command: []const u8) []const u8 {
         if (containsWord(command, "write") or containsWord(command, "edit") or containsWord(command, "replace")) return "📝";
-        if (containsWord(command, "read") or containsWord(command, "view")) return "👁";
+        if (containsWord(command, "read") or containsWord(command, "view")) return "👀";
         if (containsWord(command, "search") or containsWord(command, "grep") or containsWord(command, "find")) return "🔍";
         if (containsWord(command, "bash") or containsWord(command, "run") or containsWord(command, "exec")) return "⚡";
-        return "🛠";
+        return "🔧";
     }
 
     /// Case-insensitive whole-word search: the match must be bounded by
@@ -604,6 +606,13 @@ pub const MessageWidget = struct {
     /// `Surface.writeCell` would otherwise reset text cells to terminal-default.
     fn writeCellOnCard(surface: *vxfw.Surface, col: u16, row: u16, cell: vaxis.Cell) void {
         var written = cell;
+        // Streaming deltas are not display-normalized (an escape can split
+        // across deltas), so a raw control byte may reach here. Written to the
+        // terminal it moves the cursor (tab/CR/ESC) and desyncs vaxis's diff
+        // state until the next full repaint.
+        if (isControlGrapheme(written.char.grapheme)) {
+            written.char = .{ .grapheme = " ", .width = 1 };
+        }
         if (written.style.bg == .default) {
             const idx = (@as(usize, row) * surface.size.width) + col;
             const prev_bg = surface.buffer[idx].style.bg; // the fillCardBackground bg
@@ -612,6 +621,21 @@ pub const MessageWidget = struct {
         surface.writeCell(col, row, written);
     }
 };
+
+fn isControlGrapheme(grapheme: []const u8) bool {
+    if (grapheme.len == 0) return false;
+    return grapheme[0] < 0x20 or grapheme[0] == 0x7f;
+}
+
+test "isControlGrapheme flags tab, CR, ESC and DEL but not text" {
+    try std.testing.expect(isControlGrapheme("\t"));
+    try std.testing.expect(isControlGrapheme("\r"));
+    try std.testing.expect(isControlGrapheme("\x1b"));
+    try std.testing.expect(isControlGrapheme("\x7f"));
+    try std.testing.expect(!isControlGrapheme("a"));
+    try std.testing.expect(!isControlGrapheme(" "));
+    try std.testing.expect(!isControlGrapheme("é"));
+}
 
 fn drawMarkdown(
     self: *MessageWidget,
