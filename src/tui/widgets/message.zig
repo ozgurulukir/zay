@@ -970,39 +970,15 @@ fn diffLineStyle(line: []const u8) vaxis.Style {
     };
 }
 
+const text_fit = @import("../text_fit.zig");
+
 fn wrappedLineEnd(line: []const u8, start: usize, width: u16, ctx: vxfw.DrawContext) usize {
-    std.debug.assert(start < line.len);
-    std.debug.assert(width > 0);
-    var iter = ctx.graphemeIterator(line[start..]);
-    var col: u16 = 0;
-    var index = start;
-    var last_break: ?usize = null;
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(line[start..]);
-        const grapheme_start = index;
-        const grapheme_width = @min(ctx.stringWidth(bytes), std.math.maxInt(u16));
-        if (col + grapheme_width > width) {
-            return last_break orelse if (grapheme_start > start) grapheme_start else grapheme_start + bytes.len;
-        }
-        index += bytes.len;
-        if (isLinearWhitespace(bytes)) last_break = grapheme_start;
-        col += @intCast(grapheme_width);
-    }
-    return line.len;
+    _ = ctx;
+    return text_fit.wrappedLineEnd(line, start, width);
 }
 
 fn skipLinearWhitespace(line: []const u8, start: usize) usize {
-    var index = start;
-    while (index < line.len) {
-        const len = std.unicode.utf8ByteSequenceLength(line[index]) catch return index;
-        if (!isLinearWhitespace(line[index .. index + len])) return index;
-        index += len;
-    }
-    return index;
-}
-
-fn isLinearWhitespace(bytes: []const u8) bool {
-    return std.mem.eql(u8, bytes, " ") or std.mem.eql(u8, bytes, "\t");
+    return text_fit.skipLinearWhitespace(line, start);
 }
 
 test "failed tool title renders a non-color ✗ marker" {

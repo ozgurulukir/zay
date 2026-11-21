@@ -107,10 +107,15 @@ pub const TranscriptWidget = struct {
         var idx: usize = surface.children.len;
 
         if (needs_scrollbar) {
-            const scroll_pos: u16 = @intCast(@min(total_items, self.thread.transcript_list.scroll.top));
-            const total: u16 = @max(total_items, view_height + 1);
+            const sb_metrics = scrollbarMetrics(
+                messages,
+                self.thread.transcript_list.scroll.top,
+                self.thread.transcript_list.scroll.offset,
+                view_height,
+                view_width,
+            );
             var sb_surf = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = 1, .height = view_height });
-            panel.drawScrollbar(&sb_surf, view_height, scroll_pos, total);
+            panel.drawScrollbar(&sb_surf, view_height, sb_metrics.scroll_pos, sb_metrics.total);
             new_children[idx] = .{
                 .origin = .{ .row = 0, .col = @intCast(view_width -| 1) },
                 .surface = sb_surf,
@@ -337,4 +342,43 @@ test "MessageListBuilder.build handles out-of-range selection index" {
     try std.testing.expect(w1 != null);
     const m1: *const MessageWidget = @ptrCast(@alignCast(w1.?.userdata));
     try std.testing.expectEqual(false, m1.selected);
+}
+
+fn scrollbarMetrics(
+    messages: []transcript_mod.Message,
+    scroll_top: usize,
+    scroll_offset: i17,
+    view_height: u16,
+    view_width: u16,
+) struct { scroll_pos: u16, total: u16 } {
+    const content_width = ConversationLayout.contentWidth(view_width);
+    var total_rows: usize = 0;
+    for (messages) |*msg| {
+        total_rows += messageRowsCached(msg, content_width);
+    }
+    const top_index = @min(messages.len, scroll_top);
+    var scroll_row: usize = @intCast(@max(0, scroll_offset));
+    for (messages[0..top_index]) |*msg| {
+        scroll_row += messageRowsCached(msg, content_width);
+    }
+    const max_u16 = std.math.maxInt(u16);
+    const total: u16 = @intCast(@min(max_u16, @max(total_rows, @as(usize, view_height) + 1)));
+    const scroll_pos: u16 = @intCast(@min(total, scroll_row));
+    return .{ .scroll_pos = scroll_pos, .total = total };
+}
+
+test "TranscriptWidget scrollbar reflects visual rows for a single long message" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const long_msg = "line\n" ** 20;
+    _ = try transcript.append(gpa, .user, "user", long_msg);
+
+    const m_mid = scrollbarMetrics(transcript.messages.items, 0, 10, 6, 40);
+    try std.testing.expectEqual(@as(u16, 22), m_mid.total);
+    try std.testing.expectEqual(@as(u16, 10), m_mid.scroll_pos);
+
+    const m_top = scrollbarMetrics(transcript.messages.items, 0, 0, 6, 40);
+    try std.testing.expectEqual(@as(u16, 0), m_top.scroll_pos);
 }

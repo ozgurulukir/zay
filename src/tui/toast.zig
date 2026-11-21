@@ -22,6 +22,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui_style = @import("style.zig");
+const text_fit = @import("text_fit.zig");
 
 /// Severity of a toast; drives its accent color.
 pub const Level = enum { info, success, warn, err };
@@ -247,28 +248,9 @@ pub const Widget = struct {
 /// at `max_wrap_rows`. Mirrors `drawWrapped` so the surface height matches the
 /// drawn rows.
 fn wrappedRows(text: []const u8, width: u16, ctx: vxfw.DrawContext) u16 {
+    _ = ctx;
     if (text.len == 0 or width == 0) return 1;
-    var rows: u16 = 1;
-    var col: u16 = 0;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (std.mem.eql(u8, bytes, "\n")) {
-            rows += 1;
-            col = 0;
-            if (rows >= max_wrap_rows) return max_wrap_rows;
-            continue;
-        }
-        const w: u16 = @intCast(ctx.stringWidth(bytes));
-        if (w == 0) continue;
-        if (col + w > width) {
-            rows += 1;
-            col = 0;
-            if (rows >= max_wrap_rows) return max_wrap_rows;
-        }
-        col += w;
-    }
-    return rows;
+    return @min(text_fit.textRows(text, width), max_wrap_rows);
 }
 
 /// Draw `text` soft-wrapped at `width` starting at `row`, truncating past
@@ -276,39 +258,64 @@ fn wrappedRows(text: []const u8, width: u16, ctx: vxfw.DrawContext) u16 {
 fn drawWrapped(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, ctx: vxfw.DrawContext, row: u16, width: u16) void {
     if (text.len == 0 or width == 0) return;
     var r: u16 = row;
-    var col: u16 = 1;
-    var last_row_col: u16 = 1;
+    var line_start: usize = 0;
     var truncated = false;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        if (std.mem.eql(u8, bytes, "\n")) {
-            if (r + 1 >= row + max_wrap_rows) {
+    var last_row_col: u16 = 1;
+    while (line_start <= text.len) {
+        const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        if (line.len == 0) {
+            if (r + 1 >= row + max_wrap_rows and line_end < text.len) {
                 truncated = true;
                 break;
             }
-            r += 1;
-            col = 1;
-            continue;
-        }
-        const w: u16 = @intCast(ctx.stringWidth(bytes));
-        if (w == 0) continue;
-        if (col + w > width + 1) {
-            if (r + 1 >= row + max_wrap_rows) {
-                truncated = true;
-                break;
+            if (line_end < text.len) {
+                r += 1;
+                if (r >= row + max_wrap_rows) {
+                    truncated = true;
+                    break;
+                }
             }
-            r += 1;
-            col = 1;
+        } else {
+            var start: usize = 0;
+            while (start < line.len) {
+                const end = text_fit.wrappedLineEnd(line, start, width);
+                const next_start = text_fit.skipLinearWhitespace(line, end);
+                const has_more_in_line = next_start < line.len;
+                const has_more_lines = line_end < text.len;
+                const is_last_allowed_row = (r + 1 >= row + max_wrap_rows);
+                var col: u16 = 1;
+                var iter = ctx.graphemeIterator(line[start..end]);
+                while (iter.next()) |grapheme| {
+                    const bytes = grapheme.bytes(line[start..end]);
+                    const w: u16 = @intCast(ctx.stringWidth(bytes));
+                    if (w == 0) continue;
+                    if (col + w > surface.size.width -| 1) break;
+                    surface.writeCell(col, r, .{
+                        .char = .{ .grapheme = bytes, .width = @intCast(w) },
+                        .style = style,
+                    });
+                    col += w;
+                    last_row_col = col;
+                }
+                if (is_last_allowed_row and (has_more_in_line or has_more_lines)) {
+                    truncated = true;
+                    break;
+                }
+                start = next_start;
+                if (start < line.len) r += 1;
+            }
+            if (truncated) break;
+            if (line_end < text.len) {
+                if (r + 1 >= row + max_wrap_rows) {
+                    truncated = true;
+                    break;
+                }
+                r += 1;
+            }
         }
-        if (col < surface.size.width -| 1) {
-            surface.writeCell(col, r, .{
-                .char = .{ .grapheme = bytes, .width = @intCast(w) },
-                .style = style,
-            });
-            last_row_col = col + w;
-        }
-        col += w;
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
     }
     // If the message was truncated by the row cap, mark the tail on the last valid row with `…`.
     if (truncated and r < surface.size.height) {

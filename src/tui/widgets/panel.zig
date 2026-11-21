@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 const c = @import("c");
 
 const message = @import("message.zig");
+const text_fit = @import("../text_fit.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 
@@ -120,31 +121,21 @@ pub fn lineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxf
     if (surface.buffer.len == 0 or row >= surface.size.height) return;
     if (start_col >= surface.size.width) return;
     const stable_text = try ctx.arena.dupe(u8, text);
-    // A trailing `…` marks an overflow instead of silently dropping the tail.
-    // The last column is reserved for it, so only `width - start_col - 1` cells
-    // of text fit before truncation kicks in.
-    const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
-    const truncated = text_width > surface.size.width -| start_col -| 1;
+    const avail_width: u16 = surface.size.width -| start_col;
+    const fit = try text_fit.truncateEnd(ctx.arena, stable_text, avail_width);
     var col: u16 = start_col;
-    var iter = ctx.graphemeIterator(stable_text);
+    var iter = ctx.graphemeIterator(fit.text);
     while (iter.next()) |grapheme| {
-        if (col + 1 >= surface.size.width) break;
-        const bytes = grapheme.bytes(stable_text);
+        if (col >= surface.size.width) break;
+        const bytes = grapheme.bytes(fit.text);
         const width: u8 = @intCast(ctx.stringWidth(bytes));
         if (width == 0) continue;
-        // A truncated wide grapheme must not straddle the ellipsis column.
-        if (truncated and col + width >= surface.size.width) break;
+        if (col + width > surface.size.width) break;
         surface.writeCell(col, row, .{
             .char = .{ .grapheme = bytes, .width = width },
             .style = active_style,
         });
         col += width;
-    }
-    if (truncated) {
-        surface.writeCell(surface.size.width - 1, row, .{
-            .char = .{ .grapheme = "…", .width = 1 },
-            .style = active_style,
-        });
     }
 }
 
@@ -157,69 +148,24 @@ pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawC
 pub fn rightStyled(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, active_style: vaxis.Style) !void {
     if (row >= surface.size.height) return;
     const stable_text = try ctx.arena.dupe(u8, text);
-    const text_width: u16 = @intCast(@min(ctx.stringWidth(stable_text), std.math.maxInt(u16)));
     const end_col = surface.size.width -| message.ConversationLayout.right;
     if (end_col == 0) return;
-    if (text_width >= end_col) {
-        // Right-aligned text is suffix-anchored: keep the tail and mark an
-        // overflow with a leading `…` instead of letting the column vanish.
-        const visible: u16 = end_col -| 1;
-        const start = tailStart(stable_text, ctx, visible);
-        surface.writeCell(0, row, .{
-            .char = .{ .grapheme = "…", .width = 1 },
-            .style = active_style,
-        });
-        var col: u16 = 1;
-        var iter = ctx.graphemeIterator(stable_text[start..]);
-        while (iter.next()) |grapheme| {
-            if (col >= end_col) break;
-            const bytes = grapheme.bytes(stable_text[start..]);
-            const width: u16 = @intCast(ctx.stringWidth(bytes));
-            if (width == 0) continue;
-            if (col + width > end_col) break;
-            surface.writeCell(col, row, .{
-                .char = .{ .grapheme = bytes, .width = @intCast(width) },
-                .style = active_style,
-            });
-            col += width;
-        }
-        return;
-    }
-    var col = end_col - text_width;
-    var iter = ctx.graphemeIterator(stable_text);
+    const fit = try text_fit.truncateStart(ctx.arena, stable_text, end_col);
+    const display_width = text_fit.measure(fit.text);
+    var col: u16 = end_col -| display_width;
+    var iter = ctx.graphemeIterator(fit.text);
     while (iter.next()) |grapheme| {
-        if (col >= surface.size.width) return;
-        const bytes = grapheme.bytes(stable_text);
+        if (col >= end_col) break;
+        const bytes = grapheme.bytes(fit.text);
         const width: u8 = @intCast(ctx.stringWidth(bytes));
         if (width == 0) continue;
-        if (col + width > surface.size.width) return;
+        if (col + width > end_col) break;
         surface.writeCell(col, row, .{
             .char = .{ .grapheme = bytes, .width = width },
             .style = active_style,
         });
         col += width;
     }
-}
-
-/// Byte offset into `text` of the longest suffix whose display width is at most
-/// `max_cols`, never splitting a grapheme. Walks graphemes from the front,
-/// dropping them until the remaining tail fits; assumes the whole text is wider
-/// than `max_cols` (callers gate on that).
-fn tailStart(text: []const u8, ctx: vxfw.DrawContext, max_cols: u16) usize {
-    if (max_cols == 0) return text.len;
-    const total: u16 = @intCast(@min(ctx.stringWidth(text), std.math.maxInt(u16)));
-    var end: usize = 0;
-    var dropped: u16 = 0;
-    var iter = ctx.graphemeIterator(text);
-    while (iter.next()) |grapheme| {
-        const bytes = grapheme.bytes(text);
-        const width: u16 = @intCast(ctx.stringWidth(bytes));
-        const remaining = total -| dropped -| width;
-        end += bytes.len;
-        dropped += width;
-        if (remaining <= max_cols) return end;
-    }
-    return text.len;
 }
 
 /// Draw `text` on `row` so its last cell ends at `end_col` (inclusive), filling
@@ -229,14 +175,14 @@ fn tailStart(text: []const u8, ctx: vxfw.DrawContext, max_cols: u16) usize {
 /// NOTE: Kept for list-row trailing text / marks (fuzzy list rows, pickers), NOT for widget layout.
 pub fn writeBorderTextEndingAt(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, end_col: u16, text: []const u8, style: vaxis.Style) u16 {
     if (text.len == 0 or row >= surface.size.height or end_col == 0) return end_col + 1;
-    const text_w: u16 = @intCast(@min(ctx.stringWidth(text), std.math.maxInt(u16)));
+    const text_w = text_fit.measure(text);
     if (text_w == 0) return end_col + 1;
     if (text_w > end_col + 1) {
         // This helper right-anchors its text at `end_col`; keep the rightmost
         // `end_col` cells of an overlong label and mark the cut with `…` instead
         // of dropping the description entirely (callers rely on the right edge
         // staying put — descriptions hug the right border).
-        const tail = tailStart(text, ctx, end_col);
+        const tail = text_fit.tailStart(text, end_col);
         surface.writeCell(0, row, .{
             .char = .{ .grapheme = "…", .width = 1 },
             .style = style,
