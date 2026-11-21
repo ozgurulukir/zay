@@ -63,6 +63,13 @@ pub fn pasteFromSystemClipboard(app: *App) !bool {
     return false;
 }
 
+/// Copy arbitrary `text` to the system clipboard and append an info notice.
+pub fn copyTextWithNotice(app: *App, text: []const u8, notice: []const u8) !void {
+    if (text.len == 0) return;
+    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
+    _ = try app.thread.transcript.append(app.gpa, .info, "clipboard", notice);
+}
+
 /// Copy the text of the selected transcript block (or last agent response) to clipboard.
 pub fn copySelectedTranscriptBlock(app: *App) !bool {
     const selected_idx = app.thread.transcript.selected orelse blk: {

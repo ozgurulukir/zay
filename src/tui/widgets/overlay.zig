@@ -27,6 +27,7 @@ const model_loader = @import("../model_loader.zig");
 const provider_picker = @import("provider_picker.zig");
 const resume_picker = @import("resume_picker.zig");
 const tree_selector = @import("tree_selector.zig");
+const links_picker = @import("links_picker.zig");
 const tui_status = @import("../status.zig");
 const codex = @import("../../auth/codex.zig");
 const settings_widget = @import("settings.zig");
@@ -53,13 +54,14 @@ pub fn preferredOverlaySize(mode: App.Mode) OverlaySize {
         .plugins => .{ .width = 80, .height = 16 },
         .search => .{ .width = 90, .height = 20 },
         .theme_picker => .{ .width = 64, .height = 16 },
+        .link_picker => .{ .width = 90, .height = 16 },
         .diff_viewer => .{ .width = 0, .height = 0 },
     };
 }
 
 pub fn isListPicker(mode: App.Mode) bool {
     return switch (mode) {
-        .command, .session_picker, .model_picker, .tree_picker, .lanes, .help, .mcp, .plugins, .search, .theme_picker => true,
+        .command, .session_picker, .model_picker, .tree_picker, .lanes, .help, .mcp, .plugins, .search, .theme_picker, .link_picker => true,
         else => false,
     };
 }
@@ -124,6 +126,7 @@ fn overlayLabel(app: *const App) []const u8 {
         .plugins => "Lua Plugins",
         .search => "Search Transcript",
         .theme_picker => "Select Theme",
+        .link_picker => "Links in Message",
         .lanes => switch (app.nav.lanes_purpose) {
             .manage => "Parallel Lanes",
             .merge_dest => "Merge Into",
@@ -270,10 +273,16 @@ const OverlayInner = struct {
             .plugins => drawPluginsContent(app, ctx),
             .search => drawSearchContent(app, ctx),
             .theme_picker => drawThemeContent(app, ctx),
+            .link_picker => drawLinksContent(app, ctx),
             // The diff viewer is full-screen — `drawRoot` returns before the
             // overlay path, so this is never reached.
             .normal, .diff_viewer => unreachable,
         };
+    }
+
+    fn drawLinksContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        var content: links_picker.Content = .{ .state = &app.pickers.links };
+        return content.widget().draw(ctx);
     }
 
     fn drawSearchContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {

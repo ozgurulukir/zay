@@ -53,6 +53,30 @@ pub const Content = struct {
         self.list.item_count = @intCast(widgets.len);
         self.list.cursor = self.selection;
         self.list.ensureScroll();
+        const width = ctx.max.width orelse 0;
+        const height = ctx.max.height orelse 0;
+        const detail: ?[]const u8 = detail: {
+            if (self.selection >= self.summaries.len or height < 2) break :detail null;
+            const s = self.summaries[self.selection];
+            const label = if (s.title.len > 0) s.title else s.cwd;
+            if (panel.isTruncated(label, width -| 20)) break :detail label;
+            break :detail null;
+        };
+        if (detail) |full| {
+            const list_h = height -| 1;
+            const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+            children[0] = .{
+                .origin = .{ .row = 0, .col = 0 },
+                .surface = try self.list.widget().draw(ctx.withConstraints(
+                    .{ .width = width, .height = list_h },
+                    .{ .width = width, .height = list_h },
+                )),
+                .z_index = 0,
+            };
+            var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, children);
+            panel.drawDetailFooter(&surface, ctx, height -| 1, full);
+            return surface;
+        }
         return panel.listSurface(ctx, self.widget(), self.list.widget());
     }
 

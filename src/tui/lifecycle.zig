@@ -109,6 +109,7 @@ fn deinitSharedServices(self: *App) void {
     log.info("shutdown.pickers.begin", .{});
     self.pickers.tree.deinit();
     self.pickers.search.deinit(self.gpa);
+    self.pickers.links.deinit(self.gpa);
     self.pickers.models.deinit(self.gpa);
 
     auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);

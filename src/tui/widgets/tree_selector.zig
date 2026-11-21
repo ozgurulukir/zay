@@ -589,8 +589,14 @@ pub const Content = struct {
         self.list.cursor = self.state.selection;
         self.list.ensureScroll();
 
+        const detail: ?[]const u8 = if (self.state.selection < self.state.visible.len and height > 3) blk: {
+            const node = self.state.visible[self.state.selection];
+            if (panel.isTruncated(node.text, width -| 8)) break :blk node.text;
+            break :blk null;
+        } else null;
+
         const list_row: u16 = 2;
-        const list_height = height -| list_row;
+        const list_height = (height -| list_row) -| @as(u16, @intFromBool(detail != null));
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         children[0] = .{
             .origin = .{ .row = list_row, .col = 0 },
@@ -601,6 +607,9 @@ pub const Content = struct {
             .z_index = 0,
         };
         surface.children = children;
+        if (detail) |full| {
+            panel.drawDetailFooter(&surface, ctx, height -| 1, full);
+        }
         return surface;
     }
 
