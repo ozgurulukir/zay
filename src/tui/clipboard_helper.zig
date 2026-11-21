@@ -6,6 +6,7 @@ const std = @import("std");
 const tui = @import("../tui.zig");
 const clipboard_mod = @import("../clipboard.zig");
 const mode_lifecycle = @import("mode_lifecycle.zig");
+const paste_stash_mod = @import("paste_stash.zig");
 const tools_common = @import("../tools/common.zig");
 
 const App = tui.App;
@@ -35,7 +36,14 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     if (clean_text.len == 0) return;
 
     switch (mode_lifecycle.modeTextInputSlot(app)) {
-        .prompt => try app.inputs.input.insertSliceAtCursor(clean_text),
+        .prompt => {
+            if (paste_stash_mod.shouldCollapse(clean_text)) {
+                const placeholder = try app.inputs.paste_stash.stash(app.gpa, clean_text);
+                try app.inputs.input.insertSliceAtCursor(placeholder);
+            } else {
+                try app.inputs.input.insertSliceAtCursor(clean_text);
+            }
+        },
         .palette => try app.inputs.palette.insertSliceAtCursor(clean_text),
         .session_rename => try app.input_buffers.session_rename_text.appendSlice(app.gpa, clean_text),
         .session_project_root => try app.input_buffers.project_root_text.appendSlice(app.gpa, clean_text),

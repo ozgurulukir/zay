@@ -18,6 +18,7 @@ const auth = @import("../auth/store.zig");
 const modelsdev = @import("../models/registry.zig");
 const job_mod = @import("job.zig");
 const model_picker = @import("widgets/model_picker.zig");
+const paste_stash_mod = @import("paste_stash.zig");
 const tree_selector = @import("widgets/tree_selector.zig");
 const model_catalogue = @import("model_catalogue.zig");
 const provider_picker = @import("widgets/provider_picker.zig");
@@ -155,6 +156,7 @@ pub const InputState = struct {
     input: vxfw.TextField,
     palette: vxfw.TextField,
     comment: vxfw.TextField,
+    paste_stash: paste_stash_mod.PasteStash = .{},
 };
 
 /// The four picker widgets: file tree (overlay), model catalogue,
@@ -201,6 +203,7 @@ pub const NavState = struct {
     };
 
     block_nav: bool = false,
+    pending_ctrl_x: bool = false,
     command_selection: u32 = 0,
     resume_selection: u32 = 0,
     /// How the resume picker groups sessions. Cycles through flat (current

@@ -182,6 +182,7 @@ fn deinitOwnedState(self: *App) void {
     self.inputs.input.deinit();
     self.inputs.palette.deinit();
     self.inputs.comment.deinit();
+    self.inputs.paste_stash.deinit(self.gpa);
 
     self.input_buffers.provider_key.deinit(self.gpa);
     self.input_buffers.settings_text.deinit(self.gpa);
