@@ -330,6 +330,39 @@ fn routeKey(
     }
     // Prompt undo/redo (issue #486): only when the prompt is focused, i.e.
     // normal mode — overlays have their own text fields with no undo history.
+    if (app.getMode() == .normal and app.nav.pending_ctrl_x) {
+        app.nav.pending_ctrl_x = false;
+        if (key.matches('e', .{ .ctrl = true }) or key.matches('e', .{})) {
+            app.clearPendingQuitAt();
+            try @import("external_editor.zig").editPromptInExternalEditor(app);
+            ctx.consumeAndRedraw();
+            return;
+        }
+    }
+    if (app.getMode() == .normal and !app.nav.block_nav and key.matches('x', .{ .ctrl = true })) {
+        app.nav.pending_ctrl_x = true;
+        ctx.consumeEvent();
+        return;
+    }
+    if (app.getMode() == .normal and !app.nav.block_nav and app.inputs.paste_stash.entries.items.len > 0 and key.matches(vaxis.Key.backspace, .{})) {
+        const text = app.inputs.input.buf.dupe() catch null;
+        if (text) |owned| {
+            defer app.gpa.free(owned);
+            const cursor = app.inputs.input.buf.cursor;
+            if (app.inputs.paste_stash.placeholderSpanAtBackspace(owned, cursor)) |span| {
+                const updated = std.fmt.allocPrint(app.gpa, "{s}{s}", .{ owned[0..span.start], owned[span.end..] }) catch null;
+                if (updated) |u| {
+                    defer app.gpa.free(u);
+                    app.clearInput();
+                    try app.inputs.input.insertSliceAtCursor(u);
+                    const cur = app.inputs.input.buf.cursor;
+                    if (span.start < cur) app.inputs.input.buf.moveGapLeft(cur - span.start);
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+            }
+        }
+    }
     if (app.getMode() == .normal and key.matches('z', .{ .ctrl = true })) {
         app.clearPendingQuitAt();
         if (app.input_undo.undo(app)) ctx.consumeAndRedraw();
@@ -565,6 +598,7 @@ fn handleEscapeSequence(
     }
     if (app.inputRealLength() > 0) {
         app.clearInput();
+        app.inputs.paste_stash.clear(app.gpa);
         app.closeAtSearch();
         app.clearPendingQuitAt();
         try root.syncFocus(ctx);
@@ -595,6 +629,7 @@ fn handleQuitSequence(
 
     if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
         app.clearInput();
+        app.inputs.paste_stash.clear(app.gpa);
         app.closeAtSearch();
         app.clearBlockNav();
         app.clearPendingQuitAt();

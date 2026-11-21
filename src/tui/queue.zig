@@ -25,7 +25,11 @@ pub fn appendSkillInvocationsToTranscript(app: *App, lane: *Thread, prompt: []co
 }
 
 pub fn enqueueSubmit(app: *App) !bool {
-    const prompt = try app.inputs.input.buf.dupe();
+    const raw_prompt = try app.inputs.input.buf.dupe();
+    const prompt = if (app.inputs.paste_stash.entries.items.len > 0) blk: {
+        defer app.gpa.free(raw_prompt);
+        break :blk try app.inputs.paste_stash.expandAndClear(app.gpa, raw_prompt);
+    } else raw_prompt;
     errdefer app.gpa.free(prompt);
     if (prompt.len == 0) {
         app.gpa.free(prompt);

@@ -209,7 +209,11 @@ pub fn beginSubmit(app: *App) !bool {
         lanes_util.appendIdleLaneNotice(app);
         return false;
     }
-    const prompt = try app.inputs.input.toOwnedSlice();
+    const raw_prompt = try app.inputs.input.toOwnedSlice();
+    const prompt = if (app.inputs.paste_stash.entries.items.len > 0) blk: {
+        defer app.gpa.free(raw_prompt);
+        break :blk try app.inputs.paste_stash.expandAndClear(app.gpa, raw_prompt);
+    } else raw_prompt;
     defer app.gpa.free(prompt);
     if (prompt.len == 0) return false;
     try app.thread.pushPromptHistory(app.gpa, prompt);
