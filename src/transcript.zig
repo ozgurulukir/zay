@@ -63,6 +63,8 @@ pub const Basic = struct {
     body: []u8,
     expanded: bool = true,
     failed: bool = false,
+    /// Wall-clock seconds when the message was appended (0 when unknown).
+    timestamp_s: i64 = 0,
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
 };
@@ -307,10 +309,20 @@ pub const Transcript = struct {
             .title = owned_title,
             .body = owned_body,
             .expanded = expanded,
+            .timestamp_s = if (kind == .user) std.Io.Clock.now(.real, std.Io.Threaded.global_single_threaded.io()).toSeconds() else 0,
         };
         try self.messages.append(gpa, try payloadToMessage(kind, payload));
         if (kind.selectable() and following_tail) self.selected = index;
         return index;
+    }
+
+    /// Invalidate every message's cached row height (used when layout-wide
+    /// settings like `maxContentWidth`, `density`, or `showTurnTimestamps`
+    /// change without a terminal resize).
+    pub fn invalidateAllRowCaches(self: *Transcript) void {
+        for (self.messages.items) |*msg| {
+            msg.invalidateRowCache();
+        }
     }
 
     /// True when no message is selected, or when the selection is at the last

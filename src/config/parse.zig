@@ -81,8 +81,8 @@ const min_split_width_max: u16 = 500;
 
 /// Accepted band for `maxContentWidth` (0 disables the cap); out-of-band
 /// values are dropped, matching the minSplitWidth convention.
-const max_content_width_min: u16 = 40;
-const max_content_width_max: u16 = 500;
+const max_content_width_min: u16 = config_mod.max_content_width_min;
+const max_content_width_max: u16 = config_mod.max_content_width_max;
 /// Max length for `systemPrompt` (schema `maxLength: 10000`). Longer values
 /// are dropped with a diagnostic — a silently-truncated prompt would change
 /// semantics, so the field never clamps. Public: the settings editor's
@@ -405,6 +405,14 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
     if (updates.animations_is_set) {
         target.tui.animations = updates.animations;
         target.tui.animations_is_set = true;
+    }
+    if (updates.density_is_set) {
+        target.tui.density = updates.density;
+        target.tui.density_is_set = true;
+    }
+    if (updates.show_turn_timestamps_is_set) {
+        target.tui.show_turn_timestamps = updates.show_turn_timestamps;
+        target.tui.show_turn_timestamps_is_set = true;
     }
 }
 
@@ -1320,6 +1328,16 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
         } else {
             tui.animations = .full;
         }
+    }
+    if (stringField(value, "density")) |s| {
+        if (std.meta.stringToEnum(config_mod.TranscriptDensity, s)) |density| {
+            tui.density = density;
+            tui.density_is_set = true;
+        }
+    }
+    if (boolField(value, "showTurnTimestamps")) |b| {
+        tui.show_turn_timestamps = b;
+        tui.show_turn_timestamps_is_set = true;
     }
     return tui;
 }
@@ -2471,6 +2489,14 @@ fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     if (tui.animations_is_set or tui.animations != default_tui.animations) {
         try writeKeyNoIndent(writer, "animations", &wrote_any);
         try std.json.Stringify.value(@tagName(tui.animations), .{}, writer);
+    }
+    if (tui.density_is_set or tui.density != default_tui.density) {
+        try writeKeyNoIndent(writer, "density", &wrote_any);
+        try std.json.Stringify.value(@tagName(tui.density), .{}, writer);
+    }
+    if (tui.show_turn_timestamps_is_set or tui.show_turn_timestamps != default_tui.show_turn_timestamps) {
+        try writeKeyNoIndent(writer, "showTurnTimestamps", &wrote_any);
+        try writer.writeAll(if (tui.show_turn_timestamps) "true" else "false");
     }
     try writer.writeByte('}');
 }
@@ -4933,6 +4959,26 @@ test "parseTui round-trips all ten layout + telemetry fields" {
     defer out.deinit();
     try writeTui(&out.writer, tui);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"maxContentWidth\":100") != null);
+}
+
+test "parseTui and writeTui round-trip density and showTurnTimestamps" {
+    const json_str =
+        \\{"density":"compact","showTurnTimestamps":true}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const tui = try parseTui(std.testing.allocator, parsed.value);
+    try std.testing.expectEqual(config_mod.TranscriptDensity.compact, tui.density);
+    try std.testing.expect(tui.density_is_set);
+    try std.testing.expect(tui.show_turn_timestamps);
+    try std.testing.expect(tui.show_turn_timestamps_is_set);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeTui(&out.writer, tui);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"density\":\"compact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"showTurnTimestamps\":true") != null);
 }
 
 test "parseTui drops out-of-range layout + telemetry values" {

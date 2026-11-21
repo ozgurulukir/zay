@@ -59,7 +59,7 @@ const tab_count: u8 = @typeInfo(Tab).@"enum".fields.len;
 /// Tracks the row selected within each tab's item list.
 pub const TabSelection = [tab_count]u32;
 
-pub const EditTarget = enum { none, system_prompt, bash_classifier_url };
+pub const EditTarget = enum { none, system_prompt, bash_classifier_url, max_content_width };
 
 pub const State = struct {
     tab: Tab = .general,
@@ -75,6 +75,12 @@ pub const State = struct {
     pending_toast_enabled: ?bool = null,
     /// Pending animations level.
     pending_animations: ?config_mod.AnimationsMode = null,
+    /// Pending readable-measure width cap (0 = fill terminal, or 40..500).
+    pending_max_content_width: ?u16 = null,
+    /// Pending transcript density.
+    pending_density: ?config_mod.TranscriptDensity = null,
+    /// Pending turn separator/timestamp toggle.
+    pending_show_turn_timestamps: ?bool = null,
     /// True when there are unsaved changes.
     dirty: bool = false,
 
@@ -141,7 +147,7 @@ pub const State = struct {
 };
 
 // Item counts per section (used for wrapping navigation).
-const general_item_count: u32 = 3; // use_responses_endpoint, toast_enabled, animations
+const general_item_count: u32 = 6; // use_responses_endpoint, toast_enabled, animations, max_content_width, density, show_turn_timestamps
 const prompt_item_count: u32 = 1; // system_prompt editor entry
 const advanced_item_count: u32 = 1; // bash_classifier_url
 const about_item_count: u32 = 0; // read-only info
@@ -159,6 +165,7 @@ pub const Content = struct {
     cwd: []const u8,
     system_prompt_input: []const u8 = "",
     bash_classifier_input: []const u8 = "",
+    max_content_width_input: []const u8 = "",
     version_string: []const u8 = @import("build").version,
 
     pub fn widget(self: *Content) vxfw.Widget {
@@ -268,6 +275,60 @@ pub const Content = struct {
             try panel.lineStyledAt(surface, 10, label, ctx, left_col, style);
             const desc = "TUI animation level (full, reduced motion, or off).";
             try self.drawDescription(surface, ctx, 11, desc, selected);
+        }
+
+        // Row 13: maxContentWidth numeric field.
+        {
+            const selected = sel == 3;
+            if (selected) panel.fillRow(surface, 13, p.selected);
+            const is_editing = self.state.edit_target == .max_content_width;
+            const value = self.state.pending_max_content_width orelse self.config.tui.max_content_width;
+            const style = if (selected) p.selected_item else p.thinking_body;
+            const prefix = "  Max Content Width  ";
+            try panel.lineStyledAt(surface, 13, prefix, ctx, left_col, style);
+            const val_col = left_col + @as(u16, @intCast(ctx.stringWidth(prefix)));
+            const val_text = if (is_editing)
+                self.max_content_width_input
+            else if (value == 0)
+                "[0 (fill)]"
+            else
+                try std.fmt.allocPrint(ctx.arena, "[{d}]", .{value});
+            const val_style: vaxis.Style = if (selected) p.selected_item else p.model_status;
+            try panel.lineStyledAt(surface, 13, val_text, ctx, val_col, val_style);
+            if (is_editing) {
+                const w = @as(u16, @intCast(ctx.stringWidth(val_text)));
+                surface.cursor = .{ .row = 13, .col = val_col + w };
+            }
+            const desc = "Maximum transcript prose width in columns (0 = fill terminal, or 40..500).";
+            try self.drawDescription(surface, ctx, 14, desc, selected);
+        }
+
+        // Row 16: transcript density toggle.
+        {
+            const selected = sel == 4;
+            if (selected) panel.fillRow(surface, 16, p.selected);
+            const value = self.state.pending_density orelse self.config.tui.density;
+            const badge = switch (value) {
+                .comfortable => "[comfortable]",
+                .compact => "[compact]",
+            };
+            const label = try std.fmt.allocPrint(ctx.arena, "  Transcript Density  {s}", .{badge});
+            const style = if (selected) p.selected_item else p.thinking_body;
+            try panel.lineStyledAt(surface, 16, label, ctx, left_col, style);
+            const desc = "Vertical spacing between transcript messages (comfortable or compact).";
+            try self.drawDescription(surface, ctx, 17, desc, selected);
+        }
+
+        // Row 19: turn timestamps toggle.
+        {
+            const selected = sel == 5;
+            if (selected) panel.fillRow(surface, 19, p.selected);
+            const value = self.state.pending_show_turn_timestamps orelse self.config.tui.show_turn_timestamps;
+            const label = try std.fmt.allocPrint(ctx.arena, "  Turn Timestamps  {s}", .{boolBadge(value)});
+            const style = if (selected) p.selected_item else p.thinking_body;
+            try panel.lineStyledAt(surface, 19, label, ctx, left_col, style);
+            const desc = "Show a dim separator with timestamp above each user turn.";
+            try self.drawDescription(surface, ctx, 20, desc, selected);
         }
     }
 
@@ -573,10 +634,14 @@ test "settings selection wraps within section" {
     try std.testing.expectEqual(@as(u32, 1), state.currentSelection());
     state.moveDown(); // general item 2 (animations)
     try std.testing.expectEqual(@as(u32, 2), state.currentSelection());
+    state.moveDown(); // general item 3 (max_content_width)
+    state.moveDown(); // general item 4 (density)
+    state.moveDown(); // general item 5 (show_turn_timestamps)
+    try std.testing.expectEqual(@as(u32, 5), state.currentSelection());
     state.moveDown(); // wraps back to the first (0)
     try std.testing.expectEqual(@as(u32, 0), state.currentSelection());
-    state.moveUp(); // wraps to the last (2)
-    try std.testing.expectEqual(@as(u32, 2), state.currentSelection());
+    state.moveUp(); // wraps to the last (5)
+    try std.testing.expectEqual(@as(u32, 5), state.currentSelection());
 }
 
 test "settings boolBadge returns correct label" {

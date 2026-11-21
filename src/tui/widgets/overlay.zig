@@ -49,7 +49,7 @@ pub fn preferredOverlaySize(mode: App.Mode) OverlaySize {
         .save_message => .{ .width = 60, .height = 3 },
         .lanes => .{ .width = 80, .height = 16 },
         .help => .{ .width = 90, .height = help_picker.help_overlay_height },
-        .settings => .{ .width = 90, .height = 22 },
+        .settings => .{ .width = 90, .height = 25 },
         .mcp => .{ .width = 90, .height = 20 },
         .plugins => .{ .width = 80, .height = 16 },
         .search => .{ .width = 90, .height = 20 },
@@ -411,6 +411,7 @@ const OverlayInner = struct {
             .cwd = if (runtime) |r| r.cwd else ".",
             .system_prompt_input = app.input_buffers.settings_text.items,
             .bash_classifier_input = app.input_buffers.settings_text.items,
+            .max_content_width_input = app.input_buffers.settings_text.items,
         };
         return content.widget().draw(ctx);
     }
@@ -588,7 +589,7 @@ test "overlaySize pins known panel dimensions on standard terminal" {
     // numbers (a screen smaller than a panel must still fit).
     try std.testing.expectEqual(@as(u16, 64), overlaySize(.command, 100, 30).width);
     try std.testing.expectEqual(@as(u16, 90), overlaySize(.settings, 100, 40).width);
-    try std.testing.expectEqual(@as(u16, 22), overlaySize(.settings, 100, 40).height);
+    try std.testing.expectEqual(@as(u16, 25), overlaySize(.settings, 100, 40).height);
     try std.testing.expectEqual(@as(u16, 20), overlaySize(.tree_picker, 100, 30).height);
     // The commit-message box is a one-line input, deliberately tiny.
     try std.testing.expectEqual(@as(u16, 3), overlaySize(.save_message, 100, 30).height);

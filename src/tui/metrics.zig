@@ -30,6 +30,21 @@ pub const render_cache_max_bytes: usize = 256 * 1024;
 /// desyncs from the render.
 pub var readable_measure_max: u16 = 0;
 
+/// Transcript vertical spacing density (`comfortable` = 1 blank row between
+/// messages; `compact` = 0). Set at startup and on settings preview/save.
+pub var transcript_density: @import("../config/config.zig").TranscriptDensity = .comfortable;
+
+/// Whether user messages render a dim turn separator/timestamp row above the
+/// prompt body. Set at startup and on settings preview/save.
+pub var show_turn_timestamps: bool = false;
+
+pub fn topSpacingRows() u16 {
+    return switch (transcript_density) {
+        .comfortable => 1,
+        .compact => 0,
+    };
+}
+
 /// The transcript content width at `width` columns under the cap. With the
 /// cap at 0 this is exactly the historical `width -| left -| right`.
 pub fn effectiveContentWidth(width: u16, max_content_width: u16) u16 {
@@ -48,14 +63,15 @@ pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
     if (cache.valid and cache.width == width) {
         return cache.rows;
     }
-    const rows = messageContentRows(message, width) + 1;
+    const rows = messageContentRows(message, width) + topSpacingRows();
     cache.* = .{ .valid = true, .width = width, .rows = rows };
     return rows;
 }
 
 pub fn messageContentRows(message: *transcript_mod.Message, width: u16) u16 {
     return switch (message.*) {
-        .user, .info => |m| textRows(m.body, width -| 2),
+        .user => |m| textRows(m.body, width -| 2) + @as(u16, @intFromBool(show_turn_timestamps)),
+        .info => |m| textRows(m.body, width -| 2),
         .notice => |m| blk: {
             const has_marker = std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ");
             var stack_buf: [256]u8 = undefined;
