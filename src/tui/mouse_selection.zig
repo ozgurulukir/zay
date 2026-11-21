@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 const tui = @import("../tui.zig");
 const transcript_mod = @import("../transcript.zig");
 const tui_metrics = @import("metrics.zig");
+const text_fit = @import("text_fit.zig");
 const message_widget = @import("widgets/message.zig");
 
 const App = tui.App;
@@ -119,7 +120,7 @@ pub fn mapRowColToByteOffset(
     indent: u16,
 ) usize {
     if (body.len == 0) return 0;
-    const top_pad = ConversationLayout.top;
+    const top_pad = ConversationLayout.messageTop();
     if (msg_row < top_pad) return 0;
     const target_row = msg_row - top_pad;
     const body_left = ConversationLayout.left + indent;
@@ -135,7 +136,7 @@ pub fn mapRowColToByteOffset(
         var seg_start: usize = 0;
         while (true) {
             const seg_end = if (seg_start < hard_line.len)
-                wrappedLineEnd(hard_line, seg_start, wrap_width)
+                text_fit.wrappedLineEnd(hard_line, seg_start, wrap_width)
             else
                 seg_start;
 
@@ -144,40 +145,13 @@ pub fn mapRowColToByteOffset(
             }
             cur_row += 1;
             if (seg_end >= hard_line.len) break;
-            seg_start = skipLinearWhitespace(hard_line, seg_end);
+            seg_start = text_fit.skipLinearWhitespace(hard_line, seg_end);
         }
 
         if (hard_end >= body.len) break;
         line_start = hard_end + 1;
     }
     return body.len;
-}
-
-fn wrappedLineEnd(line: []const u8, start: usize, width: u16) usize {
-    if (start >= line.len or width == 0) return start;
-    var iter = vaxis.unicode.graphemeIterator(line[start..]);
-    var col: u16 = 0;
-    var end = start;
-    var last_space_end: ?usize = null;
-    while (iter.next()) |g| {
-        const grapheme = g.bytes(line[start..]);
-        const w: u16 = @intCast(vaxis.gwidth.gwidth(grapheme, .unicode));
-        if (col + w > width and end > start) {
-            return last_space_end orelse end;
-        }
-        col += w;
-        end = start + g.start + grapheme.len;
-        if (grapheme.len == 1 and (grapheme[0] == ' ' or grapheme[0] == '\t')) {
-            last_space_end = start + g.start;
-        }
-    }
-    return line.len;
-}
-
-fn skipLinearWhitespace(line: []const u8, start: usize) usize {
-    var i = start;
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    return i;
 }
 
 fn colToByteInSegment(seg: []const u8, seg_start: usize, target_col: u16) usize {
