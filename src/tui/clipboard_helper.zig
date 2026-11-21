@@ -119,7 +119,45 @@ pub fn copySelectedTranscriptBlock(app: *App) !bool {
 
     var notice_buf: [256]u8 = undefined;
     const kind_name = @tagName(mirror.kind);
-    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message block to clipboard ({d} bytes).", .{ kind_name, text.len });
+    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message as plain text ({d} bytes).", .{ kind_name, text.len });
+    _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
+    return true;
+}
+
+/// Copy the selected transcript message's original Markdown source bytes and
+/// announce the format in a notice (issue #514).
+pub fn copySelectedTranscriptBlockAsMarkdown(app: *App) !bool {
+    const selected_idx = app.thread.transcript.selected orelse return false;
+    if (selected_idx >= app.thread.transcript.messages.items.len) return false;
+    const mirror = app.thread.transcript.messages.items[selected_idx].mirror();
+    if (mirror.body.len == 0) return false;
+
+    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), mirror.body);
+    var notice_buf: [256]u8 = undefined;
+    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message as Markdown ({d} bytes).", .{ @tagName(mirror.kind), mirror.body.len });
+    _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
+    return true;
+}
+
+/// Copy the first `path[:line[:col]]` token in the selected message body
+/// (issue #514).
+pub fn copyFirstPathToken(app: *App) !bool {
+    const token_scan = @import("token_scan.zig");
+    const selected_idx = app.thread.transcript.selected orelse return false;
+    if (selected_idx >= app.thread.transcript.messages.items.len) return false;
+    const body = app.thread.transcript.messages.items[selected_idx].mirror().body;
+    if (body.len == 0) return false;
+
+    const tokens = try token_scan.scanPathLineTokens(app.gpa, body, 1);
+    defer app.gpa.free(tokens);
+    if (tokens.len == 0) {
+        _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", "No path:line token found in selected message.");
+        return true;
+    }
+    const tok = body[tokens[0].start..tokens[0].end];
+    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), tok);
+    var notice_buf: [256]u8 = undefined;
+    const notice_text = std.fmt.bufPrint(&notice_buf, "Copied path token: {s}", .{tok}) catch "Copied path token";
     _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
     return true;
 }

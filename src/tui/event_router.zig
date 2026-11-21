@@ -234,6 +234,75 @@ fn routeMouse(
                 }
             }
         }
+        // 5. Transcript mouse selection (single-click anchor, double-click word, triple-click line).
+        if (app.getMode() == .normal and !app.permissionPending() and mouse.row >= 0 and mouse.col >= 0) {
+            const mouse_sel = @import("mouse_selection.zig");
+            const r: u16 = @intCast(mouse.row);
+            const c: u16 = @intCast(mouse.col);
+            const now_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+            const same_spot = @abs(@as(i32, r) - @as(i32, app.nav.mouse_last_click_row)) <= 1 and
+                @abs(@as(i32, c) - @as(i32, app.nav.mouse_last_click_col)) <= 1;
+            if (same_spot and (now_ms - app.nav.mouse_last_click_ms) <= 400) {
+                app.nav.mouse_click_count = if (app.nav.mouse_click_count >= 3) 1 else app.nav.mouse_click_count + 1;
+            } else {
+                app.nav.mouse_click_count = 1;
+            }
+            app.nav.mouse_last_click_ms = now_ms;
+            app.nav.mouse_last_click_row = r;
+            app.nav.mouse_last_click_col = c;
+
+            if (mouse_sel.hitTestTranscript(app, r, c)) |hit| {
+                const body = app.thread.transcript.messages.items[hit.message_index].mirror().body;
+                app.thread.transcript.selected = hit.message_index;
+                if (app.nav.mouse_click_count == 2) {
+                    const wr = mouse_sel.wordRange(body, hit.byte_offset);
+                    app.thread.transcript.body_selection = .{ .message_index = hit.message_index, .anchor = wr[0], .focus = wr[1] };
+                    app.nav.mouse_drag_active = false;
+                } else if (app.nav.mouse_click_count == 3) {
+                    const lr = mouse_sel.lineRange(body, hit.byte_offset);
+                    app.thread.transcript.body_selection = .{ .message_index = hit.message_index, .anchor = lr[0], .focus = lr[1] };
+                    app.nav.mouse_drag_active = false;
+                } else {
+                    app.thread.transcript.body_selection = .{ .message_index = hit.message_index, .anchor = hit.byte_offset, .focus = hit.byte_offset };
+                    app.nav.mouse_drag_active = true;
+                }
+                ctx.consumeAndRedraw();
+                return;
+            } else {
+                app.thread.transcript.body_selection = null;
+                app.nav.mouse_drag_active = false;
+            }
+        }
+    }
+
+    if ((mouse.type == .drag or mouse.type == .motion) and app.nav.mouse_drag_active) {
+        if (app.thread.transcript.body_selection) |*sel| {
+            if (mouse.row >= 0 and mouse.col >= 0) {
+                const mouse_sel = @import("mouse_selection.zig");
+                if (mouse_sel.hitTestTranscript(app, @intCast(mouse.row), @intCast(mouse.col))) |hit| {
+                    if (hit.message_index == sel.message_index) {
+                        sel.focus = hit.byte_offset;
+                    } else if (hit.message_index > sel.message_index) {
+                        sel.focus = app.thread.transcript.messages.items[sel.message_index].mirror().body.len;
+                    } else {
+                        sel.focus = 0;
+                    }
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+            }
+        }
+    }
+
+    if (mouse.type == .release and app.nav.mouse_drag_active) {
+        app.nav.mouse_drag_active = false;
+        if (app.thread.transcript.body_selection) |sel| {
+            if (sel.anchor == sel.focus) {
+                app.thread.transcript.body_selection = null;
+            }
+        }
+        ctx.consumeAndRedraw();
+        return;
     }
 }
 

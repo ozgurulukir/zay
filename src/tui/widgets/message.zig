@@ -150,7 +150,8 @@ pub const MessageWidget = struct {
     }
 
     /// Combined byte-offset overlays for a body: search hits (issue #484),
-    /// active cycled hit (#502), plus Shift-arrow selection (issue #487).
+    /// active cycled hit (#502), Shift-arrow/mouse selection (#487/#513), and
+    /// `path[:line[:col]]` token underlines (#514).
     fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, active_range: ?[2]usize, selection: ?[2]usize) ?[]StyleSpan {
         var spans: std.ArrayList(StyleSpan) = .empty;
         if (active_range) |range| {
@@ -164,6 +165,13 @@ pub const MessageWidget = struct {
         if (selection) |range| {
             if (range[1] > range[0] and range[1] <= text.len) {
                 spans.append(arena, .{ .start = range[0], .end = range[1], .style = searchMatchStyle() }) catch {};
+            }
+        }
+        if (token_scan.scanPathLineTokens(arena, text, 64) catch null) |tokens| {
+            var token_style = tui_style.activePalette().tool;
+            token_style.ul_style = .single;
+            for (tokens) |tok| {
+                spans.append(arena, .{ .start = tok.start, .end = tok.end, .style = token_style }) catch {};
             }
         }
         if (spans.items.len == 0) return null;
