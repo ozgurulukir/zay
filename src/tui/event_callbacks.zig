@@ -71,7 +71,7 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
             const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
         },
-        .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins => {},
+        .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins, .link_picker => {},
     }
     ctx.consumeAndRedraw();
 }

@@ -58,6 +58,7 @@ pub fn hintText(hint: HintInputs) []const u8 {
         },
         .model_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "←/→ Effort" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .theme_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Select" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
+        .link_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER/Y] Copy" ++ symbols.separator_dot_padded ++ "[O] Open" ++ symbols.separator_dot_padded ++ "[ESC] Close",
         .tree_picker => "↑↓ Navigate" ++ symbols.separator_dot_padded ++ "[ENTER] Jump to branch" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .save_message => "[ENTER] Save" ++ symbols.separator_dot_padded ++ "[ESC] Cancel",
         .lanes => switch (hint.lanes_purpose) {
@@ -87,6 +88,7 @@ test "hintText pins every mode's text" {
     try std.testing.expectEqualStrings("[ENTER] Save API Key" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .provider_picker, .provider_stage = .form }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "←/→ Effort" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .model_picker }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Select" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .theme_picker }));
+    try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER/Y] Copy" ++ dot ++ "[O] Open" ++ dot ++ "[ESC] Close", hintText(.{ .mode = .link_picker }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[ENTER] Jump to branch" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .tree_picker }));
     try std.testing.expectEqualStrings("[ENTER] Save" ++ dot ++ "[ESC] Cancel", hintText(.{ .mode = .save_message }));
     try std.testing.expectEqualStrings("↑↓ Navigate" ++ dot ++ "[M] Merge into current" ++ dot ++ "[X] Delete" ++ dot ++ "[ESC] Back", hintText(.{ .mode = .lanes, .lanes_purpose = .manage }));

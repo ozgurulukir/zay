@@ -109,6 +109,7 @@ fn deinitSharedServices(self: *App) void {
     log.info("shutdown.pickers.begin", .{});
     self.pickers.tree.deinit();
     self.pickers.search.deinit(self.gpa);
+    self.pickers.links.deinit(self.gpa);
     self.pickers.models.deinit(self.gpa);
 
     auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);
@@ -754,7 +755,7 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         .diff_viewer => diff_lifecycle.diffFocusTarget(root),
         // The lanes overlay owns its keys via captureEvent; the palette input
         // is unused, so keep focus on the root (typed keys are ignored).
-        .lanes, .help, .settings, .mcp, .plugins => root.widget(),
+        .lanes, .help, .settings, .mcp, .plugins, .link_picker => root.widget(),
         .normal => app.inputs.input.widget(),
     };
     try ctx.requestFocus(target);

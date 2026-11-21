@@ -147,7 +147,7 @@ pub fn cancelMode(app: *App) !bool {
 pub fn isRuntimeBound(mode: App.Mode) bool {
     return switch (mode) {
         .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
-        .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker => false,
+        .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker, .link_picker => false,
     };
 }
 
@@ -192,7 +192,7 @@ pub fn modeTextInputSlot(app: *const App) TextInputSlot {
             .browse => .none,
         },
         .mcp => if (app.pickers.mcp.adding) .mcp_url else .none,
-        .lanes, .help, .plugins => .none,
+        .lanes, .help, .plugins, .link_picker => .none,
     };
 }
 
@@ -623,6 +623,14 @@ pub fn submitMode(app: *App) !bool {
             _ = try app.submitPluginsOverlay();
             return true;
         },
+        .link_picker => {
+            if (app.pickers.links.selectedUrl()) |url| {
+                try clipboard_helper.copyTextWithNotice(app, url, "Copied link URL");
+            }
+            app.pickers.links.reset(app.gpa);
+            app.setMode(.normal);
+            return true;
+        },
         // Modes with no Enter action: the switch is exhaustive, so these must
         // be listed to compile. (This is the old fall-through `return false`.)
         .normal, .diff_viewer, .help => return false,
@@ -654,7 +662,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
         // search box is still empty; once a query is active it stays part of it.
         .search => app.inputs.palette.buf.realLength() == 0,
         // Settings has its own navigation: '/' is not a command shortcut there.
-        .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp, .plugins => false,
+        .settings, .command, .diff_viewer, .save_message, .lanes, .help, .mcp, .plugins, .link_picker => false,
     };
 }
 
@@ -1087,18 +1095,18 @@ test "runtime-bound mode set is exhaustive and stable" {
     inline for (std.enums.values(App.Mode)) |m| {
         const expected = switch (m) {
             .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
-            .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker => false,
+            .normal, .command, .diff_viewer, .lanes, .help, .settings, .mcp, .plugins, .search, .theme_picker, .link_picker => false,
         };
         try std.testing.expectEqual(expected, App.isRuntimeBound(m));
     }
-    // Set sizes: 5 runtime-bound, 10 runtime-free.
+    // Set sizes: 5 runtime-bound, 11 runtime-free.
     var bound: u32 = 0;
     var free: u32 = 0;
     inline for (std.enums.values(App.Mode)) |m| {
         if (App.isRuntimeBound(m)) bound += 1 else free += 1;
     }
     try std.testing.expectEqual(@as(u32, 5), bound);
-    try std.testing.expectEqual(@as(u32, 10), free);
+    try std.testing.expectEqual(@as(u32, 11), free);
 }
 
 test "modeTextInputSlot set is exhaustive and stable" {
@@ -1122,7 +1130,7 @@ test "modeTextInputSlot set is exhaustive and stable" {
             .session_picker => .palette,
             // Default `.list` stage and non-editing defaults are inert.
             .provider_picker, .settings, .diff_viewer, .mcp => .none,
-            .lanes, .help, .plugins => .none,
+            .lanes, .help, .plugins, .link_picker => .none,
         };
         try std.testing.expectEqual(expected, modeTextInputSlot(&app));
     }

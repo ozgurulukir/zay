@@ -34,6 +34,7 @@ const clipboard_helper = @import("clipboard_helper.zig");
 const help_picker = @import("widgets/help_picker.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
+const links_picker = @import("widgets/links_picker.zig");
 const plugin_store_job = @import("plugin_store_job.zig");
 const plugin_store = @import("../plugin_store.zig");
 const transcript_mod = @import("../transcript.zig");
@@ -57,6 +58,7 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
         .plugins => try PluginsMode.handle(app, key),
         .search => try SearchMode.handle(app, key),
         .theme_picker => try ThemePicker.handle(app, key),
+        .link_picker => try LinkPicker.handle(app, key),
         // The diff viewer owns its keys directly in `captureEvent`; nothing
         // reaches the generic dispatch.
         .diff_viewer => false,
@@ -437,6 +439,42 @@ const CommandMenu = struct {
 /// selected theme (via `theme_lifecycle.applyTheme`) and is handled by
 /// `submitMode`, not here. Esc is handled by the `cancelMode` fallthrough.
 /// Other keys fall through to the focused palette input for filtering.
+const LinkPicker = struct {
+    fn handle(app: *App, key: vaxis.Key) !bool {
+        const len: u32 = @intCast(app.pickers.links.items.items.len);
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            app.pickers.links.reset(app.gpa);
+            app.setMode(.normal);
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            app.pickers.links.selection = previousIndex(app.pickers.links.selection, len);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            app.pickers.links.selection = nextIndex(app.pickers.links.selection, len);
+            return true;
+        }
+        if (isEnterKey(key) or key.matches('y', .{})) {
+            if (app.pickers.links.selectedUrl()) |url| {
+                try clipboard_helper.copyTextWithNotice(app, url, "Copied link URL");
+            }
+            app.pickers.links.reset(app.gpa);
+            app.setMode(.normal);
+            return true;
+        }
+        if (key.matches('o', .{})) {
+            if (app.pickers.links.selectedUrl()) |url| {
+                links_picker.openUrlInPlatform(app.getIo(), url) catch {};
+            }
+            app.pickers.links.reset(app.gpa);
+            app.setMode(.normal);
+            return true;
+        }
+        return false;
+    }
+};
+
 const ThemePicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
@@ -554,6 +592,16 @@ pub const BlockNav = struct {
             if (key.matches('a', .{})) {
                 app.toggleAllTranscriptBlocks();
                 return true;
+            }
+            if (key.matches('g', .{})) {
+                if (app.thread.transcript.selected) |sel| {
+                    if (sel < app.thread.transcript.messages.items.len) {
+                        const body = app.thread.transcript.messages.items[sel].bodyPtr().*;
+                        try app.pickers.links.loadFromBody(app.gpa, body);
+                        app.setMode(.link_picker);
+                        return true;
+                    }
+                }
             }
             // Shift+arrows extend a within-body selection over the selected
             // message (issue #487); 'y' then copies just the selection.

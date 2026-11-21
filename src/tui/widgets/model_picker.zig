@@ -115,9 +115,25 @@ pub const Content = struct {
         self.syncListScroll();
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
-        // Reserve the bottom row for the status footer when one is set, so
-        // the footer never overlaps the last visible model row.
-        const list_height = if (self.footer.len > 0) height -| 1 else height;
+        // Detail row (#506): if the highlighted model label/id is wider than
+        // its column, reserve one row for the full value.
+        const selected_detail: ?[]const u8 = detail: {
+            const avail = panel.secondaryColumn(width) -| 4;
+            var pos: u32 = 0;
+            for (self.models) |m| {
+                if (!matches(m, self.filter)) continue;
+                if (pos == self.selection) {
+                    if (panel.isTruncated(m.id, avail) or panel.isTruncated(m.label, avail)) {
+                        break :detail m.id;
+                    }
+                    break;
+                }
+                pos += 1;
+            }
+            break :detail null;
+        };
+        const reserved: u16 = @as(u16, @intFromBool(self.footer.len > 0)) + @as(u16, @intFromBool(selected_detail != null));
+        const list_height = height -| reserved;
         const list_surface = try self.list.widget().draw(ctx.withConstraints(
             .{ .width = width, .height = list_height },
             .{ .width = width, .height = list_height },
@@ -129,6 +145,10 @@ pub const Content = struct {
             .z_index = 0,
         };
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, children);
+        if (selected_detail) |detail| {
+            const detail_row = if (self.footer.len > 0) height -| 2 else height -| 1;
+            panel.drawDetailFooter(&surface, ctx, detail_row, detail);
+        }
         if (self.footer.len > 0 and height > 0) {
             try panel.lineStyledAt(&surface, height -| 1, self.footer, ctx, 0, p.thinking_body);
         }

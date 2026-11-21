@@ -28,6 +28,7 @@ const theme_picker = @import("widgets/theme_picker.zig");
 const mcp_status = @import("widgets/mcp_status.zig");
 const plugins_status = @import("widgets/plugins_status.zig");
 const search_widget = @import("widgets/search.zig");
+const links_picker = @import("widgets/links_picker.zig");
 const vxfw = vaxis.vxfw;
 const telemetry_mod = @import("telemetry.zig");
 
@@ -169,6 +170,7 @@ pub const PickerStates = struct {
     plugins: plugins_status.State = .{},
     search: search_widget.State = .{},
     theme: theme_picker.State = .{},
+    links: links_picker.State = .{},
 };
 
 /// Navigation cursors and the cross-pane selection state. Owns the
@@ -482,7 +484,7 @@ pub const PermissionButton = struct {
 
 /// UI interaction mode. Lives beside NavState so leaf widgets can switch on
 /// it without referencing the App.
-pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search, theme_picker };
+pub const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes, help, settings, mcp, plugins, search, theme_picker, link_picker };
 
 /// Per-line diff +/- counts shown at the input's right edge.
 pub const DiffCounts = struct {

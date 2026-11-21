@@ -766,6 +766,7 @@ test "Enter disposition sweep: every overlay consumes Enter per its submitMode a
             .diff_viewer, .normal => {},
             .mcp => {}, // list view, no selection change: consumed no-op
             .plugins => {}, // installed view: consumed no-op (space owns toggle)
+            .link_picker => {}, // empty links list: closes to normal
         }
         // Modes whose disposition is "act quietly": a leaked Enter (a
         // deleted or hollow submitMode arm) would fall through to
@@ -776,7 +777,7 @@ test "Enter disposition sweep: every overlay consumes Enter per its submitMode a
         // .theme_picker posts its own apply notice, so none of those may
         // be listed here.
         const expect_quiet = switch (m) {
-            .search, .settings, .tree_picker, .save_message, .lanes, .diff_viewer, .mcp, .plugins => true,
+            .search, .settings, .tree_picker, .save_message, .lanes, .diff_viewer, .mcp, .plugins, .link_picker => true,
             .command, .provider_picker, .model_picker, .session_picker, .theme_picker, .help, .normal => false,
         };
         const notices_before = app.thread.transcript.messages.items.len;

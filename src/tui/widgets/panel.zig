@@ -121,6 +121,19 @@ pub fn fillBackground(surface: *vxfw.Surface) void {
     });
 }
 
+/// True when `text` exceeds `max_width` terminal cells and would be ellipsized.
+pub fn isTruncated(text: []const u8, max_width: u16) bool {
+    return vaxis.gwidth.gwidth(text, .unicode) > max_width;
+}
+
+/// Render a one-line detail footer for a truncated highlighted picker row (#506).
+pub fn drawDetailFooter(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, full_value: []const u8) void {
+    if (surface.buffer.len == 0 or row >= surface.size.height or full_value.len == 0) return;
+    const p = tui_style.activePalette();
+    fillRow(surface, row, p.selected);
+    lineStyledAt(surface, row, full_value, ctx, 2, p.selected_item) catch {};
+}
+
 pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
     const p = tui_style.activePalette();
     if (selected) fillRow(surface, row, p.selected);
