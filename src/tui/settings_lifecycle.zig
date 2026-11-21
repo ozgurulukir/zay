@@ -66,6 +66,15 @@ fn hasActualChanges(state: *const State, config: *const config_mod.Config) bool 
     if (state.pending_animations) |v| {
         if (v != config.tui.animations) return true;
     }
+    if (state.pending_max_content_width) |v| {
+        if (v != config.tui.max_content_width) return true;
+    }
+    if (state.pending_density) |v| {
+        if (v != config.tui.density) return true;
+    }
+    if (state.pending_show_turn_timestamps) |v| {
+        if (v != config.tui.show_turn_timestamps) return true;
+    }
     return false;
 }
 
@@ -115,7 +124,48 @@ pub fn openSettings(app: *App) void {
 }
 
 pub fn closeSettings(app: *App) void {
+    // Restore live-preview transcript layout globals to saved config values if
+    // the user closed without saving.
+    const state = &app.pickers.settings;
+    const had_preview = state.pending_max_content_width != null or
+        state.pending_density != null or
+        state.pending_show_turn_timestamps != null;
+    if (had_preview) {
+        syncLiveTranscriptMetrics(
+            app,
+            app.cached_config.tui.max_content_width,
+            app.cached_config.tui.density,
+            app.cached_config.tui.show_turn_timestamps,
+        );
+    }
     app.setMode(.normal);
+}
+
+fn syncLiveTranscriptMetrics(
+    app: *App,
+    max_content_width: u16,
+    density: config_mod.TranscriptDensity,
+    show_turn_timestamps: bool,
+) void {
+    const metrics = @import("metrics.zig");
+    const changed = metrics.readable_measure_max != max_content_width or
+        metrics.transcript_density != density or
+        metrics.show_turn_timestamps != show_turn_timestamps;
+    metrics.readable_measure_max = max_content_width;
+    metrics.transcript_density = density;
+    metrics.show_turn_timestamps = show_turn_timestamps;
+    if (changed) {
+        app.thread.transcript.invalidateAllRowCaches();
+    }
+}
+
+fn previewPendingTranscriptMetrics(app: *App, state: *const State) void {
+    syncLiveTranscriptMetrics(
+        app,
+        state.pending_max_content_width orelse app.cached_config.tui.max_content_width,
+        state.pending_density orelse app.cached_config.tui.density,
+        state.pending_show_turn_timestamps orelse app.cached_config.tui.show_turn_timestamps,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +211,29 @@ fn submitGeneralItem(app: *App, state: *State) !void {
             };
             state.pending_animations = next;
             state.dirty = hasActualChanges(state, &app.cached_config);
+        },
+        3 => {
+            // Edit maxContentWidth as numeric text.
+            var buf: [16]u8 = undefined;
+            const cur = state.pending_max_content_width orelse app.cached_config.tui.max_content_width;
+            const cur_str = std.fmt.bufPrint(&buf, "{d}", .{cur}) catch "0";
+            beginTextEdit(app, state, .max_content_width, cur_str);
+        },
+        4 => {
+            // Toggle transcript density: comfortable <-> compact.
+            const cur = state.pending_density orelse app.cached_config.tui.density;
+            state.pending_density = switch (cur) {
+                .comfortable => .compact,
+                .compact => .comfortable,
+            };
+            state.dirty = hasActualChanges(state, &app.cached_config);
+            previewPendingTranscriptMetrics(app, state);
+        },
+        5 => {
+            // Toggle turn timestamps/separators above user messages.
+            _ = togglePending(&state.pending_show_turn_timestamps, app.cached_config.tui.show_turn_timestamps);
+            state.dirty = hasActualChanges(state, &app.cached_config);
+            previewPendingTranscriptMetrics(app, state);
         },
         else => {},
     }
@@ -243,6 +316,9 @@ pub fn saveSettings(app: *App) !bool {
         state.pending_bash_classifier_url = null;
         state.pending_toast_enabled = null;
         state.pending_animations = null;
+        state.pending_max_content_width = null;
+        state.pending_density = null;
+        state.pending_show_turn_timestamps = null;
         _ = try app.thread.transcript.append(app.gpa, .info, "Settings", "No changes to save");
         return false;
     }
@@ -294,6 +370,18 @@ pub fn saveSettings(app: *App) !bool {
         updates.tui.animations = v;
         updates.tui.animations_is_set = true;
     }
+    if (state.pending_max_content_width) |v| {
+        updates.tui.max_content_width = v;
+        updates.tui.max_content_width_is_set = true;
+    }
+    if (state.pending_density) |v| {
+        updates.tui.density = v;
+        updates.tui.density_is_set = true;
+    }
+    if (state.pending_show_turn_timestamps) |v| {
+        updates.tui.show_turn_timestamps = v;
+        updates.tui.show_turn_timestamps_is_set = true;
+    }
 
     const runtime = app.liveRuntime() orelse return false;
 
@@ -331,8 +419,14 @@ pub fn saveSettings(app: *App) !bool {
         log.warn("MCP config not applied — sync failed; see log ({s})", .{@errorName(err)});
     };
 
-    // Apply the toast toggle live to the global bus.
+    // Apply the toast toggle live to the global bus and layout globals live.
     if (state.pending_toast_enabled) |v| toast.global.enabled = v;
+    syncLiveTranscriptMetrics(
+        app,
+        app.cached_config.tui.max_content_width,
+        app.cached_config.tui.density,
+        app.cached_config.tui.show_turn_timestamps,
+    );
 
     // Reset pending state.
     if (state.pending_system_prompt) |old| app.gpa.free(old);
@@ -343,6 +437,9 @@ pub fn saveSettings(app: *App) !bool {
     state.pending_bash_classifier_url = null;
     state.pending_toast_enabled = null;
     state.pending_animations = null;
+    state.pending_max_content_width = null;
+    state.pending_density = null;
+    state.pending_show_turn_timestamps = null;
     state.edit_target = .none;
 
     // Show success feedback to user.
@@ -388,6 +485,20 @@ fn commitTextEdit(app: *App) !void {
             if (state.pending_bash_classifier_url) |old| app.gpa.free(old);
             state.pending_bash_classifier_url = next_url;
             state.dirty = true;
+        },
+        .max_content_width => {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            const parsed = std.fmt.parseInt(u16, trimmed, 10) catch {
+                _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", "Max content width must be 0 (fill) or between 40 and 500");
+                return;
+            };
+            if (parsed != 0 and (parsed < config_mod.max_content_width_min or parsed > config_mod.max_content_width_max)) {
+                _ = try app.thread.transcript.append(app.gpa, .notice, "Settings", "Max content width must be 0 (fill) or between 40 and 500");
+                return;
+            }
+            state.pending_max_content_width = parsed;
+            state.dirty = hasActualChanges(state, &app.cached_config);
+            previewPendingTranscriptMetrics(app, state);
         },
         .none => {},
     }
@@ -458,6 +569,18 @@ fn applyToCachedConfig(app: *App, state: *const State) !void {
     if (state.pending_animations) |v| {
         app.cached_config.tui.animations = v;
         app.cached_config.tui.animations_is_set = true;
+    }
+    if (state.pending_max_content_width) |v| {
+        app.cached_config.tui.max_content_width = v;
+        app.cached_config.tui.max_content_width_is_set = true;
+    }
+    if (state.pending_density) |v| {
+        app.cached_config.tui.density = v;
+        app.cached_config.tui.density_is_set = true;
+    }
+    if (state.pending_show_turn_timestamps) |v| {
+        app.cached_config.tui.show_turn_timestamps = v;
+        app.cached_config.tui.show_turn_timestamps_is_set = true;
     }
 }
 
@@ -1077,4 +1200,62 @@ test "syncClassifierUrls parks while a cancel teardown is still unwinding" {
 
     gpa.free(state.pending_bash_classifier_url.?);
     gpa.free(url);
+}
+
+test "maxContentWidth, density, and showTurnTimestamps live preview invalidates row caches and restores on close" {
+    const gpa = std.testing.allocator;
+    const metrics = @import("metrics.zig");
+    const prev_max = metrics.readable_measure_max;
+    const prev_density = metrics.transcript_density;
+    const prev_ts = metrics.show_turn_timestamps;
+    defer {
+        metrics.readable_measure_max = prev_max;
+        metrics.transcript_density = prev_density;
+        metrics.show_turn_timestamps = prev_ts;
+    }
+    metrics.readable_measure_max = 0;
+    metrics.transcript_density = .comfortable;
+    metrics.show_turn_timestamps = false;
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const idx = try app.thread.transcript.append(gpa, .user, "You", "Hello world");
+    const msg = &app.thread.transcript.messages.items[idx];
+    const comfortable_rows = metrics.messageRowsCached(msg, 80);
+    try std.testing.expectEqual(@as(u16, 2), comfortable_rows);
+    try std.testing.expect(msg.rowCachePtr().valid);
+
+    // Edit maxContentWidth -> live preview updates readable_measure_max and invalidates cache.
+    app.mode = .settings;
+    app.pickers.settings.tab = .general;
+    app.pickers.settings.edit_target = .max_content_width;
+    try app.input_buffers.settings_text.appendSlice(gpa, "80");
+    try submitSettings(&app);
+    try std.testing.expectEqual(@as(u16, 80), app.pickers.settings.pending_max_content_width.?);
+    try std.testing.expectEqual(@as(u16, 80), metrics.readable_measure_max);
+    try std.testing.expect(!msg.rowCachePtr().valid);
+
+    // Toggle density -> compact tightens by 1 row.
+    app.pickers.settings.selection[0] = 4;
+    try submitSettings(&app);
+    try std.testing.expectEqual(config_mod.TranscriptDensity.compact, metrics.transcript_density);
+    const compact_rows = metrics.messageRowsCached(msg, 80);
+    try std.testing.expectEqual(@as(u16, 1), compact_rows);
+
+    // Toggle turn timestamps -> adds 1 row on user message.
+    app.pickers.settings.selection[0] = 5;
+    try submitSettings(&app);
+    try std.testing.expect(metrics.show_turn_timestamps);
+    try std.testing.expect(!msg.rowCachePtr().valid);
+    try std.testing.expectEqual(@as(u16, 2), metrics.messageRowsCached(msg, 80));
+
+    // Close without saving -> restores globals and invalidates cache.
+    closeSettings(&app);
+    try std.testing.expectEqual(@as(u16, 0), metrics.readable_measure_max);
+    try std.testing.expectEqual(config_mod.TranscriptDensity.comfortable, metrics.transcript_density);
+    try std.testing.expect(!metrics.show_turn_timestamps);
+    try std.testing.expect(!msg.rowCachePtr().valid);
 }

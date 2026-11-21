@@ -242,6 +242,14 @@ pub const AnimationsMode = enum {
     off,
 };
 
+pub const TranscriptDensity = enum {
+    comfortable,
+    compact,
+};
+
+pub const max_content_width_min: u16 = 40;
+pub const max_content_width_max: u16 = 500;
+
 /// TUI appearance, live theme preview, and picker settings.
 ///
 /// Every scalar field carries a paired `<field>_is_set` flag (#447): parse
@@ -309,6 +317,12 @@ pub const TuiSettings = struct {
     /// Animation detail level: 'full', 'reduced' (static logo, slow spinner, lower tick rate), or 'off' (stops animation ticks entirely).
     animations: AnimationsMode = .full,
     animations_is_set: bool = false,
+    /// Transcript vertical spacing density: 'comfortable' (default) or 'compact'.
+    density: TranscriptDensity = .comfortable,
+    density_is_set: bool = false,
+    /// Render a dim turn separator/timestamp above user messages.
+    show_turn_timestamps: bool = false,
+    show_turn_timestamps_is_set: bool = false,
 
     pub fn effectiveLightTheme(self: *const TuiSettings) []const u8 {
         return self.light_theme orelse "catppuccin_latte";

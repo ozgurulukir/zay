@@ -450,6 +450,8 @@ pub const App = struct {
         try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
         tui_style.setNoColor(tui_style.isNoColorActive(app.cached_config.tui.no_color, environ_map));
         tui_metrics.readable_measure_max = app.cached_config.tui.max_content_width;
+        tui_metrics.transcript_density = app.cached_config.tui.density;
+        tui_metrics.show_turn_timestamps = app.cached_config.tui.show_turn_timestamps;
         const active_theme = app.theme_registry.resolveWithScheme(
             app.cached_config.theme,
             app.terminal_color_scheme,
@@ -1449,6 +1451,8 @@ pub fn run(
     // Install the active color theme before the first frame is drawn.
     tui_style.setNoColor(tui_style.isNoColorActive(config.tui.no_color, init.environ_map));
     tui_metrics.readable_measure_max = config.tui.max_content_width;
+    tui_metrics.transcript_density = config.tui.density;
+    tui_metrics.show_turn_timestamps = config.tui.show_turn_timestamps;
     tui_style.setActive(tui_style.resolveTheme(config.theme));
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, config_arena, init.environ_map, host_id);

@@ -34,10 +34,15 @@ pub const ConversationLayout = struct {
     pub const bottom: u16 = 1;
 
     pub fn verticalPadding() @TypeOf(vxfw.Padding.vertical(0)) {
+        const pad = tui_metrics.topSpacingRows();
         return .{
-            .top = top,
-            .bottom = bottom,
+            .top = pad,
+            .bottom = pad,
         };
+    }
+
+    pub fn messageTop() u16 {
+        return tui_metrics.topSpacingRows();
     }
 
     pub fn contentWidth(width: u16) u16 {
@@ -174,12 +179,29 @@ pub const MessageWidget = struct {
         drawWrapped(surface, text, style, selected, row, ctx, indent, bar_style);
     }
 
+    fn formatTurnAnchor(arena: std.mem.Allocator, ts_s: i64) []const u8 {
+        if (ts_s <= 0) return "────────────────";
+        const epoch_secs: u64 = @intCast(ts_s);
+        const day_secs = @mod(epoch_secs, 86400);
+        const hour = day_secs / 3600;
+        const min = (day_secs % 3600) / 60;
+        return std.fmt.allocPrint(arena, "─── {d:0>2}:{d:0>2} UTC ───", .{ hour, min }) catch "────────────────";
+    }
+
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const p = tui_style.activePalette();
         const styled_as_selected = self.selected or !self.message.kind().dimmable();
-        var row: u16 = ConversationLayout.top;
+        var row: u16 = ConversationLayout.messageTop();
         switch (self.message.*) {
-            .user => |m| drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.selection_range),
+            .user => |m| {
+                if (tui_metrics.show_turn_timestamps) {
+                    const anchor = formatTurnAnchor(ctx.arena, m.timestamp_s);
+                    var anchor_style = p.thinking_body;
+                    anchor_style.dim = true;
+                    drawLine(surface, anchor, anchor_style, styled_as_selected, &row, ctx, 2, null);
+                }
+                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.selection_range);
+            },
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .skill => |m| {
                 drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, self.selection_range);
