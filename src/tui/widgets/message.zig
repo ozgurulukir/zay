@@ -168,7 +168,7 @@ pub const MessageWidget = struct {
         selection: ?[2]usize,
     ) void {
         if (overlaySpans(ctx.arena, text, query, selection)) |spans| {
-            drawWrappedStyled(surface, text, spans, style, "", selected, row, ctx, indent);
+            drawWrappedStyled(surface, text, spans, style, "", bar_style, selected, row, ctx, indent);
             return;
         }
         drawWrapped(surface, text, style, selected, row, ctx, indent, bar_style);
@@ -305,7 +305,7 @@ pub const MessageWidget = struct {
             spans[n] = .{ .start = base + name_end, .end = base + command.len, .style = p.thinking_body };
             n += 1;
         }
-        drawWrappedStyled(surface, display_text, spans[0..n], style, prefix, selected, row, ctx, indent);
+        drawWrappedStyled(surface, display_text, spans[0..n], style, prefix, null, selected, row, ctx, indent);
     }
 
     /// Byte length of the `✗ ` failure marker ("✗" is 3 UTF-8 bytes + 1 space).
@@ -539,7 +539,7 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         start_col: u16,
     ) void {
-        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "", null);
+        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "", &.{});
     }
 
     fn writeTextWithLink(
@@ -551,7 +551,7 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         start_col: u16,
         link_url: []const u8,
-        hl: ?StyleSpan,
+        hls: []const StyleSpan,
     ) void {
         var col = ConversationLayout.left + start_col;
         const col_limit = surface.size.width -| ConversationLayout.right;
@@ -566,12 +566,16 @@ pub const MessageWidget = struct {
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
                 .style = mergedSelectedStyle(style, selected),
             };
-            // Search-hit overlay (issue #484): `hl` is a byte range relative
-            // to `text`; graphemes inside it draw with the match style.
-            if (hl) |range| {
+            // Search-hit / selection overlay (issues #484/#487/#519): `hls` are
+            // byte ranges relative to `text`; graphemes inside any range draw
+            // with the match style.
+            if (hls.len > 0) {
                 const offset = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
-                if (offset >= range.start and offset < range.end) {
-                    cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg }, selected);
+                for (hls) |range| {
+                    if (offset >= range.start and offset < range.end) {
+                        cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg }, selected);
+                        break;
+                    }
                 }
             }
             if (link_url.len > 0) {
@@ -685,19 +689,21 @@ fn drawMarkdown(
         for (markdown_row.spans) |span| {
             const span_offset = @intFromPtr(span.text.ptr) -| @intFromPtr(text.ptr);
             const borrowed = span_offset < text.len and span_offset + span.text.len <= text.len;
-            var relative_hl: ?StyleSpan = null;
+            var rel_buf: [MessageWidget.max_search_spans + 1]StyleSpan = undefined;
+            var rel_count: usize = 0;
             if (match_spans) |all| {
-                for (all) |range| {
-                    if (!borrowed) break;
-                    const lo = @max(range.start, span_offset);
-                    const hi = @min(range.end, span_offset + span.text.len);
-                    if (lo < hi) {
-                        relative_hl = .{ .start = lo - span_offset, .end = hi - span_offset, .style = MessageWidget.searchMatchStyle() };
-                        break;
+                if (borrowed) {
+                    for (all) |range| {
+                        const lo = @max(range.start, span_offset);
+                        const hi = @min(range.end, span_offset + span.text.len);
+                        if (lo < hi and rel_count < rel_buf.len) {
+                            rel_buf[rel_count] = .{ .start = lo - span_offset, .end = hi - span_offset, .style = range.style };
+                            rel_count += 1;
+                        }
                     }
                 }
             }
-            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col, span.link_url, relative_hl);
+            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col, span.link_url, rel_buf[0..rel_count]);
             start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
         }
         row.* += 1;
@@ -716,6 +722,7 @@ fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
         .task_marker => p.markdown_task_marker,
         .rule => p.markdown_rule,
         .table_border => p.thinking_body,
+        .code_border => p.markdown_code_border,
         .code => p.markdown_code,
         // Copy body fg, keep the attribute. No `.bg` is set: like every palette
         // style it stays bg-less, and `writeCellOnCard` supplies the card bg at
@@ -805,7 +812,7 @@ fn drawJson(
     for (part.spans, 0..) |span, i| {
         styles[i] = .{ .start = span.start, .end = span.end, .style = jsonTokenStyle(span.kind) };
     }
-    drawWrappedStyled(surface, part.text, styles, p.thinking_body, "", selected, row, ctx, 0);
+    drawWrappedStyled(surface, part.text, styles, p.thinking_body, "", null, selected, row, ctx, 0);
 }
 
 /// Wrapped, styled rendering of `text`. Splits on `\n` into hard lines, wraps
@@ -819,6 +826,7 @@ fn drawWrappedStyled(
     spans: []const StyleSpan,
     default_style: vaxis.Style,
     prefix: []const u8,
+    bar_style: ?vaxis.Style,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
@@ -829,6 +837,7 @@ fn drawWrappedStyled(
     if (text.len == 0) {
         if (row.* >= surface.size.height) return;
         const p = tui_style.activePalette();
+        if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0);
         if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
         row.* += 1;
         return;
@@ -839,7 +848,7 @@ fn drawWrappedStyled(
     while (line_start <= text.len) {
         const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         const line_prefix = if (first_line) prefix else "";
-        drawStyledHardLine(surface, text[line_start..line_end], line_start, spans, default_style, line_prefix, selected, row, ctx, indent, width);
+        drawStyledHardLine(surface, text[line_start..line_end], line_start, spans, default_style, line_prefix, bar_style, selected, row, ctx, indent, width);
         if (line_end == text.len) break;
         line_start = line_end + 1;
         first_line = false;
@@ -856,6 +865,7 @@ fn drawStyledHardLine(
     spans: []const StyleSpan,
     default_style: vaxis.Style,
     prefix: []const u8,
+    bar_style: ?vaxis.Style,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
@@ -865,6 +875,7 @@ fn drawStyledHardLine(
     if (row.* >= surface.size.height) return;
     if (line.len == 0) {
         const p = tui_style.activePalette();
+        if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0);
         if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
         row.* += 1;
         return;
@@ -874,7 +885,7 @@ fn drawStyledHardLine(
     while (segment_offset < line.len) {
         const line_end = wrappedLineEnd(line, segment_offset, width, ctx);
         const segment_prefix = if (first_segment) prefix else "";
-        drawStyledSegment(surface, line[segment_offset..line_end], text_abs + segment_offset, spans, default_style, segment_prefix, selected, row, ctx, indent);
+        drawStyledSegment(surface, line[segment_offset..line_end], text_abs + segment_offset, spans, default_style, segment_prefix, bar_style, selected, row, ctx, indent);
         segment_offset = skipLinearWhitespace(line, line_end);
         first_segment = false;
     }
@@ -889,6 +900,7 @@ fn drawStyledSegment(
     spans: []const StyleSpan,
     default_style: vaxis.Style,
     prefix: []const u8,
+    bar_style: ?vaxis.Style,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
@@ -896,6 +908,7 @@ fn drawStyledSegment(
 ) void {
     if (row.* >= surface.size.height) return;
     const p = tui_style.activePalette();
+    if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0);
     if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
     var col = ConversationLayout.left + indent;
     const col_limit = surface.size.width -| ConversationLayout.right;
@@ -1490,4 +1503,60 @@ test "splash suppression yields a blank card while typing" {
     try std.testing.expect(!found_star);
     const hint_cell = surface.readCell(hintCol(120), ConversationLayout.top + blackhole.rows);
     try std.testing.expectEqualStrings(" ", hint_cell.char.grapheme);
+}
+
+test "MessageWidget preserves left gutter bar on user message when search is active" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .user, "user", "find me in this message");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+        .search_query = "find",
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 5 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+    const bar_cell = surface.readCell(ConversationLayout.left, ConversationLayout.top);
+    try std.testing.expectEqualStrings("┃", bar_cell.char.grapheme);
+}
+
+test "MessageWidget highlights multiple search matches within one markdown span" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .agent, "agent", "foo_and_foo");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .gpa = gpa,
+        .search_query = "foo",
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 5 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+    // Both occurrences of "foo" (col left+0 and col left+8) should be bolded by the search overlay.
+    try std.testing.expect(surface.readCell(ConversationLayout.left + 0, ConversationLayout.top).style.bold);
+    try std.testing.expect(surface.readCell(ConversationLayout.left + 8, ConversationLayout.top).style.bold);
+    try std.testing.expect(!surface.readCell(ConversationLayout.left + 4, ConversationLayout.top).style.bold);
 }
