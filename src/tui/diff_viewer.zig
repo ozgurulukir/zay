@@ -81,6 +81,8 @@ pub const State = struct {
     /// Body height in rows, refreshed each draw so page navigation can step a
     /// screenful. Pure view state, parked here next to `cursor`/`scroll`.
     viewport_rows: u16 = 0,
+    h_scroll: u16 = 0,
+    wrap: bool = false,
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         for (self.comments.items) |*comment| comment.deinit(gpa);
@@ -117,6 +119,19 @@ pub const State = struct {
     pub fn extendSelection(self: *State, delta: i32) void {
         if (self.sel_anchor == null) self.sel_anchor = self.cursor;
         self.applyDelta(delta);
+    }
+
+    pub fn scrollLeft(self: *State, step: u16) void {
+        self.h_scroll -|= step;
+    }
+
+    pub fn scrollRight(self: *State, step: u16) void {
+        self.h_scroll +|= step;
+    }
+
+    pub fn toggleWrap(self: *State) void {
+        self.wrap = !self.wrap;
+        if (self.wrap) self.h_scroll = 0;
     }
 
     fn applyDelta(self: *State, delta: i32) void {

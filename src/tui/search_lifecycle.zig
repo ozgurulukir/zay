@@ -34,15 +34,40 @@ pub fn acceptSearchSelection(app: *App) !void {
     const state = &app.pickers.search;
     if (state.selection >= state.matches.items.len) return;
     const match = state.matches.items[state.selection];
+    state.active_hit = 0;
+    for (state.hits.items, 0..) |hit, hi| {
+        if (hit.message_index == match.message_index and hit.start == match.start) {
+            state.active_hit = hi;
+            break;
+        }
+    }
     if (match.message_index < app.thread.transcript.messages.items.len) {
         app.thread.transcript.select(match.message_index);
         app.setThreadAutoScroll(false);
         scrollMatchIntoView(app, match);
     }
-    // Keep the query alive so the transcript keeps highlighting the hit after
-    // the jump (issue #484); the next open/close clears it.
+    // Keep the query and hit list alive so the transcript keeps highlighting
+    // and cycling hits after the jump (#484/#502).
     app.pickers.search.reset(app.gpa, true);
     app.setMode(.normal);
+}
+
+/// Move the active search hit forward or backward across messages, wrapping
+/// at both ends of the document (#502).
+pub fn cycleSearchMatch(app: *App, forward: bool) bool {
+    const hit = app.pickers.search.cycleHit(forward) orelse return false;
+    if (hit.message_index < app.thread.transcript.messages.items.len) {
+        app.thread.transcript.select(hit.message_index);
+        app.setThreadAutoScroll(false);
+        scrollMatchIntoView(app, .{
+            .message_index = hit.message_index,
+            .role = "",
+            .snippet = "",
+            .start = hit.start,
+            .end = hit.end,
+        });
+    }
+    return true;
 }
 
 /// Scroll the selected message so the matched row is inside the viewport.
@@ -97,6 +122,22 @@ pub fn rebuildMatches(app: *App, filter: []const u8) !void {
         const src = search_widget.searchable(message) orelse continue;
         const body_match = firstMatchingLine(src.body, filter);
         if (panel.containsIgnoreCase(src.title, filter) or body_match != null) {
+            // Collect all body hits in document order for n/N cycling (#502).
+            var per_msg: usize = 0;
+            var pos: usize = 0;
+            while (pos + filter.len <= src.body.len and state.hits.items.len < search_widget.max_hits and per_msg < 32) {
+                if (std.ascii.eqlIgnoreCase(src.body[pos .. pos + filter.len], filter)) {
+                    try state.hits.append(app.gpa, .{
+                        .message_index = @intCast(index),
+                        .start = pos,
+                        .end = pos + filter.len,
+                    });
+                    per_msg += 1;
+                    pos += filter.len;
+                } else {
+                    pos += 1;
+                }
+            }
             // Byte range of the first hit inside the body (highlight +
             // scroll-to-match); zero when only the title matched.
             const range: ByteRange = if (body_match != null) firstMatchRange(src.body, filter) else .{ .start = 0, .end = 0 };

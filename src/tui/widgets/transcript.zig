@@ -23,6 +23,12 @@ const MessageWidget = tui_message.MessageWidget;
 const ConversationLayout = tui_message.ConversationLayout;
 const messageRowsCached = tui_metrics.messageRowsCached;
 
+pub const SearchHit = struct {
+    message_index: u32,
+    start: usize,
+    end: usize,
+};
+
 pub const TranscriptWidget = struct {
     /// The lane this pane renders — the active lane today; any lane once tiled.
     thread: *Thread,
@@ -40,6 +46,8 @@ pub const TranscriptWidget = struct {
     /// Computed at the construction site (INV-WIDGET-1 scalar).
     splash_suppressed: bool = false,
     search_query: ?[]const u8 = null,
+    active_search_hit: ?SearchHit = null,
+    now_ms: i64 = 0,
     body_selection: ?transcript_mod.BodySelection = null,
     /// Write-back: hit-test geometry for the "↓ new output" pill.
     new_output_rect_out: ?*?app_state.ChipRect = null,
@@ -72,6 +80,8 @@ pub const TranscriptWidget = struct {
             .splash_viewport_height = self.thread.transcript_view_height,
             .splash_suppressed = self.splash_suppressed,
             .search_query = self.search_query,
+            .active_search_hit = self.active_search_hit,
+            .now_ms = self.now_ms,
             .body_selection = self.thread.transcript.body_selection,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
@@ -210,6 +220,8 @@ pub const MessageListBuilder = struct {
     splash_viewport_height: u16 = 0,
     splash_suppressed: bool = false,
     search_query: ?[]const u8 = null,
+    active_search_hit: ?SearchHit = null,
+    now_ms: i64 = 0,
     body_selection: ?transcript_mod.BodySelection = null,
 
     pub fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
@@ -228,6 +240,12 @@ pub const MessageListBuilder = struct {
             .splash_viewport_height = self.splash_viewport_height,
             .splash_suppressed = self.splash_suppressed,
             .search_query = self.search_query,
+            .active_search_range = active_range: {
+                const hit = self.active_search_hit orelse break :active_range null;
+                if (hit.message_index != idx) break :active_range null;
+                break :active_range .{ hit.start, hit.end };
+            },
+            .now_ms = self.now_ms,
             .selection_range = selection_range: {
                 const selection = self.body_selection orelse break :selection_range null;
                 if (selection.message_index != idx) break :selection_range null;

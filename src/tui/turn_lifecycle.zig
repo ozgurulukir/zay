@@ -491,6 +491,7 @@ pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !
     lane.last_activity_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
     lane.stall_warned = false;
     lane.last_stall_warn_ms = 0;
+    const now_ms = lane.last_activity_ms;
     switch (event) {
         .tool_call_finished => lane.turn_tool_calls += 1,
         .skill_inventory_changed => |inventory| {
@@ -523,6 +524,11 @@ pub fn applyAgentEvent(app: *App, lane: *Thread, event: agent_mod.Agent.Event) !
         return false;
     }
     var visible_change = try lane.turn_view.apply(app.gpa, &lane.transcript, event);
+    for (lane.transcript.messages.items) |*msg| {
+        if (msg.* == .tool and msg.tool.running and msg.tool.started_ms == 0) {
+            msg.tool.started_ms = now_ms;
+        }
+    }
     if (event == .skill_inventory_changed) visible_change = true;
     switch (event) {
         .queued_messages_flushed => |count| {

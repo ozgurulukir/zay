@@ -102,6 +102,8 @@ pub const ToolView = struct {
     expanded_title_formatted: ?[]u8 = null,
     /// Wall time the finished call took (0 = unknown, e.g. resumed sessions).
     duration_ms: u32 = 0,
+    /// Monotonic start timestamp (ms) for running tools to display live elapsed time (#503).
+    started_ms: i64 = 0,
     /// Process exit code carried by shell-type tools (0 for success/other).
     exit_code: u8 = 0,
     /// When true, long tool output renders in full instead of head+tail (#499).
@@ -111,12 +113,16 @@ pub const ToolView = struct {
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
     /// The collapsed-title suffix for a finished tool: " · 1.2s" (duration
-    /// when known) and " · exit 2" for non-zero exit codes. Draw
-    /// (message.zig drawToolTitle) and the row counter (metrics toolTitleRows)
-    /// both route through `titledWithSuffix`, so wrap-width math can never
-    /// diverge between the two.
-    pub fn titleSuffix(self: *const ToolView, buf: []u8) ?[]const u8 {
-        if (self.running) return null;
+    /// when known) and " · exit 2" for non-zero exit codes, or live elapsed
+    /// time for a running tool when `now_ms > started_ms > 0` (#503).
+    pub fn titleSuffixAt(self: *const ToolView, buf: []u8, now_ms: i64) ?[]const u8 {
+        if (self.running) {
+            if (self.started_ms <= 0 or now_ms <= self.started_ms) return null;
+            const elapsed: u32 = @intCast(@min(now_ms - self.started_ms, std.math.maxInt(u32)));
+            var duration_buf: [24]u8 = undefined;
+            const duration = formatToolDuration(&duration_buf, elapsed);
+            return std.fmt.bufPrint(buf, " · {s}", .{duration}) catch null;
+        }
         if (self.duration_ms == 0 and (self.exit_code == 0 or !self.failed)) return null;
         var duration_buf: [24]u8 = undefined;
         const duration = formatToolDuration(&duration_buf, self.duration_ms);
@@ -126,13 +132,20 @@ pub const ToolView = struct {
         return std.fmt.bufPrint(buf, " · {s}", .{duration}) catch null;
     }
 
-    /// `base` with `titleSuffix` appended; returns `base` unchanged when no
-    /// suffix applies or the buffer is too small (both consumers share the
-    /// fallback, so the texts stay identical).
-    pub fn titledWithSuffix(self: *const ToolView, buf: []u8, base: []const u8) []const u8 {
+    pub fn titleSuffix(self: *const ToolView, buf: []u8) ?[]const u8 {
+        return self.titleSuffixAt(buf, 0);
+    }
+
+    /// `base` with `titleSuffixAt` appended; returns `base` unchanged when no
+    /// suffix applies or the buffer is too small.
+    pub fn titledWithSuffixAt(self: *const ToolView, buf: []u8, base: []const u8, now_ms: i64) []const u8 {
         var suffix_buf: [48]u8 = undefined;
-        const suffix = self.titleSuffix(&suffix_buf) orelse return base;
+        const suffix = self.titleSuffixAt(&suffix_buf, now_ms) orelse return base;
         return std.fmt.bufPrint(buf, "{s}{s}", .{ base, suffix }) catch base;
+    }
+
+    pub fn titledWithSuffix(self: *const ToolView, buf: []u8, base: []const u8) []const u8 {
+        return self.titledWithSuffixAt(buf, base, 0);
     }
 };
 
