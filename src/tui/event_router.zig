@@ -356,7 +356,7 @@ fn routeKey(
                     app.clearInput();
                     try app.inputs.input.insertSliceAtCursor(u);
                     const cur = app.inputs.input.buf.cursor;
-                    if (span.start < cur) app.inputs.input.buf.moveGapRight(cur - span.start);
+                    if (span.start < cur) app.inputs.input.buf.moveGapLeft(cur - span.start);
                     ctx.consumeAndRedraw();
                     return;
                 }
@@ -598,6 +598,7 @@ fn handleEscapeSequence(
     }
     if (app.inputRealLength() > 0) {
         app.clearInput();
+        app.inputs.paste_stash.clear(app.gpa);
         app.closeAtSearch();
         app.clearPendingQuitAt();
         try root.syncFocus(ctx);
@@ -628,6 +629,7 @@ fn handleQuitSequence(
 
     if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
         app.clearInput();
+        app.inputs.paste_stash.clear(app.gpa);
         app.closeAtSearch();
         app.clearBlockNav();
         app.clearPendingQuitAt();
