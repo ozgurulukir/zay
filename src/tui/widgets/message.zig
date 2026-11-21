@@ -687,8 +687,10 @@ fn drawMarkdown(
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
         for (markdown_row.spans) |span| {
-            const span_offset = @intFromPtr(span.text.ptr) -| @intFromPtr(text.ptr);
-            const borrowed = span_offset < text.len and span_offset + span.text.len <= text.len;
+            const span_addr = @intFromPtr(span.text.ptr);
+            const text_addr = @intFromPtr(text.ptr);
+            const span_offset = span_addr -| text_addr;
+            const borrowed = span_addr >= text_addr and span_offset < text.len and span_offset + span.text.len <= text.len;
             var rel_buf: [MessageWidget.max_search_spans + 1]StyleSpan = undefined;
             var rel_count: usize = 0;
             if (match_spans) |all| {
