@@ -179,13 +179,13 @@ pub const MessageWidget = struct {
         drawWrapped(surface, text, style, selected, row, ctx, indent, bar_style);
     }
 
-    fn formatTurnAnchor(buf: []u8, ts_s: i64) []const u8 {
+    fn formatTurnAnchor(arena: std.mem.Allocator, ts_s: i64) []const u8 {
         if (ts_s <= 0) return "────────────────";
         const epoch_secs: u64 = @intCast(ts_s);
         const day_secs = @mod(epoch_secs, 86400);
         const hour = day_secs / 3600;
         const min = (day_secs % 3600) / 60;
-        return std.fmt.bufPrint(buf, "─── {d:0>2}:{d:0>2} UTC ───", .{ hour, min }) catch "────────────────";
+        return std.fmt.allocPrint(arena, "─── {d:0>2}:{d:0>2} UTC ───", .{ hour, min }) catch "────────────────";
     }
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
@@ -195,8 +195,7 @@ pub const MessageWidget = struct {
         switch (self.message.*) {
             .user => |m| {
                 if (tui_metrics.show_turn_timestamps) {
-                    var ts_buf: [32]u8 = undefined;
-                    const anchor = formatTurnAnchor(&ts_buf, m.timestamp_s);
+                    const anchor = formatTurnAnchor(ctx.arena, m.timestamp_s);
                     var anchor_style = p.thinking_body;
                     anchor_style.dim = true;
                     drawLine(surface, anchor, anchor_style, styled_as_selected, &row, ctx, 2, null);

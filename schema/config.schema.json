@@ -509,6 +509,17 @@
           "enum": ["full", "reduced", "off"],
           "default": "full",
           "description": "Animation detail level: 'full', 'reduced' (static logo, slow spinner, lower tick rate), or 'off' (stops animation ticks entirely)."
+        },
+        "density": {
+          "type": "string",
+          "enum": ["comfortable", "compact"],
+          "default": "comfortable",
+          "description": "Transcript vertical spacing density: 'comfortable' or 'compact'."
+        },
+        "showTurnTimestamps": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a dim separator with timestamp above each user turn."
         }
       },
       "additionalProperties": false
