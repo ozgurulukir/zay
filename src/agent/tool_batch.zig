@@ -86,7 +86,12 @@ pub fn runToolBatch(
         .stream_context = stream_context,
         .executor = &executor,
     };
-    const results = executor.runAll(tool_calls, bridge.observer()) catch |err| {
+    var partial: []executor_mod.ToolResult = &.{};
+    const results = executor.runAllWithPartial(tool_calls, bridge.observer(), &partial) catch |err| {
+        if (partial.len > 0) {
+            defer self.gpa.free(partial);
+            try agent_mod.takeToolResults(self, partial);
+        }
         if (err == error.Canceled) {
             if (self.cancel_requested) |flag| {
                 if (flag.load(.acquire)) return error.TurnCancelled;

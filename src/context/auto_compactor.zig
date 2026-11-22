@@ -205,20 +205,25 @@ pub const AutoCompactor = struct {
         const threshold = env.settings.threshold;
 
         // Past the swap watermark: install the ready background summary.
+        var applied_ready = false;
         if (compaction.shouldSwap(used, env.context_window_tokens, threshold)) {
+            const was_ready = self.core.stateIs(.ready);
             self.applyReadyCompaction(env, listener) catch |err| log.warn("compaction apply failed: {s}", .{@errorName(err)});
+            if (was_ready) applied_ready = true;
         }
+
+        const post_apply_used = if (applied_ready) self.currentContextTokens(env) else used;
 
         // Past the start watermark: kick off the summary so it is ready by
         // the time the footprint reaches the swap watermark.
-        if (compaction.shouldStartSummary(used, env.context_window_tokens, threshold) and
+        if (compaction.shouldStartSummary(post_apply_used, env.context_window_tokens, threshold) and
             self.core.stateIs(.idle))
         {
             self.startCompaction(env) catch |err| switch (err) {
                 // Nothing worth cutting while already past the swap watermark:
                 // emit a one-shot notice instead of looping silently into
                 // provider overflow errors (TD-6).
-                error.NothingToCompact => if (compaction.shouldSwap(used, env.context_window_tokens, threshold)) {
+                error.NothingToCompact => if (compaction.shouldSwap(post_apply_used, env.context_window_tokens, threshold)) {
                     if (!self.stuck_notified) {
                         self.stuck_notified = true;
                         emitNotice(listener, .stuck);
@@ -230,9 +235,10 @@ pub const AutoCompactor = struct {
 
         // If used tokens still exceed the swap watermark and compaction is
         // running, wait synchronously so the prompt sent to the LLM fits
-        // within the window. The wait can take up to the (user-configurable)
-        // request timeout, so make it visible before blocking (H2).
-        if (compaction.shouldSwap(self.currentContextTokens(env), env.context_window_tokens, threshold) and
+        // within the window — unless we already applied a summary in this
+        // iteration (defer any follow-up wait to the next iteration, #543).
+        if (!applied_ready and
+            compaction.shouldSwap(self.currentContextTokens(env), env.context_window_tokens, threshold) and
             self.core.stateIs(.running))
         {
             emitNotice(listener, .waiting);

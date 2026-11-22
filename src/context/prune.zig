@@ -156,7 +156,18 @@ pub fn pruneHistoricalToolResultsViewsWithSkills(
         const retained = if (skills) |context| skill_history.retainedTool(context, messages, idx) else false;
         if (pruning_active and idx < cutoff_index and msg.* == .tool and !retained) {
             if (cache) |c| {
-                if (c.entries.get(idx)) |cached_ptr| {
+                const cached_hit: ?*ai.ChatMessage = blk: {
+                    const ptr = c.entries.get(idx) orelse break :blk null;
+                    if (ptr.* == .tool and std.mem.eql(u8, ptr.tool.call_id.slice(), msg.tool.call_id.slice())) {
+                        break :blk ptr;
+                    }
+                    // History shifted (e.g. replaceSystem): evict stale entry.
+                    ptr.deinit(gpa);
+                    gpa.destroy(ptr);
+                    _ = c.entries.remove(idx);
+                    break :blk null;
+                };
+                if (cached_hit) |cached_ptr| {
                     views[idx] = .{ .borrowed = cached_ptr };
                 } else {
                     const pruned = try pruneSingleToolMessage(gpa, msg.*, historical_tool_cap_bytes);

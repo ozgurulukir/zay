@@ -52,16 +52,16 @@ pub fn StreamContext(comptime L: type) type {
         /// are the reliable signal for the first-delta sizing hint.
         content_sized: bool = false,
         reasoning_sized: bool = false,
+        emit_failed: bool = false,
 
         const Self = @This();
 
         pub fn deinit(self: *Self) void {
             // Belt-and-suspenders flush: frees + flushes any bytes stranded
             // on an early-return/error path that skipped the explicit
-            // end-of-stream flush. A no-op when that flush already cleared
-            // the buffers. `deinit` returns void, so the error is swallowed;
-            // the buffers are freed regardless (OOM is fatal to the turn).
-            self.flushPending() catch {};
+            // end-of-stream flush. Skip if an earlier emit already failed so
+            // teardown never replays the same delta (#543).
+            if (!self.emit_failed) self.flushPending() catch {};
             self.pending_content.deinit(self.gpa);
             self.pending_reasoning.deinit(self.gpa);
         }
@@ -81,14 +81,21 @@ pub fn StreamContext(comptime L: type) type {
         pub fn flushPending(self: *Self) !void {
             if (self.pending_reasoning.items.len > 0) {
                 const owned = try self.gpa.dupe(u8, self.pending_reasoning.items);
-                try self.listener.emit(.{ .thinking_delta = owned });
+                self.listener.emit(.{ .thinking_delta = owned }) catch |err| {
+                    self.emit_failed = true;
+                    return err;
+                };
                 self.pending_reasoning.clearRetainingCapacity();
             }
             if (self.pending_content.items.len > 0) {
                 const owned = try self.gpa.dupe(u8, self.pending_content.items);
-                try self.listener.emit(.{ .response_delta = owned });
+                self.listener.emit(.{ .response_delta = owned }) catch |err| {
+                    self.emit_failed = true;
+                    return err;
+                };
                 self.pending_content.clearRetainingCapacity();
             }
+            self.emit_failed = false;
         }
 
         pub fn observer(self: *Self) ai.StreamObserver(Self) {
