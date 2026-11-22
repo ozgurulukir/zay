@@ -139,16 +139,7 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
 
     var props: std.ArrayList(tools_common.Schema.Property) = .empty;
     errdefer {
-        for (props.items) |*p| {
-            gpa.free(p.name);
-            gpa.free(p.description);
-            if (p.enum_values) |ev| {
-                for (ev) |v| gpa.free(v);
-                gpa.free(ev);
-            }
-            if (p.default_value) |dv| gpa.free(dv);
-            if (p.kind_alternatives.len > 0) gpa.free(p.kind_alternatives);
-        }
+        for (props.items) |*p| freeProperty(gpa, p);
         props.deinit(gpa);
     }
 
@@ -160,202 +151,243 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
             try appendUnconstrainedProperty(gpa, &props, prop_name, required_set.contains(prop_name));
             continue;
         }
-        const prop_obj = prop_val.object;
-
-        var kind_alternatives: []const tools_common.Schema.Kind = &.{};
-        var kind_alternatives_owned = false;
-        var kind_unconstrained = false;
-        errdefer if (kind_alternatives_owned) gpa.free(kind_alternatives);
-
-        // Determine kind — preserve simple oneOf/anyOf primitive branches,
-        // including mixed unions such as seek's array-or-empty-string fields.
-        const kind = blk: {
-            if (prop_obj.get("$ref") != null) {
-                kind_unconstrained = true;
-                break :blk tools_common.Schema.Kind.string;
-            }
-
-            const one_of = prop_obj.get("oneOf");
-            const any_of = prop_obj.get("anyOf");
-            if (one_of != null and any_of != null) {
-                kind_unconstrained = true;
-                break :blk tools_common.Schema.Kind.string;
-            }
-            if (one_of orelse any_of) |branches| {
-                if (try resolveUnionKinds(gpa, &branches, one_of != null)) |parsed_union| {
-                    kind_alternatives = parsed_union.alternatives;
-                    kind_alternatives_owned = parsed_union.owned;
-                    break :blk parsed_union.primary;
-                }
-                kind_unconstrained = true;
-                break :blk tools_common.Schema.Kind.string;
-            }
-
-            const type_value = prop_obj.get("type") orelse {
-                kind_unconstrained = true;
-                break :blk tools_common.Schema.Kind.string;
-            };
-            if (type_value == .array) {
-                for (type_value.array.items) |item| {
-                    if (item == .string and !std.mem.eql(u8, item.string, "null"))
-                        break :blk kindFromString(item.string);
-                }
-                kind_unconstrained = true;
-                break :blk tools_common.Schema.Kind.string;
-            }
-            if (type_value != .string) {
-                kind_unconstrained = true;
-                break :blk tools_common.Schema.Kind.string;
-            }
-            break :blk kindFromString(type_value.string);
+        // `parseProperty` owns every allocation it makes: on error it has
+        // already freed them, on success the property is fully owned and
+        // either lands in `props` or is freed right here (#555).
+        const property = try parseProperty(gpa, prop_name, prop_val, required_set.contains(prop_name));
+        props.append(gpa, property) catch |err| {
+            var owned = property;
+            freeProperty(gpa, &owned);
+            return err;
         };
-
-        // Build description — append enum values if present
-        const base_desc = if (prop_obj.get("description")) |d|
-            (if (d == .string) d.string else "")
-        else
-            "";
-
-        // Per-property owned fields. All are transferred to `props` on a
-        // successful append; this errdefer cleans them up on any error exit
-        // before that point (a partial enum extraction, a later failed dupe,
-        // or the append itself). On success each optional is nulled so the
-        // errdefer is inert. Without it, a `try` after the enum block (the
-        // name dupe, the desc writer, or `props.append`) would leak the enum
-        // list + its already-duped strings, since the outer `props` errdefer
-        // only covers already-appended items.
-        var p_name: ?[]u8 = null;
-        var p_desc: ?[]const u8 = null;
-        var p_enum: ?[]const []const u8 = null;
-        var p_enum_count: usize = 0; // populated entries in p_enum (for partial-free)
-        var p_default: ?[]const u8 = null;
-        errdefer {
-            if (p_name) |n| gpa.free(n);
-            if (p_desc) |d| gpa.free(d);
-            if (p_enum) |ev| {
-                for (ev[0..p_enum_count]) |v| gpa.free(v);
-                gpa.free(ev);
-            }
-            if (p_default) |dv| gpa.free(dv);
-        }
-
-        // Extract enum values into the dedicated field. Assign the list to
-        // `p_enum` immediately so the errdefer owns it (and every partial
-        // string) even when a mid-loop dupe fails — a bare `ev_list` local
-        // would be unreachable from the errdefer and leak on partial failure.
-        const enum_value: ?std.json.Value = if (prop_obj.get("enum")) |enum_val|
-            enum_val
-        else
-            enumValueFromNullableUnion(&prop_val, kind, kind_alternatives);
-        if (enum_value) |enum_val| {
-            if (enum_val == .array and enum_val.array.items.len > 0) {
-                const ev_list = try gpa.alloc([]const u8, enum_val.array.items.len);
-                p_enum = ev_list;
-                for (enum_val.array.items) |ev| {
-                    switch (ev) {
-                        .string => |s| {
-                            ev_list[p_enum_count] = try gpa.dupe(u8, s);
-                            p_enum_count += 1;
-                        },
-                        .integer => |n| {
-                            var buf: [32]u8 = undefined;
-                            const formatted = try std.fmt.bufPrint(&buf, "{d}", .{n});
-                            ev_list[p_enum_count] = try gpa.dupe(u8, formatted);
-                            p_enum_count += 1;
-                        },
-                        .float => |f| {
-                            // Stringify's float formatting stays JSON-round-trippable
-                            // (extreme values included), matching the default-value
-                            // fragment path. Dropping the entry would null the whole
-                            // enum hint for float/bool enums.
-                            ev_list[p_enum_count] = try std.json.Stringify.valueAlloc(gpa, f, .{});
-                            p_enum_count += 1;
-                        },
-                        .bool => |b| {
-                            ev_list[p_enum_count] = try gpa.dupe(u8, if (b) "true" else "false");
-                            p_enum_count += 1;
-                        },
-                        // object/array/null entries stay dropped: their fragment form
-                        // would not survive the flat description annotation.
-                        else => continue,
-                    }
-                }
-                if (p_enum_count == 0) {
-                    gpa.free(ev_list);
-                    p_enum = null;
-                } else if (p_enum_count != ev_list.len) {
-                    p_enum = try gpa.realloc(ev_list, p_enum_count);
-                }
-            }
-        }
-
-        p_desc = if (p_enum) |ev| blk: {
-            // Append [enum: ...] to description when enum values exist
-            var total_len = base_desc.len + 8; // "[enum: " (7) + "]" (1) = 8
-            if (base_desc.len > 0) total_len += 1; // " "
-            for (ev, 0..) |v, ei| {
-                if (ei > 0) total_len += 2; // ", "
-                total_len += v.len;
-            }
-
-            const buf = try gpa.alloc(u8, total_len);
-            errdefer gpa.free(buf);
-
-            var offset: usize = 0;
-            if (base_desc.len > 0) {
-                @memcpy(buf[offset .. offset + base_desc.len], base_desc);
-                offset += base_desc.len;
-                buf[offset] = ' ';
-                offset += 1;
-            }
-            @memcpy(buf[offset .. offset + 7], "[enum: ");
-            offset += 7;
-            for (ev, 0..) |v, ei| {
-                if (ei > 0) {
-                    @memcpy(buf[offset .. offset + 2], ", ");
-                    offset += 2;
-                }
-                @memcpy(buf[offset .. offset + v.len], v);
-                offset += v.len;
-            }
-            buf[offset] = ']';
-            offset += 1;
-            std.debug.assert(offset == total_len);
-
-            break :blk buf;
-        } else try gpa.dupe(u8, base_desc);
-
-        // Extract default value as a raw JSON string fragment.
-        if (prop_obj.get("default")) |def_val| {
-            p_default = try jsonValueToRawFragment(gpa, def_val);
-        }
-
-        p_name = try gpa.dupe(u8, prop_name);
-
-        try props.append(gpa, .{
-            .name = p_name.?,
-            .kind = kind,
-            .description = p_desc.?,
-            .required = required_set.contains(prop_name),
-            .nullable = schemaAllowsNull(&prop_val),
-            .enum_values = p_enum,
-            .default_value = p_default,
-            .kind_alternatives = kind_alternatives,
-            .kind_unconstrained = kind_unconstrained,
-        });
-        // Ownership transferred to `props`; null the locals so a later
-        // iteration's error doesn't double-free them via this errdefer.
-        p_name = null;
-        p_desc = null;
-        p_enum = null;
-        p_default = null;
-        kind_alternatives = &.{};
-        kind_alternatives_owned = false;
     }
 
     return .{
         .properties = try props.toOwnedSlice(gpa),
         .allow_extra_properties = allow_extra_properties,
+    };
+}
+
+/// Free every owned allocation of a converted property. The inverse of
+/// `parseProperty`'s success value; the parent errdefer and the failed-append
+/// path both route through it so the field list has exactly one owner.
+fn freeProperty(gpa: std.mem.Allocator, property: *tools_common.Schema.Property) void {
+    gpa.free(property.name);
+    gpa.free(property.description);
+    if (property.enum_values) |ev| {
+        for (ev) |v| gpa.free(v);
+        gpa.free(ev);
+    }
+    if (property.default_value) |dv| gpa.free(dv);
+    if (property.kind_alternatives.len > 0) gpa.free(property.kind_alternatives);
+}
+
+/// Kind resolution for one property object (#555): `$ref`, both-unions,
+/// resolvable oneOf/anyOf, type-string, and type-array shapes. Unsupported
+/// shapes come back `unconstrained` with the string fallback, matching the
+/// previous inline block verbatim. The `alternatives` slice is owned by the
+/// caller when `alternatives_owned` is set (multi-kind unions only).
+const ResolvedKind = struct {
+    kind: tools_common.Schema.Kind,
+    alternatives: []const tools_common.Schema.Kind = &.{},
+    alternatives_owned: bool = false,
+    unconstrained: bool = false,
+};
+
+fn resolvePropertyKind(gpa: std.mem.Allocator, prop_obj: *const std.json.ObjectMap) !ResolvedKind {
+    // Preserve simple oneOf/anyOf primitive branches, including mixed unions
+    // such as seek's array-or-empty-string fields.
+    if (prop_obj.get("$ref") != null) {
+        return .{ .kind = .string, .unconstrained = true };
+    }
+
+    const one_of = prop_obj.get("oneOf");
+    const any_of = prop_obj.get("anyOf");
+    if (one_of != null and any_of != null) {
+        return .{ .kind = .string, .unconstrained = true };
+    }
+    if (one_of orelse any_of) |branches| {
+        if (try resolveUnionKinds(gpa, &branches, one_of != null)) |parsed_union| {
+            return .{
+                .kind = parsed_union.primary,
+                .alternatives = parsed_union.alternatives,
+                .alternatives_owned = parsed_union.owned,
+            };
+        }
+        return .{ .kind = .string, .unconstrained = true };
+    }
+
+    const type_value = prop_obj.get("type") orelse
+        return .{ .kind = .string, .unconstrained = true };
+    if (type_value == .array) {
+        for (type_value.array.items) |item| {
+            if (item == .string and !std.mem.eql(u8, item.string, "null"))
+                return .{ .kind = kindFromString(item.string) };
+        }
+        return .{ .kind = .string, .unconstrained = true };
+    }
+    if (type_value != .string) {
+        return .{ .kind = .string, .unconstrained = true };
+    }
+    return .{ .kind = kindFromString(type_value.string) };
+}
+
+/// Extract a JSON `enum` array into owned string fragments (#555). Strings
+/// dupe verbatim; integers and booleans format as their JSON literal; floats
+/// go through Stringify so extreme values stay JSON-round-trippable (matching
+/// the default-value fragment path). Object/array/null entries are dropped —
+/// their fragment form would not survive the flat description annotation.
+/// Returns an empty slice when nothing survives; every returned allocation is
+/// freed via the caller's `freeProperty` on any later failure.
+fn buildEnumValues(gpa: std.mem.Allocator, enum_val: std.json.Value) ![]const []const u8 {
+    if (enum_val != .array or enum_val.array.items.len == 0) return &.{};
+
+    var count: usize = 0;
+    const ev_list = try gpa.alloc([]const u8, enum_val.array.items.len);
+    errdefer {
+        for (ev_list[0..count]) |v| gpa.free(v);
+        gpa.free(ev_list);
+    }
+    for (enum_val.array.items) |ev| {
+        switch (ev) {
+            .string => |s| {
+                ev_list[count] = try gpa.dupe(u8, s);
+                count += 1;
+            },
+            .integer => |n| {
+                var buf: [32]u8 = undefined;
+                const formatted = try std.fmt.bufPrint(&buf, "{d}", .{n});
+                ev_list[count] = try gpa.dupe(u8, formatted);
+                count += 1;
+            },
+            .float => |f| {
+                ev_list[count] = try std.json.Stringify.valueAlloc(gpa, f, .{});
+                count += 1;
+            },
+            .bool => |b| {
+                ev_list[count] = try gpa.dupe(u8, if (b) "true" else "false");
+                count += 1;
+            },
+            // object/array/null entries stay dropped (see doc comment).
+            else => continue,
+        }
+    }
+    if (count == 0) {
+        // Nothing survived: release the list and report an empty (unowned)
+        // slice. The errdefer above only covers error returns, so the free
+        // must happen on this success path too.
+        gpa.free(ev_list);
+        return &.{};
+    }
+    if (count != ev_list.len) return gpa.realloc(ev_list, count);
+    return ev_list;
+}
+
+/// Render `<base_desc> [enum: v1, v2]` into a fresh buffer (#555). The
+/// boundary arithmetic mirrors the old inline assembly verbatim; the trailing
+/// assert pins the length computation against drift.
+fn buildEnumDescription(gpa: std.mem.Allocator, base_desc: []const u8, enum_values: []const []const u8) ![]const u8 {
+    var total_len = base_desc.len + 8; // "[enum: " (7) + "]" (1) = 8
+    if (base_desc.len > 0) total_len += 1; // " "
+    for (enum_values, 0..) |v, ei| {
+        if (ei > 0) total_len += 2; // ", "
+        total_len += v.len;
+    }
+
+    const buf = try gpa.alloc(u8, total_len);
+    errdefer gpa.free(buf);
+
+    var offset: usize = 0;
+    if (base_desc.len > 0) {
+        @memcpy(buf[offset .. offset + base_desc.len], base_desc);
+        offset += base_desc.len;
+        buf[offset] = ' ';
+        offset += 1;
+    }
+    @memcpy(buf[offset .. offset + 7], "[enum: ");
+    offset += 7;
+    for (enum_values, 0..) |v, ei| {
+        if (ei > 0) {
+            @memcpy(buf[offset .. offset + 2], ", ");
+            offset += 2;
+        }
+        @memcpy(buf[offset .. offset + v.len], v);
+        offset += v.len;
+    }
+    buf[offset] = ']';
+    offset += 1;
+    std.debug.assert(offset == total_len);
+
+    return buf;
+}
+
+/// Convert one JSON-Schema property object into an owned `Schema.Property`
+/// (#555). On success the caller owns every allocation (free via
+/// `freeProperty`); on error nothing leaks — each owned field carries its own
+/// scoped `errdefer`, replacing the four optional locals + counter
+/// bookkeeping the inline version needed.
+fn parseProperty(
+    gpa: std.mem.Allocator,
+    prop_name: []const u8,
+    prop_val: std.json.Value,
+    required: bool,
+) !tools_common.Schema.Property {
+    const prop_obj = prop_val.object;
+
+    const resolved = try resolvePropertyKind(gpa, &prop_obj);
+    const alternatives = resolved.alternatives;
+    errdefer if (resolved.alternatives_owned) gpa.free(alternatives);
+
+    // Extract enum values — explicit `enum` first, else a nullable union's
+    // sole non-null branch enum.
+    var enum_values: []const []const u8 = &.{};
+    var enum_values_owned = false;
+    errdefer if (enum_values_owned) {
+        for (enum_values) |v| gpa.free(v);
+        gpa.free(enum_values);
+    };
+    const enum_value: ?std.json.Value = if (prop_obj.get("enum")) |enum_val|
+        enum_val
+    else
+        enumValueFromNullableUnion(&prop_val, resolved.kind, alternatives);
+    if (enum_value) |enum_val| {
+        if (enum_val == .array and enum_val.array.items.len > 0) {
+            enum_values = try buildEnumValues(gpa, enum_val);
+            enum_values_owned = enum_values.len > 0;
+        }
+    }
+
+    // Build description — append enum values if present
+    const base_desc = if (prop_obj.get("description")) |d|
+        (if (d == .string) d.string else "")
+    else
+        "";
+    const description = if (enum_values.len > 0)
+        try buildEnumDescription(gpa, base_desc, enum_values)
+    else
+        try gpa.dupe(u8, base_desc);
+    errdefer gpa.free(description);
+
+    // Extract default value as a raw JSON string fragment.
+    const default_value: ?[]const u8 = if (prop_obj.get("default")) |def_val|
+        try jsonValueToRawFragment(gpa, def_val)
+    else
+        null;
+    errdefer if (default_value) |dv| gpa.free(dv);
+
+    const name = try gpa.dupe(u8, prop_name);
+    errdefer gpa.free(name);
+
+    return .{
+        .name = name,
+        .kind = resolved.kind,
+        .description = description,
+        .required = required,
+        .nullable = schemaAllowsNull(&prop_val),
+        .enum_values = if (enum_values.len > 0) enum_values else null,
+        .default_value = default_value,
+        .kind_alternatives = alternatives,
+        .kind_unconstrained = resolved.unconstrained,
     };
 }
 
@@ -1176,6 +1208,95 @@ test "schemaFromJsonSchema preserves object and array union alternatives" {
     try std.testing.expectEqual(tools_common.Schema.Kind.object, schema.properties[0].kind);
     try std.testing.expectEqual(@as(usize, 1), schema.properties[0].kind_alternatives.len);
     try std.testing.expectEqual(tools_common.Schema.Kind.array, schema.properties[0].kind_alternatives[0]);
+}
+
+test "parseProperty builds an owned property with enum and default fragments" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"type":"string","description":"Run mode","enum":["a","b"],"default":"a"}
+    , .{});
+    defer parsed.deinit();
+
+    var property = try parseProperty(gpa, "mode", parsed.value, true);
+    defer freeProperty(gpa, &property);
+
+    try std.testing.expectEqual(tools_common.Schema.Kind.string, property.kind);
+    try std.testing.expect(property.required);
+    try std.testing.expect(!property.nullable);
+    try std.testing.expect(!property.kind_unconstrained);
+    try std.testing.expectEqualStrings("mode", property.name);
+    try std.testing.expectEqualStrings("Run mode [enum: a, b]", property.description);
+    try std.testing.expectEqual(@as(usize, 2), property.enum_values.?.len);
+    try std.testing.expectEqualStrings("a", property.enum_values.?[0]);
+    try std.testing.expectEqualStrings("b", property.enum_values.?[1]);
+    try std.testing.expectEqualStrings("\"a\"", property.default_value.?);
+}
+
+test "resolvePropertyKind classifies unsupported shapes as unconstrained string" {
+    const gpa = std.testing.allocator;
+    const Cases = struct {
+        json: []const u8,
+    };
+    const cases = [_]Cases{
+        .{ .json = "{ \"$ref\": \"#/definitions/x\" }" },
+        .{ .json = "{ \"oneOf\": [{\"type\":\"string\"}], \"anyOf\": [{\"type\":\"integer\"}] }" },
+        .{ .json = "{ \"description\": \"no type\" }" },
+        .{ .json = "{ \"type\": 42 }" },
+        .{ .json = "{ \"type\": [\"null\"] }" },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, case.json, .{});
+        defer parsed.deinit();
+        const resolved = try resolvePropertyKind(gpa, &parsed.value.object);
+        try std.testing.expectEqual(tools_common.Schema.Kind.string, resolved.kind);
+        try std.testing.expect(resolved.unconstrained);
+        try std.testing.expect(!resolved.alternatives_owned);
+    }
+}
+
+test "buildEnumValues formats scalars and drops non-fragment entries" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\["a", {"x":1}, 42, true, [1], 1.5]
+    , .{});
+    defer parsed.deinit();
+
+    const values = try buildEnumValues(gpa, parsed.value);
+    // Returned list is owned (shrunk past the dropped object/array entries);
+    // free it the same way the property owner would.
+    defer {
+        for (values) |v| gpa.free(v);
+        gpa.free(values);
+    }
+    try std.testing.expectEqual(@as(usize, 4), values.len);
+    try std.testing.expectEqualStrings("a", values[0]);
+    try std.testing.expectEqualStrings("42", values[1]);
+    try std.testing.expectEqualStrings("true", values[2]);
+    try std.testing.expectEqualStrings("1.5", values[3]);
+}
+
+test "buildEnumValues returns empty for non-array and all-dropped inputs" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\[{"x":1}, null]
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), (try buildEnumValues(gpa, .{ .string = "not an array" })).len);
+    try std.testing.expectEqual(@as(usize, 0), (try buildEnumValues(gpa, parsed.value)).len);
+}
+
+test "buildEnumDescription joins base description and enum values" {
+    const gpa = std.testing.allocator;
+    const values = [_][]const u8{ "alpha", "beta" };
+
+    const with_base = try buildEnumDescription(gpa, "Pick one", &values);
+    defer gpa.free(with_base);
+    try std.testing.expectEqualStrings("Pick one [enum: alpha, beta]", with_base);
+
+    const without_base = try buildEnumDescription(gpa, "", &values);
+    defer gpa.free(without_base);
+    try std.testing.expectEqualStrings("[enum: alpha, beta]", without_base);
 }
 
 test "parseResponse extracts result from a JSON-RPC response" {
