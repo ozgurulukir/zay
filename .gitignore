@@ -27,6 +27,8 @@ zig-cache-session/
 .zcode/
 .soloncode/
 .opencode/
+.commandcode/
+.mimosa/
 test_venv
 
 ## Scratch / plan / review artifacts (keep out of commits)
