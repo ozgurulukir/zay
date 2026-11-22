@@ -43,7 +43,7 @@ When both camelCase and snake_case keys are present, **camelCase wins**.
 | `ZAY_LOG_STDERR_LEVEL`       | Min level for the stderr sink (`err`\|`warn`\|`info`\|`debug`, case-insensitive). Default `warn` in release, `err` in debug. When the TUI is up, setting this **also** restores `warn`+ output to stderr (otherwise it goes to the toast). | `debug` |
 | `ZAY_LOG_MAX_BYTES`          | Max log file size before rotation (default 10 MB). On launch, if the existing log exceeds this, `zay.log` is renamed to `zay.log.1` and a fresh file starts. | `5242880` |
 | `ZAY_NO_WIRE_LOG`            | Set to `1` or `true` (case-insensitive) to disable provider wire-body logging (the request/response bodies logged for triage). Unset or any other value keeps wire logging enabled. Ignored on Windows, where wire logging is always on. | `1` |
-| `ZAY_BENCHMARK`              | Test-only: makes the `zig build test` ToolRegistry lookup benchmark print its `[BENCHMARK]` timing line to stdout. Not read by the shipped binary. | `1` |
+| `ZAY_BENCHMARK`              | Test-only: makes the `zig build test` ToolRegistry lookup benchmark print its `[BENCHMARK]` timing line to stderr. Not read by the shipped binary. | `1` |
 
 ---
 
