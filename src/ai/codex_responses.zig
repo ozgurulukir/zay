@@ -140,7 +140,9 @@ pub const Client = struct {
         defer payload.deinit();
         try core.writeRequestPayload(&payload.writer, self.core_client.gpa, self.core_client.config, self.core_client.responses_config, messages, self.core_client.tools_json);
         try body.writer.writeAll(payload.written()[1..]);
-        log.info("codex.websocket.request.body {s}", .{http.logBytesHead(body.written())});
+        if (http.wireBodyLoggingEnabled()) {
+            log.info("codex.websocket.request.body {s}", .{http.logBytesHead(body.written())});
+        }
         try client.writeText(body.written());
 
         var state: core.StreamState = .{};
@@ -153,7 +155,9 @@ pub const Client = struct {
             watchdog.armSeconds(websocket_idle_timeout_seconds);
             switch (message.type) {
                 .text => {
-                    log.info("codex.websocket.response.frame {s}", .{http.logBytesHead(message.data)});
+                    if (http.wireBodyLoggingEnabled()) {
+                        log.info("codex.websocket.response.frame {s}", .{http.logBytesHead(message.data)});
+                    }
                     try state.processJson(gpa, message.data, observer, &self.core_client.call_seq);
                 },
                 .binary => return error.UnsupportedWebSocketFrame,

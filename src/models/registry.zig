@@ -481,6 +481,11 @@ fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
 }
 
 fn cacheApiJson(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes: []const u8) !void {
+    // Validate JSON before replacing any existing cache snapshot (#539).
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRegistryJson;
+
     const dir = try cacheDir(gpa, home_dir);
     defer gpa.free(dir);
     try std.Io.Dir.createDirPath(.cwd(), io, dir);
@@ -488,13 +493,25 @@ fn cacheApiJson(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes:
     const path = try cachePath(gpa, home_dir);
     defer gpa.free(path);
 
-    const file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
-    defer file.close(io);
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    const hex = std.fmt.bytesToHex(rand_bytes, .lower);
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp.{s}", .{ path, hex });
+    defer gpa.free(tmp_path);
 
-    var buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
+    errdefer std.Io.Dir.deleteFile(.cwd(), io, tmp_path) catch {};
+
+    {
+        const file = try std.Io.Dir.createFile(.cwd(), io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+
+        var buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(bytes);
+        try writer.interface.flush();
+    }
+
+    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
 }
 
 fn cacheDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {

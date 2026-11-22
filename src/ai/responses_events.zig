@@ -63,7 +63,9 @@ pub fn run(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype, en
     var source: stream_part.Source = .{ .reader = reader };
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
-        log.info("responses.response.sse data={s}", .{http.logBytesHead(data)});
+        if (http.wireBodyLoggingEnabled()) {
+            log.info("responses.response.sse data={s}", .{http.logBytesHead(data)});
+        }
         try state.processJson(gpa, data, observer, &call_seq);
     }
     const turn = try state.finish(gpa, &call_seq);
@@ -180,7 +182,10 @@ fn processEventRouted(
         return;
     };
     switch (event_type) {
-        .provider_error => return error.ProviderError,
+        .provider_error => {
+            logProviderErrorDetails(parsed.value);
+            return error.ProviderError;
+        },
         .completed => {
             terminal.completed = true;
             terminal.usage = parseResponseUsage(parsed.value);
@@ -224,6 +229,25 @@ fn processEventRouted(
         .function_call_arguments_done => return onArgumentsDone(gpa, parsed.value, blocks, tools, observer),
         .output_item_done => return onItemDone(gpa, parsed.value, blocks, tools, observer, routes),
     }
+}
+
+fn logProviderErrorDetails(event: std.json.Value) void {
+    const err_obj = blk: {
+        if (event.object.get("response")) |resp| {
+            if (resp == .object) {
+                if (resp.object.get("error")) |e| {
+                    if (e == .object) break :blk e.object;
+                }
+            }
+        }
+        if (event.object.get("error")) |e| {
+            if (e == .object) break :blk e.object;
+        }
+        return;
+    };
+    const code = if (err_obj.get("code")) |c| (if (c == .string) c.string else "unknown") else "unknown";
+    const msg = if (err_obj.get("message")) |m| (if (m == .string) m.string else "") else "";
+    log.warn("responses.response.failed code={s} message={s}", .{ code, payloadLogHead(msg) });
 }
 
 /// Extract `response.usage` from a `response.completed` event. Returns null

@@ -162,7 +162,6 @@ pub const Transport = struct {
     fn recordErrorDetail(self: *Transport, status_code: u16, body: []const u8) void {
         const message = http.extractErrorMessage(self.gpa, body) catch return;
         defer self.gpa.free(message);
-        log.warn("{s}.recordErrorDetail status={d} body={s}", .{ self.log_tag, status_code, message });
         const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
         self.clearErrorDetail();
         self.last_error_detail = detail;
@@ -219,9 +218,13 @@ pub const Transport = struct {
         // the C2 path swaps `payload` for a fresh buffer — comparing against
         // the new buffer at exit would free the (already-freed) old one.
         const written = payload.written();
-        const req_body_log = try http.logBytesToolsTail(self.gpa, written);
-        defer if (req_body_log.ptr != written.ptr) self.gpa.free(req_body_log);
-        log.info("{s}.request POST {s} {s} body={s}", .{ self.log_tag, self.url, self.log_context, req_body_log });
+        if (http.wireBodyLoggingEnabled()) {
+            const req_body_log = try http.logBytesToolsTail(self.gpa, written);
+            defer if (req_body_log.ptr != written.ptr) self.gpa.free(req_body_log);
+            log.info("{s}.request POST {s} {s} body={s}", .{ self.log_tag, self.url, self.log_context, req_body_log });
+        } else {
+            log.info("{s}.request POST {s} {s} bytes={d}", .{ self.log_tag, self.url, self.log_context, written.len });
+        }
         // L2: when this client carries no tools, say so next to the request
         // log — it tells the main agent apart from the summarizer/naming
         // clients (which are correctly tool-less) when several are alive.
@@ -325,6 +328,11 @@ pub const Transport = struct {
             .extra_headers = extra_headers,
         }) catch |err| return http.headPhaseFailure(err);
         defer req.deinit();
+
+        // Arm the socket-level read timeout before sending the request /
+        // reading the response head so a stalled server/proxy cannot hang the
+        // worker indefinitely during receiveHead (#538).
+        if (req.connection) |conn| http.setSocketTimeout(conn, self.request_timeout_seconds);
 
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
