@@ -383,6 +383,16 @@ pub const Incremental = struct {
 
     const max_cached_bytes: usize = 256 * 1024;
 
+    fn boundedTailSlice(body: []const u8) []const u8 {
+        if (body.len <= max_cached_bytes) return body;
+        var tail_start = body.len - max_cached_bytes;
+        // Advance past UTF-8 continuation bytes so slicing never splits a multi-byte codepoint.
+        while (tail_start < body.len and (body[tail_start] & 0xC0) == 0x80) {
+            tail_start += 1;
+        }
+        return body[tail_start..];
+    }
+
     /// The full row list for `body` at `width`, materialized into `arena` (valid
     /// until the arena is reset). `gpa` owns the persistent stable cache; call
     /// `deinit` with the same `gpa`.
@@ -398,10 +408,10 @@ pub const Incremental = struct {
         // bounded tail into the frame arena.
         if (body.len > max_cached_bytes) {
             self.reset(gpa, width);
-            const tail_start = body.len - max_cached_bytes;
+            const tail_slice = boundedTailSlice(body);
             var tail_only: RowBuilder = .{};
             var tail_only_state: BlockState = .{};
-            try renderInto(arena, &tail_only, body[tail_start..], width, &tail_only_state, std.math.maxInt(usize), true);
+            try renderInto(arena, &tail_only, tail_slice, width, &tail_only_state, std.math.maxInt(usize), true);
             const out = try arena.alloc(Row, tail_only.rows.items.len);
             for (tail_only.rows.items, 0..) |meta, i| {
                 out[i] = .{ .indent = meta.indent, .spans = tail_only.pool.items[meta.start..][0..meta.len] };
@@ -457,7 +467,7 @@ pub const Incremental = struct {
     /// shorter body) falls back to the full scan, mirroring `rows()`'s reset.
     pub fn countRows(self: *Incremental, body: []const u8, width: u16) u16 {
         if (body.len > max_cached_bytes) {
-            return countRowsFull(std.heap.page_allocator, body[body.len - max_cached_bytes ..], width);
+            return countRowsFull(std.heap.page_allocator, boundedTailSlice(body), width);
         }
         if (self.primed and self.width == width and body.len >= self.boundary) {
             const stable_rows: u16 = @intCast(self.stable.rows.items.len);
@@ -3141,4 +3151,30 @@ test "list items support lazy continuation lines with countRows and incremental 
         const got = try inc.rows(gpa, arena.allocator(), text, 40);
         try expectRowsEqual(out.rows, got);
     }
+}
+
+test "Incremental.boundedTailSlice aligns past UTF-8 continuation bytes and preserves rows/countRows parity" {
+    const gpa = std.testing.allocator;
+    // Build a body > 256 KB whose tail_start lands inside a 4-byte emoji.
+    const prefix_len = Incremental.max_cached_bytes + 4;
+    var body = try gpa.alloc(u8, prefix_len + 10);
+    defer gpa.free(body);
+    for (body, 0..) |*b, idx| {
+        b.* = if (idx % 64 == 63) '\n' else 'a';
+    }
+    // Place a 4-byte UTF-8 character straddling body.len - max_cached_bytes (= 14).
+    const emoji = "🚀"; // 4 bytes: F0 9F 9A 80
+    @memcpy(body[12..16], emoji);
+    @memcpy(body[16..20], "\nhi!");
+
+    const tail = Incremental.boundedTailSlice(body);
+    try std.testing.expect((tail[0] & 0xC0) != 0x80);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tail));
+
+    var inc: Incremental = .{};
+    defer inc.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const rendered = try inc.rows(gpa, arena.allocator(), body, 80);
+    try std.testing.expectEqual(@as(u16, @intCast(rendered.len)), inc.countRows(body, 80));
 }
