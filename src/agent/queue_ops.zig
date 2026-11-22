@@ -65,18 +65,22 @@ pub fn enqueueSteer(self: *Agent, content: []const u8) !void {
 /// decide whether an idle lane should start a turn to deliver a background
 /// completion that was enqueued while no turn was running.
 pub fn hasQueuedMessages(self: *Agent) bool {
-    self.message_queue_mutex.lock(self.io) catch return false;
+    self.message_queue_mutex.lockUncancelable(self.io);
     defer self.message_queue_mutex.unlock(self.io);
     return self.message_queue.len() > 0;
 }
 
 pub fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
-    const queued = takeQueuedUserMessage(self, steer_only) orelse return 0;
-    defer self.gpa.free(queued.prompt);
+    const peeked = peekQueuedUserMessage(self, steer_only) orelse return 0;
+    defer self.gpa.free(peeked.prompt);
     // Raw (machine-generated) messages bypass `@`-mention expansion and skill
     // prefixing so their body is never reinterpreted; user-typed prompts go
-    // through the full expansion path.
-    if (queued.raw) try self.addUser(queued.prompt) else try self.addUserPrompt(queued.prompt);
+    // through the full expansion path. Only pop after insertion succeeds so
+    // an error never drops the queued prompt (#543).
+    if (peeked.raw) try self.addUser(peeked.prompt) else try self.addUserPrompt(peeked.prompt);
+    if (takeQueuedUserMessage(self, steer_only)) |popped| {
+        self.gpa.free(popped.prompt);
+    }
     return 1;
 }
 
@@ -93,12 +97,20 @@ pub fn drainAllQueuedToHistory(self: *Agent) !u32 {
 /// Drop every queued message without delivering it. Thread-safe; the worker
 /// drains under the same mutex.
 pub fn clearQueue(self: *Agent) void {
-    if (self.message_queue_mutex.lock(self.io) catch null) |_| {
-        defer self.message_queue_mutex.unlock(self.io);
-        while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-            self.gpa.free(queued.prompt);
-        }
+    self.message_queue_mutex.lockUncancelable(self.io);
+    defer self.message_queue_mutex.unlock(self.io);
+    while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
+        self.gpa.free(queued.prompt);
     }
+}
+
+fn peekQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
+    self.message_queue_mutex.lockUncancelable(self.io);
+    defer self.message_queue_mutex.unlock(self.io);
+    const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
+    if (steer_only and !front.steer) return null;
+    const prompt_copy = self.gpa.dupe(u8, front.prompt) catch return null;
+    return .{ .prompt = prompt_copy, .steer = front.steer, .raw = front.raw };
 }
 
 /// Pop and return the front queued message. When `steer_only` is set, only

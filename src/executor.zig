@@ -320,15 +320,36 @@ pub const ExecutorService = struct {
         calls: []const ai.ToolCall,
         observer: anytype,
     ) ![]ToolResult {
+        var unused_partial: []ToolResult = &.{};
+        return self.runAllWithPartial(calls, observer, &unused_partial);
+    }
+
+    pub fn runAllWithPartial(
+        self: *ExecutorService,
+        calls: []const ai.ToolCall,
+        observer: anytype,
+        partial_out: *[]ToolResult,
+    ) ![]ToolResult {
+        partial_out.* = &.{};
         const results = try self.gpa.alloc(ToolResult, calls.len);
         var initialized: usize = 0;
-        errdefer {
+        var transferred = false;
+        errdefer if (!transferred) {
             for (results[0..initialized]) |*r| r.deinit(self.gpa);
             self.gpa.free(results);
-        }
+        };
         for (calls, 0..) |call, i| {
             if (self.ctx.cancel_requested) |flag| {
-                if (flag.load(.acquire)) return error.Canceled;
+                if (flag.load(.acquire)) {
+                    if (initialized > 0) {
+                        const partial = try self.gpa.alloc(ToolResult, initialized);
+                        @memcpy(partial, results[0..initialized]);
+                        self.gpa.free(results);
+                        transferred = true;
+                        partial_out.* = partial;
+                    }
+                    return error.Canceled;
+                }
             }
             try observer.on_started(observer.ctx, call);
             switch (try self.shouldRejectUnsafeShell(call, observer)) {

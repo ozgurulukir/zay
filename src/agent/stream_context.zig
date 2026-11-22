@@ -81,13 +81,13 @@ pub fn StreamContext(comptime L: type) type {
         pub fn flushPending(self: *Self) !void {
             if (self.pending_reasoning.items.len > 0) {
                 const owned = try self.gpa.dupe(u8, self.pending_reasoning.items);
-                try self.listener.emit(.{ .thinking_delta = owned });
                 self.pending_reasoning.clearRetainingCapacity();
+                try self.listener.emit(.{ .thinking_delta = owned });
             }
             if (self.pending_content.items.len > 0) {
                 const owned = try self.gpa.dupe(u8, self.pending_content.items);
-                try self.listener.emit(.{ .response_delta = owned });
                 self.pending_content.clearRetainingCapacity();
+                try self.listener.emit(.{ .response_delta = owned });
             }
         }
 

@@ -268,7 +268,7 @@ pub fn run(self: *Agent, listener: anytype) !void {
             // and let the wire-shape recovery below run.
             finalization = runTurnFinalizationOutcome(finish_reason, false, false, tool_calls_truncated, truncation_retried);
         }
-        if (finalization != .dispatch) {
+        if (finalization != .dispatch and finalization != .continue_after_queued_drain) {
             try skill_ops.emitPendingInventory(self, L, l);
         }
         switch (finalization) {
