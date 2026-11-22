@@ -800,6 +800,14 @@ fn warnProjectLayerEnvExpansion(project: *const Config) usize {
             .stdio => {},
         }
     }
+    if (project.database.url != null or project.database.auth_token != null or project.database.path != null) {
+        log.warn("project-layer config overrides session database storage (url_set={} token_set={} path_set={})", .{
+            project.database.url != null,
+            project.database.auth_token != null,
+            project.database.path != null,
+        });
+        risks += 1;
+    }
     return risks;
 }
 
@@ -1206,7 +1214,13 @@ fn parseDatabase(
         }
     }
     if (stringFieldCompat(value, "url", "url")) |s| {
-        if (s.len > 0) db_cfg.url = try gpa.dupe(u8, s);
+        if (s.len > 0) {
+            if (isValidDatabaseUrl(s)) {
+                db_cfg.url = try gpa.dupe(u8, s);
+            } else {
+                try appendConfigError(gpa, diagnostics, path, "invalid database url scheme (expected https:// or loopback http://)", .{});
+            }
+        }
     }
     if (stringFieldCompat(value, "authToken", "auth_token")) |s| {
         if (s.len > 0) db_cfg.auth_token = try gpa.dupe(u8, s);
@@ -1220,6 +1234,22 @@ fn parseDatabase(
         }
     }
     return db_cfg;
+}
+
+fn isValidDatabaseUrl(url: []const u8) bool {
+    if (std.ascii.startsWithIgnoreCase(url, "https://") or
+        std.ascii.startsWithIgnoreCase(url, "libsql://") or
+        std.ascii.startsWithIgnoreCase(url, "d1://"))
+    {
+        return true;
+    }
+    if (std.ascii.startsWithIgnoreCase(url, "http://127.0.0.1") or
+        std.ascii.startsWithIgnoreCase(url, "http://localhost") or
+        std.ascii.startsWithIgnoreCase(url, "http://[::1]"))
+    {
+        return true;
+    }
+    return false;
 }
 
 fn parseToast(gpa: std.mem.Allocator, value: std.json.Value) !ToastSettings {
@@ -2009,6 +2039,7 @@ pub fn readGlobal(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Con
 const ConfigFileIdentity = struct {
     mtime_ns: ?i96,
     size: u64 = 0,
+    content_hash: u64 = 0,
 };
 
 fn statConfigFile(io: std.Io, path: []const u8) !ConfigFileIdentity {
@@ -2018,7 +2049,17 @@ fn statConfigFile(io: std.Io, path: []const u8) !ConfigFileIdentity {
     };
     defer file.close(io);
     const stat = try file.stat(io);
-    return .{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size };
+    var hasher = std.hash.Wyhash.init(0);
+    var buf: [4096]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = file.readPositionalAll(io, &buf, offset) catch break;
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+        offset += n;
+        if (n < buf.len) break;
+    }
+    return .{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size, .content_hash = hasher.final() };
 }
 
 /// Bounded retry for the unlocked read-merge-write sequence in
@@ -2060,7 +2101,7 @@ fn mergeAndWriteFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, updat
         try applyConfigOverlay(gpa, &current, updates);
 
         const write_identity = try statConfigFile(io, path);
-        if (write_identity.mtime_ns != read_identity.mtime_ns or write_identity.size != read_identity.size) {
+        if (write_identity.mtime_ns != read_identity.mtime_ns or write_identity.size != read_identity.size or write_identity.content_hash != read_identity.content_hash) {
             if (attempts_left == 0) return error.ConfigChangedOnDisk;
             attempts_left -= 1;
             continue;

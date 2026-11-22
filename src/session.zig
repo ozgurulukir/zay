@@ -195,6 +195,16 @@ pub const SessionManager = struct {
                 error.Canceled => return error.Canceled,
                 else => return error.SystemResources,
             };
+            // Pre-create with 0600 on POSIX so SQLite does not create a
+            // world-readable database file under default umask (#541).
+            if (!comptime @import("os.zig").is_windows) {
+                if (std.Io.Dir.createFile(.cwd(), io, path, .{
+                    .exclusive = true,
+                    .permissions = std.Io.File.Permissions.fromMode(0o600),
+                })) |f| {
+                    f.close(io);
+                } else |_| {}
+            }
         }
         // In-memory sessions can share this connection with the database tool.
         var connection = try db.Connection.open(path, .{ .full_mutex = true });
@@ -325,12 +335,7 @@ pub const SessionManager = struct {
             .postgres_native => {
                 const log = std.log.scoped(.session);
                 log.warn("session.backend_not_implemented backend=postgres_native", .{});
-                // Honor fallback_ok like every other remote arm: a resume/picker
-                // open must never quietly talk to local SQLite when the
-                // configured backend is a different (unimplemented) store —
-                // the id would resolve against the wrong database.
-                if (!fallback_ok) return error.BackendNotImplemented;
-                return initConfiguredLocal(gpa, io, home_dir, host_id, store.path);
+                return error.BackendNotImplemented;
             },
             .remote_service, .turso_http, .d1_http => {
                 const url = store.url orelse "";
@@ -343,11 +348,25 @@ pub const SessionManager = struct {
                 } else |err| {
                     if (!fallback_ok) return err;
                     const log = std.log.scoped(.session);
-                    log.warn("session.external_db_fallback url={s} err={s}", .{ url, @errorName(err) });
+                    const safe_url = redactUrlForLog(gpa, url) catch "(redacted)";
+                    defer if (safe_url.ptr != url.ptr and !std.mem.eql(u8, safe_url, "(redacted)")) gpa.free(safe_url);
+                    log.warn("session.external_db_fallback url={s} err={s}", .{ safe_url, @errorName(err) });
                     return initConfiguredLocal(gpa, io, home_dir, host_id, store.path);
                 }
             },
         }
+    }
+
+    fn redactUrlForLog(gpa: std.mem.Allocator, url: []const u8) ![]const u8 {
+        const no_query = if (std.mem.indexOfScalar(u8, url, '?')) |q| url[0..q] else url;
+        if (std.mem.indexOf(u8, no_query, "://")) |scheme_end| {
+            const auth_start = scheme_end + 3;
+            const path_start = std.mem.indexOfScalarPos(u8, no_query, auth_start, '/') orelse no_query.len;
+            if (std.mem.indexOfScalarPos(u8, no_query[0..path_start], auth_start, '@')) |at_pos| {
+                return std.fmt.allocPrint(gpa, "{s}***@{s}", .{ no_query[0..auth_start], no_query[at_pos + 1 ..] });
+            }
+        }
+        return gpa.dupe(u8, no_query);
     }
 
     fn openRemoteStore(
