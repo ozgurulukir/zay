@@ -1243,11 +1243,17 @@ fn isValidDatabaseUrl(url: []const u8) bool {
     {
         return true;
     }
-    if (std.ascii.startsWithIgnoreCase(url, "http://127.0.0.1") or
-        std.ascii.startsWithIgnoreCase(url, "http://localhost") or
-        std.ascii.startsWithIgnoreCase(url, "http://[::1]"))
-    {
-        return true;
+    const loopback_prefixes = [_][]const u8{
+        "http://127.0.0.1",
+        "http://localhost",
+        "http://[::1]",
+    };
+    for (loopback_prefixes) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(url, prefix)) {
+            if (url.len == prefix.len) return true;
+            const next = url[prefix.len];
+            return next == ':' or next == '/' or next == '?' or next == '#';
+        }
     }
     return false;
 }
@@ -6499,4 +6505,16 @@ test "parseFile preserves valid settings on bad responsePolicy, wrong-typed sect
     try std.testing.expectEqualStrings("https://fallback.example/v1", cfg.base_url.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
     try std.testing.expectEqual(@as(usize, 2), sink.items.len);
+}
+
+test "isValidDatabaseUrl accepts https/loopback and rejects lookalike hosts" {
+    try std.testing.expect(isValidDatabaseUrl("https://db.example.com"));
+    try std.testing.expect(isValidDatabaseUrl("libsql://db.turso.io"));
+    try std.testing.expect(isValidDatabaseUrl("http://127.0.0.1:8080/db"));
+    try std.testing.expect(isValidDatabaseUrl("http://localhost:3000"));
+    try std.testing.expect(isValidDatabaseUrl("http://[::1]:8080"));
+    try std.testing.expect(!isValidDatabaseUrl("http://evil.com/db"));
+    try std.testing.expect(!isValidDatabaseUrl("http://localhost.evil.com/db"));
+    try std.testing.expect(!isValidDatabaseUrl("http://127.0.0.1.evil.com/db"));
+    try std.testing.expect(!isValidDatabaseUrl("http://localhost@evil.com/db"));
 }

@@ -390,23 +390,39 @@ pub const SessionWriter = struct {
     pub fn unsavedCount(self: *SessionWriter) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.entry_queue.len + @intFromBool(self.failed_entry != null);
+        return self.entry_queue.len() + @intFromBool(self.failed_entry != null);
     }
 
     fn retryFailedEntry(self: *SessionWriter) Error!void {
-        if (self.write_failure) |failure| {
-            if (!isRecoverableFailure(failure)) return failure;
-            if (self.failed_entry) |*owned| {
-                writeQueuedEntry(self, owned) catch |err| {
-                    self.write_failure = err;
-                    return err;
-                };
-                owned.deinit(self.gpa);
-                self.failed_entry = null;
-            }
-            self.write_failure = null;
-            log.info("session writer recovered from transient failure", .{});
+        self.mutex.lockUncancelable(self.io);
+        const failure = self.write_failure orelse {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        if (!isRecoverableFailure(failure)) {
+            self.mutex.unlock(self.io);
+            return failure;
         }
+        const entry_opt = self.failed_entry;
+        self.mutex.unlock(self.io);
+
+        if (entry_opt) |entry| {
+            writeQueuedEntry(self, &entry) catch |err| {
+                self.mutex.lockUncancelable(self.io);
+                self.write_failure = err;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+        }
+
+        self.mutex.lockUncancelable(self.io);
+        if (self.failed_entry) |*owned| {
+            owned.deinit(self.gpa);
+            self.failed_entry = null;
+        }
+        self.write_failure = null;
+        self.mutex.unlock(self.io);
+        log.info("session writer recovered from transient failure", .{});
     }
 
     fn quiesce(self: *SessionWriter) Error!void {
@@ -466,16 +482,14 @@ pub const SessionWriter = struct {
                 self.mutex.unlock(self.io);
                 return failure;
             }
-            // Recoverable transient failure: push the new entry if space allows
-            // and respawn the writer if it exited on the transient error.
-            const need_respawn = self.thread == null and !self.stopping;
+            // Recoverable transient failure: push the new entry and wake the
+            // waiting writer thread to retry the failed entry first.
             if (!self.entry_queue.push(self.queue, entry)) {
                 self.mutex.unlock(self.io);
                 return error.QueueFull;
             }
             self.condition.signal(self.io);
             self.mutex.unlock(self.io);
-            if (need_respawn) self.restart() catch {};
             return;
         }
         if (!self.entry_queue.push(self.queue, entry)) {
@@ -493,13 +507,33 @@ fn runWriter(writer: *SessionWriter) void {
         const has_failed = writer.failed_entry != null;
         writer.mutex.unlock(writer.io);
         if (has_failed) {
-            writer.retryFailedEntry() catch return;
+            writer.retryFailedEntry() catch |err| {
+                if (!SessionWriter.isRecoverableFailure(err)) return;
+                writer.mutex.lockUncancelable(writer.io);
+                const queue_len = writer.entry_queue.len();
+                while (writer.entry_queue.len() == queue_len and !writer.stopping) {
+                    writer.condition.waitUncancelable(writer.io, &writer.mutex);
+                }
+                const stop = writer.stopping;
+                writer.mutex.unlock(writer.io);
+                if (stop) return;
+                continue;
+            };
         }
         if (takeQueuedEntry(writer)) |entry| {
             var owned = entry;
             writeQueuedEntry(writer, &owned) catch |err| {
                 writer.recordFailure(owned, err);
-                return;
+                if (!SessionWriter.isRecoverableFailure(err)) return;
+                writer.mutex.lockUncancelable(writer.io);
+                const queue_len = writer.entry_queue.len();
+                while (writer.entry_queue.len() == queue_len and !writer.stopping) {
+                    writer.condition.waitUncancelable(writer.io, &writer.mutex);
+                }
+                const stop = writer.stopping;
+                writer.mutex.unlock(writer.io);
+                if (stop) return;
+                continue;
             };
             owned.deinit(writer.gpa);
         } else {
