@@ -2,6 +2,7 @@ const std = @import("std");
 const os = @import("../os.zig");
 const capture_sink = @import("capture_sink.zig");
 const temp_files = @import("temp_files.zig");
+const tools_common = @import("common.zig");
 
 const assert = std.debug.assert;
 
@@ -521,15 +522,9 @@ fn isWindowsBashLauncherPath(path: []const u8) bool {
         containsIgnoreCase(path, "/System32/");
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
-}
+/// Named alias at the Windows-launcher call sites: keeps the intent reads as
+/// a substring probe, with the shared ASCII-folding primitive (#557).
+const containsIgnoreCase = tools_common.containsIgnoreCase;
 
 test "Windows Bash launcher paths are rejected" {
     try std.testing.expect(isWindowsBashLauncherPath("C:\\Windows\\System32\\bash.exe"));

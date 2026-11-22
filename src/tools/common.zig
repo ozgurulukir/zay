@@ -183,6 +183,26 @@ pub fn stripAnsi(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
     return out.toOwnedSlice(gpa);
 }
 
+/// ASCII case-insensitive substring search — the shared primitive behind the
+/// shell classifiers (`bash_safety`, `bash_exec`) and the TUI picker filters
+/// (`panel.containsIgnoreCase` and its re-exports), which previously kept
+/// three copies that could drift (#557). Folds ASCII-only: command text and
+/// picker labels never need Unicode folding. An empty needle matches
+/// everywhere, matching `std.ascii.findIgnoreCase`'s semantics.
+pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
+}
+
+test "containsIgnoreCase folds ASCII case, matches empty needles, rejects longer ones" {
+    try std.testing.expect(containsIgnoreCase("Remove-Item", ""));
+    try std.testing.expect(containsIgnoreCase("", ""));
+    try std.testing.expect(containsIgnoreCase("rm -RF /", "-rf"));
+    try std.testing.expect(containsIgnoreCase("C:\\Windows\\System32", "system32"));
+    try std.testing.expect(!containsIgnoreCase("", "rm"));
+    try std.testing.expect(!containsIgnoreCase("rm", "-rf"));
+}
+
 /// Normalize untrusted text for terminal display (SSOT for transcript
 /// ingestion and input paste). Unlike `stripAnsi` — which cleans MODEL
 /// observations and handles CSI only — this is the DISPLAY contract:

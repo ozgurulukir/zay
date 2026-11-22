@@ -12,6 +12,7 @@
 const std = @import("std");
 const http = @import("../http.zig");
 const os = @import("../os.zig");
+const tools_common = @import("common.zig");
 
 const assert = std.debug.assert;
 
@@ -429,12 +430,10 @@ fn isDangerousClearRecycleBin(command: []const u8) bool {
 }
 
 /// Case-insensitive substring search over ASCII (command text is shell code,
-/// which never needs Unicode folding). Deliberately a named wrapper at the
-/// classifier's call sites; `std.ascii.findIgnoreCase` folds ASCII-only, which
-/// is exactly the old hand-rolled loop's semantics (empty needle matches).
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.findIgnoreCase(haystack, needle) != null;
-}
+/// which never needs Unicode folding). Deliberately a named alias at the
+/// classifier's call sites; the shared primitive in `tools/common.zig`
+/// documents the exact semantics (ASCII-only folding, empty needle matches).
+const containsIgnoreCase = tools_common.containsIgnoreCase;
 
 test "containsIgnoreCase: empty needle matches, case folded" {
     try std.testing.expect(containsIgnoreCase("Remove-Item", ""));

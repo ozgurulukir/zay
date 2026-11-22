@@ -7,6 +7,7 @@ const message = @import("message.zig");
 const text_fit = @import("../text_fit.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
+const tools_common = @import("../../tools/common.zig");
 
 const secondary_column: u16 = 52;
 
@@ -361,11 +362,10 @@ fn greedyRunePositions(query: []const u8, text: []const u8, positions: []usize) 
 
 /// Case-insensitive substring match shared by every picker filter (command
 /// palette, model/provider/theme pickers, tree selector, transcript search)
-/// so the filters never drift.
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    return std.ascii.findIgnoreCase(haystack, needle) != null;
-}
+/// so the filters never drift. Re-export of the shared ASCII-folding
+/// primitive in `tools/common.zig` (#557); picker call sites keep the
+/// `panel.containsIgnoreCase` path.
+pub const containsIgnoreCase = tools_common.containsIgnoreCase;
 
 /// Compare two decoded runes (as byte slices) for the fuzzy matcher: single-byte
 /// (ASCII) runes compare case-insensitively; multi-byte runes compare exactly.
