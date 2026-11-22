@@ -220,7 +220,9 @@ pub const BackgroundManager = struct {
 
         var log_file: ?std.Io.File = null;
         defer if (log_file) |*f| f.close(io);
-        log_file = try std.Io.Dir.createFileAbsolute(io, log_path.?, .{});
+        log_file = try std.Io.Dir.createFileAbsolute(io, log_path.?, .{
+            .permissions = if (comptime os.is_windows) .default_file else std.Io.File.Permissions.fromMode(0o600),
+        });
 
         // Merge stderr into stdout so the log preserves chronological order, like
         // the foreground capture path. The prefix/suffix come from the shell tool
@@ -389,6 +391,12 @@ pub const BackgroundManager = struct {
         // Trailing drain for any unread bytes buffered before EOF/error.
         drainBufferedChunks(job, io, gpa, reader, stderr_reader);
 
+        // Do not reap `job.child` while a concurrent `cancel`/`terminateJobsInCwd`
+        // is issuing `terminateTreeSync(job.pid)`: keeping the child unreaped
+        // (at worst a zombie) prevents OS PID recycling during the kill (#537).
+        while (job.kill_in_progress.load(.acquire)) {
+            io.sleep(.fromMilliseconds(1), .awake) catch break;
+        }
         const term = job.child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
         job.log_file.close(io);
         job.exit_code = os.termCode(term);
