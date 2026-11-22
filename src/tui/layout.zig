@@ -26,8 +26,6 @@ pub const min_usable_height: u16 = 5;
 const root_chrome_rows: u16 = 3;
 /// The input widget never shrinks below this, even on a tiny terminal.
 const input_height_floor: u16 = 6;
-/// Panel (diff viewer) height cap when visible.
-const panel_height_max: u16 = 7;
 
 /// A single split pane's geometry and the lane it projects. Row/col are
 /// relative to the transcript area (whose top-left is the root origin).
@@ -97,14 +95,12 @@ pub fn computeSplitLayout(
 pub const RootLayout = struct {
     input_height: u16,
     loading_height: u16,
-    panel_height: u16,
     transcript_height: u16,
     loading_row: u16,
-    panel_row: u16,
     input_row: u16,
 };
 
-pub fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, loading_visible: bool, queued_visible: bool) RootLayout {
+pub fn rootLayout(max_height: u16, input_text_rows: u16, loading_visible: bool, queued_visible: bool) RootLayout {
     // Reserve: top border + bottom border + one hint/diff-counts row (the `3`),
     // the wrapped input text, and — when a steered message is queued — the extra
     // line the InputWidget draws above the border for it. Omitting the queued row
@@ -121,14 +117,11 @@ pub fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, lo
     const above_input_height: u16 = max_height - input_height;
     const loading_height: u16 = if (loading_visible) @min(loading_status_rows, above_input_height) else 0;
     const transcript_height: u16 = above_input_height - loading_height;
-    const panel_height: u16 = if (panel_visible) @min(transcript_height, panel_height_max) else 0;
     return .{
         .input_height = input_height,
         .loading_height = loading_height,
-        .panel_height = panel_height,
         .transcript_height = transcript_height,
         .loading_row = transcript_height,
-        .panel_row = transcript_height - panel_height,
         .input_row = transcript_height + loading_height,
     };
 }
@@ -211,33 +204,30 @@ test "rootLayout table-driven across heights 5..80 and input sizes" {
     const Case = struct {
         height: u16,
         text_rows: u16,
-        panel: bool,
         loading: bool,
         queued: bool,
     };
     const cases = [_]Case{
-        .{ .height = 5, .text_rows = 1, .panel = false, .loading = false, .queued = false },
-        .{ .height = 5, .text_rows = 50, .panel = false, .loading = false, .queued = false },
-        .{ .height = 10, .text_rows = 1, .panel = false, .loading = false, .queued = false },
-        .{ .height = 10, .text_rows = 20, .panel = true, .loading = true, .queued = true },
-        .{ .height = 24, .text_rows = 1, .panel = false, .loading = false, .queued = false },
-        .{ .height = 24, .text_rows = 10, .panel = true, .loading = false, .queued = false },
-        .{ .height = 40, .text_rows = 1, .panel = false, .loading = true, .queued = false },
-        .{ .height = 40, .text_rows = 100, .panel = true, .loading = true, .queued = true },
-        .{ .height = 80, .text_rows = 1, .panel = false, .loading = false, .queued = false },
-        .{ .height = 80, .text_rows = 100, .panel = true, .loading = true, .queued = true },
+        .{ .height = 5, .text_rows = 1, .loading = false, .queued = false },
+        .{ .height = 5, .text_rows = 50, .loading = false, .queued = false },
+        .{ .height = 10, .text_rows = 1, .loading = false, .queued = false },
+        .{ .height = 10, .text_rows = 20, .loading = true, .queued = true },
+        .{ .height = 24, .text_rows = 1, .loading = false, .queued = false },
+        .{ .height = 24, .text_rows = 10, .loading = false, .queued = false },
+        .{ .height = 40, .text_rows = 1, .loading = true, .queued = false },
+        .{ .height = 40, .text_rows = 100, .loading = true, .queued = true },
+        .{ .height = 80, .text_rows = 1, .loading = false, .queued = false },
+        .{ .height = 80, .text_rows = 100, .loading = true, .queued = true },
     };
 
     for (cases) |c| {
-        const res = rootLayout(c.height, c.panel, c.text_rows, c.loading, c.queued);
+        const res = rootLayout(c.height, c.text_rows, c.loading, c.queued);
         // Invariants:
         // 1. input_height + loading_height + transcript_height == height
         try std.testing.expectEqual(c.height, res.input_height + res.loading_height + res.transcript_height);
         // 2. input_row == transcript_height + loading_height
         try std.testing.expectEqual(res.transcript_height + res.loading_height, res.input_row);
-        // 3. panel_height <= transcript_height
-        try std.testing.expect(res.panel_height <= res.transcript_height);
-        // 4. Input height never starves the transcript when height > 6 and text_rows is large (capped around 40%)
+        // 3. Input height never starves the transcript when height > 6 and text_rows is large (capped around 40%)
         if (c.height >= 20 and c.text_rows >= 50) {
             const max_input_fraction = (c.height * 40) / 100;
             try std.testing.expect(res.input_height <= max_input_fraction or res.input_height <= input_height_floor);

@@ -23,15 +23,105 @@ const tui = @import("../tui.zig");
 
 const App = tui.App;
 const RootWidget = tui.RootWidget;
+const app_state_mod = @import("app_state.zig");
 const provider_model = @import("provider_model.zig");
 const clipboard_helper = @import("clipboard_helper.zig");
 const lifecycle = @import("lifecycle.zig");
 
 const command_router = @import("command_router.zig");
 const help_picker = @import("widgets/help_picker.zig");
+const panel = @import("widgets/panel.zig");
+const root_layout = @import("root_layout.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
+const theme_picker = @import("widgets/theme_picker.zig");
 const tui_style = @import("style.zig");
 const toast = @import("toast.zig");
+
+/// Map a mouse click inside `overlay_panel_rect` to the corresponding list row
+/// and update the active overlay's selection before submission. Returns true
+/// only when a valid list row was hit.
+fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) bool {
+    if (mouse_row < 0) return false;
+    const m_row: u16 = @intCast(mouse_row);
+    // Row 0 is the `>` search prompt and row 1 is the `─` separator.
+    if (m_row < rect.row + 2) return false;
+    const clicked_row: u32 = m_row - (rect.row + 2);
+    const content_h: u16 = rect.height -| 2;
+
+    switch (app.getMode()) {
+        .command => {
+            const total = tui.commandMatchesCount(app);
+            const vp = panel.ViewportWindow.compute(app.nav.command_selection, total, content_h);
+            const target = vp.start_index + clicked_row;
+            if (target >= total) return false;
+            app.nav.command_selection = target;
+            return true;
+        },
+        .theme_picker => {
+            const filter = app.peekPaletteInput() catch return false;
+            defer app.gpa.free(filter);
+            const total = theme_picker.countMatching(app.theme_registry.slice(), filter);
+            const vp = panel.ViewportWindow.compute(app.pickers.theme.selection, total, content_h);
+            const target = vp.start_index + clicked_row;
+            if (target >= total) return false;
+            app.pickers.theme.selection = target;
+            return true;
+        },
+        .search => {
+            const total: u32 = @intCast(app.pickers.search.matches.items.len);
+            const vp = panel.ViewportWindow.compute(app.pickers.search.selection, total, content_h);
+            const target = vp.start_index + clicked_row;
+            if (target >= total) return false;
+            app.pickers.search.selection = target;
+            return true;
+        },
+        .link_picker => {
+            const list_h: u16 = if (content_h > 1) content_h - 1 else content_h;
+            if (clicked_row >= list_h) return false;
+            const total: u32 = @intCast(app.pickers.links.items.items.len);
+            const vp = panel.ViewportWindow.compute(app.pickers.links.selection, total, list_h);
+            const target = vp.start_index + clicked_row;
+            if (target >= total) return false;
+            app.pickers.links.selection = target;
+            return true;
+        },
+        .provider_picker => {
+            if (app.pickers.provider.stage != .list) return false;
+            const total: u32 = @intCast(app.pickers.provider.entries.len);
+            const vp = panel.ViewportWindow.compute(app.pickers.provider.selection, total, content_h);
+            const target = vp.start_index + clicked_row;
+            if (target >= total) return false;
+            app.pickers.provider.selection = target;
+            return true;
+        },
+        .model_picker => {
+            const target = app.list_widgets.model_list.scroll.top + clicked_row;
+            if (app.list_widgets.model_list.item_count) |c| if (target >= c) return false;
+            app.pickers.models.model_selection = target;
+            return true;
+        },
+        .session_picker => {
+            if (app.nav.session_action != .browsing) return false;
+            const target = app.list_widgets.resume_list.scroll.top + clicked_row;
+            if (app.list_widgets.resume_list.item_count) |c| if (target >= c) return false;
+            app.nav.resume_selection = target;
+            return true;
+        },
+        .tree_picker => {
+            const target = app.list_widgets.tree_list.scroll.top + clicked_row;
+            if (app.list_widgets.tree_list.item_count) |c| if (target >= c) return false;
+            app.pickers.tree.selection = target;
+            return true;
+        },
+        .lanes => {
+            const target = app.list_widgets.lanes_list.scroll.top + clicked_row;
+            if (app.list_widgets.lanes_list.item_count) |c| if (target >= c) return false;
+            app.nav.lanes_selection = target;
+            return true;
+        },
+        .help, .settings, .mcp, .plugins, .save_message, .normal, .diff_viewer => return false,
+    }
+}
 
 /// Top-level event entry, called by vxfw for every event the root receives.
 ///
@@ -131,7 +221,8 @@ fn routeMouse(
                 return;
             }
         }
-        if (app.permissionPending()) {
+        const layer = root_layout.activeModalLayer(app);
+        if (layer == .permission) {
             if (mouse.button == .wheel_up) {
                 if (app.thread.permission_scroll > 0) app.thread.permission_scroll -= 1;
             } else {
@@ -140,7 +231,7 @@ fn routeMouse(
             ctx.consumeAndRedraw();
             return;
         }
-        if (app.getMode() != .normal and app.getMode() != .diff_viewer) {
+        if (layer == .overlay) {
             if (mouse.button == .wheel_up) {
                 _ = try command_router.handleCommandKey(app, .{ .codepoint = vaxis.Key.up });
             } else {
@@ -163,8 +254,10 @@ fn routeMouse(
             }
         }
 
+        const layer = root_layout.activeModalLayer(app);
+
         // 2. Permission buttons click
-        if (app.permissionPending() and app.nav.permission_buttons != null) {
+        if (layer == .permission and app.nav.permission_buttons != null) {
             for (app.nav.permission_buttons.?) |btn| {
                 if (btn.contains(mouse.row, mouse.col)) {
                     switch (btn.choice) {
@@ -180,7 +273,7 @@ fn routeMouse(
         }
 
         // 3. Modal overlay dismiss (click outside) or row activation
-        if (app.getMode() != .normal and app.getMode() != .diff_viewer) {
+        if (layer == .overlay) {
             if (app.nav.overlay_panel_rect) |rect| {
                 if (!rect.contains(mouse.row, mouse.col)) {
                     // Cancel repeatedly until returning to .normal (some pickers
@@ -195,7 +288,7 @@ fn routeMouse(
                     }
                     ctx.consumeAndRedraw();
                     return;
-                } else if (mouse.row >= rect.row + 3 and app.getMode() != .help) {
+                } else if (selectOverlayRowAt(app, rect, mouse.row)) {
                     try root.submit(ctx);
                     return;
                 }
@@ -401,8 +494,9 @@ fn routeKey(
     }
     if (try routeKeyPromptEditing(app, ctx, key)) return;
     if (try routeKeyViewChords(app, root, ctx, key)) return;
-    // While the jobs modal is open it owns navigation/cancel keys.
-    if (app.getBackgroundModal() and app.isNormalMode()) {
+    const modal_layer = root_layout.activeModalLayer(app);
+    // While the jobs modal is top-most it owns navigation/cancel keys.
+    if (modal_layer == .background) {
         app.clearPendingQuitAt();
         if (app.handleBackgroundModalKey(key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
         return;
@@ -415,7 +509,7 @@ fn routeKey(
     if (try handleQuitSequence(app, ctx, key)) return;
     // Any other key cancels the pending-quit prompt.
     app.clearPendingQuitAt();
-    if (app.permissionPending()) {
+    if (modal_layer == .permission) {
         if (try app.handlePermissionKey(key)) {
             ctx.consumeAndRedraw();
         } else {
@@ -707,20 +801,23 @@ fn handleEscapeSequence(
     root: *RootWidget,
     ctx: *vxfw.EventContext,
 ) !void {
-    if (app.getBackgroundModal()) {
-        app.closeBackgroundModal();
-        ctx.consumeAndRedraw();
-        return;
-    }
-    if (app.permissionPending()) {
-        try app.resolvePermission(.reject);
-        ctx.consumeAndRedraw();
-        return;
-    }
-    if (app.isAtSearchActive()) {
-        app.closeAtSearch();
-        ctx.consumeAndRedraw();
-        return;
+    switch (root_layout.activeModalLayer(app)) {
+        .background => {
+            app.closeBackgroundModal();
+            ctx.consumeAndRedraw();
+            return;
+        },
+        .permission => {
+            try app.resolvePermission(.reject);
+            ctx.consumeAndRedraw();
+            return;
+        },
+        .at_search => {
+            app.closeAtSearch();
+            ctx.consumeAndRedraw();
+            return;
+        },
+        .overlay, .none => {},
     }
     if (try lifecycle.transitionMode(root, ctx, .cancel)) {
         ctx.consumeAndRedraw();

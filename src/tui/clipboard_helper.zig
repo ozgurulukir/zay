@@ -60,6 +60,7 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
         .settings_value => try app.input_buffers.settings_text.appendSlice(app.gpa, clean_text),
         .diff_comment => try app.inputs.comment.insertSliceAtCursor(clean_text),
         .mcp_url => try app.input_buffers.mcp_url.appendSlice(app.gpa, clean_text),
+        .plugin_store_url => try app.input_buffers.plugin_store_url.appendSlice(app.gpa, clean_text),
         .none => {},
     }
 }

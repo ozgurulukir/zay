@@ -170,6 +170,7 @@ pub const TextInputSlot = enum {
     settings_value,
     diff_comment,
     mcp_url,
+    plugin_store_url,
     none,
 };
 
@@ -192,7 +193,8 @@ pub fn modeTextInputSlot(app: *const App) TextInputSlot {
             .browse => .none,
         },
         .mcp => if (app.pickers.mcp.adding) .mcp_url else .none,
-        .lanes, .help, .plugins, .link_picker => .none,
+        .plugins => if (app.pickers.plugins.adding) .plugin_store_url else .none,
+        .lanes, .help, .link_picker => .none,
     };
 }
 
@@ -1176,6 +1178,11 @@ test "modeTextInputSlot set is exhaustive and stable" {
     try std.testing.expectEqual(TextInputSlot.none, modeTextInputSlot(&app));
     app.pickers.mcp.adding = true;
     try std.testing.expectEqual(TextInputSlot.mcp_url, modeTextInputSlot(&app));
+
+    app.mode = .plugins;
+    try std.testing.expectEqual(TextInputSlot.none, modeTextInputSlot(&app));
+    app.pickers.plugins.adding = true;
+    try std.testing.expectEqual(TextInputSlot.plugin_store_url, modeTextInputSlot(&app));
 }
 
 test "closeRuntimeBoundOverlays closes exactly the runtime-bound set" {
