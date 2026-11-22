@@ -381,6 +381,8 @@ pub const Incremental = struct {
         self.primed = true;
     }
 
+    const max_cached_bytes: usize = 256 * 1024;
+
     /// The full row list for `body` at `width`, materialized into `arena` (valid
     /// until the arena is reset). `gpa` owns the persistent stable cache; call
     /// `deinit` with the same `gpa`.
@@ -391,6 +393,22 @@ pub const Incremental = struct {
         body: []const u8,
         width: u16,
     ) ![]const Row {
+        // Cap persistent cache growth for multi-megabyte streaming bodies (#545):
+        // if the body exceeds 256 KB, reset the stable cache and render only a
+        // bounded tail into the frame arena.
+        if (body.len > max_cached_bytes) {
+            self.reset(gpa, width);
+            const tail_start = body.len - max_cached_bytes;
+            var tail_only: RowBuilder = .{};
+            var tail_only_state: BlockState = .{};
+            try renderInto(arena, &tail_only, body[tail_start..], width, &tail_only_state, std.math.maxInt(usize), true);
+            const out = try arena.alloc(Row, tail_only.rows.items.len);
+            for (tail_only.rows.items, 0..) |meta, i| {
+                out[i] = .{ .indent = meta.indent, .spans = tail_only.pool.items[meta.start..][0..meta.len] };
+            }
+            return out;
+        }
+
         // A width change re-wraps everything; an append-only body never shrinks,
         // so a shorter `body` means it was replaced. Either way, start over.
         if (!self.primed or self.width != width or body.len < self.boundary) {
@@ -438,6 +456,9 @@ pub const Incremental = struct {
     /// rendered rows never desync. A stale cache (width change or a replaced,
     /// shorter body) falls back to the full scan, mirroring `rows()`'s reset.
     pub fn countRows(self: *Incremental, body: []const u8, width: u16) u16 {
+        if (body.len > max_cached_bytes) {
+            return countRowsFull(std.heap.page_allocator, body[body.len - max_cached_bytes ..], width);
+        }
         if (self.primed and self.width == width and body.len >= self.boundary) {
             const stable_rows: u16 = @intCast(self.stable.rows.items.len);
             // The tail sits just past a blank line outside a code fence, so its

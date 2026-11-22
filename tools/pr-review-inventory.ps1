@@ -1,5 +1,8 @@
 param([string]$OutputDirectory = '.git/pr-review')
 $ErrorActionPreference = 'Stop'
+if ([System.IO.Path]::IsPathRooted($OutputDirectory) -or $OutputDirectory -match '(^|[\\/])\.\.([\\/]|$)') {
+    throw "OutputDirectory must be a relative path inside the repository without '..' traversal: $OutputDirectory"
+}
 $repository = 'ozgurulukir/zay'
 $origin = git remote get-url origin
 if ($LASTEXITCODE -ne 0 -or $origin -notmatch 'github\.com[:/]ozgurulukir/zay(?:\.git)?$') {

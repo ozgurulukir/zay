@@ -26,7 +26,8 @@ def test_health(client: TestClient):
     data = response.json()
     assert data["status"] == "ok"
     assert data["backend"] == "sqlite"
-    assert data["auth_required"] is True
+    assert "auth_required" not in data
+    assert "version" not in data
 
 
 def test_auth_unauthorized(client: TestClient):
@@ -128,6 +129,16 @@ def test_to_pg_sql_translation():
     assert to_pg_sql("SELECT * FROM t WHERE a = ? AND b = ?") == "SELECT * FROM t WHERE a = $1 AND b = $2"
     assert to_pg_sql("UPDATE t SET a = ?1 WHERE b = ?2") == "UPDATE t SET a = $1 WHERE b = $2"
     assert to_pg_sql("SELECT 'what? is ?' FROM t WHERE x = ?") == "SELECT 'what? is ?' FROM t WHERE x = $1"
+    assert to_pg_sql("SELECT 'it''s ?' FROM t WHERE x = ?") == "SELECT 'it''s ?' FROM t WHERE x = $1"
+    assert to_pg_sql('SELECT "col""?" FROM t WHERE x = ?') == 'SELECT "col""?" FROM t WHERE x = $1'
+    assert to_pg_sql("SELECT ? -- ignored ?\nAND y = ?") == "SELECT $1 -- ignored ?\nAND y = $2"
+    assert to_pg_sql("SELECT /* ignored ? */ ? FROM t") == "SELECT /* ignored ? */ $1 FROM t"
+
+
+def test_schema_invalid_identifier_rejected(client: TestClient):
+    headers = {"Authorization": "Bearer test-secret"}
+    resp = client.post("/v1/schema", json={"table": "bad; DROP TABLE x"}, headers=headers)
+    assert resp.status_code == 400
 
 
 def test_postgres_backend_ssl_parsing():

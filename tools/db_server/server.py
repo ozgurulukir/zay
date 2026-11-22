@@ -116,9 +116,8 @@ def build_app(host: DatabaseHost) -> FastAPI:
     async def health() -> dict[str, Any]:
         h = await host.backend.health()
         return {
-            "version": DEFAULT_API_VERSION,
-            "auth_required": host.api_key is not None,
-            **h,
+            "status": h.get("status", "ok"),
+            "backend": h.get("backend", "unknown"),
         }
 
     @app.post("/v1/exec", response_model=ExecResponse, dependencies=[Depends(verify_auth)])
