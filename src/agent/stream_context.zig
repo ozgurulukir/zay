@@ -20,6 +20,8 @@ const std = @import("std");
 const ai = @import("../ai.zig");
 const stream_parser = @import("../ai/stream_parser.zig");
 
+const log = std.log.scoped(.stream_context);
+
 /// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
 /// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
 /// little gain; a comptime constant is simpler.
@@ -61,7 +63,14 @@ pub fn StreamContext(comptime L: type) type {
             // on an early-return/error path that skipped the explicit
             // end-of-stream flush. Skip if an earlier emit already failed so
             // teardown never replays the same delta (#543).
-            if (!self.emit_failed) self.flushPending() catch {};
+            if (!self.emit_failed) {
+                self.flushPending() catch |err| {
+                    // The stranded tail is dropped without replay (#543), so
+                    // this is the only trace the truncated response leaves —
+                    // log it instead of vanishing (#554).
+                    log.warn("deferred stream flush failed on teardown; response tail dropped without replay: {s}", .{@errorName(err)});
+                };
+            }
             self.pending_content.deinit(self.gpa);
             self.pending_reasoning.deinit(self.gpa);
         }
@@ -199,4 +208,76 @@ pub fn emitToolDelta(
             .arguments = owned_arguments,
         },
     });
+}
+
+/// Minimal duck-typed event for the failure-path tests below. Mirrors the
+/// listener ownership contract (a listener that reports failure has not
+/// consumed the event and deinits its payload itself — see
+/// `agent_worker.postAgentEvent`'s errdefer) so the testing allocator's leak
+/// check can police the teardown path.
+const TestEvent = union(enum) {
+    thinking_delta: []const u8,
+    response_delta: []const u8,
+
+    fn deinit(self: *TestEvent, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .thinking_delta, .response_delta => |payload| gpa.free(payload),
+        }
+    }
+};
+
+const TestListener = struct {
+    gpa: std.mem.Allocator,
+    emits: usize = 0,
+    fail_all: bool = true,
+
+    pub fn emit(self: *TestListener, event: TestEvent) anyerror!void {
+        self.emits += 1;
+        if (self.fail_all) {
+            var owned = event;
+            owned.deinit(self.gpa);
+            return error.EmitFailed;
+        }
+        var owned = event;
+        owned.deinit(self.gpa);
+    }
+};
+
+test "deferred flush failure on teardown is attempted, swallowed, and not replayed" {
+    const gpa = std.testing.allocator;
+    var listener: TestListener = .{ .gpa = gpa };
+    var context: StreamContext(*TestListener) = .{
+        .gpa = gpa,
+        .listener = &listener,
+    };
+
+    // Buffer below the coalesce threshold so nothing flushes mid-stream; the
+    // only flush attempt is the teardown one.
+    try onContentDeltaImpl(*TestListener)(&context, "stranded tail");
+
+    context.deinit();
+    // One emit: the teardown flush itself (it failed). The emit_failed latch
+    // from that failure means no second attempt can ever replay the delta.
+    try std.testing.expectEqual(@as(usize, 1), listener.emits);
+    try std.testing.expect(context.emit_failed);
+}
+
+test "a prior emit failure skips the teardown flush entirely" {
+    const gpa = std.testing.allocator;
+    var listener: TestListener = .{ .gpa = gpa };
+    var context: StreamContext(*TestListener) = .{
+        .gpa = gpa,
+        .listener = &listener,
+    };
+
+    try onContentDeltaImpl(*TestListener)(&context, "first tail");
+    try std.testing.expectError(error.EmitFailed, context.flushPending());
+    try std.testing.expect(context.emit_failed);
+    const emits_after_failed_flush = listener.emits;
+
+    // More content after the failure must not be flushed on teardown (#543:
+    // no replay), so the emit count stays frozen.
+    try onContentDeltaImpl(*TestListener)(&context, "second tail");
+    context.deinit();
+    try std.testing.expectEqual(emits_after_failed_flush, listener.emits);
 }

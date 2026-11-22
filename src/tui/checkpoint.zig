@@ -1,11 +1,14 @@
 //! Git checkpoint and save command logic.
 //! Free functions taking `*App` — extracted from `tui.zig`.
 
+const std = @import("std");
 const tui = @import("../tui.zig");
 const vcs = @import("../vcs.zig");
 
 const App = tui.App;
 const Thread = tui.Thread;
+
+const log = std.log.scoped(.checkpoint);
 
 /// What a `sealCheckpoint` attempt did — so callers can tell a genuine
 /// failure apart from the benign "nothing to bind" and "git unavailable"
@@ -31,8 +34,12 @@ pub fn sealCheckpoint(app: *App, lane: *Thread) SealOutcome {
     // snapshot is an orphan (gc'd later) — report nothing happened.
     const leaf_id = rt.session_writer.leaf() orelse return .nothing;
     // Keep the snapshot reachable against `git gc`, named by the entry it
-    // binds so it can be pruned with that entry.
-    vcs.keepRef(app.gpa, app.getIo(), rt.cwd, leaf_id, sha) catch {};
+    // binds so it can be pruned with that entry. The seal itself already
+    // succeeded, so this stays non-fatal — but the only loss is GC
+    // durability, so log it rather than dropping the ref silently (#554).
+    vcs.keepRef(app.gpa, app.getIo(), rt.cwd, leaf_id, sha) catch |err| {
+        log.warn("checkpoint keep-ref failed for leaf {s}: {s} — snapshot may be collected by git gc", .{ leaf_id, @errorName(err) });
+    };
     return .sealed;
 }
 

@@ -181,9 +181,16 @@ pub const AutoCompactor = struct {
     }
 
     /// Emit a one-shot compaction notice through the agent's event stream
-    /// (duck-typed listener; no import of the agent needed).
-    fn emitNotice(listener: anytype, notice: CompactionNotice) void {
-        listener.emit(.{ .compaction_notice = notice }) catch {};
+    /// (duck-typed listener; no import of the agent needed). A failed emit is
+    /// logged, not propagated: the one-shot latch was already set before
+    /// emission, so re-raising would either corrupt that latch or drop a
+    /// state transition, and the notice is advisory — the log line is the
+    /// only trace a suppressed breaker/stuck/waiting notice leaves (#554).
+    /// Pub for the emit-failure regression test.
+    pub fn emitNotice(listener: anytype, notice: CompactionNotice) void {
+        listener.emit(.{ .compaction_notice = notice }) catch |err| {
+            log.warn("compaction notice ({s}) emit failed: {s}", .{ @tagName(notice), @errorName(err) });
+        };
     }
 
     /// The per-turn-iteration hook (moved verbatim from Agent.maybeCompact).
@@ -451,3 +458,23 @@ pub const AutoCompactor = struct {
         return env.tool_tokens +| env.estimateAll(env.ctx);
     }
 };
+
+test "compaction notice emit failure is swallowed, not propagated" {
+    // #554: a listener that rejects the notice must not turn the advisory
+    // emission into a turn failure — emitNotice logs the failure and
+    // returns. Drives all three one-shot notice kinds through the failure
+    // path.
+    const FailingListener = struct {
+        emit_calls: usize = 0,
+        pub fn emit(self: *@This(), event: anytype) anyerror!void {
+            _ = event;
+            self.emit_calls += 1;
+            return error.EmitFailed;
+        }
+    };
+    var listener: FailingListener = .{};
+    AutoCompactor.emitNotice(&listener, .breaker_tripped);
+    AutoCompactor.emitNotice(&listener, .stuck);
+    AutoCompactor.emitNotice(&listener, .waiting);
+    try std.testing.expectEqual(@as(usize, 3), listener.emit_calls);
+}
