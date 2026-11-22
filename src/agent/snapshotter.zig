@@ -10,6 +10,8 @@ const std = @import("std");
 const session_mod = @import("../session.zig");
 const vcs = @import("../vcs.zig");
 
+const log = std.log.scoped(.snapshotter);
+
 pub const Snapshotter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -58,7 +60,12 @@ pub const Snapshotter = struct {
         }
         const commit = vcs.commitTree(self.gpa, self.io, cwd, tree) catch return;
         writer.setLeafSnapshot(commit.slice()) catch return;
-        if (writer.leaf()) |leaf_id| vcs.keepRef(self.gpa, self.io, cwd, leaf_id, commit) catch {};
+        if (writer.leaf()) |leaf_id| vcs.keepRef(self.gpa, self.io, cwd, leaf_id, commit) catch |err| {
+            // The leaf binding already succeeded, so the only loss is GC
+            // durability: the snapshot becomes unreachable after `git gc`.
+            // Surface it instead of silently dropping the ref (#554).
+            log.warn("snapshot keep-ref failed for leaf {s}: {s} — snapshot may be collected by git gc", .{ leaf_id, @errorName(err) });
+        };
         self.last_tree = tree;
     }
 };
