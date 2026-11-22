@@ -48,6 +48,9 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
     var view_col: u16 = 0;
     var view_width: u16 = app.thread.transcript_view_width;
     var view_height: u16 = app.thread.transcript_view_height;
+    const list_top_pad = ConversationLayout.top;
+    const list_bottom_pad = ConversationLayout.bottom;
+    var list_bottom: u16 = list_top_pad +| view_height;
 
     if (app.split_rect_count > 0) {
         const rects = app.split_rects[0..app.split_rect_count];
@@ -59,16 +62,18 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
                 view_col = rect.col;
                 view_width = rect.width;
                 view_height = rect.height;
+                list_bottom = view_height -| list_bottom_pad;
                 matched_driver = true;
                 break;
             }
         }
         if (!matched_driver) return null;
     } else {
-        if (row >= view_height or col >= view_width) return null;
+        if (row >= list_bottom or col >= view_width) return null;
     }
 
     const local_row: i32 = @as(i32, row) - @as(i32, view_row);
+    if (local_row < @as(i32, list_top_pad) or local_row >= @as(i32, list_bottom)) return null;
     const local_col: u16 = col -| view_col;
     const messages = app.thread.transcript.messages.items;
     if (messages.len == 0) return null;
@@ -77,7 +82,7 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
     const top_idx = app.thread.transcript_list.scroll.top;
     if (top_idx >= messages.len) return null;
 
-    var y: i32 = -@as(i32, app.thread.transcript_list.scroll.offset);
+    var y: i32 = @as(i32, list_top_pad) - @as(i32, app.thread.transcript_list.scroll.offset);
     var idx: usize = top_idx;
     while (idx < messages.len) : (idx += 1) {
         const h: i32 = tui_metrics.messageRowsCached(&messages[idx], content_width);
@@ -85,9 +90,10 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
             const msg_row: u16 = @intCast(local_row - y);
             const body = messages[idx].mirror().body;
             const indent = messageBodyIndent(&messages[idx]);
+            const extra_header_rows = messageHeaderRows(&messages[idx]);
             const byte_off = mapRowColToByteOffset(
                 body,
-                msg_row,
+                msg_row -| extra_header_rows,
                 local_col,
                 content_width,
                 indent,
@@ -98,9 +104,17 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
             };
         }
         y += h;
-        if (y >= view_height) break;
+        if (y >= @as(i32, list_bottom)) break;
     }
     return null;
+}
+
+fn messageHeaderRows(msg: *const transcript_mod.Message) u16 {
+    return switch (msg.*) {
+        .user => if (tui_metrics.show_turn_timestamps) 1 else 0,
+        .thinking => |m| if (m.expanded) 1 else 0,
+        else => 0,
+    };
 }
 
 fn messageBodyIndent(msg: *const transcript_mod.Message) u16 {
@@ -181,4 +195,31 @@ test "wordRange and lineRange select expected slices" {
     try std.testing.expectEqualStrings("beta_gamma", body[w[0]..w[1]]);
     const l = lineRange(body, 8);
     try std.testing.expectEqualStrings("alpha beta_gamma", body[l[0]..l[1]]);
+}
+
+test "hitTestTranscript accounts for vertical list padding, indent, wrapping, and scroll offset" {
+    const agent_mod = @import("../agent.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(gpa, .user, "you", "alpha beta gamma delta");
+    app.thread.transcript_view_width = 20; // contentWidth = 16, user wrap_width = 14
+    app.thread.transcript_view_height = 10;
+    app.thread.transcript_list.scroll.top = 0;
+    app.thread.transcript_list.scroll.offset = 1; // scrolled past messageTop()
+
+    // Screen row 0 is the top padding of TranscriptWidget -> outside list.
+    try std.testing.expect(hitTestTranscript(&app, 0, 4) == null);
+    // Screen row 1 with scroll.offset = 1 lands on message row 1 (first body line).
+    // User indent = 2, ConversationLayout.left = 2 -> body starts at col 4.
+    const hit = hitTestTranscript(&app, 1, 4).?;
+    try std.testing.expectEqual(@as(u32, 0), hit.message_index);
+    try std.testing.expectEqual(@as(usize, 0), hit.byte_offset);
+    // Screen row 2 lands on wrapped second row ("delta").
+    const hit2 = hitTestTranscript(&app, 2, 4).?;
+    try std.testing.expectEqual(@as(u32, 0), hit2.message_index);
+    try std.testing.expectEqual(@as(usize, "alpha beta ".len), hit2.byte_offset);
 }

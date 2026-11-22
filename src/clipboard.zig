@@ -22,13 +22,18 @@ const log = std.log.scoped(.clipboard);
 // Maximum bytes allowed for clipboard copy/paste (10 MB sanity limit).
 pub const max_clipboard_bytes: usize = 10 * 1024 * 1024;
 
+pub const CopyResult = struct {
+    copied_bytes: usize,
+    truncated: bool,
+};
+
 /// Copy `text` to the system clipboard.
 ///
 /// Sends an OSC 52 sequence to the terminal and attempts to invoke native
 /// OS clipboard tools (`wl-copy`, `xclip`, `pbcopy`, etc.) so external
 /// desktop applications also receive the text.
-pub fn copyToClipboard(gpa: std.mem.Allocator, io: std.Io, text: []const u8) void {
-    if (text.len == 0) return;
+pub fn copyToClipboard(gpa: std.mem.Allocator, io: std.Io, text: []const u8) CopyResult {
+    if (text.len == 0) return .{ .copied_bytes = 0, .truncated = false };
     const send_len = @min(text.len, max_clipboard_bytes);
     const slice = text[0..send_len];
 
@@ -37,6 +42,11 @@ pub fn copyToClipboard(gpa: std.mem.Allocator, io: std.Io, text: []const u8) voi
 
     // 2. Native OS clipboard command.
     copyToOsClipboard(gpa, io, slice);
+
+    return .{
+        .copied_bytes = send_len,
+        .truncated = text.len > max_clipboard_bytes,
+    };
 }
 
 /// Read text from the system clipboard using OS clipboard tools.

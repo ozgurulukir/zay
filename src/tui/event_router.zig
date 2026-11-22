@@ -349,6 +349,13 @@ fn routeKey(
     // search space in half — see AGENTS.md "vxfw Windows input-thread death".
     log.debug("key cp=0x{x:0>4} mods={any} mode={s} inlen={d} pallen={d}", .{ raw.codepoint, raw.mods, @tagName(app.mode), app.inputs.input.buf.realLength(), app.inputs.palette.buf.realLength() });
 
+    if (app.inputs.paste_stash.entries.items.len > 0) {
+        if (app.inputs.input.buf.dupe() catch null) |cur_text| {
+            defer app.gpa.free(cur_text);
+            app.inputs.paste_stash.syncWithText(app.gpa, cur_text);
+        }
+    }
+
     // Some Windows Terminal input paths deliver control combos as BARE C0
     // codepoints with an empty — or noise-decorated (stray alt) — modifier
     // set. Observed in a user log (2026-09-15): Ctrl+C as `cp=0x03 mods={}`
@@ -424,6 +431,7 @@ fn routeKey(
                     defer app.gpa.free(u);
                     app.clearInput();
                     try app.inputs.input.insertSliceAtCursor(u);
+                    app.inputs.paste_stash.syncWithText(app.gpa, u);
                     const cur = app.inputs.input.buf.cursor;
                     if (span.start < cur) app.inputs.input.buf.moveGapLeft(cur - span.start);
                     ctx.consumeAndRedraw();
