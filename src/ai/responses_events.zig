@@ -61,6 +61,7 @@ pub fn run(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype, en
     errdefer state.deinitBlocks(gpa);
     var call_seq = env.id_seq.*;
     var source: stream_part.Source = .{ .reader = reader };
+    defer source.deinit(gpa);
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
         if (http.wireBodyLoggingEnabled()) {

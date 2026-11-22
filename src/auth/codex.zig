@@ -398,6 +398,7 @@ const AcceptSlot = struct {
     cond: std.Io.Condition = .init,
     stream: ?std.Io.net.Stream = null,
     done: bool = false,
+    active_acceptors: u8 = 0,
 
     fn offer(self: *AcceptSlot, io: std.Io, stream: std.Io.net.Stream) void {
         self.mutex.lockUncancelable(io);
@@ -413,6 +414,12 @@ const AcceptSlot = struct {
     }
 
     fn acceptOne(server: *std.Io.net.Server, io: std.Io, slot: *AcceptSlot) void {
+        defer {
+            slot.mutex.lockUncancelable(io);
+            slot.active_acceptors -= 1;
+            if (slot.active_acceptors == 0) slot.cond.signal(io);
+            slot.mutex.unlock(io);
+        }
         const stream = server.accept(io) catch return;
         slot.offer(io, stream);
     }
@@ -446,12 +453,21 @@ fn waitForAuthorizationCode(
         watchdog_thread.join();
     }
 
-    var slot: AcceptSlot = .{};
+    var slot: AcceptSlot = .{ .active_acceptors = 1 };
     var t4 = try std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ &server4, io, &slot });
-    const t6_opt: ?std.Thread = if (server6_opt) |*s6|
-        std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ s6, io, &slot }) catch null
-    else
-        null;
+    const t6_opt: ?std.Thread = if (server6_opt) |*s6| blk: {
+        slot.mutex.lockUncancelable(io);
+        slot.active_acceptors += 1;
+        slot.mutex.unlock(io);
+        if (std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ s6, io, &slot })) |t6| {
+            break :blk t6;
+        } else |_| {
+            slot.mutex.lockUncancelable(io);
+            slot.active_acceptors -= 1;
+            slot.mutex.unlock(io);
+            break :blk null;
+        }
+    } else null;
     defer {
         slot.mutex.lockUncancelable(io);
         slot.done = true;
@@ -470,8 +486,12 @@ fn waitForAuthorizationCode(
     }
 
     slot.mutex.lockUncancelable(io);
-    while (slot.stream == null) {
+    while (slot.stream == null and slot.active_acceptors > 0) {
         slot.cond.waitUncancelable(io, &slot.mutex);
+    }
+    if (slot.stream == null) {
+        slot.mutex.unlock(io);
+        return error.AcceptFailed;
     }
     var stream = slot.stream.?;
     slot.stream = null;

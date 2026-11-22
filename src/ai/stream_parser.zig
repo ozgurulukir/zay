@@ -156,6 +156,7 @@ pub fn readStream(
     // Same last-wins accumulation for the terminal `finish_reason`.
     var finish_reason: ?ai.FinishReason = null;
     var source: stream_part.Source = .{ .reader = reader };
+    defer source.deinit(gpa);
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
         const change = try parseStreamChunk(gpa, data, &content, &reasoning, &stream);

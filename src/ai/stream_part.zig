@@ -77,6 +77,13 @@ pub const Source = struct {
     saw_done: bool = false,
     pending_data: ?[]u8 = null,
 
+    pub fn deinit(self: *Source, gpa: std.mem.Allocator) void {
+        if (self.pending_data) |p| {
+            gpa.free(p);
+            self.pending_data = null;
+        }
+    }
+
     /// Return the next SSE event `data:` payload (owned by the caller), or null
     /// at the `[DONE]` sentinel or end of stream. Consecutive `data:` lines in
     /// one event are joined with `\n` and dispatched at the blank-line boundary
