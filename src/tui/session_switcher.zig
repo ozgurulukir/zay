@@ -738,6 +738,10 @@ fn createRuntimeImpl(app: *App, cwd: []const u8, session_dir: []const u8, sessio
             // no manual push duplicates it.
             log.warn("Session switch: MCP config not applied — sync failed; see log ({s})", .{@errorName(err)});
         };
+        if (cross_project) {
+            app.theme_registry.loadCustom(app.gpa, app.io, current.home_dir, cwd, app.cached_config.tui.custom_themes_dir) catch {};
+        }
+        app.syncPresentationConfig();
     }
 
     // Cross-project plugin repoint: sync config, repoint discovery, re-register.

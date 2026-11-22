@@ -75,7 +75,11 @@ pub fn handleColorSchemeChange(app: *App, scheme: vaxis.Color.Scheme) void {
             app.cached_config.tui.effectiveLightTheme(),
             app.cached_config.tui.effectiveDarkTheme(),
         );
-        tui_style.setActive(theme);
+        if (app.mode == .theme_picker and app.theme_preview_original != null) {
+            app.theme_preview_original = theme;
+        } else {
+            tui_style.setActive(theme);
+        }
     }
 }
 

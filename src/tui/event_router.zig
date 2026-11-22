@@ -209,7 +209,7 @@ fn routeMouse(
 ) !void {
     // Scrolling may bring the logo back into view; the tick stops itself
     // again on the next frame if it didn't.
-    try root.ensureTick(ctx);
+    if (lifecycle.decideShouldTick(root)) try root.ensureTick(ctx);
     if (mouse.button == .wheel_up or mouse.button == .wheel_down) {
         if (app.getMode() == .help) {
             if (mouse.button == .wheel_up) {
@@ -464,7 +464,7 @@ fn routeKey(
         ctx.consumeEvent();
         return;
     }
-    try root.ensureTick(ctx);
+    if (lifecycle.decideShouldTick(root)) try root.ensureTick(ctx);
     // The diff viewer is a self-contained full-screen mode: it owns every
     // key (including Esc) so it can manage its own sub-states.
     if (app.isDiffViewerMode()) {

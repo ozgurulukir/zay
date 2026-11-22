@@ -1376,7 +1376,7 @@ test "spinner frame advances while visible lane writes a response" {
     try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
 }
 
-test "spinner frame advances while a background lane is active and visible lane is idle" {
+test "spinner frame only advances for visible lanes when background lane is active" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -1385,7 +1385,7 @@ test "spinner frame advances while a background lane is active and visible lane 
 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    lane2.turn.submit();
+    _ = lane2.turn.submit();
     try app.threads.append(lane2);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1394,6 +1394,18 @@ test "spinner frame advances while a background lane is active and visible lane 
     root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
     var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
+    // Off-screen in .tab mode: idle visible lane does not force spinner redraws.
+    app.split_mode = .tab;
+    app.split_rect_count = 0;
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
+
+    // Visible in .dual mode: active worker pane advances the spinner frame.
+    app.split_mode = .dual;
+    app.split_rects[0] = .{ .row = 0, .col = 0, .width = 80, .height = 20, .lane_index = 0 };
+    app.split_rects[1] = .{ .row = 0, .col = 80, .width = 80, .height = 20, .lane_index = 1 };
+    app.split_rect_count = 2;
+    root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
     try lifecycle.handleTick(&root, &ctx);
     try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
 }
@@ -4622,4 +4634,81 @@ test "drawRoot composites toast over diff_viewer (#570)" {
     // Child 0 is main_surface (diff viewer), child 1 is toast.Widget at z_index 4.
     try std.testing.expectEqual(@as(usize, 2), surface.children.len);
     try std.testing.expectEqual(@as(u8, 4), surface.children[1].z_index);
+}
+
+test "syncLiveTranscriptMetrics invalidates row caches across all lanes (#565)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const sibling = try gpa.create(Thread);
+    sibling.* = .{
+        .title = try gpa.dupe(u8, "sibling"),
+        .engine = .{ .idle = .{ .working = .{ .branch = try gpa.dupe(u8, "zay/s1"), .path = try gpa.dupe(u8, "/tmp/s1") } } },
+    };
+    try app.threads.append(sibling);
+
+    const idx0 = try app.thread.transcript.append(gpa, .agent, "agent", "first");
+    const idx1 = try sibling.transcript.append(gpa, .agent, "agent", "second");
+    app.thread.transcript.messages.items[idx0].agent.row_cache.valid = true;
+    sibling.transcript.messages.items[idx1].agent.row_cache.valid = true;
+
+    const metrics_mod = @import("metrics.zig");
+    const orig_max = metrics_mod.readable_measure_max;
+    const orig_density = metrics_mod.transcript_density;
+    const orig_ts = metrics_mod.show_turn_timestamps;
+    defer {
+        metrics_mod.readable_measure_max = orig_max;
+        metrics_mod.transcript_density = orig_density;
+        metrics_mod.show_turn_timestamps = orig_ts;
+    }
+
+    @import("settings_lifecycle.zig").syncLiveTranscriptMetrics(&app, orig_max + 10, .compact, !orig_ts);
+    try std.testing.expect(!app.thread.transcript.messages.items[idx0].agent.row_cache.valid);
+    try std.testing.expect(!sibling.transcript.messages.items[idx1].agent.row_cache.valid);
+}
+
+test "setMode and handleColorSchemeChange preserve theme preview invariants (#565)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const style_mod = @import("style.zig");
+    const theme_lc = @import("theme_lifecycle.zig");
+    const original_theme = app.theme_registry.resolve("default");
+    defer style_mod.setActive(original_theme);
+
+    const light_theme = app.theme_registry.resolve("catppuccin_latte");
+    const dark_theme = app.theme_registry.resolve("dracula");
+
+    // 1. handleColorSchemeChange while previewing updates theme_preview_original instead of clobbering active preview.
+    const auto_theme = try gpa.dupe(u8, "auto");
+    defer gpa.free(auto_theme);
+    app.cached_config.theme = auto_theme;
+    app.mode = .theme_picker;
+    app.theme_preview_original = light_theme;
+    style_mod.setActive(dark_theme);
+    theme_lc.handleColorSchemeChange(&app, .dark);
+    try std.testing.expect(style_mod.buildPalette(dark_theme).background.eql(style_mod.active.background));
+    try std.testing.expect(app.theme_preview_original != null);
+
+    // 2. setMode transitioning out of .theme_picker automatically reverts the preview.
+    const expected_reverted = app.theme_preview_original.?;
+    app.setMode(.normal);
+    try std.testing.expect(app.theme_preview_original == null);
+    try std.testing.expect(style_mod.buildPalette(expected_reverted).background.eql(style_mod.active.background));
+
+    // 3. setModeKeepInput transitioning out of .theme_picker also reverts the preview.
+    app.mode = .theme_picker;
+    app.theme_preview_original = light_theme;
+    style_mod.setActive(dark_theme);
+    app.setModeKeepInput(.command);
+    try std.testing.expect(app.theme_preview_original == null);
+    try std.testing.expect(style_mod.buildPalette(light_theme).background.eql(style_mod.active.background));
 }
