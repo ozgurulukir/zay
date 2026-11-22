@@ -130,7 +130,13 @@ fn readStdioLineBounded(client: *McpClient, io: std.Io, reader: *std.Io.Reader, 
                     .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 },
                 };
                 const ready = std.posix.poll(&poll_fds, 0) catch return error.ReadFailed;
-                if (ready > 0) break;
+                if (ready > 0) {
+                    if ((poll_fds[0].revents & std.posix.POLL.IN) != 0) break;
+                    if ((poll_fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+                        return error.McpServerCrashed;
+                    }
+                    break;
+                }
             }
 
             const now = std.Io.Timestamp.now(io, .awake);
@@ -144,7 +150,9 @@ fn readStdioLineBounded(client: *McpClient, io: std.Io, reader: *std.Io.Reader, 
         // re-checked per chunk. Zero bytes without EOF is not an end — the
         // next wait re-polls with the remaining budget.
         reader.fillMore() catch |err| switch (err) {
-            error.EndOfStream => return try line_writer.toOwnedSlice(),
+            // An MCP stdio JSON-RPC message must be newline-terminated; EOF
+            // before '\n' indicates a crashed or prematurely closed server (#540).
+            error.EndOfStream => return error.McpServerCrashed,
             error.ReadFailed => return error.McpServerCrashed,
         };
     }

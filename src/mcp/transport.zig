@@ -194,6 +194,7 @@ pub fn responseId(gpa: std.mem.Allocator, payload: []const u8) ?i64 {
     if (parsed.value != .object) return null;
     const obj = parsed.value.object;
     if (obj.get("method") != null) return null;
+    if (obj.get("result") == null and obj.get("error") == null) return null;
     const id_val = obj.get("id") orelse return null;
     if (id_val != .integer) return null;
     return id_val.integer;

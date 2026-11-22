@@ -212,12 +212,10 @@ fn scanRoot(
         defer if (manifest) |*value| value.deinit(gpa);
         const name = if (manifest) |value| value.name else entry.name;
         var enabled = true;
-        if (manifest != null) {
-            for (configs) |config| {
-                if (std.mem.eql(u8, config.name, name)) {
-                    enabled = config.enabled;
-                    break;
-                }
+        for (configs) |config| {
+            if (std.mem.eql(u8, config.name, name)) {
+                enabled = config.enabled;
+                break;
             }
         }
         if (!enabled) continue;

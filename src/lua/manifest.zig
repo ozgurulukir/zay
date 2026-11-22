@@ -98,6 +98,7 @@ pub const Manifest = struct {
         if (!L.isTable(-1)) return error.InvalidManifest;
 
         const raw_name = bridge.getTableString(L, -1, "name") orelse return error.MissingPluginName;
+        if (!isValidPluginName(raw_name)) return error.InvalidManifest;
         const name = try allocator.dupe(u8, raw_name);
         errdefer allocator.free(name);
 
@@ -157,14 +158,30 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
     if (bridge.getTableBoolean(L, -1, "allow_os_remove")) |v| perms.allow_os_remove = v;
     if (bridge.getTableBoolean(L, -1, "allow_env")) |v| perms.allow_env = v;
 
-    // Clamp on the i64 before the u32 cast so a negative value (a manifest typo
-    // or a hand-edited plugin.lua) cannot wrap to ~4e9. 0 keeps its "unlimited"
-    // semantics, so clamp only the lower bound at 0.
-    if (bridge.getTableInteger(L, -1, "instruction_limit")) |v| perms.instruction_limit = @intCast(std.math.clamp(v, 0, std.math.maxInt(u32)));
-    if (bridge.getTableInteger(L, -1, "memory_limit_mb")) |v| perms.memory_limit_mb = @intCast(std.math.clamp(v, 0, std.math.maxInt(u32)));
-    if (bridge.getTableInteger(L, -1, "timeout_ms")) |v| perms.timeout_ms = @intCast(std.math.clamp(v, 0, std.math.maxInt(u32)));
+    // Clamp resource limits to host ceilings and treat <= 0 as the host ceiling
+    // so a manifest cannot disable VM instruction/memory/timeout caps (#540).
+    if (bridge.getTableInteger(L, -1, "instruction_limit")) |v| {
+        perms.instruction_limit = if (v <= 0) 100_000_000 else @intCast(@min(v, 100_000_000));
+    }
+    if (bridge.getTableInteger(L, -1, "memory_limit_mb")) |v| {
+        perms.memory_limit_mb = if (v <= 0) 512 else @intCast(@min(v, 512));
+    }
+    if (bridge.getTableInteger(L, -1, "timeout_ms")) |v| {
+        perms.timeout_ms = if (v <= 0) 600_000 else @intCast(@min(v, 600_000));
+    }
 
     return perms;
+}
+
+pub fn isValidPluginName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (std.mem.eql(u8, name, ".")) return false;
+    if (std.mem.indexOf(u8, name, "..") != null) return false;
+    for (name) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.') continue;
+        return false;
+    }
+    return true;
 }
 
 /// Whether `key` is a recognized permission key. Pure — testable without a
@@ -420,4 +437,16 @@ test "manifest: isRecognizedPermissionKey rejects a typo (T3)" {
     try testing.expect(!isRecognizedPermissionKey("reqiure_others"));
     try testing.expect(!isRecognizedPermissionKey("file_acces"));
     try testing.expect(!isRecognizedPermissionKey(""));
+}
+
+test "manifest: isValidPluginName rejects empty, dot, traversal, and path separators" {
+    const testing = std.testing;
+    try testing.expect(isValidPluginName("sitting-duck"));
+    try testing.expect(isValidPluginName("my_plugin.v2"));
+    try testing.expect(!isValidPluginName(""));
+    try testing.expect(!isValidPluginName("."));
+    try testing.expect(!isValidPluginName(".."));
+    try testing.expect(!isValidPluginName("foo..bar"));
+    try testing.expect(!isValidPluginName("foo/bar"));
+    try testing.expect(!isValidPluginName("foo\\bar"));
 }

@@ -12,6 +12,8 @@ return {
   permissions = {
     -- No zay.require of other plugins.
     require_others = false,
+    -- Read ZAY_SITTING_DUCK_BIN override.
+    allow_env = true,
     -- Wall-clock per-dispatch deadline, checked by the instruction hook when
     -- Lua resumes after run_bash returns: one dispatch can chain
     -- --version (10s) + bootstrap INSTALL (300s cap) + query (60s cap)

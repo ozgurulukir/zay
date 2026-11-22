@@ -128,6 +128,11 @@ pub const Discovery = struct {
         schema: tools_common.Schema,
         raw_input_schema: ?[]const u8,
     ) !void {
+        for (self.tools.items) |existing| {
+            if (std.mem.eql(u8, existing.server_name, server_name) and std.mem.eql(u8, existing.name, tool_name)) {
+                return error.DuplicateToolName;
+            }
+        }
         const record = try buildToolRecord(self.gpa, server_name, tool_name, description, schema, raw_input_schema);
         // Append may fail; on failure the schema stays caller-owned (the
         // discovery loop's errdefer frees it), so release every field the
@@ -213,6 +218,15 @@ pub fn buildToolRecord(
     };
 }
 
+pub fn isValidToolName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (std.mem.indexOf(u8, name, naming.separator) != null) return false;
+    for (name) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
 /// Extract one `tools/list` entry into an owned record. Null when the
 /// entry is malformed (skipped silently, matching the discovery
 /// contract); an error only for allocation failure. On success the
@@ -227,6 +241,7 @@ pub fn toolRecordFromListEntry(
     const obj = tool_val.object;
 
     const tool_name = if (obj.get("name")) |n| (if (n == .string) n.string else return null) else return null;
+    if (!isValidToolName(tool_name)) return null;
     const description = if (obj.get("description")) |d| (if (d == .string) d.string else "") else "";
     const input_schema = obj.get("inputSchema");
     var schema = if (input_schema) |s| (try schema_mod.schemaFromJsonSchema(gpa, s)) else tools_common.Schema{ .properties = &.{} };
