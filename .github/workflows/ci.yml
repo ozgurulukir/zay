@@ -57,6 +57,10 @@ jobs:
       # The exit code is authoritative (see docs/BUILDING.md "Test runner
       # quirks"): output may contain a misleading `failed command` line on
       # build-server hosts, and known load flakes are documented there too.
+      - name: zig build
+        shell: bash
+        run: zig build
+
       - name: zig build test
         shell: bash
         run: zig build test

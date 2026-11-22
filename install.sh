@@ -95,14 +95,14 @@ elif curl -fLs "$CHECKSUM_URL" -o "$TEMP_DIR/$ARTIFACT.sha256"; then
   (
     cd "$TEMP_DIR"
     if command -v sha256sum >/dev/null 2>&1; then
-      if sha256sum -c "${ARTIFACT}.sha256" --status; then
+      if sha256sum --status -c "${ARTIFACT}.sha256"; then
         echo -e "${GREEN}✓ Checksum verified.${RESET}"
       else
         echo -e "${RED}Checksum verification failed!${RESET}" >&2
         exit 1
       fi
     elif command -v shasum >/dev/null 2>&1; then
-      if shasum -a 256 -c "${ARTIFACT}.sha256" --status; then
+      if shasum -a 256 --status -c "${ARTIFACT}.sha256"; then
         echo -e "${GREEN}✓ Checksum verified.${RESET}"
       else
         echo -e "${RED}Checksum verification failed!${RESET}" >&2

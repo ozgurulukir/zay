@@ -342,7 +342,8 @@ pub fn indexPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) CmdError![
     defer gpa.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return error.GitBadOutput;
-    return gpa.dupe(u8, trimmed);
+    if (std.fs.path.isAbsolute(trimmed)) return gpa.dupe(u8, trimmed);
+    return std.fs.path.resolve(gpa, &.{ dir, trimmed }) catch return error.OutOfMemory;
 }
 
 /// Snapshot the working tree of `dir` into an off-branch commit and return its
@@ -393,28 +394,44 @@ pub fn commitTree(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, tree: Obj
 /// files are left alone. Used by timeline navigation to restore the code state
 /// bound to a conversation node. `index_path` comes from `indexPath`.
 pub fn restore(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, index_path: []const u8, rev: ObjectId) CmdError!void {
+    const tree_spec = std.fmt.allocPrint(gpa, "{s}^{{tree}}", .{rev.slice()}) catch return error.OutOfMemory;
+    defer gpa.free(tree_spec);
+
+    // Validate the target tree object BEFORE mutating the dedicated index or
+    // working tree (#544).
+    {
+        var verify_out = try run(gpa, io, dir, &.{ "rev-parse", "--verify", "--quiet", tree_spec }, null);
+        defer verify_out.deinit(gpa);
+        if (verify_out.code != 0) {
+            log.warn("vcs.restore invalid target tree dir={s} rev={s}", .{ dir, rev.slice() });
+            return error.GitCommandFailed;
+        }
+    }
+
     var env = try indexEnv(gpa, io, index_path);
     defer env.deinit();
 
     // Sync the dedicated index to the current working tree first, so the
     // subsequent reset knows which files to remove (those present now but absent
-    // in the target tree).
+    // in the target tree), and capture the pre-restore tree for rollback.
     {
         var out = try run(gpa, io, dir, &.{ "add", "-A" }, &env);
         defer out.deinit(gpa);
         if (out.code != 0) return error.GitCommandFailed;
     }
-    const tree_spec = std.fmt.allocPrint(gpa, "{s}^{{tree}}", .{rev.slice()}) catch return error.OutOfMemory;
-    defer gpa.free(tree_spec);
+    const pre_tree_raw = runOut(gpa, io, dir, &.{"write-tree"}, &env) catch null;
+    defer if (pre_tree_raw) |p| gpa.free(p);
+
     var out = try run(gpa, io, dir, &.{ "read-tree", "-u", "--reset", tree_spec }, &env);
     defer out.deinit(gpa);
     if (out.code != 0) {
-        // B4: a restore failure leaves the working tree on the wrong node —
-        // surface it in the operator log so it is not silent. The caller
-        // (session_switcher.restoreCheckpointForBranch) swallows the error and
-        // leaves the tree as-is; this log is the only visibility. Use `warn`
-        // not `err` — `log.err` trips the test-runner success gate (AGENTS.md
-        // §Logging). The `warn` sink is active in all builds incl. ReleaseFast.
+        if (pre_tree_raw) |raw| {
+            const pre_tree = std.mem.trim(u8, raw, " \t\r\n");
+            if (pre_tree.len > 0) {
+                var rb = run(gpa, io, dir, &.{ "read-tree", "-u", "--reset", pre_tree }, &env) catch null;
+                if (rb) |*r| r.deinit(gpa);
+            }
+        }
         log.warn("vcs.restore failed dir={s} rev={s} code={d} stderr={s}", .{
             dir, rev.slice(), out.code, std.mem.trim(u8, out.stderr, " \t\r\n"),
         });
