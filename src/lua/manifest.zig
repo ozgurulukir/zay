@@ -175,6 +175,7 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
 
 pub fn isValidPluginName(name: []const u8) bool {
     if (name.len == 0 or name.len > 128) return false;
+    if (std.mem.eql(u8, name, ".")) return false;
     if (std.mem.indexOf(u8, name, "..") != null) return false;
     for (name) |ch| {
         if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.') continue;
@@ -436,4 +437,16 @@ test "manifest: isRecognizedPermissionKey rejects a typo (T3)" {
     try testing.expect(!isRecognizedPermissionKey("reqiure_others"));
     try testing.expect(!isRecognizedPermissionKey("file_acces"));
     try testing.expect(!isRecognizedPermissionKey(""));
+}
+
+test "manifest: isValidPluginName rejects empty, dot, traversal, and path separators" {
+    const testing = std.testing;
+    try testing.expect(isValidPluginName("sitting-duck"));
+    try testing.expect(isValidPluginName("my_plugin.v2"));
+    try testing.expect(!isValidPluginName(""));
+    try testing.expect(!isValidPluginName("."));
+    try testing.expect(!isValidPluginName(".."));
+    try testing.expect(!isValidPluginName("foo..bar"));
+    try testing.expect(!isValidPluginName("foo/bar"));
+    try testing.expect(!isValidPluginName("foo\\bar"));
 }
