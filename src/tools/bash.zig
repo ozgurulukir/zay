@@ -37,31 +37,50 @@ pub const Backend = struct {
         \\cd() { while [ $# -gt 0 ] && { [ "$1" = -P ] || [ "$1" = -L ] || [ "$1" = -- ]; }; do shift; done; local _prev="$PWD"; builtin cd "$@" || return 1; local _phys="$(pwd -P)"; if [ "$_phys" != "$_zay_root" ] && [ "${_phys#$_zay_root}" = "$_phys" ]; then printf 'cd: %s escapes the workspace root\n' "$_phys" >&2; builtin cd "$_prev" 2>/dev/null || builtin cd "$_zay_root"; return 1; fi; return 0; };
         \\pushd() { printf 'pushd: not allowed in this workspace\n' >&2; return 1; };
         \\popd() { printf 'popd: not allowed in this workspace\n' >&2; return 1; };
+        \\readonly -f cd pushd popd;
         \\
     ;
 
-    /// Reject `builtin`/`command`-prefixed `cd`/`pushd`/`popd` in contained
-    /// workspaces: Bash resolves builtins directly when prefixed, bypassing the
-    /// `cd()`/`pushd()`/`popd()` shell functions (#418). The compare skips
-    /// quotes and backslashes because bash strips them before command lookup,
-    /// so `'builtin'`, `"builtin"`, and `\builtin` all reach the real builtin
-    /// (#439).
+    /// Reject `builtin`/`command`/`unset`/`enable`-prefixed `cd`/`pushd`/`popd`
+    /// in contained workspaces: Bash resolves builtins directly when prefixed,
+    /// and `unset -f` / `enable` attempt to remove or alter the guard (#418, #536).
+    /// The compare skips quotes and backslashes because bash strips them before
+    /// command lookup (#439).
     pub fn hasCdGuardBypass(command: []const u8) bool {
-        var it = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()");
-        while (it.next()) |tok| {
-            const is_command = tokenUnescapedEquals(tok, "command");
-            if (!tokenUnescapedEquals(tok, "builtin") and !is_command) continue;
-            var next = it.next() orelse break;
-            if (is_command) {
-                while (next.len > 0 and next[0] == '-') {
-                    next = it.next() orelse break;
+        var seg_it = std.mem.tokenizeAny(u8, command, "\n;|&()");
+        while (seg_it.next()) |segment| {
+            var it = std.mem.tokenizeAny(u8, segment, " \t\r");
+            while (it.next()) |tok| {
+                const is_command = tokenUnescapedEquals(tok, "command");
+                const is_builtin = tokenUnescapedEquals(tok, "builtin");
+                const is_unset = tokenUnescapedEquals(tok, "unset");
+                const is_enable = tokenUnescapedEquals(tok, "enable");
+                if (!is_builtin and !is_command and !is_unset and !is_enable) continue;
+                var next = it.next() orelse break;
+                if (is_command or is_unset or is_enable) {
+                    while (next.len > 0 and next[0] == '-') {
+                        next = it.next() orelse break;
+                    }
                 }
-            }
-            if (tokenUnescapedEquals(next, "cd") or
-                tokenUnescapedEquals(next, "pushd") or
-                tokenUnescapedEquals(next, "popd"))
-            {
-                return true;
+                if (is_unset or is_enable) {
+                    // Check all remaining words in this segment.
+                    while (true) {
+                        if (tokenUnescapedEquals(next, "cd") or
+                            tokenUnescapedEquals(next, "pushd") or
+                            tokenUnescapedEquals(next, "popd"))
+                        {
+                            return true;
+                        }
+                        next = it.next() orelse break;
+                    }
+                    break;
+                }
+                if (tokenUnescapedEquals(next, "cd") or
+                    tokenUnescapedEquals(next, "pushd") or
+                    tokenUnescapedEquals(next, "popd"))
+                {
+                    return true;
+                }
             }
         }
         return false;
@@ -607,6 +626,9 @@ test "hasCdGuardBypass flags quoted and escaped builtin spellings (#439)" {
         "\\command cd /tmp",
         "builtin pushd /tmp",
         "builtin popd /tmp",
+        "unset -f cd; cd /tmp",
+        "unset -f pushd; pushd /tmp",
+        "enable -n cd; cd /tmp",
         // A bare target-less cd still bypasses the function override.
         "builtin cd",
         "'bui\"ltin' cd /tmp",
@@ -628,6 +650,7 @@ test "hasCdGuardBypass flags quoted and escaped builtin spellings (#439)" {
         "COMMAND cd /tmp",
         "",
         "ls 'builtin' /tmp",
+        "unset FOO; echo cd",
     };
     for (allowed) |command| {
         try std.testing.expect(!Backend.hasCdGuardBypass(command));

@@ -589,12 +589,40 @@ fn isDangerousBashRedirect(command: []const u8) bool {
         if (after < command.len and command[after] == '|') after += 1;
         while (after < command.len and std.ascii.isWhitespace(command[after])) after += 1;
         if (after < command.len and (command[after] == '\'' or command[after] == '"')) after += 1;
+        const target_slice = command[after..];
+        // Variable (`$x`, `${x}`) and brace (`{/etc,/tmp}/x`) redirect targets
+        // can expand to protected paths at runtime — fail closed (#536).
+        if (target_slice.len > 0 and (target_slice[0] == '$' or target_slice[0] == '{')) return true;
+        if (redirectTargetHasParentTraversal(target_slice)) return true;
         for (dangerous_targets) |target| {
-            if (unescapedStartsWith(command[after..], target)) return true;
+            if (unescapedStartsWith(target_slice, target)) return true;
         }
         idx = gt + 1;
     }
     return false;
+}
+
+fn redirectTargetHasParentTraversal(target: []const u8) bool {
+    var i: usize = 0;
+    var seg_len: usize = 0;
+    var seg_dots: usize = 0;
+    while (i < target.len) : (i += 1) {
+        var c = target[i];
+        if (std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&' or c == '\'' or c == '"') break;
+        if (c == '\\' and i + 1 < target.len) {
+            i += 1;
+            c = target[i];
+        }
+        if (c == '/') {
+            if (seg_len == 2 and seg_dots == 2) return true;
+            seg_len = 0;
+            seg_dots = 0;
+        } else {
+            seg_len += 1;
+            if (c == '.') seg_dots += 1;
+        }
+    }
+    return seg_len == 2 and seg_dots == 2;
 }
 
 /// Compare `haystack` against `prefix` while unescaping bash backslash escapes
@@ -1504,4 +1532,11 @@ test "bash safety classifier catches backslash redirect, uppercase rm -Rf, and >
 
     const long_cmd = "echo " ++ ("a" ** 5000) ++ "; sudo apt install malware";
     try std.testing.expectEqual(Verdict.unsafe, localClassify(long_cmd));
+
+    // Variable, brace, and parent-traversal redirect targets fail closed (#536).
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > $TARGET_FILE"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > ${HOME}/out"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > {/etc,/tmp}/pwn"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > /tmp/../etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > /" ++ ("a" ** 300) ++ "/../etc/passwd"));
 }

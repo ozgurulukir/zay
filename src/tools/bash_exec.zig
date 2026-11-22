@@ -145,7 +145,7 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
         .environ_map = options.env_map,
         .stdin = .ignore,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
         .pgid = if (os.is_windows) null else 0,
     });
     defer {
@@ -164,13 +164,14 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     const deadline = options.timeout.toDeadline(io);
     var timed_out = false;
     if (os.is_windows) {
-        timed_out = try capture_sink.captureWindows(Sink, gpa, io, &child, &.{child.stdout.?}, options.timeout, options.cancel_requested, &sink);
+        timed_out = try capture_sink.captureWindows(Sink, gpa, io, &child, &.{ child.stdout.?, child.stderr.? }, options.timeout, options.cancel_requested, &sink);
     } else {
-        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
         var multi_reader: std.Io.File.MultiReader = undefined;
-        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{child.stdout.?});
+        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
         defer multi_reader.deinit();
-        const reader = multi_reader.reader(0);
+        const stdout_reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
         while (true) {
             if (options.cancel_requested) |flag| if (flag.load(.acquire)) return error.Canceled;
             if (deadline.toDurationFromNow(io)) |remaining| {
@@ -187,10 +188,16 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
                 },
                 else => |e| return e,
             };
-            const chunk = reader.buffered();
-            if (chunk.len == 0) continue;
-            try sink.ingest(gpa, io, chunk);
-            reader.tossBuffered();
+            const out_chunk = stdout_reader.buffered();
+            if (out_chunk.len > 0) {
+                try sink.ingest(gpa, io, out_chunk);
+                stdout_reader.tossBuffered();
+            }
+            const err_chunk = stderr_reader.buffered();
+            if (err_chunk.len > 0) {
+                try sink.ingest(gpa, io, err_chunk);
+                stderr_reader.tossBuffered();
+            }
         }
         if (!timed_out) {
             // EOF need not mean exit (#440): a child that closed its pipes but

@@ -157,6 +157,8 @@ pub fn readLogTailBounded(
         return try gpa.dupe(u8, "(no output yet)\n");
     }
 
+    if (max_lines == 0) return try gpa.dupe(u8, "");
+
     var lines_found: u32 = 0;
     var start_idx: usize = slice.len;
     var i: usize = slice.len;
@@ -180,6 +182,9 @@ pub fn readLogTailBounded(
     while (start_idx < slice.len and (slice[start_idx] & 0xC0) == 0x80) start_idx += 1;
 
     const tail_slice = slice[start_idx..];
+    if (file_size > max_bytes_to_scan and start_idx == 0) {
+        return try std.fmt.allocPrint(gpa, "... [truncated to last 64 KB]\n{s}", .{tail_slice});
+    }
     return try gpa.dupe(u8, tail_slice);
 }
 
@@ -436,6 +441,16 @@ test "readLogTailBounded reads trailing lines accurately" {
     const tail_10 = try readLogTailBounded(io, gpa, log_path, 10);
     defer gpa.free(tail_10);
     try std.testing.expectEqualStrings("line 1\nline 2\nline 3\nline 4\nline 5\n", tail_10);
+
+    // >64 KB single-line log preserves the last 64 KB with an explicit truncation notice.
+    const big = try gpa.alloc(u8, 70 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    try file.writeStreamingAll(io, big);
+    const big_tail = try readLogTailBounded(io, gpa, log_path, 20);
+    defer gpa.free(big_tail);
+    try std.testing.expect(std.mem.startsWith(u8, big_tail, "... [truncated to last 64 KB]\n"));
+    try std.testing.expect(big_tail.len > 64 * 1024);
 }
 
 test "background tool reports unavailable without a manager in context" {
