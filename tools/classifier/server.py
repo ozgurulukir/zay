@@ -37,7 +37,7 @@ def build_app(host: ModelHost, model_name: str) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         if host.loading_error:
-            return {"status": "error", "detail": host.loading_error}
+            return {"status": "error", "detail": "classifier failed to load"}
         return {
             "status": "ok",
             "model": model_name,
@@ -48,7 +48,7 @@ def build_app(host: ModelHost, model_name: str) -> FastAPI:
     def classify(request: ClassifyRequest) -> ClassifyResponse:
         if host.classifier is None:
             if host.loading_error:
-                raise HTTPException(status_code=500, detail=f"Model failed to load: {host.loading_error}")
+                raise HTTPException(status_code=500, detail="Classifier failed to load")
             raise HTTPException(status_code=503, detail="Classifier is still loading, please retry in a moment")
         return host.classifier.classify(request.command, request.cwd)
 

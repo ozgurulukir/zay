@@ -202,8 +202,9 @@ class SqliteBackend(DatabaseBackend):
             cur = self._conn.cursor()
             try:
                 if table:
-                    safe_table = table.replace('"', '""')
-                    cur.execute(f'PRAGMA table_info("{safe_table}")')
+                    if not _is_valid_identifier(table):
+                        raise ValueError("Invalid table identifier")
+                    cur.execute(f'PRAGMA table_info("{table}")')
                     cols = [
                         {"cid": row[0], "name": row[1], "type": row[2], "notnull": bool(row[3]), "dflt_value": row[4], "pk": bool(row[5])}
                         for row in cur.fetchall()
@@ -214,8 +215,9 @@ class SqliteBackend(DatabaseBackend):
                     tables = [row[0] for row in cur.fetchall()]
                     result: dict[str, Any] = {}
                     for t in tables:
-                        safe_t = t.replace('"', '""')
-                        cur.execute(f'PRAGMA table_info("{safe_t}")')
+                        if not _is_valid_identifier(t):
+                            continue
+                        cur.execute(f'PRAGMA table_info("{t}")')
                         result[t] = [
                             {"cid": row[0], "name": row[1], "type": row[2], "notnull": bool(row[3]), "dflt_value": row[4], "pk": bool(row[5])}
                             for row in cur.fetchall()
@@ -225,34 +227,66 @@ class SqliteBackend(DatabaseBackend):
                 cur.close()
 
 
+def _is_valid_identifier(name: str) -> bool:
+    if not name or len(name) > 128:
+        return False
+    return (name[0].isalpha() or name[0] == "_") and all(ch.isalnum() or ch == "_" for ch in name)
+
+
 def to_pg_sql(sql: str) -> str:
-    """Translates '?' or '?1' placeholders in SQL to '$1, $2, ...' for Postgres/asyncpg."""
+    """Translates '?' or '?N' placeholders in SQL to '$1, $2, ...' for Postgres/asyncpg."""
     parts: list[str] = []
     param_idx = 1
-    in_single_quote = False
-    in_double_quote = False
     i = 0
-    while i < len(sql):
+    n = len(sql)
+    while i < n:
         c = sql[i]
-        if c == "'" and not in_double_quote:
-            in_single_quote = not in_single_quote
+        if c == "'" or c == '"':
+            quote = c
             parts.append(c)
-        elif c == '"' and not in_single_quote:
-            in_double_quote = not in_double_quote
-            parts.append(c)
-        elif c == '?' and not in_single_quote and not in_double_quote:
+            i += 1
+            while i < n:
+                ch = sql[i]
+                parts.append(ch)
+                if ch == quote:
+                    if i + 1 < n and sql[i + 1] == quote:
+                        parts.append(sql[i + 1])
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            end = sql.find("\n", i)
+            if end == -1:
+                parts.append(sql[i:])
+                break
+            parts.append(sql[i : end + 1])
+            i = end + 1
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            if end == -1:
+                parts.append(sql[i:])
+                break
+            parts.append(sql[i : end + 2])
+            i = end + 2
+            continue
+        if c == "?":
             j = i + 1
-            while j < len(sql) and sql[j].isdigit():
+            while j < n and sql[j].isdigit():
                 j += 1
             if j > i + 1:
                 digit = int(sql[i + 1 : j])
                 parts.append(f"${digit}")
-                i = j - 1
+                i = j
             else:
                 parts.append(f"${param_idx}")
                 param_idx += 1
-        else:
-            parts.append(c)
+                i += 1
+            continue
+        parts.append(c)
         i += 1
     return "".join(parts)
 

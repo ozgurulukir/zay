@@ -51,9 +51,10 @@ class LlmProxyClassifier(BaseClassifier):
                 label: Literal["safe", "unsafe"] = "unsafe" if result.get("label") == "unsafe" else "safe"
                 score = float(result.get("score", 0.99 if label == "unsafe" else 0.01))
         except Exception:
-            # Fallback on LLM failure: default to safe so local built-in regex handles it
-            label = "safe"
-            score = 0.0
+            # Fail closed when the upstream LLM proxy classifier is unavailable
+            # or returns malformed output so the safety gate does not silently downgrade.
+            label = "unsafe"
+            score = 1.0
 
         latency = (time.perf_counter() - started) * 1000.0
         return ClassifyResponse(
