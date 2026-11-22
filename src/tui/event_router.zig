@@ -349,12 +349,7 @@ fn routeKey(
     // search space in half — see AGENTS.md "vxfw Windows input-thread death".
     log.debug("key cp=0x{x:0>4} mods={any} mode={s} inlen={d} pallen={d}", .{ raw.codepoint, raw.mods, @tagName(app.mode), app.inputs.input.buf.realLength(), app.inputs.palette.buf.realLength() });
 
-    if (app.inputs.paste_stash.entries.items.len > 0) {
-        if (app.inputs.input.buf.dupe() catch null) |cur_text| {
-            defer app.gpa.free(cur_text);
-            app.inputs.paste_stash.syncWithText(app.gpa, cur_text);
-        }
-    }
+    routeKeySyncPasteStash(app);
 
     // Some Windows Terminal input paths deliver control combos as BARE C0
     // codepoints with an empty — or noise-decorated (stray alt) — modifier
@@ -404,82 +399,8 @@ fn routeKey(
         ctx.consumeAndRedraw();
         return;
     }
-    // Prompt undo/redo (issue #486): only when the prompt is focused, i.e.
-    // normal mode — overlays have their own text fields with no undo history.
-    if (app.getMode() == .normal and app.nav.pending_ctrl_x) {
-        app.nav.pending_ctrl_x = false;
-        if (key.matches('e', .{ .ctrl = true }) or key.matches('e', .{})) {
-            app.clearPendingQuitAt();
-            try @import("external_editor.zig").editPromptInExternalEditor(app);
-            ctx.consumeAndRedraw();
-            return;
-        }
-    }
-    if (app.getMode() == .normal and !app.nav.block_nav and key.matches('x', .{ .ctrl = true })) {
-        app.nav.pending_ctrl_x = true;
-        ctx.consumeEvent();
-        return;
-    }
-    if (app.getMode() == .normal and !app.nav.block_nav and app.inputs.paste_stash.entries.items.len > 0 and key.matches(vaxis.Key.backspace, .{})) {
-        const text = app.inputs.input.buf.dupe() catch null;
-        if (text) |owned| {
-            defer app.gpa.free(owned);
-            const cursor = app.inputs.input.buf.cursor;
-            if (app.inputs.paste_stash.placeholderSpanAtBackspace(owned, cursor)) |span| {
-                const updated = std.fmt.allocPrint(app.gpa, "{s}{s}", .{ owned[0..span.start], owned[span.end..] }) catch null;
-                if (updated) |u| {
-                    defer app.gpa.free(u);
-                    app.clearInput();
-                    try app.inputs.input.insertSliceAtCursor(u);
-                    app.inputs.paste_stash.syncWithText(app.gpa, u);
-                    const cur = app.inputs.input.buf.cursor;
-                    if (span.start < cur) app.inputs.input.buf.moveGapLeft(cur - span.start);
-                    ctx.consumeAndRedraw();
-                    return;
-                }
-            }
-        }
-    }
-    if (app.getMode() == .normal and key.matches('z', .{ .ctrl = true })) {
-        app.clearPendingQuitAt();
-        if (app.input_undo.undo(app)) ctx.consumeAndRedraw();
-        return;
-    }
-    if (app.getMode() == .normal and key.matches('y', .{ .ctrl = true })) {
-        app.clearPendingQuitAt();
-        if (app.input_undo.redoStep(app)) ctx.consumeAndRedraw();
-        return;
-    }
-    if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
-        app.clearPendingQuitAt();
-        // Ctrl+L cycles the focused worker lane in `.dual`; in `.grid`/`.tab`
-        // it falls back to the mode cycle (the same cycle as Ctrl+W).
-        if (app.split_mode == .dual and app.threads.len() > 1) {
-            app.cycleFocusedWorker();
-        } else {
-            app.cycleSplitMode();
-        }
-        ctx.consumeAndRedraw();
-        return;
-    }
-    // Ctrl+W cycles the split layout (dual → grid → tab → dual). Free in
-    // normal mode — the diff viewer (which also binds Ctrl+W) short-circuits
-    // `routeKey` before reaching here.
-    if (key.matches('w', .{ .ctrl = true }) and app.isNormalMode()) {
-        app.clearPendingQuitAt();
-        app.cycleSplitMode();
-        ctx.consumeAndRedraw();
-        return;
-    }
-    // Transcript search: the universal "find" affordance. `/search` is the
-    // guaranteed, terminal-agnostic path; Ctrl+F works when the terminal lets
-    // it through (verified free across all modes — nothing else binds it).
-    if (key.matches('f', .{ .ctrl = true }) and app.isNormalMode()) {
-        app.clearPendingQuitAt();
-        _ = try lifecycle.transitionMode(root, ctx, .open_search);
-        ctx.consumeAndRedraw();
-        return;
-    }
+    if (try routeKeyPromptEditing(app, ctx, key)) return;
+    if (try routeKeyViewChords(app, root, ctx, key)) return;
     // While the jobs modal is open it owns navigation/cancel keys.
     if (app.getBackgroundModal() and app.isNormalMode()) {
         app.clearPendingQuitAt();
@@ -502,13 +423,135 @@ fn routeKey(
         }
         return;
     }
-    // While a bracketed paste is in flight, its bytes are CONTENT, not
-    // commands. Newlines in the paste become prompt newlines (the same
-    // mechanism as Shift+Enter) instead of submitting, and a leading '/'
-    // must not open the command menu. Non-newline bytes are left
-    // unconsumed here on purpose: vxfw only forwards a key to the focused
-    // input when the root capture did not consume it, which is how typed
-    // characters reach the buffer today.
+    if (try routeKeyPastingContent(app, ctx, key)) return;
+    if (try routeKeyCommandMenuEntry(app, root, ctx, key)) return;
+    if (try routeKeySubmit(app, root, ctx, key)) return;
+    if (try routeKeyQueuedNav(app, ctx, key)) return;
+    if (try routeKeyWorkerShift(app, ctx, key)) return;
+    if (try routeKeyPromptCursorNav(app, ctx, key)) return;
+    if (try handlePerModeKey(app, root, ctx, key)) {
+        ctx.consumeAndRedraw();
+    }
+}
+
+/// Mirror prompt edits into the paste stash before any key can remove or
+/// edit a pasted placeholder span, so stale text never desyncs the stash.
+fn routeKeySyncPasteStash(app: *App) void {
+    if (app.inputs.paste_stash.entries.items.len > 0) {
+        if (app.inputs.input.buf.dupe() catch null) |cur_text| {
+            defer app.gpa.free(cur_text);
+            app.inputs.paste_stash.syncWithText(app.gpa, cur_text);
+        }
+    }
+}
+
+/// Normal-mode prompt editing chords, in routeKey's order: pending Ctrl+X →
+/// external editor, Ctrl+X arm, backspace over a pasted placeholder, and the
+/// Ctrl+Z / Ctrl+Y undo/redo pair (#486, #555). Returns true when the key was
+/// fully routed (consumed or deliberately swallowed); false falls through.
+fn routeKeyPromptEditing(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+    // Prompt undo/redo (issue #486): only when the prompt is focused, i.e.
+    // normal mode — overlays have their own text fields with no undo history.
+    if (app.getMode() == .normal and app.nav.pending_ctrl_x) {
+        app.nav.pending_ctrl_x = false;
+        if (key.matches('e', .{ .ctrl = true }) or key.matches('e', .{})) {
+            app.clearPendingQuitAt();
+            try @import("external_editor.zig").editPromptInExternalEditor(app);
+            ctx.consumeAndRedraw();
+            return true;
+        }
+    }
+    if (app.getMode() == .normal and !app.nav.block_nav and key.matches('x', .{ .ctrl = true })) {
+        app.nav.pending_ctrl_x = true;
+        ctx.consumeEvent();
+        return true;
+    }
+    if (try routeKeyPastePlaceholderBackspace(app, ctx, key)) return true;
+    if (app.getMode() == .normal and key.matches('z', .{ .ctrl = true })) {
+        app.clearPendingQuitAt();
+        if (app.input_undo.undo(app)) ctx.consumeAndRedraw();
+        return true;
+    }
+    if (app.getMode() == .normal and key.matches('y', .{ .ctrl = true })) {
+        app.clearPendingQuitAt();
+        if (app.input_undo.redoStep(app)) ctx.consumeAndRedraw();
+        return true;
+    }
+    return false;
+}
+
+/// Backspace over a pasted-placeholder span in normal mode: splices the
+/// placeholder out of the buffer and re-syncs the stash with the shortened
+/// text.
+fn routeKeyPastePlaceholderBackspace(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+    if (app.getMode() == .normal and !app.nav.block_nav and app.inputs.paste_stash.entries.items.len > 0 and key.matches(vaxis.Key.backspace, .{})) {
+        const text = app.inputs.input.buf.dupe() catch null;
+        if (text) |owned| {
+            defer app.gpa.free(owned);
+            const cursor = app.inputs.input.buf.cursor;
+            if (app.inputs.paste_stash.placeholderSpanAtBackspace(owned, cursor)) |span| {
+                const updated = std.fmt.allocPrint(app.gpa, "{s}{s}", .{ owned[0..span.start], owned[span.end..] }) catch null;
+                if (updated) |u| {
+                    defer app.gpa.free(u);
+                    app.clearInput();
+                    try app.inputs.input.insertSliceAtCursor(u);
+                    app.inputs.paste_stash.syncWithText(app.gpa, u);
+                    const cur = app.inputs.input.buf.cursor;
+                    if (span.start < cur) app.inputs.input.buf.moveGapLeft(cur - span.start);
+                    ctx.consumeAndRedraw();
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Cross-mode layout and navigation chords (#555): Ctrl+L cycles the focused
+/// worker lane (falling back to the split-mode cycle outside `.dual`), Ctrl+W
+/// cycles the split layout, Ctrl+F opens transcript search.
+fn routeKeyViewChords(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+    if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
+        app.clearPendingQuitAt();
+        // Ctrl+L cycles the focused worker lane in `.dual`; in `.grid`/`.tab`
+        // it falls back to the mode cycle (the same cycle as Ctrl+W).
+        if (app.split_mode == .dual and app.threads.len() > 1) {
+            app.cycleFocusedWorker();
+        } else {
+            app.cycleSplitMode();
+        }
+        ctx.consumeAndRedraw();
+        return true;
+    }
+    // Ctrl+W cycles the split layout (dual → grid → tab → dual). Free in
+    // normal mode — the diff viewer (which also binds Ctrl+W) short-circuits
+    // `routeKey` before reaching here.
+    if (key.matches('w', .{ .ctrl = true }) and app.isNormalMode()) {
+        app.clearPendingQuitAt();
+        app.cycleSplitMode();
+        ctx.consumeAndRedraw();
+        return true;
+    }
+    // Transcript search: the universal "find" affordance. `/search` is the
+    // guaranteed, terminal-agnostic path; Ctrl+F works when the terminal lets
+    // it through (verified free across all modes — nothing else binds it).
+    if (key.matches('f', .{ .ctrl = true }) and app.isNormalMode()) {
+        app.clearPendingQuitAt();
+        _ = try lifecycle.transitionMode(root, ctx, .open_search);
+        ctx.consumeAndRedraw();
+        return true;
+    }
+    return false;
+}
+
+/// While a bracketed paste is in flight, its bytes are CONTENT, not
+/// commands (#555). Newlines in the paste become prompt newlines (the same
+/// mechanism as Shift+Enter) instead of submitting, and a leading '/'
+/// must not open the command menu. Everything inside the paste window is
+/// reported handled; non-newline bytes stay unconsumed on purpose: vxfw
+/// only forwards a key to the focused input when the root capture did not
+/// consume it, which is how typed characters reach the buffer today.
+fn routeKeyPastingContent(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (app.isPasting() and app.isNormalMode()) {
         if (key.matches('j', .{ .ctrl = true }) or
             key.matches(vaxis.Key.enter, .{ .shift = true }) or
@@ -517,85 +560,110 @@ fn routeKey(
             try app.insertInputNewline();
             ctx.consumeAndRedraw();
         }
-        return;
+        return true;
     }
-    // Keep the slash entry point for existing command workflows. Ctrl+K is an
-    // additional binding; removing slash here would send `/connect` and other
-    // commands to the model because normal submit has no command parser.
+    return false;
+}
+
+/// Slash and Ctrl+K open the command menu (#555). Keep the slash entry point
+/// for existing command workflows. Ctrl+K is an additional binding; removing
+/// slash here would send `/connect` and other commands to the model because
+/// normal submit has no command parser.
+fn routeKeyCommandMenuEntry(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (tui.shouldOpenCommandMenuForSlash(app, key)) {
         _ = try lifecycle.transitionMode(root, ctx, .open_command_menu);
         ctx.consumeAndRedraw();
-        return;
+        return true;
     }
     if (app.isNormalMode() and key.matches('k', .{ .ctrl = true })) {
         _ = try lifecycle.transitionMode(root, ctx, .open_command_menu);
         ctx.consumeAndRedraw();
-        return;
+        return true;
     }
+    return false;
+}
+
+/// Enter-family routing (#555): Shift+Enter inserts a prompt newline; Enter
+/// accepts an @-mention search selection when one is active, else hands the
+/// key to `root.submit` — every mode's Enter disposition is owned by
+/// submitMode (the single wiring site — overlay forms included); the generic
+/// chat submit only fires when no mode arm claimed the key.
+fn routeKeySubmit(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (app.isNormalMode() and key.matches(vaxis.Key.enter, .{ .shift = true })) {
         try app.insertInputNewline();
         ctx.consumeAndRedraw();
-        return;
+        return true;
     }
     if (command_router.isEnterKey(key)) {
         if (app.isAtSearchActive() and app.atSearchHasResults()) {
             try app.acceptAtSelection();
             ctx.consumeAndRedraw();
-            return;
+            return true;
         }
-        // Every mode's Enter disposition is owned by submitMode (the single
-        // wiring site — overlay forms included); the generic chat submit
-        // only fires when no mode arm claimed the key.
         try root.submit(ctx);
-        return;
+        return true;
     }
-    // Arrow keys are owned by the input until the cursor leaves the top of
-    // it. While the input owns them (`!block_nav`) up/down move the cursor
-    // between lines; going up past the first line hands control to block
-    // navigation, and down stays trapped in the input. Once in block
-    // navigation the arrows fall through to `handleTranscriptKey`, which
-    // walks blocks and re-enters the input when you press down past the
-    // last block. The @-mention popup keeps the arrows for itself.
+    return false;
+}
+
+/// ALT+←/→ navigate queued messages; CTRL+→ steers the selected one (#555).
+/// Gated on a non-empty queue so the keys fall through to normal cursor/word
+/// movement otherwise.
+fn routeKeyQueuedNav(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (app.isNormalMode() and !app.isAtSearchActive() and app.queuedCount() > 0) {
-        // ALT+←/→ navigate queued messages; CTRL+→ steers the selected
-        // one. Gated on a non-empty queue so the keys fall through to
-        // normal cursor/word movement otherwise.
         if (key.matches(vaxis.Key.left, .{ .alt = true })) {
             app.selectPrevQueued();
             ctx.consumeAndRedraw();
-            return;
+            return true;
         } else if (key.matches(vaxis.Key.right, .{ .alt = true })) {
             app.selectNextQueued();
             ctx.consumeAndRedraw();
-            return;
+            return true;
         } else if (key.matches(vaxis.Key.right, .{ .ctrl = true })) {
             app.steerSelectedQueued();
             ctx.consumeAndRedraw();
-            return;
+            return true;
         }
     }
-    // In `.dual` split with no queued messages, Alt+Left/Alt+Right shift the
-    // focused worker lane (the right pane). Alt+Right = next worker, Alt+Left
-    // = previous worker, wrapping within `[1, lane_count - 1]` — the only
-    // representable pane-focus bit under Resolved Decision 3. This never swaps
-    // `app.thread`; input routing stays with the driver (lane 0, the left pane).
+    return false;
+}
+
+/// In `.dual` split with no queued messages, Alt+Left/Alt+Right shift the
+/// focused worker lane (the right pane) (#555). Alt+Right = next worker,
+/// Alt+Left = previous worker, wrapping within `[1, lane_count - 1]` — the
+/// only representable pane-focus bit under Resolved Decision 3. This never
+/// swaps `app.thread`; input routing stays with the driver (lane 0, the left
+/// pane).
+fn routeKeyWorkerShift(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (app.isNormalMode() and !app.isAtSearchActive() and app.queuedCount() == 0 and app.split_mode == .dual and app.threads.len() > 1) {
         if (key.matches(vaxis.Key.right, .{ .alt = true })) {
             app.shiftFocusedWorker(1);
             ctx.consumeAndRedraw();
-            return;
+            return true;
         } else if (key.matches(vaxis.Key.left, .{ .alt = true })) {
             app.shiftFocusedWorker(-1);
             ctx.consumeAndRedraw();
-            return;
+            return true;
         }
     }
+    return false;
+}
+
+/// Arrow keys are owned by the input until the cursor leaves the top of it
+/// (#555). While the input owns them (`!block_nav`) up/down move the cursor
+/// between lines; going up past the first line hands control to block
+/// navigation, and down stays trapped in the input. Once in block
+/// navigation the arrows fall through to `handleTranscriptKey`, which
+/// walks blocks and re-enters the input when you press down past the
+/// last block. The @-mention popup keeps the arrows for itself. Returns
+/// false on those fall-throughs so `handlePerModeKey` still sees the key.
+fn routeKeyPromptCursorNav(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (app.isNormalMode() and !app.isAtSearchActive()) {
         if (key.matches(vaxis.Key.up, .{})) {
             if (!app.getBlockNav()) {
                 if (try app.moveInputCursorVertical(.up)) {
                     ctx.consumeAndRedraw();
-                    return;
+                    return true;
                 }
                 // Top line: leave the input and start walking blocks.
                 app.setBlockNav(true);
@@ -606,19 +674,17 @@ fn routeKey(
                     if (try app.moveInputCursorVertical(.down)) {
                         app.clearBlockNav();
                         ctx.consumeAndRedraw();
-                        return;
+                        return true;
                     }
                 }
             } else {
                 _ = try app.moveInputCursorVertical(.down);
                 ctx.consumeAndRedraw();
-                return;
+                return true;
             }
         }
     }
-    if (try handlePerModeKey(app, root, ctx, key)) {
-        ctx.consumeAndRedraw();
-    }
+    return false;
 }
 
 /// Wrapper duty for the per-mode key dispatch (#292): a per-mode handler can
