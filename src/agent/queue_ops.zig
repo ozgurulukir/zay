@@ -71,7 +71,7 @@ pub fn hasQueuedMessages(self: *Agent) bool {
 }
 
 pub fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
-    const peeked = peekQueuedUserMessage(self, steer_only) orelse return 0;
+    const peeked = (try peekQueuedUserMessage(self, steer_only)) orelse return 0;
     defer self.gpa.free(peeked.prompt);
     // Raw (machine-generated) messages bypass `@`-mention expansion and skill
     // prefixing so their body is never reinterpreted; user-typed prompts go
@@ -104,12 +104,12 @@ pub fn clearQueue(self: *Agent) void {
     }
 }
 
-fn peekQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
+fn peekQueuedUserMessage(self: *Agent, steer_only: bool) !?QueuedUserMessage {
     self.message_queue_mutex.lockUncancelable(self.io);
     defer self.message_queue_mutex.unlock(self.io);
     const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
     if (steer_only and !front.steer) return null;
-    const prompt_copy = self.gpa.dupe(u8, front.prompt) catch return null;
+    const prompt_copy = try self.gpa.dupe(u8, front.prompt);
     return .{ .prompt = prompt_copy, .steer = front.steer, .raw = front.raw };
 }
 
