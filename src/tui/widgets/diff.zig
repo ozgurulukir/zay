@@ -40,8 +40,13 @@ pub const DiffBodyWidget = struct {
         // Display rows = diff lines interleaved with one preview row per comment
         // (inserted after the comment's last line). We never materialize the full
         // list: only on-screen rows allocate, so a huge diff stays bounded.
-        const total = lines.len + comments.len;
-        var cursor_display = state.cursor;
+        var total: usize = comments.len;
+        var cursor_display: usize = 0;
+        for (lines, 0..) |line, li| {
+            const rows_for_line = lineDisplayRows(ctx.arena, line, w, state.wrap);
+            if (li < state.cursor) cursor_display += rows_for_line;
+            total += rows_for_line;
+        }
         for (comments) |comment| {
             if (comment.row_end < state.cursor) cursor_display += 1;
         }
@@ -63,10 +68,12 @@ pub const DiffBodyWidget = struct {
         var display: usize = 0;
         var li: usize = 0;
         while (li < lines.len and display < scroll + h) : (li += 1) {
-            if (display >= scroll) {
-                drawDiffRow(&surface, ctx, state, li, @intCast(display - scroll), li >= sel.start and li <= sel.end, active);
+            const line_rows = lineDisplayRows(ctx.arena, lines[li], w, state.wrap);
+            if (display + line_rows > scroll) {
+                const start_sub: usize = if (scroll > display) scroll - display else 0;
+                drawDiffLine(&surface, ctx, state, li, display, start_sub, scroll, h, li >= sel.start and li <= sel.end, active);
             }
-            display += 1;
+            display += line_rows;
             for (comments, 0..) |comment, ci| {
                 if (comment.row_end != li) continue;
                 if (display >= scroll and display < scroll + h) {
@@ -78,6 +85,116 @@ pub const DiffBodyWidget = struct {
         return surface;
     }
 };
+
+fn lineWrapWidth(kind: diff_viewer.LineKind, surface_width: u16) u16 {
+    return switch (kind) {
+        .file_header => @max(surface_width, 1),
+        .hunk_header => @max(surface_width -| 1, 1),
+        else => @max(surface_width -| diff_content_col, 1),
+    };
+}
+
+fn lineDisplayRows(arena: std.mem.Allocator, line: diff_viewer.Line, surface_width: u16, wrap: bool) usize {
+    if (!wrap) return 1;
+    const width = lineWrapWidth(line.kind, surface_width);
+    if (line.kind == .modified) {
+        const d = diff_viewer.inlineDiff(line.old_text, line.new_text);
+        const total_cols = expandedWidth(arena, d.prefix) + expandedWidth(arena, d.old_mid) + expandedWidth(arena, d.new_mid) + expandedWidth(arena, d.suffix);
+        return @max((total_cols + width - 1) / width, 1);
+    }
+    const expanded = expandTabs(arena, line.text) catch line.text;
+    const cols = displayWidth(expanded);
+    return @max((cols + width - 1) / width, 1);
+}
+
+fn expandedWidth(arena: std.mem.Allocator, text: []const u8) usize {
+    const expanded = expandTabs(arena, text) catch text;
+    return displayWidth(expanded);
+}
+
+fn displayWidth(text: []const u8) usize {
+    var cols: usize = 0;
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |g| {
+        cols += vaxis.gwidth.gwidth(g.bytes(text), .unicode);
+    }
+    return cols;
+}
+
+fn drawDiffLine(
+    surface: *vxfw.Surface,
+    ctx: vxfw.DrawContext,
+    state: *diff_viewer.State,
+    idx: usize,
+    display_base: usize,
+    start_sub: usize,
+    scroll: usize,
+    viewport_h: u16,
+    highlighted: bool,
+    active: ?usize,
+) void {
+    if (!state.wrap) {
+        drawDiffRow(surface, ctx, state, idx, @intCast(display_base - scroll), highlighted, active);
+        return;
+    }
+    const line = state.lines.items[idx];
+    const p = tui_style.activePalette();
+    const wrap_w = lineWrapWidth(line.kind, surface.size.width);
+    const total_rows = lineDisplayRows(ctx.arena, line, surface.size.width, true);
+
+    var sub: usize = start_sub;
+    while (sub < total_rows and display_base + sub < scroll + viewport_h) : (sub += 1) {
+        const row: u16 = @intCast(display_base + sub - scroll);
+        const skip_cols: u16 = @intCast(@min(sub * wrap_w, std.math.maxInt(u16)));
+        if (sub == 0) {
+            drawDiffRow(surface, ctx, state, idx, row, highlighted, active);
+            continue;
+        }
+        // Continuation rows keep the row background wash without repeating the line number/sign.
+        const row_bg: ?vaxis.Style = if (highlighted)
+            p.selected
+        else switch (line.kind) {
+            .added => p.diff_added_row,
+            .removed => p.diff_removed_row,
+            else => null,
+        };
+        if (row_bg) |bg| panel.fillRow(surface, row, bg);
+        switch (line.kind) {
+            .file_header => {
+                const content = sliceFromDisplayCol(line.text, skip_cols);
+                panel.lineStyledAt(surface, row, content, ctx, 0, mergedDiffStyle(p.diff_file_header, highlighted)) catch {};
+            },
+            .hunk_header => {
+                const content = sliceFromDisplayCol(line.text, skip_cols);
+                panel.lineStyledAt(surface, row, content, ctx, 1, mergedDiffStyle(p.diff_hunk, highlighted)) catch {};
+            },
+            .meta => {
+                const content = sliceFromDisplayCol(line.text, skip_cols);
+                panel.lineStyledAt(surface, row, content, ctx, diff_content_col, mergedDiffStyle(p.diff_hunk, highlighted)) catch {};
+            },
+            .modified => {
+                const d = diff_viewer.inlineDiff(line.old_text, line.new_text);
+                const neutral = bgMerged(p.thinking_body, row_bg);
+                var remaining = skip_cols;
+                var col = diff_content_col;
+                col = writeDiffSegmentScrolled(surface, ctx, row, col, d.prefix, neutral, &remaining);
+                col = writeDiffSegmentScrolled(surface, ctx, row, col, d.old_mid, p.diff_inline_del, &remaining);
+                col = writeDiffSegmentScrolled(surface, ctx, row, col, d.new_mid, p.diff_inline_add, &remaining);
+                _ = writeDiffSegmentScrolled(surface, ctx, row, col, d.suffix, neutral, &remaining);
+            },
+            .added, .removed, .context => {
+                const fg = switch (line.kind) {
+                    .added => p.tool,
+                    .removed => p.tool_failed,
+                    else => p.thinking_body,
+                };
+                const expanded = expandTabs(ctx.arena, line.text) catch line.text;
+                const content = sliceFromDisplayCol(expanded, skip_cols);
+                panel.lineStyledAt(surface, row, content, ctx, diff_content_col, bgMerged(fg, row_bg)) catch {};
+            },
+        }
+    }
+}
 
 fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *diff_viewer.State, idx: usize, row: u16, highlighted: bool, active: ?usize) void {
     const p = tui_style.activePalette();
@@ -146,11 +263,12 @@ fn drawDiffRow(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *diff_viewe
     if (line.kind == .modified) {
         const d = diff_viewer.inlineDiff(line.old_text, line.new_text);
         const neutral = bgMerged(p.thinking_body, row_bg);
+        var remaining_skip = state.h_scroll;
         var col = diff_content_col;
-        col = writeDiffSegment(surface, ctx, row, col, d.prefix, neutral);
-        col = writeDiffSegment(surface, ctx, row, col, d.old_mid, p.diff_inline_del);
-        col = writeDiffSegment(surface, ctx, row, col, d.new_mid, p.diff_inline_add);
-        _ = writeDiffSegment(surface, ctx, row, col, d.suffix, neutral);
+        col = writeDiffSegmentScrolled(surface, ctx, row, col, d.prefix, neutral, &remaining_skip);
+        col = writeDiffSegmentScrolled(surface, ctx, row, col, d.old_mid, p.diff_inline_del, &remaining_skip);
+        col = writeDiffSegmentScrolled(surface, ctx, row, col, d.new_mid, p.diff_inline_add, &remaining_skip);
+        _ = writeDiffSegmentScrolled(surface, ctx, row, col, d.suffix, neutral, &remaining_skip);
         return;
     }
 
@@ -208,15 +326,32 @@ fn bgMerged(style: vaxis.Style, source: ?vaxis.Style) vaxis.Style {
 /// Write one styled segment of an inline-diff line starting at `col`, expanding
 /// tabs, and return the next free column. Stops at the surface edge.
 fn writeDiffSegment(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, col: u16, text: []const u8, style: vaxis.Style) u16 {
+    var zero: u16 = 0;
+    return writeDiffSegmentScrolled(surface, ctx, row, col, text, style, &zero);
+}
+
+fn writeDiffSegmentScrolled(
+    surface: *vxfw.Surface,
+    ctx: vxfw.DrawContext,
+    row: u16,
+    col: u16,
+    text: []const u8,
+    style: vaxis.Style,
+    remaining_skip: *u16,
+) u16 {
     if (text.len == 0) return col;
     const expanded = expandTabs(ctx.arena, text) catch text;
     var c = col;
     var iter = ctx.graphemeIterator(expanded);
     while (iter.next()) |grapheme| {
-        if (c + 1 >= surface.size.width) return c;
         const bytes = grapheme.bytes(expanded);
         const width: u8 = @intCast(ctx.stringWidth(bytes));
         if (width == 0) continue;
+        if (remaining_skip.* > 0) {
+            remaining_skip.* -|= width;
+            continue;
+        }
+        if (c + width > surface.size.width) return c;
         surface.writeCell(c, row, .{ .char = .{ .grapheme = bytes, .width = width }, .style = style });
         c += width;
     }
@@ -419,4 +554,42 @@ test "expandTabs expands tabs to four spaces and passes plain text through" {
 
     const expanded = try expandTabs(arena.allocator(), "\tindented\ttail");
     try std.testing.expectEqualStrings("    indented    tail", expanded);
+}
+
+test "DiffBodyWidget wraps long lines when wrap is enabled and h_scrolls modified rows" {
+    const gpa = std.testing.allocator;
+    var state: diff_viewer.State = .{};
+    defer state.deinit(gpa);
+
+    try state.lines.append(gpa, .{
+        .kind = .modified,
+        .text = "abcdefghij1234567890",
+        .old_text = "abcdefghijOLD",
+        .new_text = "abcdefghijNEW",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 16, .height = 4 },
+        .max = .{ .width = 16, .height = 4 },
+        .cell_size = .{ .width = 1, .height = 1 },
+    };
+
+    // With wrap=false and h_scroll=10, .modified skips "abcdefghij" and renders "OLDNEW".
+    state.h_scroll = 10;
+    var body: DiffBodyWidget = .{ .state = &state };
+    const surf_hscroll = try body.widget().draw(ctx);
+    try std.testing.expectEqualStrings("O", surf_hscroll.readCell(diff_content_col, 0).char.grapheme);
+
+    // With wrap=true, 16-col width (10 content cols) wraps 16 chars across 2 rows:
+    // row 0 = "abcdefghij", row 1 = "OLDNEW".
+    state.toggleWrap();
+    try std.testing.expect(state.wrap);
+    try std.testing.expectEqual(@as(u16, 0), state.h_scroll);
+    const surf_wrap = try body.widget().draw(ctx);
+    try std.testing.expectEqualStrings("a", surf_wrap.readCell(diff_content_col, 0).char.grapheme);
+    try std.testing.expectEqualStrings("O", surf_wrap.readCell(diff_content_col, 1).char.grapheme);
+    try std.testing.expectEqualStrings("N", surf_wrap.readCell(diff_content_col + 3, 1).char.grapheme);
 }

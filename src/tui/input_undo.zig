@@ -56,6 +56,9 @@ pub const InputUndo = struct {
                 return false;
             }
         }
+        if (app.inputs.paste_stash.entries.items.len > 0) {
+            app.inputs.paste_stash.syncWithText(app.gpa, current);
+        }
         // The buffer changed since the last tick. Push the PREVIOUS state
         // (the pre-edit text) unless this edit coalesces with the last one.
         if (self.last_seen) |seen| {
@@ -102,6 +105,9 @@ pub const InputUndo = struct {
         }
         self.last_seen = null;
         self.restore(app, entry);
+        if (app.inputs.paste_stash.entries.items.len > 0) {
+            app.inputs.paste_stash.syncWithText(app.gpa, entry.text);
+        }
         // The popped snapshot's text was consumed by restore; its allocation
         // ends here.
         app.gpa.free(entry.text);
@@ -119,6 +125,9 @@ pub const InputUndo = struct {
         }
         self.last_seen = null;
         self.restore(app, entry);
+        if (app.inputs.paste_stash.entries.items.len > 0) {
+            app.inputs.paste_stash.syncWithText(app.gpa, entry.text);
+        }
         app.gpa.free(entry.text);
         return true;
     }

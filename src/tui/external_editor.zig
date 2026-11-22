@@ -105,6 +105,58 @@ pub fn editTextInEditor(
     return .{ .ok = normalized };
 }
 
+/// Split `editor_cmd` into argv tokens, respecting single quotes, double
+/// quotes, and backslash escapes, without invoking a shell.
+pub fn parseEditorCommand(gpa: std.mem.Allocator, editor_cmd: []const u8) !std.ArrayList([]u8) {
+    var args: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (args.items) |a| gpa.free(a);
+        args.deinit(gpa);
+    }
+
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(gpa);
+    var in_token = false;
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < editor_cmd.len) : (i += 1) {
+        const c = editor_cmd[i];
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            } else if (quote == '"' and c == '\\' and i + 1 < editor_cmd.len) {
+                i += 1;
+                try current.append(gpa, editor_cmd[i]);
+            } else {
+                try current.append(gpa, c);
+            }
+            continue;
+        }
+        if (std.ascii.isWhitespace(c)) {
+            if (in_token) {
+                try args.append(gpa, try current.toOwnedSlice(gpa));
+                in_token = false;
+            }
+            continue;
+        }
+        in_token = true;
+        if (c == '\'' or c == '"') {
+            quote = c;
+        } else if (c == '\\' and i + 1 < editor_cmd.len) {
+            i += 1;
+            try current.append(gpa, editor_cmd[i]);
+        } else {
+            try current.append(gpa, c);
+        }
+    }
+    if (quote != 0) return error.InvalidEditorCommand;
+    if (in_token) {
+        try args.append(gpa, try current.toOwnedSlice(gpa));
+    }
+    if (args.items.len == 0) return error.InvalidEditorCommand;
+    return args;
+}
+
 pub fn spawnEditor(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -116,33 +168,25 @@ pub fn spawnEditor(
     var line_arg_buf: [24]u8 = undefined;
     const line_arg: ?[]const u8 = if (line) |l| std.fmt.bufPrint(&line_arg_buf, "+{d}", .{l}) catch null else null;
 
-    var child = if (os.is_windows) blk: {
-        const cmdline = if (line_arg) |la|
-            try std.fmt.allocPrint(gpa, "{s} {s} \"{s}\"", .{ editor_cmd, la, file_path })
-        else
-            try std.fmt.allocPrint(gpa, "{s} \"{s}\"", .{ editor_cmd, file_path });
-        defer gpa.free(cmdline);
-        break :blk try std.process.spawn(io, .{
-            .argv = &.{ "cmd", "/c", cmdline },
-            .environ_map = env_map,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        });
-    } else blk: {
-        const shell_cmd = if (line_arg) |la|
-            try std.fmt.allocPrint(gpa, "exec {s} \"{s}\" \"$1\"", .{ editor_cmd, la })
-        else
-            try std.fmt.allocPrint(gpa, "exec {s} \"$1\"", .{editor_cmd});
-        defer gpa.free(shell_cmd);
-        break :blk try std.process.spawn(io, .{
-            .argv = &.{ "sh", "-c", shell_cmd, "zay-editor", file_path },
-            .environ_map = env_map,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        });
-    };
+    var parsed = try parseEditorCommand(gpa, editor_cmd);
+    defer {
+        for (parsed.items) |a| gpa.free(a);
+        parsed.deinit(gpa);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, parsed.items);
+    if (line_arg) |la| try argv.append(gpa, la);
+    try argv.append(gpa, file_path);
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .environ_map = env_map,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
 
     const term = try child.wait(io);
     return switch (term) {
@@ -248,4 +292,20 @@ test "editTextInEditor round-trips edited text and preserves on non-zero exit" {
         .non_zero_exit => |code| try std.testing.expect(code != 0),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parseEditorCommand splits quoted paths and flags without shell expansion" {
+    const gpa = std.testing.allocator;
+    var parsed = try parseEditorCommand(gpa, "\"/path/with spaces/code\" --wait -n");
+    defer {
+        for (parsed.items) |a| gpa.free(a);
+        parsed.deinit(gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 3), parsed.items.len);
+    try std.testing.expectEqualStrings("/path/with spaces/code", parsed.items[0]);
+    try std.testing.expectEqualStrings("--wait", parsed.items[1]);
+    try std.testing.expectEqualStrings("-n", parsed.items[2]);
+
+    try std.testing.expectError(error.InvalidEditorCommand, parseEditorCommand(gpa, "\"unterminated"));
+    try std.testing.expectError(error.InvalidEditorCommand, parseEditorCommand(gpa, "   "));
 }

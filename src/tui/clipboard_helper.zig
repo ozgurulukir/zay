@@ -38,7 +38,10 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     switch (mode_lifecycle.modeTextInputSlot(app)) {
         .prompt => {
             if (paste_stash_mod.shouldCollapse(clean_text)) {
-                const placeholder = try app.inputs.paste_stash.stash(app.gpa, clean_text);
+                const current = try app.inputs.input.buf.dupe();
+                defer app.gpa.free(current);
+                const cursor = app.inputs.input.buf.cursor;
+                const placeholder = try app.inputs.paste_stash.stashAt(app.gpa, clean_text, current, cursor);
                 try app.inputs.input.insertSliceAtCursor(placeholder);
             } else {
                 try app.inputs.input.insertSliceAtCursor(clean_text);
@@ -71,11 +74,21 @@ pub fn pasteFromSystemClipboard(app: *App) !bool {
     return false;
 }
 
+fn formatTruncSuffix(res: clipboard_mod.CopyResult) []const u8 {
+    return if (res.truncated) " (truncated at 10 MB limit)" else "";
+}
+
 /// Copy arbitrary `text` to the system clipboard and append an info notice.
 pub fn copyTextWithNotice(app: *App, text: []const u8, notice: []const u8) !void {
     if (text.len == 0) return;
-    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
-    _ = try app.thread.transcript.append(app.gpa, .info, "clipboard", notice);
+    const res = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
+    if (res.truncated) {
+        const msg = try std.fmt.allocPrint(app.gpa, "{s} (copied {d} bytes, truncated at 10 MB limit)", .{ notice, res.copied_bytes });
+        defer app.gpa.free(msg);
+        _ = try app.thread.transcript.append(app.gpa, .info, "clipboard", msg);
+    } else {
+        _ = try app.thread.transcript.append(app.gpa, .info, "clipboard", notice);
+    }
 }
 
 /// Copy the text of the selected transcript block (or last agent response) to clipboard.
@@ -104,22 +117,20 @@ pub fn copySelectedTranscriptBlock(app: *App) !bool {
         if (selection.message_index == selected_idx) {
             const range = selection.range();
             if (range[1] > range[0] and range[1] <= text.len) {
-                clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text[range[0]..range[1]]);
-                var sel_buf: [64]u8 = undefined;
-                const count = try std.fmt.bufPrint(&sel_buf, "{d}", .{range[1] - range[0]});
-                var notice_buf: [96]u8 = undefined;
-                const notice = std.fmt.bufPrint(&notice_buf, "Copied {s} selected bytes", .{count}) catch "Copied selection";
+                const res = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text[range[0]..range[1]]);
+                var notice_buf: [160]u8 = undefined;
+                const notice = std.fmt.bufPrint(&notice_buf, "Copied {d} selected bytes{s}", .{ res.copied_bytes, formatTruncSuffix(res) }) catch "Copied selection";
                 _ = try app.thread.transcript.append(app.gpa, .info, "clipboard", notice);
                 return true;
             }
         }
     }
 
-    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
+    const res = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), text);
 
     var notice_buf: [256]u8 = undefined;
     const kind_name = @tagName(mirror.kind);
-    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message as plain text ({d} bytes).", .{ kind_name, text.len });
+    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message as plain text ({d} bytes{s}).", .{ kind_name, res.copied_bytes, formatTruncSuffix(res) });
     _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
     return true;
 }
@@ -132,15 +143,15 @@ pub fn copySelectedTranscriptBlockAsMarkdown(app: *App) !bool {
     const mirror = app.thread.transcript.messages.items[selected_idx].mirror();
     if (mirror.body.len == 0) return false;
 
-    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), mirror.body);
+    const res = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), mirror.body);
     var notice_buf: [256]u8 = undefined;
-    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message as Markdown ({d} bytes).", .{ @tagName(mirror.kind), mirror.body.len });
+    const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied {s} message as Markdown ({d} bytes{s}).", .{ @tagName(mirror.kind), res.copied_bytes, formatTruncSuffix(res) });
     _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
     return true;
 }
 
-/// Copy the first `path[:line[:col]]` token in the selected message body
-/// (issue #514).
+/// Copy the first `path[:line[:col]]` token in the active selection (when
+/// present) or in the selected message body (issue #514).
 pub fn copyFirstPathToken(app: *App) !bool {
     const token_scan = @import("token_scan.zig");
     const selected_idx = app.thread.transcript.selected orelse return false;
@@ -148,14 +159,35 @@ pub fn copyFirstPathToken(app: *App) !bool {
     const body = app.thread.transcript.messages.items[selected_idx].mirror().body;
     if (body.len == 0) return false;
 
-    const tokens = try token_scan.scanPathLineTokens(app.gpa, body, 1);
+    var scan_slice: []const u8 = body;
+    if (app.thread.transcript.body_selection) |selection| {
+        if (selection.message_index == selected_idx) {
+            const range = selection.range();
+            if (range[1] > range[0] and range[1] <= body.len) {
+                const sel_tokens = try token_scan.scanPathLineTokens(app.gpa, body[range[0]..range[1]], 1);
+                if (sel_tokens.len > 0) {
+                    defer app.gpa.free(sel_tokens);
+                    const tok = body[range[0] + sel_tokens[0].start .. range[0] + sel_tokens[0].end];
+                    _ = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), tok);
+                    var notice_buf: [256]u8 = undefined;
+                    const notice_text = std.fmt.bufPrint(&notice_buf, "Copied path token: {s}", .{tok}) catch "Copied path token";
+                    _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
+                    return true;
+                }
+                app.gpa.free(sel_tokens);
+                scan_slice = body;
+            }
+        }
+    }
+
+    const tokens = try token_scan.scanPathLineTokens(app.gpa, scan_slice, 1);
     defer app.gpa.free(tokens);
     if (tokens.len == 0) {
         _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", "No path:line token found in selected message.");
         return true;
     }
-    const tok = body[tokens[0].start..tokens[0].end];
-    clipboard_mod.copyToClipboard(app.gpa, app.getIo(), tok);
+    const tok = scan_slice[tokens[0].start..tokens[0].end];
+    _ = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), tok);
     var notice_buf: [256]u8 = undefined;
     const notice_text = std.fmt.bufPrint(&notice_buf, "Copied path token: {s}", .{tok}) catch "Copied path token";
     _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
@@ -206,9 +238,9 @@ pub fn copySelectedCodeBlock(app: *App) !bool {
 
     if (extractFirstCodeBlock(text)) |code| {
         if (code.len > 0) {
-            clipboard_mod.copyToClipboard(app.gpa, app.getIo(), code);
+            const res = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), code);
             var notice_buf: [256]u8 = undefined;
-            const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied code block to clipboard ({d} bytes).", .{code.len});
+            const notice_text = try std.fmt.bufPrint(&notice_buf, "Copied code block to clipboard ({d} bytes{s}).", .{ res.copied_bytes, formatTruncSuffix(res) });
             _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
             return true;
         }
@@ -223,8 +255,10 @@ pub fn copyDiffToClipboard(app: *App) !bool {
     const composed = try app.diff.composeMessage(app.gpa);
     if (composed) |msg| {
         defer app.gpa.free(msg);
-        clipboard_mod.copyToClipboard(app.gpa, app.getIo(), msg);
-        _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", "Copied diff review comments to clipboard.");
+        const res = clipboard_mod.copyToClipboard(app.gpa, app.getIo(), msg);
+        var notice_buf: [128]u8 = undefined;
+        const notice_text = std.fmt.bufPrint(&notice_buf, "Copied diff review comments to clipboard{s}.", .{formatTruncSuffix(res)}) catch "Copied diff review comments to clipboard.";
+        _ = try app.thread.transcript.append(app.gpa, .notice, "clipboard", notice_text);
         return true;
     }
     return false;
