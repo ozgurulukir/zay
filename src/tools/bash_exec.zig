@@ -522,7 +522,7 @@ fn isWindowsBashLauncherPath(path: []const u8) bool {
         containsIgnoreCase(path, "/System32/");
 }
 
-/// Named alias at the Windows-launcher call sites: keeps the intent reads as
+/// Named alias at the Windows-launcher call sites: keeps the intent readable as
 /// a substring probe, with the shared ASCII-folding primitive (#557).
 const containsIgnoreCase = tools_common.containsIgnoreCase;
 
