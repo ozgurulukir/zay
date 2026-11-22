@@ -604,24 +604,25 @@ fn isDangerousBashRedirect(command: []const u8) bool {
 
 fn redirectTargetHasParentTraversal(target: []const u8) bool {
     var i: usize = 0;
-    var token_len: usize = 0;
-    var buf: [256]u8 = undefined;
-    while (i < target.len and token_len < buf.len) : (i += 1) {
-        const c = target[i];
+    var seg_len: usize = 0;
+    var seg_dots: usize = 0;
+    while (i < target.len) : (i += 1) {
+        var c = target[i];
         if (std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&' or c == '\'' or c == '"') break;
         if (c == '\\' and i + 1 < target.len) {
             i += 1;
-            buf[token_len] = target[i];
-        } else {
-            buf[token_len] = c;
+            c = target[i];
         }
-        token_len += 1;
+        if (c == '/') {
+            if (seg_len == 2 and seg_dots == 2) return true;
+            seg_len = 0;
+            seg_dots = 0;
+        } else {
+            seg_len += 1;
+            if (c == '.') seg_dots += 1;
+        }
     }
-    const word = buf[0..token_len];
-    if (std.mem.eql(u8, word, "..")) return true;
-    if (std.mem.startsWith(u8, word, "../")) return true;
-    if (std.mem.endsWith(u8, word, "/..")) return true;
-    return std.mem.indexOf(u8, word, "/../") != null;
+    return seg_len == 2 and seg_dots == 2;
 }
 
 /// Compare `haystack` against `prefix` while unescaping bash backslash escapes
@@ -1537,4 +1538,5 @@ test "bash safety classifier catches backslash redirect, uppercase rm -Rf, and >
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > ${HOME}/out"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > {/etc,/tmp}/pwn"));
     try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > /tmp/../etc/passwd"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("echo x > /" ++ ("a" ** 300) ++ "/../etc/passwd"));
 }

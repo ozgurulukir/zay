@@ -47,37 +47,40 @@ pub const Backend = struct {
     /// The compare skips quotes and backslashes because bash strips them before
     /// command lookup (#439).
     pub fn hasCdGuardBypass(command: []const u8) bool {
-        var it = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()");
-        while (it.next()) |tok| {
-            const is_command = tokenUnescapedEquals(tok, "command");
-            const is_builtin = tokenUnescapedEquals(tok, "builtin");
-            const is_unset = tokenUnescapedEquals(tok, "unset");
-            const is_enable = tokenUnescapedEquals(tok, "enable");
-            if (!is_builtin and !is_command and !is_unset and !is_enable) continue;
-            var next = it.next() orelse break;
-            if (is_command or is_unset or is_enable) {
-                while (next.len > 0 and next[0] == '-') {
-                    next = it.next() orelse break;
-                }
-            }
-            if (is_unset or is_enable) {
-                // Check all remaining words in this segment up to another keyword/command.
-                while (true) {
-                    if (tokenUnescapedEquals(next, "cd") or
-                        tokenUnescapedEquals(next, "pushd") or
-                        tokenUnescapedEquals(next, "popd"))
-                    {
-                        return true;
+        var seg_it = std.mem.tokenizeAny(u8, command, "\n;|&()");
+        while (seg_it.next()) |segment| {
+            var it = std.mem.tokenizeAny(u8, segment, " \t\r");
+            while (it.next()) |tok| {
+                const is_command = tokenUnescapedEquals(tok, "command");
+                const is_builtin = tokenUnescapedEquals(tok, "builtin");
+                const is_unset = tokenUnescapedEquals(tok, "unset");
+                const is_enable = tokenUnescapedEquals(tok, "enable");
+                if (!is_builtin and !is_command and !is_unset and !is_enable) continue;
+                var next = it.next() orelse break;
+                if (is_command or is_unset or is_enable) {
+                    while (next.len > 0 and next[0] == '-') {
+                        next = it.next() orelse break;
                     }
-                    next = it.next() orelse break;
                 }
-                break;
-            }
-            if (tokenUnescapedEquals(next, "cd") or
-                tokenUnescapedEquals(next, "pushd") or
-                tokenUnescapedEquals(next, "popd"))
-            {
-                return true;
+                if (is_unset or is_enable) {
+                    // Check all remaining words in this segment.
+                    while (true) {
+                        if (tokenUnescapedEquals(next, "cd") or
+                            tokenUnescapedEquals(next, "pushd") or
+                            tokenUnescapedEquals(next, "popd"))
+                        {
+                            return true;
+                        }
+                        next = it.next() orelse break;
+                    }
+                    break;
+                }
+                if (tokenUnescapedEquals(next, "cd") or
+                    tokenUnescapedEquals(next, "pushd") or
+                    tokenUnescapedEquals(next, "popd"))
+                {
+                    return true;
+                }
             }
         }
         return false;
@@ -647,6 +650,7 @@ test "hasCdGuardBypass flags quoted and escaped builtin spellings (#439)" {
         "COMMAND cd /tmp",
         "",
         "ls 'builtin' /tmp",
+        "unset FOO; echo cd",
     };
     for (allowed) |command| {
         try std.testing.expect(!Backend.hasCdGuardBypass(command));
