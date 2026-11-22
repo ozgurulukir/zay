@@ -152,7 +152,7 @@ pub fn applyFromConfig(self: *AgentRuntime, config: config_mod.Config) !void {
     // Use provider_name (the config key) so custom providers round-trip.
     // The resolved reasoning effort is persisted too so session-scoped
     // effort survives restart.
-    try self.session_writer.session.updateModel(selection.providerName(), model_id, selection.model().reasoning.resolve().label());
+    try self.session_writer.updateModel(selection.providerName(), model_id, selection.model().reasoning.resolve().label());
 }
 
 pub fn clientState(self: *const AgentRuntime) ClientState {

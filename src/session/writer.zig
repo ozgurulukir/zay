@@ -360,6 +360,12 @@ pub const SessionWriter = struct {
         try self.session.updateModel(provider, model_id, effort_label);
     }
 
+    pub fn sessionSummary(self: *SessionWriter, gpa: std.mem.Allocator) Error!session_mod.SessionSummary {
+        try self.quiesce();
+        defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
+        return self.session.summary(gpa);
+    }
+
     pub fn leaf(self: *const SessionWriter) ?[]const u8 {
         return self.session.leaf();
     }
@@ -368,6 +374,57 @@ pub const SessionWriter = struct {
     /// leaving the calling thread sole owner of the sqlite connection. Pair
     /// with `restart`. Queued entries are written (not dropped) so an
     /// in-flight assistant turn isn't lost.
+    fn isRecoverableFailure(err: anyerror) bool {
+        return switch (err) {
+            error.SqliteBusy,
+            error.Timeout,
+            error.ConnectionFailed,
+            error.HttpServerError,
+            error.HttpRateLimited,
+            error.UnavailableBackend,
+            => true,
+            else => false,
+        };
+    }
+
+    pub fn unsavedCount(self: *SessionWriter) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.entry_queue.len() + @intFromBool(self.failed_entry != null);
+    }
+
+    fn retryFailedEntry(self: *SessionWriter) Error!void {
+        self.mutex.lockUncancelable(self.io);
+        const failure = self.write_failure orelse {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        if (!isRecoverableFailure(failure)) {
+            self.mutex.unlock(self.io);
+            return failure;
+        }
+        const entry_opt = self.failed_entry;
+        self.mutex.unlock(self.io);
+
+        if (entry_opt) |entry| {
+            writeQueuedEntry(self, &entry) catch |err| {
+                self.mutex.lockUncancelable(self.io);
+                self.write_failure = err;
+                self.mutex.unlock(self.io);
+                return err;
+            };
+        }
+
+        self.mutex.lockUncancelable(self.io);
+        if (self.failed_entry) |*owned| {
+            owned.deinit(self.gpa);
+            self.failed_entry = null;
+        }
+        self.write_failure = null;
+        self.mutex.unlock(self.io);
+        log.info("session writer recovered from transient failure", .{});
+    }
+
     fn quiesce(self: *SessionWriter) Error!void {
         self.mutex.lockUncancelable(self.io);
         self.stopping = true;
@@ -377,7 +434,7 @@ pub const SessionWriter = struct {
             thread.join();
             self.thread = null;
         }
-        if (self.write_failure) |failure| return failure;
+        try self.retryFailedEntry();
         // The drain uses the same mutex discipline as the writer thread
         // (`takeQueuedEntry`): enqueue pushes under the mutex, so an
         // unprotected pop here could race a model switch that enqueues
@@ -406,7 +463,9 @@ pub const SessionWriter = struct {
 
     fn restart(self: *SessionWriter) Error!void {
         assert(self.thread == null);
-        if (self.write_failure) |failure| return failure;
+        if (self.write_failure) |failure| {
+            if (!isRecoverableFailure(failure)) return failure;
+        }
         self.stopping = false;
         self.thread = std.Thread.spawn(.{}, runWriter, .{self}) catch |err| {
             self.mutex.lockUncancelable(self.io);
@@ -419,8 +478,19 @@ pub const SessionWriter = struct {
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
         try self.mutex.lock(self.io);
         if (self.write_failure) |failure| {
+            if (!isRecoverableFailure(failure)) {
+                self.mutex.unlock(self.io);
+                return failure;
+            }
+            // Recoverable transient failure: push the new entry and wake the
+            // waiting writer thread to retry the failed entry first.
+            if (!self.entry_queue.push(self.queue, entry)) {
+                self.mutex.unlock(self.io);
+                return error.QueueFull;
+            }
+            self.condition.signal(self.io);
             self.mutex.unlock(self.io);
-            return failure;
+            return;
         }
         if (!self.entry_queue.push(self.queue, entry)) {
             self.mutex.unlock(self.io);
@@ -433,11 +503,37 @@ pub const SessionWriter = struct {
 
 fn runWriter(writer: *SessionWriter) void {
     while (true) {
+        writer.mutex.lockUncancelable(writer.io);
+        const has_failed = writer.failed_entry != null;
+        writer.mutex.unlock(writer.io);
+        if (has_failed) {
+            writer.retryFailedEntry() catch |err| {
+                if (!SessionWriter.isRecoverableFailure(err)) return;
+                writer.mutex.lockUncancelable(writer.io);
+                const queue_len = writer.entry_queue.len();
+                while (writer.entry_queue.len() == queue_len and !writer.stopping) {
+                    writer.condition.waitUncancelable(writer.io, &writer.mutex);
+                }
+                const stop = writer.stopping;
+                writer.mutex.unlock(writer.io);
+                if (stop) return;
+                continue;
+            };
+        }
         if (takeQueuedEntry(writer)) |entry| {
             var owned = entry;
             writeQueuedEntry(writer, &owned) catch |err| {
                 writer.recordFailure(owned, err);
-                return;
+                if (!SessionWriter.isRecoverableFailure(err)) return;
+                writer.mutex.lockUncancelable(writer.io);
+                const queue_len = writer.entry_queue.len();
+                while (writer.entry_queue.len() == queue_len and !writer.stopping) {
+                    writer.condition.waitUncancelable(writer.io, &writer.mutex);
+                }
+                const stop = writer.stopping;
+                writer.mutex.unlock(writer.io);
+                if (stop) return;
+                continue;
             };
             owned.deinit(writer.gpa);
         } else {

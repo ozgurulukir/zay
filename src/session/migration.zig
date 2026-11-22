@@ -404,6 +404,38 @@ fn remoteTableExists(target: anytype, io: std.Io, table: []const u8, is_postgres
     };
 }
 
+fn remoteIndexExists(target: anytype, io: std.Io, index_name: []const u8, is_postgres: bool) !bool {
+    const sql = if (is_postgres)
+        "select count(*) from pg_indexes where indexname = ?"
+    else
+        "select count(*) from sqlite_master where type = 'index' and name = ?";
+    var res = try target.query(io, sql, &.{.{ .text = index_name }});
+    defer res.deinit();
+    if (res.rows.len == 0 or res.rows[0].len == 0) return false;
+    return switch (res.rows[0][0]) {
+        .int => |v| v > 0,
+        else => false,
+    };
+}
+
+fn createdIndexName(sql: []const u8) ?[]const u8 {
+    const prefixes = [_][]const u8{
+        "create unique index if not exists ",
+        "create index if not exists ",
+        "create unique index ",
+        "create index ",
+    };
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, sql, prefix)) {
+            const rest = sql[prefix.len..];
+            var end: usize = 0;
+            while (end < rest.len and rest[end] != ' ' and rest[end] != '\n' and rest[end] != '(') end += 1;
+            if (end > 0) return rest[0..end];
+        }
+    }
+    return null;
+}
+
 /// Extract the table name from a `create table if not exists <name>(...)`
 /// statement, or null when the statement is not of that shape.
 fn createdTableName(sql: []const u8) ?[]const u8 {
@@ -478,8 +510,11 @@ fn applyRemoteMigration(target: anytype, gpa: std.mem.Allocator, io: std.Io, uni
             }
             const recheck_list = if (is_postgres) (unit.postgres_sql orelse unit.sqlite_sql) else unit.sqlite_sql;
             for (recheck_list) |sql| {
-                const table = createdTableName(sql) orelse continue;
-                if (!(try remoteTableExists(target, io, table, is_postgres))) return err;
+                if (createdTableName(sql)) |table| {
+                    if (!(try remoteTableExists(target, io, table, is_postgres))) return err;
+                } else if (createdIndexName(sql)) |index_name| {
+                    if (!(try remoteIndexExists(target, io, index_name, is_postgres))) return err;
+                }
             }
         };
     }
@@ -817,6 +852,9 @@ const RacingAlterTarget = struct {
                 try self.inner.batch(io, &.{
                     .{ .sql = "alter table sessions add column project_key text" },
                     .{ .sql = "create table project_locations(project_key text not null, host_id text not null, cwd text not null, cwd_key text not null, updated_at_ms bigint not null, primary key(project_key, host_id, cwd_key))" },
+                    .{ .sql = "create index if not exists sessions_project_updated on sessions(project_key, updated_at_ms)" },
+                    .{ .sql = "create index if not exists project_locations_lookup on project_locations(project_key, host_id, updated_at_ms)" },
+                    .{ .sql = "create index if not exists project_locations_host_cwd on project_locations(host_id, cwd_key, updated_at_ms)" },
                 });
                 // ...so ours fails with a duplicate-column error.
                 return error.QueryFailed;

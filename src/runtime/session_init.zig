@@ -194,7 +194,7 @@ pub fn initSession(target: *AgentRuntime, genesis: AgentRuntime.Genesis) !void {
 /// attaching the config as-is — resume is never fatal for restore gaps.
 pub fn restoreResumedModel(self: *AgentRuntime, config: config_mod.Config) !void {
     const gpa = self.gpa;
-    var summary = try self.session_writer.session.summary(gpa);
+    var summary = try self.session_writer.sessionSummary(gpa);
     defer summary.deinit(gpa);
     // Resolve the session's stored reasoning effort (if any) so resume
     // restores the exact effort in use at save time. Invalid DB values

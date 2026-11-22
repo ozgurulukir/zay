@@ -248,7 +248,12 @@ pub fn writeBlob(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, bytes
         };
         return writeBlobFile(gpa, io, home_dir, bytes);
     };
-    deleteBlobFile(gpa, io, home_dir) catch {};
+    deleteBlobFile(gpa, io, home_dir) catch |err| {
+        if (err != error.FileNotFound) {
+            log.warn("auth.json cleanup failed ({s}); scrubbing file", .{@errorName(err)});
+            writeBlobFile(gpa, io, home_dir, "{}") catch {};
+        }
+    };
 }
 
 /// Remove the blob from both the keychain and the plaintext file.
