@@ -508,8 +508,9 @@ pub const PluginManager = struct {
         while (iter.next()) |entry| {
             const plugin = entry.value_ptr.*;
             if (!plugin.active or !events.subscribed(&plugin.event_subscriptions, event)) continue;
+            const min_budget_ms: u32 = @min(self.execution_policy.event_budget_ms, 50);
             const remaining = @max(0, deadline - std.Io.Timestamp.now(self.io, .awake).nanoseconds);
-            const remaining_ms: u32 = @intCast(@divFloor(remaining, std.time.ns_per_ms));
+            const remaining_ms: u32 = @max(@as(u32, @intCast(@divFloor(remaining, std.time.ns_per_ms))), min_budget_ms);
             plugin.lockExecution(self.io, remaining_ms, ctx.cancel) catch |err| {
                 if (err == error.Canceled) return;
                 log.warn("plugin.event.skipped plugin={s} event={s} err={s}", .{ plugin.manifest.name, event_name, @errorName(err) });
@@ -522,7 +523,8 @@ pub const PluginManager = struct {
             defer c.lua_settop(plugin.state.handle, top);
             sandbox.resetInstructionBudget(plugin.state.handle);
             const execution_remaining = @max(0, deadline - std.Io.Timestamp.now(self.io, .awake).nanoseconds);
-            execution.capDeadline(plugin.state.handle, @intCast(@divFloor(execution_remaining, std.time.ns_per_ms)));
+            const exec_ms: u32 = @max(@as(u32, @intCast(@divFloor(execution_remaining, std.time.ns_per_ms))), min_budget_ms);
+            execution.capDeadline(plugin.state.handle, exec_ms);
             drainEventCallbacks(plugin.state.handle, plugin.manifest.name, event_name, event);
         }
     }

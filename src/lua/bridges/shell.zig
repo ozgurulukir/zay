@@ -279,7 +279,7 @@ pub fn runShell(L: ?*c.lua_State) callconv(.c) c_int {
 /// Environment variables a plugin may always read. These identify the
 /// runtime environment but carry no secrets, so they stay readable without
 /// the `allow_env` permission (#448). Exact, case-sensitive matches.
-const safe_env_names = [_][]const u8{ "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER", "TZ" };
+const safe_env_names = [_][]const u8{ "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER", "TZ", "OS" };
 
 fn isSafeEnvName(name: []const u8) bool {
     for (safe_env_names) |safe| {
