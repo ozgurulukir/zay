@@ -156,6 +156,7 @@ pub fn readStream(
     // Same last-wins accumulation for the terminal `finish_reason`.
     var finish_reason: ?ai.FinishReason = null;
     var source: stream_part.Source = .{ .reader = reader };
+    defer source.deinit(gpa);
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
         const change = try parseStreamChunk(gpa, data, &content, &reasoning, &stream);
@@ -279,11 +280,11 @@ pub const ChunkChange = struct {
         return true;
     }
 
-    fn recordToolCall(self: *ChunkChange, index: u32) void {
+    fn recordToolCall(self: *ChunkChange, index: u32) !void {
         for (self.tool_call_indexes[0..self.tool_call_count]) |existing| {
             if (existing == index) return;
         }
-        std.debug.assert(self.tool_call_count < tool_call_array_cap);
+        if (self.tool_call_count >= tool_call_array_cap) return error.TooManyToolCalls;
         self.tool_call_indexes[self.tool_call_count] = index;
         self.tool_call_count += 1;
     }
@@ -745,7 +746,7 @@ fn parseToolCallObject(
     }
     if (has_pending_arguments) try target.arguments.appendSlice(gpa, pending.arguments.items);
     const before = change.tool_call_count;
-    change.recordToolCall(physical);
+    try change.recordToolCall(physical);
     if (change.tool_call_count > before) try stream.parts.append(gpa, .{ .tool_call = physical });
 }
 

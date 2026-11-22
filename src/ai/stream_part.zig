@@ -74,26 +74,109 @@ pub const Source = struct {
     reader: *std.Io.Reader,
     chunk_count: u32 = 0,
     bytes_read: u64 = 0,
+    saw_done: bool = false,
+    pending_data: ?[]u8 = null,
 
-    /// Return the next `data:` payload (owned by the caller), or null at the
-    /// `[DONE]` sentinel or end of stream. Skips non-data and keep-alive lines
-    /// and enforces the stream bounds.
+    pub fn deinit(self: *Source, gpa: std.mem.Allocator) void {
+        if (self.pending_data) |p| {
+            gpa.free(p);
+            self.pending_data = null;
+        }
+    }
+
+    /// Return the next SSE event `data:` payload (owned by the caller), or null
+    /// at the `[DONE]` sentinel or end of stream. Consecutive `data:` lines in
+    /// one event are joined with `\n` and dispatched at the blank-line boundary
+    /// (or EOF) per the SSE specification. If a consecutive `data:` line arrives
+    /// after an already-complete JSON object without an intervening blank line,
+    /// the completed object is yielded first so single-newline-delimited streams
+    /// also parse cleanly.
     pub fn next(self: *Source, gpa: std.mem.Allocator) !?[]u8 {
+        if (self.saw_done) {
+            if (self.pending_data) |p| {
+                gpa.free(p);
+                self.pending_data = null;
+            }
+            return null;
+        }
+        var event_buf: std.ArrayList(u8) = .empty;
+        errdefer event_buf.deinit(gpa);
+        var has_data = false;
+
+        if (self.pending_data) |p| {
+            defer gpa.free(p);
+            self.pending_data = null;
+            try event_buf.appendSlice(gpa, p);
+            has_data = true;
+        }
+
         while (try readLine(gpa, self.reader, bytes_max -| self.bytes_read)) |line| {
             defer gpa.free(line);
             self.chunk_count += 1;
             self.bytes_read += line.len;
             if (self.chunk_count > chunk_count_max) return error.StreamTooManyChunks;
             if (self.bytes_read > bytes_max) return error.StreamTooLarge;
+
+            const trimmed_cr = std.mem.trimEnd(u8, line, "\r");
+            if (trimmed_cr.len == 0) {
+                if (has_data) return try event_buf.toOwnedSlice(gpa);
+                continue;
+            }
             switch (classify(line)) {
                 .skip => continue,
-                .done => return null,
-                .data => |data| return try gpa.dupe(u8, data),
+                .done => {
+                    self.saw_done = true;
+                    if (has_data) return try event_buf.toOwnedSlice(gpa);
+                    event_buf.deinit(gpa);
+                    return null;
+                },
+                .data => |data| {
+                    if (has_data and isJsonBalanced(event_buf.items)) {
+                        self.pending_data = try gpa.dupe(u8, data);
+                        return try event_buf.toOwnedSlice(gpa);
+                    }
+                    if (has_data) try event_buf.append(gpa, '\n');
+                    try event_buf.appendSlice(gpa, data);
+                    has_data = true;
+                },
             }
         }
+        if (has_data) return try event_buf.toOwnedSlice(gpa);
+        event_buf.deinit(gpa);
         return null;
     }
 };
+
+fn isJsonBalanced(bytes: []const u8) bool {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len < 2) return false;
+    if (trimmed[0] != '{' and trimmed[0] != '[') return false;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (trimmed) |c| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return !in_string and depth == 0;
+}
 
 /// Read one `\n`-terminated line (delimiter stripped), bounded by `max_bytes`
 /// during the read so an unterminated line cannot exhaust memory (#422).
@@ -236,4 +319,23 @@ test "readLine aborts during read when line exceeds max_bytes (#422)" {
     const gpa = std.testing.allocator;
     var reader = std.Io.Reader.fixed("data: " ++ ("x" ** 64));
     try std.testing.expectError(error.StreamTooLarge, readLine(gpa, &reader, 32));
+}
+
+test "Source.next joins multi-line data events at blank-line boundary (#538)" {
+    const gpa = std.testing.allocator;
+    const sse_input =
+        \\data: {
+        \\data:   "chunk": 1
+        \\data: }
+        \\
+        \\data: [DONE]
+    ;
+    var reader = std.Io.Reader.fixed(sse_input);
+    var source: Source = .{ .reader = &reader };
+
+    const first = (try source.next(gpa)).?;
+    defer gpa.free(first);
+    try std.testing.expectEqualStrings("{\n\"chunk\": 1\n}", first);
+    try std.testing.expect((try source.next(gpa)) == null);
+    try std.testing.expect(source.saw_done);
 }

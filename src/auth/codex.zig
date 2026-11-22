@@ -366,8 +366,17 @@ const AcceptWatchdog = struct {
     }
 
     fn poke(self: *AcceptWatchdog, io: std.Io, cancelled: bool) void {
-        var address = std.Io.net.IpAddress.parseIp4(auth_host, self.port) catch return;
-        if (address.connect(io, .{ .mode = .stream })) |stream| {
+        if (std.Io.net.IpAddress.parseIp4(auth_host, self.port)) |addr4| {
+            pokeAddress(io, addr4, cancelled);
+        } else |_| {}
+        if (std.Io.net.IpAddress.parseIp6("::1", self.port)) |addr6| {
+            pokeAddress(io, addr6, cancelled);
+        } else |_| {}
+    }
+
+    fn pokeAddress(io: std.Io, address: std.Io.net.IpAddress, cancelled: bool) void {
+        var addr = address;
+        if (addr.connect(io, .{ .mode = .stream })) |stream| {
             var local_stream = stream;
             defer local_stream.close(io);
             if (!cancelled) return;
@@ -384,6 +393,38 @@ const AcceptWatchdog = struct {
     }
 };
 
+const AcceptSlot = struct {
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    stream: ?std.Io.net.Stream = null,
+    done: bool = false,
+    active_acceptors: u8 = 0,
+
+    fn offer(self: *AcceptSlot, io: std.Io, stream: std.Io.net.Stream) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.stream == null and !self.done) {
+            self.stream = stream;
+            self.done = true;
+            self.cond.signal(io);
+            return;
+        }
+        var extra = stream;
+        extra.close(io);
+    }
+
+    fn acceptOne(server: *std.Io.net.Server, io: std.Io, slot: *AcceptSlot) void {
+        defer {
+            slot.mutex.lockUncancelable(io);
+            slot.active_acceptors -= 1;
+            if (slot.active_acceptors == 0) slot.cond.signal(io);
+            slot.mutex.unlock(io);
+        }
+        const stream = server.accept(io) catch return;
+        slot.offer(io, stream);
+    }
+};
+
 fn waitForAuthorizationCode(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -392,14 +433,19 @@ fn waitForAuthorizationCode(
     state: []const u8,
     cancel_requested: ?*const std.atomic.Value(bool),
 ) ![]u8 {
-    var address = try std.Io.net.IpAddress.parseIp4(auth_host, port);
-    var server = try address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
+    var address4 = try std.Io.net.IpAddress.parseIp4(auth_host, port);
+    var server4 = try address4.listen(io, .{ .reuse_address = true });
+    defer server4.deinit(io);
 
-    // A hung browser hand-off must not hang the whole process forever: a
-    // watchdog thread bounds the wait and forces `accept` to return when the
-    // deadline passes (the throwaway connection yields an empty request,
-    // surfaced as error.Timeout below).
+    // Also bind IPv6 loopback (`::1`) when available so `http://localhost:...`
+    // callbacks succeed on dual-stack hosts that resolve `localhost` to `::1`
+    // first (#539).
+    var server6_opt: ?std.Io.net.Server = blk: {
+        var address6 = std.Io.net.IpAddress.parseIp6("::1", port) catch break :blk null;
+        break :blk address6.listen(io, .{ .reuse_address = true }) catch null;
+    };
+    defer if (server6_opt) |*s6| s6.deinit(io);
+
     var watchdog = AcceptWatchdog.arm(port, cancel_requested);
     var watchdog_thread = try std.Thread.spawn(.{}, AcceptWatchdog.watch, .{ &watchdog, io, timeout_ms });
     defer {
@@ -407,10 +453,49 @@ fn waitForAuthorizationCode(
         watchdog_thread.join();
     }
 
-    // The watchdog poke completes as an ordinary loopback connection whose
-    // client immediately hangs up; the empty request below surfaces the
-    // deadline as error.Timeout.
-    const stream = try server.accept(io);
+    var slot: AcceptSlot = .{ .active_acceptors = 1 };
+    var t4 = try std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ &server4, io, &slot });
+    const t6_opt: ?std.Thread = if (server6_opt) |*s6| blk: {
+        slot.mutex.lockUncancelable(io);
+        slot.active_acceptors += 1;
+        slot.mutex.unlock(io);
+        if (std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ s6, io, &slot })) |t6| {
+            break :blk t6;
+        } else |_| {
+            slot.mutex.lockUncancelable(io);
+            slot.active_acceptors -= 1;
+            slot.mutex.unlock(io);
+            break :blk null;
+        }
+    } else null;
+    defer {
+        slot.mutex.lockUncancelable(io);
+        slot.done = true;
+        slot.mutex.unlock(io);
+        // Unblock whichever listener thread did not receive the connection.
+        if (std.Io.net.IpAddress.parseIp4(auth_host, port)) |a4| {
+            AcceptWatchdog.pokeAddress(io, a4, false);
+        } else |_| {}
+        if (server6_opt != null) {
+            if (std.Io.net.IpAddress.parseIp6("::1", port)) |a6| {
+                AcceptWatchdog.pokeAddress(io, a6, false);
+            } else |_| {}
+        }
+        t4.join();
+        if (t6_opt) |t6| t6.join();
+    }
+
+    slot.mutex.lockUncancelable(io);
+    while (slot.stream == null and slot.active_acceptors > 0) {
+        slot.cond.waitUncancelable(io, &slot.mutex);
+    }
+    if (slot.stream == null) {
+        slot.mutex.unlock(io);
+        return error.AcceptFailed;
+    }
+    var stream = slot.stream.?;
+    slot.stream = null;
+    slot.mutex.unlock(io);
     defer stream.close(io);
 
     var read_buffer: [8192]u8 = undefined;

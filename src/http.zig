@@ -51,6 +51,13 @@ pub fn logBytesHead(bytes: []const u8) []const u8 {
 /// Returns either `bytes` verbatim (short body, or long body without a
 /// tools array past the head — caller frees nothing) or a freshly
 /// allocated slice (caller frees via `gpa` when `result.ptr != bytes.ptr`).
+pub fn wireBodyLoggingEnabled() bool {
+    if (comptime os.is_windows) return true;
+    const raw = std.c.getenv("ZAY_NO_WIRE_LOG") orelse return true;
+    const val = std.mem.span(raw);
+    return !std.mem.eql(u8, val, "1") and !std.ascii.eqlIgnoreCase(val, "true");
+}
+
 pub fn logBytesToolsTail(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const limit = log_head_bytes_max;
     if (bytes.len <= limit) return bytes;
