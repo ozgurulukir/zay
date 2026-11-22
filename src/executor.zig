@@ -320,17 +320,16 @@ pub const ExecutorService = struct {
         calls: []const ai.ToolCall,
         observer: anytype,
     ) ![]ToolResult {
-        var unused_partial: []ToolResult = &.{};
-        return self.runAllWithPartial(calls, observer, &unused_partial);
+        return self.runAllWithPartial(calls, observer, null);
     }
 
     pub fn runAllWithPartial(
         self: *ExecutorService,
         calls: []const ai.ToolCall,
         observer: anytype,
-        partial_out: *[]ToolResult,
+        partial_out: ?*[]ToolResult,
     ) ![]ToolResult {
-        partial_out.* = &.{};
+        if (partial_out) |out| out.* = &.{};
         const results = try self.gpa.alloc(ToolResult, calls.len);
         var initialized: usize = 0;
         var transferred = false;
@@ -341,12 +340,14 @@ pub const ExecutorService = struct {
         for (calls, 0..) |call, i| {
             if (self.ctx.cancel_requested) |flag| {
                 if (flag.load(.acquire)) {
-                    if (initialized > 0) {
-                        const partial = try self.gpa.alloc(ToolResult, initialized);
-                        @memcpy(partial, results[0..initialized]);
-                        self.gpa.free(results);
-                        transferred = true;
-                        partial_out.* = partial;
+                    if (partial_out) |out| {
+                        if (initialized > 0) {
+                            const partial = try self.gpa.alloc(ToolResult, initialized);
+                            @memcpy(partial, results[0..initialized]);
+                            self.gpa.free(results);
+                            transferred = true;
+                            out.* = partial;
+                        }
                     }
                     return error.Canceled;
                 }
