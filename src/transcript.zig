@@ -102,6 +102,22 @@ pub const ScanCache = struct {
         return self.shell_tokens;
     }
 
+    pub fn cachedPathTokens(self: *const ScanCache, arena: std.mem.Allocator, text: []const u8) []const token_scan.PathLineToken {
+        const ptr = if (text.len > 0) @intFromPtr(text.ptr) else 0;
+        if (self.path_valid and self.path_text_ptr == ptr and self.path_text_len == text.len) {
+            return self.path_tokens;
+        }
+        return token_scan.scanPathLineTokens(arena, text, 64) catch &.{};
+    }
+
+    pub fn cachedShellDiagnostics(self: *const ScanCache, arena: std.mem.Allocator, text: []const u8) []const token_scan.Token {
+        const ptr = if (text.len > 0) @intFromPtr(text.ptr) else 0;
+        if (self.shell_valid and self.shell_text_ptr == ptr and self.shell_text_len == text.len) {
+            return self.shell_tokens;
+        }
+        return token_scan.scanShellDiagnostics(arena, text, 64) catch &.{};
+    }
+
     pub fn invalidate(self: *ScanCache) void {
         self.path_valid = false;
         self.shell_valid = false;

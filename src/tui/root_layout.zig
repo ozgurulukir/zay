@@ -164,7 +164,6 @@ pub fn buildTranscriptProps(app: *App, lane: *tui.Thread, now_ms: i64) tx_widget
     const active_hit = app.pickers.search.activeHit();
     return .{
         .thread = lane,
-        .gpa = app.gpa,
         .has_model_configured = has_model,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,

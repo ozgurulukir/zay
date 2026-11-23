@@ -155,6 +155,8 @@ pub const App = struct {
     /// acquires the worker's approval mutex.
     cached_approval: ?agent_worker.ApprovalSnapshot = null,
     cached_approval_command: []u8 = &.{},
+    cached_approval_generation: u64 = std.math.maxInt(u64),
+    cached_approval_selection: agent_worker.ApprovalChoice = .approve,
     inputs: app_state.InputState,
     /// Cross-pane navigation cursors and the lane-chip hit-test rect.
     nav: app_state.NavState = .{},
@@ -772,12 +774,23 @@ pub const App = struct {
         const lane = permission_mod.approvalLane(self);
         const worker = if (lane) |l| if (l.worker_context) |*wc| wc else null else null;
         if (worker) |w| {
-            if (w.approval.snapshot(w.io, self.gpa, self.thread.permission_selection) catch null) |snap| {
+            const gen = w.approval.generation.load(.acquire);
+            const sel = self.thread.permission_selection;
+            if (gen == self.cached_approval_generation and sel == self.cached_approval_selection) {
+                return;
+            }
+            if (w.approval.snapshot(w.io, self.gpa, sel) catch null) |snap| {
                 if (self.cached_approval_command.len > 0) self.gpa.free(self.cached_approval_command);
                 self.cached_approval_command = @constCast(snap.command);
                 self.cached_approval = snap;
+                self.cached_approval_generation = gen;
+                self.cached_approval_selection = sel;
                 return;
             }
+            self.cached_approval_generation = gen;
+            self.cached_approval_selection = sel;
+        } else {
+            self.cached_approval_generation = std.math.maxInt(u64);
         }
         if (self.cached_approval_command.len > 0) {
             self.gpa.free(self.cached_approval_command);

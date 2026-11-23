@@ -106,18 +106,14 @@ pub const ToastBus = struct {
         }
     }
 
-    /// UI thread: collect the newest `max_visible` non-expired toasts into
-    /// `out` (oldest-to-newest among the visible set), dropping expired ones.
-    /// Returns the number written. `out` must have room for `max_visible`.
-    pub fn drain(self: *ToastBus, out: []Item) usize {
-        if (!self.initialized) return 0;
-        self.mutex.lock(self.io) catch return 0;
+    /// UI thread (tick): drop expired items from the ring buffer. Returns true
+    /// if any item was expired or any active toast remains visible.
+    pub fn expire(self: *ToastBus) bool {
+        if (!self.initialized) return false;
+        self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
         const now_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds();
-        const cap = @min(self.max_visible, @as(u8, @intCast(out.len)));
-
-        // First pass: drop expired items and compact the ring.
         var write: u8 = 0;
         var i: u8 = 0;
         while (i < self.count) : (i += 1) {
@@ -126,18 +122,36 @@ pub const ToastBus = struct {
             if (write != i) self.items[(self.head + write) % max_items] = self.items[idx];
             write += 1;
         }
+        const dropped = self.count - write;
         self.count = write;
+        return dropped > 0 or self.count > 0;
+    }
 
-        // Second pass: copy the newest `cap` non-expired items, oldest-first.
+    /// UI thread (draw): read-only snapshot of the newest `max_visible` toasts
+    /// into `out` (oldest-to-newest) without mutating the ring buffer.
+    pub fn snapshot(self: *ToastBus, out: []Item) usize {
+        if (!self.initialized) return 0;
+        self.mutex.lock(self.io) catch return 0;
+        defer self.mutex.unlock(self.io);
+
+        const cap = @min(self.max_visible, @as(u8, @intCast(out.len)));
         const start = if (self.count > cap) self.count - cap else 0;
         var n: usize = 0;
-        i = start;
+        var i: u8 = start;
         while (i < self.count) : (i += 1) {
             const idx = (self.head + i) % max_items;
             out[n] = self.items[idx];
             n += 1;
         }
         return n;
+    }
+
+    /// UI thread: collect the newest `max_visible` non-expired toasts into
+    /// `out` (oldest-to-newest among the visible set), dropping expired ones.
+    /// Returns the number written. `out` must have room for `max_visible`.
+    pub fn drain(self: *ToastBus, out: []Item) usize {
+        _ = self.expire();
+        return self.snapshot(out);
     }
 
     /// Clear the current toasts (e.g. Esc-to-dismiss).
@@ -173,7 +187,7 @@ pub const Widget = struct {
         const width = ctx.max.width orelse 0;
 
         var items: [max_items]Item = undefined;
-        const n = self.bus.drain(&items);
+        const n = self.bus.snapshot(&items);
         if (n == 0) return vxfw.Surface.empty(self.widget());
 
         // Each toast is a bordered box: 2 rows (border top/bottom) + up to
