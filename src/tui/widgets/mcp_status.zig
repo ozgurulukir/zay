@@ -10,12 +10,14 @@ const tui_style = @import("../style.zig");
 
 pub const State = struct {
     selection: usize = 0,
+    scroll: panel.ListScrollState = .{},
     /// True while the "add server by URL" form is open. The overlay swaps the
     /// server list for a single-line URL input; Enter submits, Esc cancels.
     adding: bool = false,
 
     pub fn reset(self: *State) void {
         self.selection = 0;
+        self.scroll = .{};
         self.adding = false;
     }
 
@@ -69,16 +71,25 @@ pub const Content = struct {
             return surface;
         }
 
-        var row: u16 = 4;
+        const list_start_row: u16 = 4;
         if (self.manager.clients.items.len == 0) {
-            try panel.lineStyledAt(&surface, row, "No MCP servers configured. Press [a] to add a remote server by URL.", ctx, 2, p.thinking_body);
-            try panel.lineStyledAt(&surface, height -| 2, "[a] Add Server  |  [Esc] Close", ctx, 2, p.thinking_body);
+            try panel.lineStyledAt(&surface, list_start_row, "No MCP servers configured. Press [a] to add a remote server by URL.", ctx, 2, p.muted);
+            try panel.lineStyledAt(&surface, height -| 2, "[a] Add Server  |  [Esc] Close", ctx, 2, p.muted);
             return surface;
         }
 
-        for (self.manager.clients.items, 0..) |client, i| {
-            if (row >= height -| 2) break;
-            const is_selected = i == self.state.selection;
+        const footer_reserved: u16 = 2;
+        const avail_rows: u16 = height -| (list_start_row + footer_reserved);
+        const visible_items: u16 = @max(@as(u16, 1), avail_rows / 2);
+        const total_items: u32 = @intCast(self.manager.clients.items.len);
+        const viewport = panel.ViewportWindow.computeStateful(@intCast(self.state.selection), total_items, visible_items, &self.state.scroll);
+
+        var idx = viewport.start_index;
+        while (idx < viewport.end_index) : (idx += 1) {
+            const client = self.manager.clients.items[idx];
+            const row: u16 = list_start_row + viewport.screenRow(idx) * 2;
+            if (row >= height -| footer_reserved) break;
+            const is_selected = idx == self.state.selection;
             if (is_selected) panel.fillRow(&surface, row, p.selected);
 
             const badge = client.status().label();
@@ -99,12 +110,14 @@ pub const Content = struct {
                     "  [{s}] {s} ({s}) - {d} tools ({d}ms)",
                     .{ badge, client.name, transport_tag, tool_count, client.latency_ms },
                 );
-            const style = if (is_selected) p.selected_item else p.thinking_body;
+            const style = if (is_selected) p.selected_item else p.muted;
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
-            row += 2;
+        }
+        if (total_items > visible_items) {
+            panel.drawScrollbarAt(&surface, list_start_row, avail_rows, @intCast(viewport.scroll_top), @intCast(total_items));
         }
 
-        try panel.lineStyledAt(&surface, height -| 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, p.thinking_body);
+        try panel.lineStyledAt(&surface, height -| 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, p.muted);
 
         return surface;
     }

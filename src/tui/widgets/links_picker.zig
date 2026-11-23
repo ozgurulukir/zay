@@ -124,12 +124,12 @@ pub const Content = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        @memset(surface.buffer, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = p.background });
+        panel.fillBackground(&surface);
         if (width == 0 or height == 0) return surface;
 
         const items = self.state.items.items;
         if (items.len == 0) {
-            panel.lineStyledAt(&surface, 0, "  No links in this message · Esc closes", ctx, 1, p.thinking_body) catch {};
+            panel.lineStyledAt(&surface, 0, "  No links in this message · Esc closes", ctx, 1, p.muted) catch {};
             return surface;
         }
 
@@ -146,12 +146,13 @@ pub const Content = struct {
                 try std.fmt.allocPrint(ctx.arena, "{s}  →  {s}", .{ item.label, item.url });
             try panel.commandLine(&surface, screen_row, row_text, ctx, selected);
         }
+        panel.drawViewportScrollbar(&surface, viewport, @intCast(items.len));
         if (height > 1) {
             if (self.state.selectedUrl()) |url| {
                 if (text_fit.measure(url) > width -| 4) {
                     panel.drawDetailFooter(&surface, ctx, height - 1, url);
                 } else {
-                    panel.lineStyledAt(&surface, height - 1, "  Enter/y: copy · o: open · Esc: close", ctx, 1, p.thinking_body) catch {};
+                    panel.lineStyledAt(&surface, height - 1, "  Enter/y: copy · o: open · Esc: close", ctx, 1, p.muted) catch {};
                 }
             }
         }

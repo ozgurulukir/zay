@@ -61,7 +61,7 @@ pub const Content = struct {
 
         const total_matches: u32 = @intCast(matching_entries.items.len);
         if (total_matches == 0) {
-            try panel.lineStyledAt(surface, 0, "  No matching commands", ctx, 1, p.thinking_body);
+            try panel.lineStyledAt(surface, 0, "  No matching commands", ctx, 1, p.muted);
             return;
         }
 
@@ -95,6 +95,7 @@ pub const Content = struct {
                 .highlight_style = self.highlight_style,
             });
         }
+        panel.drawViewportScrollbar(surface, viewport, total_matches);
     }
 };
 

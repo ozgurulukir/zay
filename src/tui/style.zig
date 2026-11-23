@@ -497,7 +497,14 @@ pub const Palette = struct {
     markdown_code_constant: vaxis.Style,
     settings_active_tab: vaxis.Style,
     permission_approve: vaxis.Style,
+    muted: vaxis.Style,
+    border: vaxis.Style,
+    border_focused: vaxis.Style,
 };
+
+fn badgeForeground(bg: Rgb) Rgb {
+    return if (relativeLuminance(bg) > 0.179) .{ 0, 0, 0 } else .{ 255, 255, 255 };
+}
 
 /// Derive the full runtime palette from a theme. For `default_theme` this
 /// reproduces the exact pre-theme styles. Pure and comptime-evaluable, so it
@@ -518,10 +525,10 @@ pub fn buildPalette(theme: Theme) Palette {
         .error_style = .{ .fg = .{ .rgb = theme.failure_red }, .bold = true },
         .info = .{ .fg = .{ .rgb = theme.white } },
         .border_label = .{ .fg = .{ .rgb = theme.accent_orange } },
-        // Bottom-left background-jobs badge: black text on the thinking-blue
-        // fill, so the live-job count reads as a status pill, not body text.
-        .background_badge = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = theme.thinking_blue } },
-        .lanes_badge = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = theme.lane_pink } },
+        // Bottom-left background-jobs badge: pick black or white text from the
+        // fill luminance so light-theme badges maintain WCAG AA contrast.
+        .background_badge = .{ .fg = .{ .rgb = badgeForeground(theme.thinking_blue) }, .bg = .{ .rgb = theme.thinking_blue } },
+        .lanes_badge = .{ .fg = .{ .rgb = badgeForeground(theme.lane_pink) }, .bg = .{ .rgb = theme.lane_pink } },
         .model_status = .{ .fg = .{ .rgb = theme.thinking_blue } },
         .thinking_label = .{ .fg = .{ .rgb = theme.thinking_blue } },
         .thinking_body = .{ .fg = .{ .rgb = theme.muted_gray } },
@@ -562,6 +569,9 @@ pub fn buildPalette(theme: Theme) Palette {
         .markdown_code_constant = .{ .bold = true, .fg = .{ .rgb = theme.amber_yellow } },
         .settings_active_tab = .{ .fg = .{ .rgb = theme.accent_orange }, .ul_style = .single, .bold = true },
         .permission_approve = .{ .fg = .{ .rgb = theme.success_green }, .bold = true },
+        .muted = .{ .fg = .{ .rgb = theme.muted_gray } },
+        .border = .{ .fg = .{ .rgb = theme.muted_gray }, .dim = true },
+        .border_focused = .{ .fg = .{ .rgb = theme.accent_orange } },
     };
 }
 
@@ -659,6 +669,9 @@ pub fn buildMonochromePalette() Palette {
         .markdown_code_constant = .{ .bold = true, .italic = true },
         .settings_active_tab = .{ .bold = true, .ul_style = .single },
         .permission_approve = .{ .bold = true },
+        .muted = .{ .dim = true },
+        .border = .{ .dim = true },
+        .border_focused = .{ .bold = true },
     };
 }
 
@@ -790,6 +803,10 @@ test "every theme's body/background stays readable (WCAG contrast and channel de
         // selection_bg vs background must differ significantly so a selected picker row is
         // visible against a coincident card.
         try std.testing.expect(maxChannelDelta(t.selection_bg, t.background) >= 20);
+        // Badge foregrounds must maintain WCAG AA >= 4.5:1 across light and dark themes.
+        const p = buildPalette(t);
+        try std.testing.expect(contrastRatio(p.background_badge.fg.rgb, p.background_badge.bg.rgb) >= 4.5);
+        try std.testing.expect(contrastRatio(p.lanes_badge.fg.rgb, p.lanes_badge.bg.rgb) >= 4.5);
     }
 }
 

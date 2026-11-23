@@ -208,9 +208,10 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
     // `active` and `focused` are distinct: `active` marks the ●/dim state,
     // `focused` is the single column whose border is highlighted (when the
     // knob is enabled).
-    var border_style: vaxis.Style = if (active) .{} else .{ .dim = true };
+    const p = tui_style.activePalette();
+    var border_style: vaxis.Style = if (active) p.body else p.border;
     if (focused and app.cached_config.tui.highlight_focused_border) {
-        border_style = tui_style.activePalette().border_label;
+        border_style = p.border_label;
     }
     return .{
         .transcript = buildTranscriptProps(app, lane, now_ms),

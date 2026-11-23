@@ -41,6 +41,10 @@ pub fn listSurface(ctx: vxfw.DrawContext, owner: vxfw.Widget, list: vxfw.Widget)
     return vxfw.Surface.initWithChildren(ctx.arena, owner, .{ .width = width, .height = height }, children);
 }
 
+pub const ListScrollState = struct {
+    scroll_top: u32 = 0,
+};
+
 pub const ViewportWindow = struct {
     scroll_top: u32,
     start_index: u32,
@@ -48,15 +52,25 @@ pub const ViewportWindow = struct {
     visible_height: u32,
 
     pub fn compute(selection: u32, total_count: u32, height: u16) ViewportWindow {
+        var scratch: ListScrollState = .{};
+        return computeStateful(selection, total_count, height, &scratch);
+    }
+
+    pub fn computeStateful(selection: u32, total_count: u32, height: u16, scroll_state: *ListScrollState) ViewportWindow {
         const visible_height: u32 = height;
         if (visible_height == 0 or total_count == 0) {
+            scroll_state.scroll_top = 0;
             return .{ .scroll_top = 0, .start_index = 0, .end_index = 0, .visible_height = 0 };
         }
 
-        var scroll_top: u32 = 0;
-        if (selection >= visible_height) {
+        const max_scroll = total_count -| visible_height;
+        var scroll_top = @min(scroll_state.scroll_top, max_scroll);
+        if (selection < scroll_top) {
+            scroll_top = selection;
+        } else if (selection >= scroll_top + visible_height) {
             scroll_top = selection - visible_height + 1;
         }
+        scroll_state.scroll_top = scroll_top;
 
         const end_index = @min(total_count, scroll_top + visible_height);
         return .{
@@ -76,8 +90,17 @@ pub fn secondaryColumn(width: u16) u16 {
     return @min(secondary_column, width / 2);
 }
 
+pub fn drawViewportScrollbar(surface: *vxfw.Surface, viewport: ViewportWindow, total_count: u32) void {
+    if (total_count <= viewport.visible_height or viewport.visible_height == 0) return;
+    drawScrollbarAt(surface, 0, @intCast(viewport.visible_height), @intCast(viewport.scroll_top), @intCast(total_count));
+}
+
 pub fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) void {
-    if (surface.buffer.len == 0 or surface.size.width == 0 or surface.size.height == 0) return;
+    drawScrollbarAt(surface, 0, height, scroll, total);
+}
+
+pub fn drawScrollbarAt(surface: *vxfw.Surface, start_row: u16, height: u16, scroll: u16, total: u16) void {
+    if (surface.buffer.len == 0 or surface.size.width == 0 or surface.size.height == 0 or height == 0) return;
     const p = tui_style.activePalette();
     const col = surface.size.width -| 1;
     const max_s = total -| height;
@@ -88,11 +111,11 @@ pub fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u1
     const top: u16 = @intCast(@as(usize, scroll) * @as(usize, max_top) / @as(usize, max_s));
 
     var r: u16 = 0;
-    while (r < height and r < surface.size.height) : (r += 1) {
+    while (r < height and start_row + r < surface.size.height) : (r += 1) {
         const is_thumb = r >= top and r < top + bar_height;
         const grapheme: []const u8 = if (r == 0) "▲" else if (r == height - 1) "▼" else if (is_thumb) "█" else "│";
-        const style: vaxis.Style = if (is_thumb) p.border_label else p.thinking_body;
-        surface.writeCell(col, r, .{
+        const style: vaxis.Style = if (is_thumb) p.border_label else p.border;
+        surface.writeCell(col, start_row + r, .{
             .char = .{ .grapheme = grapheme, .width = 1 },
             .style = style,
         });
@@ -811,4 +834,19 @@ test "scoreCandidate awards name bonus so name hits outrank description hits" {
     }
     // "xyz" matches neither name nor description
     try std.testing.expect(scoreCandidate("xyz", "Status", "Show agent runtime & git state") == null);
+}
+
+test "ViewportWindow.computeStateful preserves scroll_top on upward navigation (#571)" {
+    var scroll: ListScrollState = .{};
+    // Scroll down to row 10 in a 5-row viewport: scroll_top becomes 6 (window 6..11).
+    const down = ViewportWindow.computeStateful(10, 20, 5, &scroll);
+    try std.testing.expectEqual(@as(u32, 6), down.scroll_top);
+
+    // Move up to row 9: still inside [6, 11), so scroll_top stays 6 (does not pin to bottom).
+    const up_inside = ViewportWindow.computeStateful(9, 20, 5, &scroll);
+    try std.testing.expectEqual(@as(u32, 6), up_inside.scroll_top);
+
+    // Move up to row 5: above scroll_top, so scroll_top shifts to 5.
+    const up_above = ViewportWindow.computeStateful(5, 20, 5, &scroll);
+    try std.testing.expectEqual(@as(u32, 5), up_above.scroll_top);
 }
