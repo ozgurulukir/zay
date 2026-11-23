@@ -64,6 +64,7 @@ pub const EditTarget = enum { none, system_prompt, bash_classifier_url, max_cont
 pub const State = struct {
     tab: Tab = .general,
     selection: TabSelection = @splat(0),
+    general_scroll: panel.ListScrollState = .{},
     edit_target: EditTarget = .none,
     /// Pending (unsaved) edits — null means use the live cached_config value.
     pending_use_responses_endpoint: ?bool = null,
@@ -217,7 +218,7 @@ pub const Content = struct {
             const style: vaxis.Style = if (is_active)
                 p.settings_active_tab
             else
-                p.thinking_body;
+                p.muted;
             try panel.lineStyledAt(surface, 0, label, ctx, col, style);
             col += @intCast(ctx.stringWidth(label) + 2);
         }
@@ -234,101 +235,99 @@ pub const Content = struct {
         // Row 2: section header.
         try panel.lineStyledAt(surface, 2, "GENERAL SETTINGS", ctx, left_col, p.panel_header);
 
-        // Row 4: use_responses_endpoint toggle.
-        {
-            const selected = sel == 0;
-            if (selected) panel.fillRow(surface, 4, p.selected);
-            const value = self.state.pending_use_responses_endpoint orelse
-                (if (self.config.model_selection) |ms| ms.useResponsesEndpoint() else false);
-            const label = try std.fmt.allocPrint(ctx.arena, "  Use Responses Endpoint  {s}", .{boolBadge(value)});
-            const style = if (selected) p.selected_item else p.thinking_body;
-            try panel.lineStyledAt(surface, 4, label, ctx, left_col, style);
-            const desc = "Route completions through the OpenAI Responses API instead of Chat Completions.";
-            try self.drawDescription(surface, ctx, 5, desc, selected);
-        }
+        const list_start_row: u16 = 4;
+        const footer_reserved: u16 = 2;
+        const avail_rows: u16 = surface.size.height -| (list_start_row + footer_reserved);
+        const visible_items: u16 = @max(@as(u16, 1), avail_rows / 3);
+        const viewport = panel.ViewportWindow.computeStateful(sel, general_item_count, visible_items, &self.state.general_scroll);
 
-        // Row 7: toast notifications toggle.
-        {
-            const selected = sel == 1;
-            if (selected) panel.fillRow(surface, 7, p.selected);
-            const value = self.state.pending_toast_enabled orelse
-                (self.config.toast.enabled orelse true);
-            const label = try std.fmt.allocPrint(ctx.arena, "  Toast Notifications  {s}", .{boolBadge(value)});
-            const style = if (selected) p.selected_item else p.thinking_body;
-            try panel.lineStyledAt(surface, 7, label, ctx, left_col, style);
-            const desc = "Show transient notifications (e.g. warnings) in the top-right corner.";
-            try self.drawDescription(surface, ctx, 8, desc, selected);
-        }
+        var idx = viewport.start_index;
+        while (idx < viewport.end_index) : (idx += 1) {
+            const row = list_start_row + viewport.screenRow(idx) * 3;
+            if (row >= surface.size.height -| footer_reserved) break;
+            const selected = sel == idx;
+            if (selected) panel.fillRow(surface, row, p.selected);
+            const style = if (selected) p.selected_item else p.muted;
 
-        // Row 10: animations toggle.
-        {
-            const selected = sel == 2;
-            if (selected) panel.fillRow(surface, 10, p.selected);
-            const value = self.state.pending_animations orelse self.config.tui.animations;
-            const badge = switch (value) {
-                .full => "[full]",
-                .reduced => "[reduced]",
-                .off => "[off]",
-            };
-            const label = try std.fmt.allocPrint(ctx.arena, "  Animations  {s}", .{badge});
-            const style = if (selected) p.selected_item else p.thinking_body;
-            try panel.lineStyledAt(surface, 10, label, ctx, left_col, style);
-            const desc = "TUI animation level (full, reduced motion, or off).";
-            try self.drawDescription(surface, ctx, 11, desc, selected);
-        }
-
-        // Row 13: maxContentWidth numeric field.
-        {
-            const selected = sel == 3;
-            if (selected) panel.fillRow(surface, 13, p.selected);
-            const is_editing = self.state.edit_target == .max_content_width;
-            const value = self.state.pending_max_content_width orelse self.config.tui.max_content_width;
-            const style = if (selected) p.selected_item else p.thinking_body;
-            const prefix = "  Max Content Width  ";
-            try panel.lineStyledAt(surface, 13, prefix, ctx, left_col, style);
-            const val_col = left_col + @as(u16, @intCast(ctx.stringWidth(prefix)));
-            const val_text = if (is_editing)
-                self.max_content_width_input
-            else if (value == 0)
-                "[0 (fill)]"
-            else
-                try std.fmt.allocPrint(ctx.arena, "[{d}]", .{value});
-            const val_style: vaxis.Style = if (selected) p.selected_item else p.model_status;
-            try panel.lineStyledAt(surface, 13, val_text, ctx, val_col, val_style);
-            if (is_editing) {
-                const w = @as(u16, @intCast(ctx.stringWidth(val_text)));
-                surface.cursor = .{ .row = 13, .col = val_col + w };
+            switch (idx) {
+                0 => {
+                    const value = self.state.pending_use_responses_endpoint orelse
+                        (if (self.config.model_selection) |ms| ms.useResponsesEndpoint() else false);
+                    const label = try std.fmt.allocPrint(ctx.arena, "  Use Responses Endpoint  {s}", .{boolBadge(value)});
+                    try panel.lineStyledAt(surface, row, label, ctx, left_col, style);
+                    if (row + 1 < surface.size.height -| footer_reserved) {
+                        try self.drawDescription(surface, ctx, row + 1, "Route completions through the OpenAI Responses API instead of Chat Completions.", selected);
+                    }
+                },
+                1 => {
+                    const value = self.state.pending_toast_enabled orelse
+                        (self.config.toast.enabled orelse true);
+                    const label = try std.fmt.allocPrint(ctx.arena, "  Toast Notifications  {s}", .{boolBadge(value)});
+                    try panel.lineStyledAt(surface, row, label, ctx, left_col, style);
+                    if (row + 1 < surface.size.height -| footer_reserved) {
+                        try self.drawDescription(surface, ctx, row + 1, "Show transient notifications (e.g. warnings) in the top-right corner.", selected);
+                    }
+                },
+                2 => {
+                    const value = self.state.pending_animations orelse self.config.tui.animations;
+                    const badge = switch (value) {
+                        .full => "[full]",
+                        .reduced => "[reduced]",
+                        .off => "[off]",
+                    };
+                    const label = try std.fmt.allocPrint(ctx.arena, "  Animations  {s}", .{badge});
+                    try panel.lineStyledAt(surface, row, label, ctx, left_col, style);
+                    if (row + 1 < surface.size.height -| footer_reserved) {
+                        try self.drawDescription(surface, ctx, row + 1, "TUI animation level (full, reduced motion, or off).", selected);
+                    }
+                },
+                3 => {
+                    const is_editing = self.state.edit_target == .max_content_width;
+                    const value = self.state.pending_max_content_width orelse self.config.tui.max_content_width;
+                    const prefix = "  Max Content Width  ";
+                    try panel.lineStyledAt(surface, row, prefix, ctx, left_col, style);
+                    const val_col = left_col + @as(u16, @intCast(ctx.stringWidth(prefix)));
+                    const val_text = if (is_editing)
+                        self.max_content_width_input
+                    else if (value == 0)
+                        "[0 (fill)]"
+                    else
+                        try std.fmt.allocPrint(ctx.arena, "[{d}]", .{value});
+                    const val_style: vaxis.Style = if (selected) p.selected_item else p.model_status;
+                    try panel.lineStyledAt(surface, row, val_text, ctx, val_col, val_style);
+                    if (is_editing) {
+                        const w = @as(u16, @intCast(ctx.stringWidth(val_text)));
+                        surface.cursor = .{ .row = row, .col = val_col + w };
+                    }
+                    if (row + 1 < surface.size.height -| footer_reserved) {
+                        try self.drawDescription(surface, ctx, row + 1, "Maximum transcript prose width in columns (0 = fill terminal, or 40..500).", selected);
+                    }
+                },
+                4 => {
+                    const value = self.state.pending_density orelse self.config.tui.density;
+                    const badge = switch (value) {
+                        .comfortable => "[comfortable]",
+                        .compact => "[compact]",
+                    };
+                    const label = try std.fmt.allocPrint(ctx.arena, "  Transcript Density  {s}", .{badge});
+                    try panel.lineStyledAt(surface, row, label, ctx, left_col, style);
+                    if (row + 1 < surface.size.height -| footer_reserved) {
+                        try self.drawDescription(surface, ctx, row + 1, "Vertical spacing between transcript messages (comfortable or compact).", selected);
+                    }
+                },
+                5 => {
+                    const value = self.state.pending_show_turn_timestamps orelse self.config.tui.show_turn_timestamps;
+                    const label = try std.fmt.allocPrint(ctx.arena, "  Turn Timestamps  {s}", .{boolBadge(value)});
+                    try panel.lineStyledAt(surface, row, label, ctx, left_col, style);
+                    if (row + 1 < surface.size.height -| footer_reserved) {
+                        try self.drawDescription(surface, ctx, row + 1, "Show a dim separator with timestamp above each user turn.", selected);
+                    }
+                },
+                else => {},
             }
-            const desc = "Maximum transcript prose width in columns (0 = fill terminal, or 40..500).";
-            try self.drawDescription(surface, ctx, 14, desc, selected);
         }
-
-        // Row 16: transcript density toggle.
-        {
-            const selected = sel == 4;
-            if (selected) panel.fillRow(surface, 16, p.selected);
-            const value = self.state.pending_density orelse self.config.tui.density;
-            const badge = switch (value) {
-                .comfortable => "[comfortable]",
-                .compact => "[compact]",
-            };
-            const label = try std.fmt.allocPrint(ctx.arena, "  Transcript Density  {s}", .{badge});
-            const style = if (selected) p.selected_item else p.thinking_body;
-            try panel.lineStyledAt(surface, 16, label, ctx, left_col, style);
-            const desc = "Vertical spacing between transcript messages (comfortable or compact).";
-            try self.drawDescription(surface, ctx, 17, desc, selected);
-        }
-
-        // Row 19: turn timestamps toggle.
-        {
-            const selected = sel == 5;
-            if (selected) panel.fillRow(surface, 19, p.selected);
-            const value = self.state.pending_show_turn_timestamps orelse self.config.tui.show_turn_timestamps;
-            const label = try std.fmt.allocPrint(ctx.arena, "  Turn Timestamps  {s}", .{boolBadge(value)});
-            const style = if (selected) p.selected_item else p.thinking_body;
-            try panel.lineStyledAt(surface, 19, label, ctx, left_col, style);
-            const desc = "Show a dim separator with timestamp above each user turn.";
-            try self.drawDescription(surface, ctx, 20, desc, selected);
+        if (general_item_count > visible_items) {
+            panel.drawViewportScrollbarAt(surface, list_start_row, avail_rows, viewport, general_item_count);
         }
     }
 
@@ -647,4 +646,28 @@ test "settings selection wraps within section" {
 test "settings boolBadge returns correct label" {
     try std.testing.expectEqualStrings("[ON] ", boolBadge(true));
     try std.testing.expectEqualStrings("[OFF]", boolBadge(false));
+}
+
+test "settings General tab scrolls on short terminals so later items stay visible (#571)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state: State = .{};
+    state.selection[@intFromEnum(Tab.general)] = 5; // Turn Timestamps (last item)
+    const cfg: config_mod.Config = .{};
+    var content: Content = .{
+        .state = &state,
+        .config = &cfg,
+        .home_dir = "/tmp",
+        .cwd = "/tmp",
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 60, .height = 10 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+    try std.testing.expectEqual(@as(u16, 10), surface.size.height);
+    // Selection 5 must have scrolled the viewport past item 0.
+    try std.testing.expect(state.general_scroll.scroll_top > 0);
 }

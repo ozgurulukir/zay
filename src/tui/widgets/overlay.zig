@@ -164,7 +164,7 @@ pub const OverlayWidget = struct {
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .labels = border_labels,
-            .style = p.thinking_body,
+            .style = p.border,
         };
         return border.widget().draw(ctx.withConstraints(
             .{ .width = total_w, .height = total_h },
@@ -216,7 +216,7 @@ const OverlayInner = struct {
         while (sep_col < iw) : (sep_col += 1) {
             surface.writeCell(sep_col, 1, .{
                 .char = .{ .grapheme = "─", .width = 1 },
-                .style = p.thinking_body,
+                .style = p.border,
             });
         }
 
