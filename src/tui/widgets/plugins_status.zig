@@ -49,6 +49,7 @@ pub const Content = struct {
     uninstalling: bool = false,
     refreshing: bool = false,
     details: []const u8 = "",
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -56,7 +57,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(

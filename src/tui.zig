@@ -218,6 +218,9 @@ pub const App = struct {
     /// Registry-aware theme catalogue (builtins seeded in `App.init`, custom
     /// JSON themes loaded by `initRuntime`). Owned; freed in `deinitApp`.
     theme_registry: tui_style.ThemeRegistry = .{},
+    /// App-owned presentation state (replaces global `tui_style.active` and `tui_metrics` vars).
+    palette: tui_style.Palette = tui_style.default_palette,
+    presentation: tui_metrics.PresentationConfig = .{},
     /// Snapshot of the active theme taken when the /theme picker opens, so
     /// `Esc` can restore the exact pre-open look. Set in `openThemePicker`,
     /// cleared on commit (`applyTheme`) or cancel (`closeThemePicker`).
@@ -456,7 +459,7 @@ pub const App = struct {
     /// active presentation state and invalidate all lane row caches if metrics
     /// changed. Called on startup (`initRuntime`) and cross-project resume.
     pub fn syncPresentationConfig(self: *App) void {
-        tui_style.setNoColor(tui_style.isNoColorActive(self.cached_config.tui.no_color, self.environ_map));
+        self.presentation.no_color = tui_style.isNoColorActive(self.cached_config.tui.no_color, self.environ_map);
         settings_lifecycle.syncLiveTranscriptMetrics(
             self,
             self.cached_config.tui.max_content_width,
@@ -469,7 +472,18 @@ pub const App = struct {
             self.cached_config.tui.effectiveLightTheme(),
             self.cached_config.tui.effectiveDarkTheme(),
         );
-        tui_style.setActive(active_theme);
+        self.setActiveTheme(active_theme);
+    }
+
+    pub fn activePalette(self: *const App) *const tui_style.Palette {
+        return &self.palette;
+    }
+
+    pub fn setActiveTheme(self: *App, theme: tui_style.Theme) void {
+        self.palette = if (self.presentation.no_color)
+            tui_style.buildMonochromePalette()
+        else
+            tui_style.buildPalette(theme);
     }
 
     /// Test seam mirroring root.zig's hand-off: install a caller-owned
@@ -1463,13 +1477,6 @@ pub fn run(
     if (config.toast.enabled) |enabled| toast.global.enabled = enabled;
     if (config.toast.duration_ms) |ms| toast.global.duration_ms = ms;
     if (config.toast.max_visible) |n| toast.global.max_visible = n;
-
-    // Install the active color theme before the first frame is drawn.
-    tui_style.setNoColor(tui_style.isNoColorActive(config.tui.no_color, init.environ_map));
-    tui_metrics.readable_measure_max = config.tui.max_content_width;
-    tui_metrics.transcript_density = config.tui.density;
-    tui_metrics.show_turn_timestamps = config.tui.show_turn_timestamps;
-    tui_style.setActive(tui_style.resolveTheme(config.theme));
 
     var app = try App.initRuntime(init.io, gpa, runtime, config, config_arena, init.environ_map, host_id);
     // Arm the shared subsystems now that `app` is in its final stack frame.

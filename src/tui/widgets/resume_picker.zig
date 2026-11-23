@@ -36,6 +36,7 @@ pub const Content = struct {
     project_root_error: ?[]const u8 = null,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -73,7 +74,7 @@ pub const Content = struct {
                 .z_index = 0,
             };
             var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, children);
-            panel.drawDetailFooter(&surface, ctx, height -| 1, full);
+            panel.drawDetailFooter(&surface, ctx, height -| 1, full, self.palette);
             return surface;
         }
         return panel.listSurface(ctx, self.widget(), self.list.widget());
@@ -83,7 +84,7 @@ pub const Content = struct {
     /// "nothing matches the current search". Keeps the overlay informative
     /// instead of blank, with a concrete next step.
     fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
@@ -106,7 +107,7 @@ pub const Content = struct {
     /// of the session list. The list stays behind (not redrawn) but the
     /// overlay border label changes to indicate the active sub-state.
     fn drawSubState(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(
@@ -340,6 +341,7 @@ const Row = struct {
     filter: []const u8 = "",
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     const Kind = union(enum) {
         project: Project,
@@ -381,14 +383,13 @@ const Row = struct {
     }
 
     fn drawDateHeader(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, header: DateHeader) !void {
-        _ = self;
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const text = try std.fmt.allocPrint(ctx.arena, "  {s} ({d})", .{ header.label, header.count });
         try panel.lineStyledAt(surface, 0, text, ctx, 2, p.panel_header);
     }
 
     fn drawProject(self: *Row, surface: *vxfw.Surface, ctx: vxfw.DrawContext, project: Project) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         if (self.selected) panel.fillRow(surface, 0, p.selected);
 
         const marker = "  ";
@@ -400,12 +401,12 @@ const Row = struct {
         try panel.lineStyledAt(surface, 0, marker, ctx, start_col, marker_style);
 
         var col: u16 = start_col + @as(u16, @intCast(ctx.stringWidth(marker)));
-        const prefix_style = tui_style.onSelectionBg(p.thinking_body, self.selected);
+        const prefix_style = tui_style.onSelectionBg(p.thinking_body, self.selected, p);
         try panel.lineStyledAt(surface, 0, project.prefix, ctx, col, prefix_style);
         col += @intCast(ctx.stringWidth(project.prefix));
 
         const name = project.label;
-        try panel.lineStyledAt(surface, 0, name, ctx, col, tui_style.onSelectionBg(p.markdown_code, self.selected));
+        try panel.lineStyledAt(surface, 0, name, ctx, col, tui_style.onSelectionBg(p.markdown_code, self.selected, p));
         col += @intCast(ctx.stringWidth(name));
 
         const count = try std.fmt.allocPrint(ctx.arena, " ({d})", .{project.session_count});
@@ -438,8 +439,9 @@ const Row = struct {
             .start_col = panel.panel_margin_x,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .palette = self.palette,
         });
-        try panel.right(surface, 0, modified, ctx, self.selected);
+        try panel.right(surface, 0, modified, ctx, self.selected, self.palette);
     }
 };
 

@@ -34,20 +34,20 @@ pub const ConversationLayout = struct {
     pub const top: u16 = 1;
     pub const bottom: u16 = 1;
 
-    pub fn verticalPadding() @TypeOf(vxfw.Padding.vertical(0)) {
-        const pad = tui_metrics.topSpacingRows();
+    pub fn verticalPadding(pres: tui_metrics.PresentationConfig) @TypeOf(vxfw.Padding.vertical(0)) {
+        const pad = tui_metrics.topSpacingRows(pres);
         return .{
             .top = pad,
             .bottom = pad,
         };
     }
 
-    pub fn messageTop() u16 {
-        return tui_metrics.topSpacingRows();
+    pub fn messageTop(pres: tui_metrics.PresentationConfig) u16 {
+        return tui_metrics.topSpacingRows(pres);
     }
 
-    pub fn contentWidth(width: u16) u16 {
-        return tui_metrics.effectiveContentWidth(width, tui_metrics.readable_measure_max);
+    pub fn contentWidth(width: u16, max_content_width: u16) u16 {
+        return tui_metrics.effectiveContentWidth(width, max_content_width);
     }
 };
 
@@ -83,6 +83,8 @@ pub const MessageWidget = struct {
     /// Shift-arrow body selection (issue #487), resolved per message by the
     /// list builder; `[min, max)` byte range into this message's body.
     selection_range: ?[2]usize = null,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
+    presentation: tui_metrics.PresentationConfig = .{},
 
     pub fn widget(self: *MessageWidget) vxfw.Widget {
         return .{
@@ -94,7 +96,7 @@ pub const MessageWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *MessageWidget = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse ctx.min.width;
-        const requested_height = messageRowsCached(self.message, ConversationLayout.contentWidth(width));
+        const requested_height = messageRowsCached(self.message, ConversationLayout.contentWidth(width, self.presentation.max_content_width), self.presentation);
         var height = clippedSurfaceHeight(width, requested_height);
         if (self.message.* == .logo and self.splash_fills_viewport and self.splash_viewport_height > 0) {
             // Splash-only state: fill the viewport so the intro block can
@@ -105,7 +107,7 @@ pub const MessageWidget = struct {
             .width = width,
             .height = height,
         });
-        MessageWidget.fillCardBackground(&surface);
+        MessageWidget.fillCardBackground(&surface, self.palette);
         try self.drawBody(&surface, ctx);
         return surface;
     }
@@ -123,14 +125,14 @@ pub const MessageWidget = struct {
     /// All case-insensitive `query` hits in `text` as byte-offset style spans
     /// (the same overlay model `drawWrappedStyled` already renders), or null
     /// when there is no query or no hit. Arena-owned.
-    fn findMatchSpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8) ?[]StyleSpan {
+    fn findMatchSpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, p: *const tui_style.Palette) ?[]StyleSpan {
         const q = query orelse return null;
         if (q.len == 0 or q.len > text.len) return null;
         var spans: std.ArrayList(StyleSpan) = .empty;
         var i: usize = 0;
         while (i + q.len <= text.len) : (i += 1) {
             if (std.ascii.eqlIgnoreCase(text[i .. i + q.len], q)) {
-                spans.append(arena, .{ .start = i, .end = i + q.len, .style = searchMatchStyle() }) catch return null;
+                spans.append(arena, .{ .start = i, .end = i + q.len, .style = searchMatchStyle(p) }) catch return null;
                 i += q.len - 1;
             }
             if (spans.items.len >= max_search_spans) break;
@@ -141,34 +143,34 @@ pub const MessageWidget = struct {
 
     /// The search-hit overlay: bold body text over the selection background
     /// (or reverse video in no-color mode).
-    fn searchMatchStyle() vaxis.Style {
-        return tui_style.onSelectionBg(.{ .bold = true }, true);
+    fn searchMatchStyle(p: *const tui_style.Palette) vaxis.Style {
+        return tui_style.onSelectionBg(.{ .bold = true }, true, p);
     }
 
-    fn activeSearchMatchStyle() vaxis.Style {
-        return tui_style.onSelectionBg(.{ .bold = true, .reverse = true }, true);
+    fn activeSearchMatchStyle(p: *const tui_style.Palette) vaxis.Style {
+        return tui_style.onSelectionBg(.{ .bold = true, .reverse = true }, true, p);
     }
 
     /// Combined byte-offset overlays for a body: search hits (issue #484),
     /// active cycled hit (#502), Shift-arrow/mouse selection (#487/#513), and
     /// `path[:line[:col]]` token underlines (#514).
-    fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, active_range: ?[2]usize, selection: ?[2]usize) ?[]StyleSpan {
+    fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, active_range: ?[2]usize, selection: ?[2]usize, p: *const tui_style.Palette) ?[]StyleSpan {
         var spans: std.ArrayList(StyleSpan) = .empty;
         if (active_range) |range| {
             if (range[1] > range[0] and range[1] <= text.len) {
-                spans.append(arena, .{ .start = range[0], .end = range[1], .style = activeSearchMatchStyle() }) catch {};
+                spans.append(arena, .{ .start = range[0], .end = range[1], .style = activeSearchMatchStyle(p) }) catch {};
             }
         }
-        if (findMatchSpans(arena, text, query)) |matches| {
+        if (findMatchSpans(arena, text, query, p)) |matches| {
             spans.appendSlice(arena, matches) catch {};
         }
         if (selection) |range| {
             if (range[1] > range[0] and range[1] <= text.len) {
-                spans.append(arena, .{ .start = range[0], .end = range[1], .style = searchMatchStyle() }) catch {};
+                spans.append(arena, .{ .start = range[0], .end = range[1], .style = searchMatchStyle(p) }) catch {};
             }
         }
         if (token_scan.scanPathLineTokens(arena, text, 64) catch null) |tokens| {
-            var token_style = tui_style.activePalette().tool;
+            var token_style = p.tool;
             token_style.ul_style = .single;
             for (tokens) |tok| {
                 spans.append(arena, .{ .start = tok.start, .end = tok.end, .style = token_style }) catch {};
@@ -194,12 +196,14 @@ pub const MessageWidget = struct {
         query: ?[]const u8,
         active_range: ?[2]usize,
         selection: ?[2]usize,
+        p: *const tui_style.Palette,
+        max_content_width: u16,
     ) void {
-        if (overlaySpans(ctx.arena, text, query, active_range, selection)) |spans| {
-            drawWrappedStyled(surface, text, spans, style, "", bar_style, selected, row, ctx, indent);
+        if (overlaySpans(ctx.arena, text, query, active_range, selection, p)) |spans| {
+            drawWrappedStyled(surface, text, spans, style, "", bar_style, selected, row, ctx, indent, p, max_content_width);
             return;
         }
-        drawWrapped(surface, text, style, selected, row, ctx, indent, bar_style);
+        drawWrapped(surface, text, style, selected, row, ctx, indent, bar_style, p, max_content_width);
     }
 
     fn formatTurnAnchor(arena: std.mem.Allocator, ts_s: i64) []const u8 {
@@ -212,48 +216,48 @@ pub const MessageWidget = struct {
     }
 
     fn drawBody(self: *MessageWidget, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const styled_as_selected = self.selected or !self.message.kind().dimmable();
-        var row: u16 = ConversationLayout.messageTop();
+        var row: u16 = ConversationLayout.messageTop(self.presentation);
         switch (self.message.*) {
             .user => |m| {
-                if (tui_metrics.show_turn_timestamps) {
+                if (self.presentation.show_turn_timestamps) {
                     const anchor = formatTurnAnchor(ctx.arena, m.timestamp_s);
                     var anchor_style = p.thinking_body;
                     anchor_style.dim = true;
-                    drawLine(surface, anchor, anchor_style, styled_as_selected, &row, ctx, 2, null);
+                    drawLine(surface, anchor, anchor_style, styled_as_selected, &row, ctx, 2, null, p);
                 }
-                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.active_search_range, self.selection_range);
+                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
             },
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .skill => |m| {
-                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, null, self.selection_range);
+                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, null, self.selection_range, p, self.presentation.max_content_width);
                 if (m.expanded and m.body.len > 0) {
-                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query, self.active_search_range, self.selection_range);
+                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
                 }
             },
             .notice => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ")) "" else "! ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.active_search_range, self.selection_range);
+                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
             },
             .success => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "✓ ")) "" else "✓ ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.active_search_range, self.selection_range);
+                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
             },
-            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.active_search_range, self.selection_range),
+            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
                 const title_style = if (m.failed) p.tool_failed else p.tool;
-                try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, self.now_ms, &row, ctx);
-                if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx, self.search_query, self.selection_range);
+                try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, self.now_ms, &row, ctx, p, self.presentation.max_content_width);
+                if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx, self.search_query, self.selection_range, p, self.presentation.max_content_width);
             },
             .thinking => |m| {
-                drawLine(surface, m.title, p.thinking_label, styled_as_selected, &row, ctx, 2, p.thinking_bar);
-                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query, self.active_search_range, self.selection_range);
+                drawLine(surface, m.title, p.thinking_label, styled_as_selected, &row, ctx, 2, p.thinking_bar, p);
+                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
             },
-            .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx),
+            .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx, p),
         }
     }
 
@@ -263,12 +267,12 @@ pub const MessageWidget = struct {
         loading_frame: u8,
         row: *u16,
         ctx: vxfw.DrawContext,
+        p: *const tui_style.Palette,
     ) void {
         std.debug.assert(loading_frame < loading_frames.len);
         if (row.* >= surface.size.height) return;
-        const p = tui_style.activePalette();
-        writeText(surface, loading_frames[loading_frame % loading_frames.len], p.thinking_label, true, row.*, ctx, 0);
-        writeText(surface, text, p.thinking_body, true, row.*, ctx, 2);
+        writeText(surface, loading_frames[loading_frame % loading_frames.len], p.thinking_label, true, row.*, ctx, 0, p);
+        writeText(surface, text, p.thinking_body, true, row.*, ctx, 2, p);
         row.* += 1;
     }
 
@@ -281,6 +285,8 @@ pub const MessageWidget = struct {
         now_ms: i64,
         row: *u16,
         ctx: vxfw.DrawContext,
+        p: *const tui_style.Palette,
+        max_content_width: u16,
     ) !void {
         std.debug.assert(loading_frame < loading_frames.len);
         // m6: prefer the precomputed formatted expanded title; fall back to the
@@ -309,16 +315,16 @@ pub const MessageWidget = struct {
                 try std.fmt.allocPrint(ctx.arena, "✗ {s}", .{command})
             else
                 command;
-            try drawStyledCommandTitle(surface, command, display_text, marker_len, prefix, style, selected, row, ctx, indent);
+            try drawStyledCommandTitle(surface, command, display_text, marker_len, prefix, style, selected, row, ctx, indent, p, max_content_width);
             return;
         }
 
         if (failed) {
             const marked = try std.fmt.allocPrint(ctx.arena, "✗ {s}", .{command});
-            drawToolTitleWrapped(surface, prefix, marked, style, selected, row, ctx);
+            drawToolTitleWrapped(surface, prefix, marked, style, selected, row, ctx, p, max_content_width);
             return;
         }
-        drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx);
+        drawToolTitleWrapped(surface, prefix, command, style, selected, row, ctx, p, max_content_width);
     }
 
     /// Render a formatted command title with an accent name + dimmed args
@@ -334,8 +340,9 @@ pub const MessageWidget = struct {
         row: *u16,
         ctx: vxfw.DrawContext,
         indent: u16,
+        p: *const tui_style.Palette,
+        max_content_width: u16,
     ) !void {
-        const p = tui_style.activePalette();
         const name_end = std.mem.indexOfScalar(u8, command, ' ') orelse command.len;
         const base = marker_len;
         var spans: [3]StyleSpan = undefined;
@@ -351,7 +358,7 @@ pub const MessageWidget = struct {
             spans[n] = .{ .start = base + name_end, .end = base + command.len, .style = p.thinking_body };
             n += 1;
         }
-        drawWrappedStyled(surface, display_text, spans[0..n], style, prefix, null, selected, row, ctx, indent);
+        drawWrappedStyled(surface, display_text, spans[0..n], style, prefix, null, selected, row, ctx, indent, p, max_content_width);
     }
 
     /// Byte length of the `✗ ` failure marker ("✗" is 3 UTF-8 bytes + 1 space).
@@ -367,13 +374,15 @@ pub const MessageWidget = struct {
         selected: bool,
         row: *u16,
         ctx: vxfw.DrawContext,
+        p: *const tui_style.Palette,
+        max_content_width: u16,
     ) void {
         std.debug.assert(prefix.len > 0);
         const indent: u16 = 3;
-        const content_width = ConversationLayout.contentWidth(surface.size.width);
+        const content_width = ConversationLayout.contentWidth(surface.size.width, max_content_width);
         const width = @max(content_width -| indent, 1);
         if (command.len == 0) {
-            drawToolTitleLine(surface, prefix, "", style, selected, row, ctx);
+            drawToolTitleLine(surface, prefix, "", style, selected, row, ctx, p);
             return;
         }
 
@@ -381,7 +390,7 @@ pub const MessageWidget = struct {
         while (start < command.len) {
             const end = wrappedLineEnd(command, start, width, ctx);
             const line_prefix = if (start == 0) prefix else "";
-            drawToolTitleLine(surface, line_prefix, command[start..end], style, selected, row, ctx);
+            drawToolTitleLine(surface, line_prefix, command[start..end], style, selected, row, ctx, p);
             start = skipLinearWhitespace(command, end);
         }
     }
@@ -394,11 +403,11 @@ pub const MessageWidget = struct {
         selected: bool,
         row: *u16,
         ctx: vxfw.DrawContext,
+        p: *const tui_style.Palette,
     ) void {
         if (row.* >= surface.size.height) return;
-        const p = tui_style.activePalette();
-        if (prefix.len > 0) writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
-        writeText(surface, command, style, selected, row.*, ctx, 3);
+        if (prefix.len > 0) writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0, p);
+        writeText(surface, command, style, selected, row.*, ctx, 3, p);
         row.* += 1;
     }
 
@@ -444,37 +453,37 @@ pub const MessageWidget = struct {
             (surface.size.height -| blackhole.intro_block_rows) / 2
         else
             row_start;
-        drawBlackhole(surface, frame_index, block_row);
+        self.drawBlackhole(surface, frame_index, block_row);
         self.drawConnectHint(surface, block_row + blackhole.rows, ctx);
         row.* = row_start + blackhole.intro_block_rows;
     }
 
-    fn drawBlackhole(surface: *vxfw.Surface, frame_index: u16, row_start: u16) void {
+    fn drawBlackhole(self: *MessageWidget, surface: *vxfw.Surface, frame_index: u16, row_start: u16) void {
         const data = blackhole.frame(frame_index);
         var row = row_start;
         var iter = std.mem.splitScalar(u8, data, '\n');
         while (iter.next()) |line| : (row += 1) {
-            writeBlackholeLine(surface, line, row);
+            self.writeBlackholeLine(surface, line, row);
         }
     }
 
     fn drawConnectHint(self: *MessageWidget, surface: *vxfw.Surface, row: u16, ctx: vxfw.DrawContext) void {
         if (self.has_model_configured) return;
         const hint_width: u16 = @intCast(ctx.stringWidth(logo_connect_text));
-        const content_width = ConversationLayout.contentWidth(surface.size.width);
+        const content_width = ConversationLayout.contentWidth(surface.size.width, self.presentation.max_content_width);
         const col_start = ConversationLayout.left + (content_width -| hint_width) / 2;
         if (col_start >= surface.size.width -| ConversationLayout.right) return;
-        writeLogoLine(surface, logo_connect_text, row, col_start, ctx);
+        self.writeLogoLine(surface, logo_connect_text, row, col_start, ctx);
     }
 
     // Frames are single-width ASCII, so we walk bytes directly (no grapheme
     // segmentation) and slice glyph bytes out of the static frame data — those
     // slices outlive the render, so the cells need no allocation. Void bytes
     // are skipped entirely, leaving the terminal background as empty space.
-    fn writeBlackholeLine(surface: *vxfw.Surface, line: []const u8, row: u16) void {
+    fn writeBlackholeLine(self: *MessageWidget, surface: *vxfw.Surface, line: []const u8, row: u16) void {
         if (row >= surface.size.height) return;
-        const p = tui_style.activePalette();
-        var col = ConversationLayout.left + (ConversationLayout.contentWidth(surface.size.width) -| blackhole.cols) / 2;
+        const p = self.palette;
+        var col = ConversationLayout.left + (ConversationLayout.contentWidth(surface.size.width, self.presentation.max_content_width) -| blackhole.cols) / 2;
         const col_limit = surface.size.width -| ConversationLayout.right;
         for (line, 0..) |byte, i| {
             if (col >= col_limit) return;
@@ -491,9 +500,9 @@ pub const MessageWidget = struct {
         }
     }
 
-    fn writeLogoLine(surface: *vxfw.Surface, line: []const u8, row: u16, col_start: u16, ctx: vxfw.DrawContext) void {
+    fn writeLogoLine(self: *MessageWidget, surface: *vxfw.Surface, line: []const u8, row: u16, col_start: u16, ctx: vxfw.DrawContext) void {
         if (row >= surface.size.height) return;
-        const p = tui_style.activePalette();
+        const p = self.palette;
         var col = col_start;
         const col_limit = surface.size.width -| ConversationLayout.right;
         var iter = ctx.graphemeIterator(line);
@@ -520,18 +529,20 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         indent: u16,
         bar_style: ?vaxis.Style,
+        p: *const tui_style.Palette,
+        max_content_width: u16,
     ) void {
-        const content_width = ConversationLayout.contentWidth(surface.size.width);
+        const content_width = ConversationLayout.contentWidth(surface.size.width, max_content_width);
         const width = @max(content_width -| indent, 1);
         if (text.len == 0) {
-            drawLine(surface, "", style, selected, row, ctx, indent, bar_style);
+            drawLine(surface, "", style, selected, row, ctx, indent, bar_style, p);
             return;
         }
 
         var line_start: usize = 0;
         while (line_start <= text.len) {
             const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
-            drawWrappedHardLine(surface, text[line_start..line_end], style, selected, row, ctx, indent, bar_style, width);
+            drawWrappedHardLine(surface, text[line_start..line_end], style, selected, row, ctx, indent, bar_style, width, p);
             if (line_end == text.len) break;
             line_start = line_end + 1;
         }
@@ -547,15 +558,16 @@ pub const MessageWidget = struct {
         indent: u16,
         bar_style: ?vaxis.Style,
         width: u16,
+        p: *const tui_style.Palette,
     ) void {
         if (line.len == 0) {
-            drawLine(surface, "", style, selected, row, ctx, indent, bar_style);
+            drawLine(surface, "", style, selected, row, ctx, indent, bar_style, p);
             return;
         }
         var start: usize = 0;
         while (start < line.len) {
             const end = wrappedLineEnd(line, start, width, ctx);
-            drawLine(surface, line[start..end], style, selected, row, ctx, indent, bar_style);
+            drawLine(surface, line[start..end], style, selected, row, ctx, indent, bar_style, p);
             start = skipLinearWhitespace(line, end);
         }
     }
@@ -569,10 +581,11 @@ pub const MessageWidget = struct {
         ctx: vxfw.DrawContext,
         indent: u16,
         bar_style: ?vaxis.Style,
+        p: *const tui_style.Palette,
     ) void {
         if (row.* >= surface.size.height) return;
-        if (bar_style) |active_bar_style| writeText(surface, "┃", active_bar_style, selected, row.*, ctx, 0);
-        writeText(surface, text, style, selected, row.*, ctx, indent);
+        if (bar_style) |active_bar_style| writeText(surface, "┃", active_bar_style, selected, row.*, ctx, 0, p);
+        writeText(surface, text, style, selected, row.*, ctx, indent, p);
         row.* += 1;
     }
 
@@ -584,8 +597,9 @@ pub const MessageWidget = struct {
         row: u16,
         ctx: vxfw.DrawContext,
         start_col: u16,
+        p: *const tui_style.Palette,
     ) void {
-        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "", &.{});
+        writeTextWithLink(surface, text, style, selected, row, ctx, start_col, "", &.{}, p);
     }
 
     fn writeTextWithLink(
@@ -598,6 +612,7 @@ pub const MessageWidget = struct {
         start_col: u16,
         link_url: []const u8,
         hls: []const StyleSpan,
+        p: *const tui_style.Palette,
     ) void {
         var col = ConversationLayout.left + start_col;
         const col_limit = surface.size.width -| ConversationLayout.right;
@@ -619,7 +634,7 @@ pub const MessageWidget = struct {
                 const offset = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
                 for (hls) |range| {
                     if (offset >= range.start and offset < range.end) {
-                        cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg, .reverse = range.style.reverse }, selected);
+                        cell.style = tui_style.onSelectionBg(.{ .bold = true, .fg = cell.style.fg, .reverse = range.style.reverse }, selected, p);
                         break;
                     }
                 }
@@ -641,8 +656,8 @@ pub const MessageWidget = struct {
     /// margins, blank lines, black-hole void) carry the themed card background. An
     /// explicit (non-`.default`) cell is required — `.default` composites as
     /// terminal-default. `writeCellOnCard` then preserves this on text cells.
-    pub fn fillCardBackground(surface: *vxfw.Surface) void {
-        const bg: vaxis.Style = tui_style.activePalette().background;
+    pub fn fillCardBackground(surface: *vxfw.Surface, p: *const tui_style.Palette) void {
+        const bg: vaxis.Style = p.background;
         const fill_cell = vaxis.Cell{
             .char = .{}, // default space grapheme
             .style = .{ .bg = bg.bg },
@@ -694,9 +709,9 @@ fn drawMarkdown(
     row: *u16,
     ctx: vxfw.DrawContext,
 ) void {
-    const p = tui_style.activePalette();
+    const p = self.palette;
     const text = self.message.agent.body;
-    const content_width = @max(ConversationLayout.contentWidth(surface.size.width), 1);
+    const content_width = @max(ConversationLayout.contentWidth(surface.size.width, self.presentation.max_content_width), 1);
 
     const rows: []const terminal_markdown.Row = rows: {
         if (text.len > render_cache_max_bytes) {
@@ -708,7 +723,7 @@ fn drawMarkdown(
                     text.len,
                     content_width,
                 });
-                MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null);
+                MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null, p, self.presentation.max_content_width);
                 return;
             }).rows;
         }
@@ -719,16 +734,12 @@ fn drawMarkdown(
                 text.len,
                 content_width,
             });
-            MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null);
+            MessageWidget.drawWrapped(surface, text, p.body, selected, row, ctx, 0, null, p, self.presentation.max_content_width);
             return;
         };
     };
 
-    // Search-hit ranges over the body (issue #484). Markdown spans borrow the
-    // body bytes, so a span's absolute offset is `span.text.ptr - body.ptr`;
-    // owned-text spans (stacked table keys) fall outside the body bounds and
-    // simply never highlight.
-    const match_spans: ?[]StyleSpan = MessageWidget.overlaySpans(ctx.arena, text, self.search_query, self.active_search_range, self.selection_range);
+    const match_spans: ?[]StyleSpan = MessageWidget.overlaySpans(ctx.arena, text, self.search_query, self.active_search_range, self.selection_range, p);
     for (rows) |markdown_row| {
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
@@ -751,15 +762,14 @@ fn drawMarkdown(
                     }
                 }
             }
-            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style), selected, row.*, ctx, start_col, span.link_url, rel_buf[0..rel_count]);
+            MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style, p), selected, row.*, ctx, start_col, span.link_url, rel_buf[0..rel_count], p);
             start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
         }
         row.* += 1;
     }
 }
 
-fn markdownStyle(style: terminal_markdown.Style) vaxis.Style {
-    const p = tui_style.activePalette();
+fn markdownStyle(style: terminal_markdown.Style, p: *const tui_style.Palette) vaxis.Style {
     return switch (style) {
         .normal => p.body,
         .heading => p.markdown_heading,
@@ -801,33 +811,34 @@ fn drawToolBody(
     ctx: vxfw.DrawContext,
     query: ?[]const u8,
     selection: ?[2]usize,
+    p: *const tui_style.Palette,
+    max_content_width: u16,
 ) !void {
-    const p = tui_style.activePalette();
     if (message.group_items.len > 0) {
         var buf: [256]u8 = undefined;
         for (message.group_items) |item| {
             const item_text = try ctx.arena.dupe(u8, tui_metrics.formatGroupItemRow(&buf, item));
             const item_style = if (item.failed) p.tool_failed else p.thinking_body;
-            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, null, selection);
+            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, null, selection, p, max_content_width);
         }
         return;
     }
     if (message.parts.len > 0) {
         for (message.parts) |part| {
             switch (part.kind) {
-                .text => drawToolTextSegment(surface, part.text, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection),
-                .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx),
-                .json => drawJson(surface, part, selected, row, ctx),
+                .text => drawToolTextSegment(surface, part.text, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection, p, max_content_width),
+                .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx, p, max_content_width),
+                .json => drawJson(surface, part, selected, row, ctx, p, max_content_width),
             }
         }
     } else if (message.body.len > 0) {
         switch (message.render) {
-            .plain, .shell => drawToolTextSegment(surface, message.body, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection),
-            .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx),
+            .plain, .shell => drawToolTextSegment(surface, message.body, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection, p, max_content_width),
+            .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx, p, max_content_width),
         }
     }
     if (message.stderr) |stderr| {
-        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, null, selection);
+        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, null, selection, p, max_content_width);
     }
 }
 
@@ -841,18 +852,19 @@ fn drawToolTextSegment(
     ctx: vxfw.DrawContext,
     query: ?[]const u8,
     selection: ?[2]usize,
+    p: *const tui_style.Palette,
+    max_content_width: u16,
 ) void {
-    const p = tui_style.activePalette();
     if (tui_metrics.splitToolBodyHeadTail(text, expanded_in_place)) |ht| {
         var fbuf: [96]u8 = undefined;
         const formatted_footer = tui_metrics.formatTruncationFooter(&fbuf, ht.omitted_lines);
         const footer = ctx.arena.dupe(u8, formatted_footer) catch "… more lines · Enter to expand in place";
-        drawToolStyledText(surface, ht.head, render, selected, row, ctx, query, selection);
-        MessageWidget.drawWrapped(surface, footer, .{ .fg = p.thinking_body.fg, .dim = true }, selected, row, ctx, 0, null);
-        drawToolStyledText(surface, ht.tail, render, selected, row, ctx, query, selection);
+        drawToolStyledText(surface, ht.head, render, selected, row, ctx, query, selection, p, max_content_width);
+        MessageWidget.drawWrapped(surface, footer, .{ .fg = p.thinking_body.fg, .dim = true }, selected, row, ctx, 0, null, p, max_content_width);
+        drawToolStyledText(surface, ht.tail, render, selected, row, ctx, query, selection, p, max_content_width);
         return;
     }
-    drawToolStyledText(surface, text, render, selected, row, ctx, query, selection);
+    drawToolStyledText(surface, text, render, selected, row, ctx, query, selection, p, max_content_width);
 }
 
 fn drawToolStyledText(
@@ -864,20 +876,21 @@ fn drawToolStyledText(
     ctx: vxfw.DrawContext,
     query: ?[]const u8,
     selection: ?[2]usize,
+    p: *const tui_style.Palette,
+    max_content_width: u16,
 ) void {
-    const p = tui_style.activePalette();
     if (render != .shell) {
-        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, null, selection);
+        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, null, selection, p, max_content_width);
         return;
     }
     const tokens = token_scan.scanShellDiagnostics(ctx.arena, text, 64) catch &.{};
-    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, null, selection) orelse &.{};
+    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, null, selection, p) orelse &.{};
     if (tokens.len == 0 and overlays.len == 0) {
-        MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null);
+        MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null, p, max_content_width);
         return;
     }
     const spans = ctx.arena.alloc(StyleSpan, tokens.len + overlays.len) catch {
-        MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null);
+        MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null, p, max_content_width);
         return;
     };
     var idx: usize = 0;
@@ -894,7 +907,7 @@ fn drawToolStyledText(
         spans[idx] = ov;
         idx += 1;
     }
-    drawWrappedStyled(surface, text, spans[0..idx], p.thinking_body, "", null, selected, row, ctx, 0);
+    drawWrappedStyled(surface, text, spans[0..idx], p.thinking_body, "", null, selected, row, ctx, 0, p, max_content_width);
 }
 
 /// A byte-span into some text plus the vaxis style to draw those bytes with.
@@ -906,8 +919,7 @@ const StyleSpan = struct {
 };
 
 /// Map a JSON token kind to a vaxis style using the existing palette.
-fn jsonTokenStyle(kind: parts_mod.JsonTokenKind) vaxis.Style {
-    const p = tui_style.activePalette();
+fn jsonTokenStyle(kind: parts_mod.JsonTokenKind, p: *const tui_style.Palette) vaxis.Style {
     return switch (kind) {
         .key => p.border_label,
         .string => p.markdown_code,
@@ -927,13 +939,14 @@ fn drawJson(
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
+    p: *const tui_style.Palette,
+    max_content_width: u16,
 ) void {
-    const p = tui_style.activePalette();
     const styles = ctx.arena.alloc(StyleSpan, part.spans.len) catch return;
     for (part.spans, 0..) |span, i| {
-        styles[i] = .{ .start = span.start, .end = span.end, .style = jsonTokenStyle(span.kind) };
+        styles[i] = .{ .start = span.start, .end = span.end, .style = jsonTokenStyle(span.kind, p) };
     }
-    drawWrappedStyled(surface, part.text, styles, p.thinking_body, "", null, selected, row, ctx, 0);
+    drawWrappedStyled(surface, part.text, styles, p.thinking_body, "", null, selected, row, ctx, 0, p, max_content_width);
 }
 
 /// Wrapped, styled rendering of `text`. Splits on `\n` into hard lines, wraps
@@ -952,14 +965,15 @@ fn drawWrappedStyled(
     row: *u16,
     ctx: vxfw.DrawContext,
     indent: u16,
+    p: *const tui_style.Palette,
+    max_content_width: u16,
 ) void {
-    const content_width = ConversationLayout.contentWidth(surface.size.width);
+    const content_width = ConversationLayout.contentWidth(surface.size.width, max_content_width);
     const width = @max(content_width -| indent, 1);
     if (text.len == 0) {
         if (row.* >= surface.size.height) return;
-        const p = tui_style.activePalette();
-        if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0);
-        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
+        if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0, p);
+        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0, p);
         row.* += 1;
         return;
     }
@@ -969,7 +983,7 @@ fn drawWrappedStyled(
     while (line_start <= text.len) {
         const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         const line_prefix = if (first_line) prefix else "";
-        drawStyledHardLine(surface, text[line_start..line_end], line_start, spans, default_style, line_prefix, bar_style, selected, row, ctx, indent, width);
+        drawStyledHardLine(surface, text[line_start..line_end], line_start, spans, default_style, line_prefix, bar_style, selected, row, ctx, indent, width, p);
         if (line_end == text.len) break;
         line_start = line_end + 1;
         first_line = false;
@@ -992,12 +1006,12 @@ fn drawStyledHardLine(
     ctx: vxfw.DrawContext,
     indent: u16,
     width: u16,
+    p: *const tui_style.Palette,
 ) void {
     if (row.* >= surface.size.height) return;
     if (line.len == 0) {
-        const p = tui_style.activePalette();
-        if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0);
-        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
+        if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0, p);
+        if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0, p);
         row.* += 1;
         return;
     }
@@ -1006,7 +1020,7 @@ fn drawStyledHardLine(
     while (segment_offset < line.len) {
         const line_end = wrappedLineEnd(line, segment_offset, width, ctx);
         const segment_prefix = if (first_segment) prefix else "";
-        drawStyledSegment(surface, line[segment_offset..line_end], text_abs + segment_offset, spans, default_style, segment_prefix, bar_style, selected, row, ctx, indent);
+        drawStyledSegment(surface, line[segment_offset..line_end], text_abs + segment_offset, spans, default_style, segment_prefix, bar_style, selected, row, ctx, indent, p);
         segment_offset = skipLinearWhitespace(line, line_end);
         first_segment = false;
     }
@@ -1026,11 +1040,11 @@ fn drawStyledSegment(
     row: *u16,
     ctx: vxfw.DrawContext,
     indent: u16,
+    p: *const tui_style.Palette,
 ) void {
     if (row.* >= surface.size.height) return;
-    const p = tui_style.activePalette();
-    if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0);
-    if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0);
+    if (bar_style) |active_bar| MessageWidget.writeText(surface, "┃", active_bar, selected, row.*, ctx, 0, p);
+    if (prefix.len > 0) MessageWidget.writeText(surface, prefix, p.thinking_label, selected, row.*, ctx, 0, p);
     var col = ConversationLayout.left + indent;
     const col_limit = surface.size.width -| ConversationLayout.right;
     var iter = ctx.graphemeIterator(segment);
@@ -1074,12 +1088,13 @@ fn drawWrappedDiff(
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
+    p: *const tui_style.Palette,
+    max_content_width: u16,
 ) !void {
-    const content_width = ConversationLayout.contentWidth(surface.size.width);
+    const content_width = ConversationLayout.contentWidth(surface.size.width, max_content_width);
     const width = @max(content_width, 1);
     if (text.len == 0) {
-        const p = tui_style.activePalette();
-        MessageWidget.drawLine(surface, "", p.thinking_body, selected, row, ctx, 0, null);
+        MessageWidget.drawLine(surface, "", p.thinking_body, selected, row, ctx, 0, null, p);
         return;
     }
 
@@ -1087,9 +1102,9 @@ fn drawWrappedDiff(
     while (line_start <= text.len) {
         const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         const line = text[line_start..line_end];
-        const style = diffLineStyle(line);
+        const style = diffLineStyle(line, p);
         const expanded = expandDiffTabs(ctx.arena, line) catch line;
-        MessageWidget.drawWrappedHardLine(surface, expanded, style, selected, row, ctx, 0, null, width);
+        MessageWidget.drawWrappedHardLine(surface, expanded, style, selected, row, ctx, 0, null, width, p);
         if (line_end == text.len) break;
         line_start = line_end + 1;
     }
@@ -1100,8 +1115,7 @@ fn expandDiffTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
     return std.mem.replaceOwned(u8, arena, line, "\t", "    ");
 }
 
-fn diffLineStyle(line: []const u8) vaxis.Style {
-    const p = tui_style.activePalette();
+fn diffLineStyle(line: []const u8, p: *const tui_style.Palette) vaxis.Style {
     if (line.len == 0) return p.thinking_body;
     if (std.mem.startsWith(u8, line, "@@")) return p.diff_hunk;
     if (std.mem.startsWith(u8, line, "diff --git ") or std.mem.startsWith(u8, line, "--- ") or std.mem.startsWith(u8, line, "+++ ")) {
@@ -1305,8 +1319,7 @@ test "drawJson highlights a key with the accent style" {
 }
 
 test "agent body renders Palette.body (not default)" {
-    tui_style.setActive(tui_style.nord);
-    defer tui_style.setActive(tui_style.default_theme);
+    const nord_palette = tui_style.buildPalette(tui_style.nord);
 
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
@@ -1321,6 +1334,7 @@ test "agent body renders Palette.body (not default)" {
         .loading_frame = 0,
         .blackhole_frame = 0,
         .gpa = gpa,
+        .palette = &nord_palette,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -1336,8 +1350,7 @@ test "agent body renders Palette.body (not default)" {
 }
 
 test "text cells carry the card background (C1 regression)" {
-    tui_style.setActive(tui_style.nord);
-    defer tui_style.setActive(tui_style.default_theme);
+    const nord_palette = tui_style.buildPalette(tui_style.nord);
 
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
@@ -1352,6 +1365,7 @@ test "text cells carry the card background (C1 regression)" {
         .loading_frame = 0,
         .blackhole_frame = 0,
         .gpa = gpa,
+        .palette = &nord_palette,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -1369,8 +1383,7 @@ test "text cells carry the card background (C1 regression)" {
 }
 
 test "segment-rendered cells carry the card background (drawStyledSegment bypass)" {
-    tui_style.setActive(tui_style.nord);
-    defer tui_style.setActive(tui_style.default_theme);
+    const nord_palette = tui_style.buildPalette(tui_style.nord);
 
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
@@ -1390,6 +1403,7 @@ test "segment-rendered cells carry the card background (drawStyledSegment bypass
         .loading_frame = 0,
         .blackhole_frame = 0,
         .gpa = gpa,
+        .palette = &nord_palette,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -1406,8 +1420,7 @@ test "segment-rendered cells carry the card background (drawStyledSegment bypass
 }
 
 test "padding/void cells are filled with the card background" {
-    tui_style.setActive(tui_style.nord);
-    defer tui_style.setActive(tui_style.default_theme);
+    const nord_palette = tui_style.buildPalette(tui_style.nord);
 
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
@@ -1422,6 +1435,7 @@ test "padding/void cells are filled with the card background" {
         .loading_frame = 0,
         .blackhole_frame = 0,
         .gpa = gpa,
+        .palette = &nord_palette,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -1439,8 +1453,7 @@ test "padding/void cells are filled with the card background" {
 }
 
 test "intro * accent uses intro_accent" {
-    tui_style.setActive(tui_style.dracula);
-    defer tui_style.setActive(tui_style.default_theme);
+    const dracula_palette = tui_style.buildPalette(tui_style.dracula);
 
     const gpa = std.testing.allocator;
     var transcript: transcript_mod.Transcript = .{};
@@ -1455,6 +1468,7 @@ test "intro * accent uses intro_accent" {
         .loading_frame = 0,
         .blackhole_frame = 0,
         .gpa = gpa,
+        .palette = &dracula_palette,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -1555,7 +1569,7 @@ test "drawConnectHint omits connect hint when has_model_configured is true" {
 /// `drawConnectHint`'s math so the assert stays readable.
 fn hintCol(width: u16) u16 {
     const hint_w: u16 = @intCast(logo_connect_text.len);
-    return ConversationLayout.left + (ConversationLayout.contentWidth(width) -| hint_w) / 2;
+    return ConversationLayout.left + (ConversationLayout.contentWidth(width, 0) -| hint_w) / 2;
 }
 
 test "splash fills and centers in the viewport when it is the sole message" {

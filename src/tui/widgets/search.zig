@@ -126,6 +126,7 @@ pub fn searchable(message: transcript_mod.Message) ?Searchable {
 
 pub const Content = struct {
     state: *State,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -133,7 +134,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
@@ -162,7 +163,7 @@ pub const Content = struct {
             const screen_row = viewport.screenRow(match_idx);
             var label_buf: [64]u8 = undefined;
             const label = std.fmt.bufPrint(&label_buf, "{d} {s}  ", .{ m.message_index, m.role }) catch unreachable;
-            try panel.commandLine(&surface, screen_row, label, ctx, selected);
+            try panel.commandLine(&surface, screen_row, label, ctx, selected, p);
             if (m.snippet.len > 0 and width > 24) {
                 const desc_style = if (selected) p.selected_item else p.thinking_body;
                 _ = panel.writeBorderTextEndingAt(&surface, ctx, screen_row, width -| 2, m.snippet, desc_style);

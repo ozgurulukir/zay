@@ -34,6 +34,7 @@ pub const Content = struct {
     notice: []const u8 = "",
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -50,7 +51,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         var body: Body = .{ .content = self };
         var border: vxfw.Border = .{
             .child = body.widget(),
@@ -73,14 +74,15 @@ const Body = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        panel.fillBackground(&surface);
-
         const content = self.content;
+        const p = content.palette;
+        panel.fillBackground(&surface, p);
+
         if (content.results.len == 0) {
-            try panel.lineAt(&surface, 0, content.emptyMessage(), ctx, false, 0);
+            try panel.lineAt(&surface, 0, content.emptyMessage(), ctx, false, 0, p);
             if (content.notice.len > 0 and surface.size.height > 1) {
-                try panel.lineAt(&surface, 1, "! ", ctx, false, 0);
-                try panel.lineAt(&surface, 1, content.notice, ctx, false, 2);
+                try panel.lineAt(&surface, 1, "! ", ctx, false, 0, p);
+                try panel.lineAt(&surface, 1, content.notice, ctx, false, 2, p);
             }
             return surface;
         }
@@ -101,11 +103,12 @@ const Body = struct {
                 .start_col = 0,
                 .highlight_enabled = content.highlight_enabled,
                 .highlight_style = content.highlight_style,
+                .palette = p,
             });
         }
         if (content.notice.len > 0 and row < surface.size.height) {
-            try panel.lineAt(&surface, row, "! ", ctx, false, 0);
-            try panel.lineAt(&surface, row, content.notice, ctx, false, 2);
+            try panel.lineAt(&surface, row, "! ", ctx, false, 0, p);
+            try panel.lineAt(&surface, row, content.notice, ctx, false, 2, p);
         }
         return surface;
     }

@@ -87,14 +87,14 @@ fn scrollMatchIntoView(app: *App, match: search_widget.Match) void {
         else => return,
     };
     if (match.start > body.len) return;
-    const width = ConversationLayout.contentWidth(app.thread.transcript_view_width);
+    const width = ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width);
     var rows_before: u16 = switch (message.*) {
         .agent => terminal_markdown.countRows(std.heap.page_allocator, body[0..match.start], width),
         else => tui_metrics.textRows(body[0..match.start], width),
     };
     // One title row above the body (see messageRowsCached's +1).
     rows_before += 1;
-    const total_rows = tui_metrics.messageRowsCached(message, width);
+    const total_rows = tui_metrics.messageRowsCached(message, width, app.presentation);
     const offset = @min(rows_before, total_rows -| 1);
     transcript_nav.setSelectedMessageOffset(app, match.message_index, offset);
 }

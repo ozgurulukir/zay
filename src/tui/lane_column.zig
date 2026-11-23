@@ -14,6 +14,8 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
+const tui_metrics = @import("metrics.zig");
+const tui_style = @import("style.zig");
 const tx_widget = @import("widgets/transcript.zig");
 
 const Thread = tui.Thread;
@@ -31,6 +33,8 @@ pub const LaneColumnProps = struct {
     state_glyph: []const u8,
     ws_marker: []const u8,
     border_style: vaxis.Style,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
+    presentation: tui_metrics.PresentationConfig = .{},
 };
 
 /// The border label: active marker + turn-state glyph + title + workspace

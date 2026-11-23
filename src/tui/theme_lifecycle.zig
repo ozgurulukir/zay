@@ -42,8 +42,8 @@ pub fn openThemePicker(app: *App) void {
 /// Recolor the live UI to `theme` without persisting or notifying. UI-thread
 /// only; the /theme picker calls this on every up/down navigation when
 /// `tui.theme_live_preview` is enabled.
-pub fn previewTheme(_: *App, theme: tui_style.Theme) void {
-    tui_style.setActive(theme);
+pub fn previewTheme(app: *App, theme: tui_style.Theme) void {
+    app.setActiveTheme(theme);
 }
 
 /// Restore the pre-open theme captured in `openThemePicker`. Idempotent — safe
@@ -51,7 +51,7 @@ pub fn previewTheme(_: *App, theme: tui_style.Theme) void {
 /// any non-commit exit from `.theme_picker` (M2).
 pub fn revertThemePreview(app: *App) void {
     if (app.theme_preview_original) |original| {
-        tui_style.setActive(original);
+        app.setActiveTheme(original);
         app.theme_preview_original = null;
     }
 }
@@ -78,7 +78,7 @@ pub fn handleColorSchemeChange(app: *App, scheme: vaxis.Color.Scheme) void {
         if (app.mode == .theme_picker and app.theme_preview_original != null) {
             app.theme_preview_original = theme;
         } else {
-            tui_style.setActive(theme);
+            app.setActiveTheme(theme);
         }
     }
 }
@@ -125,7 +125,7 @@ pub fn applyTheme(app: *App, raw_name: []const u8) !void {
         app.cached_config.tui.effectiveDarkTheme(),
     );
     app.theme_preview_original = null;
-    tui_style.setActive(theme);
+    app.setActiveTheme(theme);
 
     var persist_err: ?anyerror = null;
     if (app.liveRuntime()) |rt| {
@@ -268,14 +268,13 @@ test "applyTheme updates live palette, config arena theme, and transcript" {
     defer gpa.destroy(arena_state);
     defer arena_state.deinit();
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     app.cached_config.theme = try arena_state.allocator().dupe(u8, "default");
 
     try applyTheme(&app, "cappuccino");
 
     // Palette updated
-    try std.testing.expectEqual(tui_style.cappuccino_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.cappuccino_theme.body, app.activePalette().body.fg.rgb);
     // Cached config updated
     try std.testing.expectEqualStrings("cappuccino", app.cached_config.theme.?);
     // Transcript has success notice
@@ -291,14 +290,13 @@ test "applyTheme without a config arena does not alter cached_config.theme" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     app.cached_config.theme = null;
 
     try applyTheme(&app, "dracula");
 
     // Palette is updated
-    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.dracula.body, app.activePalette().body.fg.rgb);
     // Cached config remained null because no config arena was installed
     try std.testing.expect(app.cached_config.theme == null);
 }
@@ -332,7 +330,6 @@ test "applyTheme persists to project config when project defines theme" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.cwd = proj_dir;
@@ -381,7 +378,6 @@ test "applyTheme persists to global config when project does not define theme" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.cwd = proj_dir;
@@ -421,7 +417,6 @@ test "applyTheme surfaces (not saved) notice when persistence fails" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.cwd = blocker_path;
@@ -431,7 +426,7 @@ test "applyTheme surfaces (not saved) notice when persistence fails" {
     try applyTheme(&app, "gruvbox_dark");
 
     // Live palette is still updated
-    try std.testing.expectEqual(tui_style.gruvbox_dark.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.gruvbox_dark.body, app.activePalette().body.fg.rgb);
 
     // Transcript has the "(not saved)" notice
     const count = app.thread.transcript.messages.items.len;
@@ -447,7 +442,6 @@ test "applyTheme fallback notice behavior for default vs unknown themes" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     // 1. Explicit "default" theme: only success message, no fallback notice
     try applyTheme(&app, "default");
@@ -470,10 +464,9 @@ test "previewTheme recolors without persisting or notifying" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     previewTheme(&app, tui_style.dracula);
-    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.dracula.body, app.activePalette().body.fg.rgb);
     // No transcript notice, no cached-config change.
     try std.testing.expectEqual(@as(usize, 0), app.thread.transcript.messages.items.len);
     try std.testing.expect(app.cached_config.theme == null);
@@ -485,20 +478,19 @@ test "revertThemePreview restores the snapshot and is idempotent" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     // Original = default; user previewed dracula.
     app.theme_preview_original = tui_style.default_theme;
     previewTheme(&app, tui_style.dracula);
-    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.dracula.body, app.activePalette().body.fg.rgb);
 
     revertThemePreview(&app);
-    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.default_theme.body, app.activePalette().body.fg.rgb);
     try std.testing.expect(app.theme_preview_original == null);
 
     // Second call is a no-op (idempotent).
     revertThemePreview(&app);
-    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.default_theme.body, app.activePalette().body.fg.rgb);
 }
 
 test "openThemePicker snapshots the active theme for revert" {

@@ -9,10 +9,9 @@ const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 const model_loader = @import("../model_loader.zig");
 
-fn columnStyle(focused: bool, selected: bool) vaxis.Style {
-    const p = tui_style.activePalette();
+fn columnStyle(focused: bool, selected: bool, p: *const tui_style.Palette) vaxis.Style {
     if (focused) return p.selected_item;
-    return tui_style.onSelectionBg(p.thinking_body, selected);
+    return tui_style.onSelectionBg(p.thinking_body, selected, p);
 }
 
 pub const Column = enum {
@@ -91,6 +90,7 @@ pub const Content = struct {
     error_message: ?[]const u8 = null,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -98,7 +98,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         // Only mask the list when it is actually empty. The disk cache restores
         // instantly on open, so a populated list must remain visible while the
         // background revalidate runs — otherwise the cache is wasted behind a
@@ -146,7 +146,7 @@ pub const Content = struct {
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, children);
         if (selected_detail) |detail| {
             const detail_row = if (self.footer.len > 0) height -| 2 else height -| 1;
-            panel.drawDetailFooter(&surface, ctx, detail_row, detail);
+            panel.drawDetailFooter(&surface, ctx, detail_row, detail, p);
         }
         if (self.footer.len > 0 and height > 0) {
             try panel.lineStyledAt(&surface, height -| 1, self.footer, ctx, 0, p.thinking_body);
@@ -163,7 +163,7 @@ pub const Content = struct {
     }
 
     fn drawEmpty(self: *Content, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
@@ -185,7 +185,7 @@ pub const Content = struct {
 
         const widgets = try ctx.arena.alloc(vxfw.Widget, match_count + 1);
         const header = try ctx.arena.create(Header);
-        header.* = .{};
+        header.* = .{ .palette = self.palette };
         widgets[0] = header.widget();
         const rows = try ctx.arena.alloc(Row, match_count);
 
@@ -205,6 +205,7 @@ pub const Content = struct {
                 .filter = self.filter,
                 .highlight_enabled = self.highlight_enabled,
                 .highlight_style = self.highlight_style,
+                .palette = self.palette,
             };
             widgets[vis + 1] = rows[vis].widget();
             if (self.selection == d) cursor = @intCast(vis + 1);
@@ -233,13 +234,15 @@ pub const Content = struct {
 };
 
 const Header = struct {
+    palette: *const tui_style.Palette = &tui_style.default_palette,
+
     fn widget(self: *Header) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
     }
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Header = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         try panel.lineStyledAt(&surface, 0, "NAME", ctx, panel.panel_margin_x + 2, p.panel_header);
@@ -417,6 +420,7 @@ pub const Row = struct {
     filter: []const u8 = "",
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -424,7 +428,7 @@ pub const Row = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Row = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
 
@@ -438,10 +442,11 @@ pub const Row = struct {
             .text = self.model.label,
             .query = self.filter,
             .selected = self.selected,
-            .base_style = columnStyle(model_focused, self.selected),
+            .base_style = columnStyle(model_focused, self.selected, p),
             .start_col = start_col,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .palette = p,
         });
         // Keep the inline ✓ badge (m3) and the SUB/PAYG tier tag from
         // colliding with the reasoning column on selected rows.
@@ -451,7 +456,7 @@ pub const Row = struct {
                 @as(usize, std.math.maxInt(u16)),
             )));
         if (self.activeModel()) {
-            try panel.lineStyledAt(&surface, 0, " ✓", ctx, label_end, tui_style.onSelectionBg(p.success, self.selected));
+            try panel.lineStyledAt(&surface, 0, " ✓", ctx, label_end, tui_style.onSelectionBg(p.success, self.selected, p));
         }
         if (tierTag(self.source, self.model.id)) |tag| {
             const tag_col = panel.secondaryColumn(surface.size.width) -| @as(u16, @intCast(tag.len)) -| 1;
@@ -459,7 +464,7 @@ pub const Row = struct {
             // Skip the tag when it would overwrite the label/✓ tail (narrow
             // terminals, long labels) — cosmetic, same class as the ✓ badge.
             if (tag_col > label_end + 1) {
-                try panel.lineStyledAt(&surface, 0, tag, ctx, tag_col, tui_style.onSelectionBg(tag_style, self.selected));
+                try panel.lineStyledAt(&surface, 0, tag, ctx, tag_col, tui_style.onSelectionBg(tag_style, self.selected, p));
             }
         }
         if (self.selected) try self.drawReasoning(&surface, ctx);
@@ -475,6 +480,6 @@ pub const Row = struct {
         const focused = self.column == .reasoning;
         const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.reasoning_label });
-        try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), columnStyle(focused, self.selected));
+        try panel.lineStyledAt(surface, 0, text, ctx, panel.secondaryColumn(surface.size.width), columnStyle(focused, self.selected, self.palette));
     }
 };

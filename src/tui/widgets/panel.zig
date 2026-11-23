@@ -14,6 +14,7 @@ const secondary_column: u16 = 52;
 
 pub const Shell = struct {
     child: vxfw.Widget,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Shell) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -21,8 +22,7 @@ pub const Shell = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Shell = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
-        var border: vxfw.Border = .{ .child = self.child, .style = p.tool };
+        var border: vxfw.Border = .{ .child = self.child, .style = self.palette.tool };
         return border.widget().draw(ctx);
     }
 };
@@ -92,15 +92,14 @@ pub fn secondaryColumn(width: u16) u16 {
     return @min(secondary_column, width / 2);
 }
 
-pub fn drawViewportScrollbar(surface: *vxfw.Surface, viewport: ViewportWindow, total_count: u32) void {
+pub fn drawViewportScrollbar(surface: *vxfw.Surface, viewport: ViewportWindow, total_count: u32, p: *const tui_style.Palette) void {
     if (total_count <= viewport.visible_height or viewport.visible_height == 0) return;
-    drawViewportScrollbarAt(surface, 0, @intCast(viewport.visible_height), viewport, total_count);
+    drawViewportScrollbarAt(surface, 0, @intCast(viewport.visible_height), viewport, total_count, p);
 }
 
-pub fn drawViewportScrollbarAt(surface: *vxfw.Surface, start_row: u16, track_height: u16, viewport: ViewportWindow, total_count: u32) void {
+pub fn drawViewportScrollbarAt(surface: *vxfw.Surface, start_row: u16, track_height: u16, viewport: ViewportWindow, total_count: u32, p: *const tui_style.Palette) void {
     if (surface.buffer.len == 0 or surface.size.width == 0 or surface.size.height == 0 or track_height == 0) return;
     if (total_count <= viewport.visible_height or viewport.visible_height == 0) return;
-    const p = tui_style.activePalette();
     const col = surface.size.width -| 1;
     const max_s = total_count -| viewport.visible_height;
     if (max_s == 0) return;
@@ -122,13 +121,12 @@ pub fn drawViewportScrollbarAt(surface: *vxfw.Surface, start_row: u16, track_hei
     }
 }
 
-pub fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) void {
-    drawScrollbarAt(surface, 0, height, scroll, total);
+pub fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16, p: *const tui_style.Palette) void {
+    drawScrollbarAt(surface, 0, height, scroll, total, p);
 }
 
-pub fn drawScrollbarAt(surface: *vxfw.Surface, start_row: u16, height: u16, scroll: u16, total: u16) void {
+pub fn drawScrollbarAt(surface: *vxfw.Surface, start_row: u16, height: u16, scroll: u16, total: u16, p: *const tui_style.Palette) void {
     if (surface.buffer.len == 0 or surface.size.width == 0 or surface.size.height == 0 or height == 0) return;
-    const p = tui_style.activePalette();
     const col = surface.size.width -| 1;
     const max_s = total -| height;
     if (max_s == 0) return;
@@ -149,8 +147,8 @@ pub fn drawScrollbarAt(surface: *vxfw.Surface, start_row: u16, height: u16, scro
     }
 }
 
-pub fn commandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
-    try lineAt(surface, row, text, ctx, selected, panel_margin_x);
+pub fn commandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, p: *const tui_style.Palette) !void {
+    try lineAt(surface, row, text, ctx, selected, panel_margin_x, p);
 }
 
 pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
@@ -163,9 +161,8 @@ pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
 
 /// Pre-fill an entire modal/floating surface with the active palette's opaque
 /// background color so underlying transcript cells never bleed through.
-pub fn fillBackground(surface: *vxfw.Surface) void {
+pub fn fillBackground(surface: *vxfw.Surface, p: *const tui_style.Palette) void {
     if (surface.buffer.len == 0) return;
-    const p = tui_style.activePalette();
     @memset(surface.buffer, .{
         .char = .{ .grapheme = " ", .width = 1 },
         .style = p.background,
@@ -178,15 +175,13 @@ pub fn isTruncated(text: []const u8, max_width: u16) bool {
 }
 
 /// Render a one-line detail footer for a truncated highlighted picker row (#506).
-pub fn drawDetailFooter(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, full_value: []const u8) void {
+pub fn drawDetailFooter(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, full_value: []const u8, p: *const tui_style.Palette) void {
     if (surface.buffer.len == 0 or row >= surface.size.height or full_value.len == 0) return;
-    const p = tui_style.activePalette();
     fillRow(surface, row, p.selected);
     lineStyledAt(surface, row, full_value, ctx, 2, p.selected_item) catch {};
 }
 
-pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16) !void {
-    const p = tui_style.activePalette();
+pub fn lineAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, start_col: u16, p: *const tui_style.Palette) !void {
     if (selected) fillRow(surface, row, p.selected);
     const active_style = if (selected) p.selected_item else p.thinking_body;
     try lineStyledAt(surface, row, text, ctx, start_col, active_style);
@@ -214,8 +209,7 @@ pub fn lineStyledAt(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxf
     }
 }
 
-pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
-    const p = tui_style.activePalette();
+pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool, p: *const tui_style.Palette) !void {
     const active_style = if (selected) p.selected_item else p.thinking_body;
     try rightStyled(surface, row, text, ctx, active_style);
 }
@@ -439,6 +433,7 @@ pub const ListRowOptions = struct {
     start_col: u16 = 1,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 };
 
 /// Draw one picker list row: an optional prefix, the fuzzy-highlighted text, and
@@ -448,7 +443,7 @@ pub const ListRowOptions = struct {
 /// gpa allocation; the arena-bumped per-span dupes are cheap).
 pub fn drawFuzzyListRow(surface: *vxfw.Surface, screen_row: u16, ctx: vxfw.DrawContext, options: ListRowOptions) !void {
     if (screen_row >= surface.size.height) return;
-    const p = tui_style.activePalette();
+    const p = options.palette;
     const base_style = options.base_style orelse (if (options.selected) p.selected_item else p.thinking_body);
     if (options.selected) fillRow(surface, screen_row, p.selected);
 
@@ -468,7 +463,7 @@ pub fn drawFuzzyListRow(surface: *vxfw.Surface, screen_row: u16, ctx: vxfw.DrawC
     if (match_count == 0) {
         try lineStyledAt(surface, screen_row, options.text, ctx, text_col, base_style);
     } else {
-        const match_style = matchStyle(base_style, options.highlight_style);
+        const match_style = matchStyle(base_style, options.highlight_style, p);
         var span_start: usize = 0;
         for (pos_buf[0..match_count]) |match_byte| {
             if (match_byte > span_start) {
@@ -499,8 +494,7 @@ fn textCol(ctx: vxfw.DrawContext, base_col: u16, text: []const u8, byte_offset: 
 }
 
 /// The style for matched runes, from a configurable `FuzzyHighlightStyle`.
-fn matchStyle(base: vaxis.Style, style: config_mod.FuzzyHighlightStyle) vaxis.Style {
-    const p = tui_style.activePalette();
+fn matchStyle(base: vaxis.Style, style: config_mod.FuzzyHighlightStyle, p: *const tui_style.Palette) vaxis.Style {
     return switch (style) {
         .accent => .{ .fg = p.selected_item.fg, .bg = base.bg },
         .bold => .{ .fg = base.fg, .bold = true, .bg = base.bg },

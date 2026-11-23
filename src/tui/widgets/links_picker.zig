@@ -113,6 +113,7 @@ pub fn openUrlInPlatform(io: std.Io, url: []const u8) !void {
 
 pub const Content = struct {
     state: *State,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -120,11 +121,11 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        panel.fillBackground(&surface);
+        panel.fillBackground(&surface, p);
         if (width == 0 or height == 0) return surface;
 
         const items = self.state.items.items;
@@ -144,13 +145,13 @@ pub const Content = struct {
                 item.url
             else
                 try std.fmt.allocPrint(ctx.arena, "{s}  →  {s}", .{ item.label, item.url });
-            try panel.commandLine(&surface, screen_row, row_text, ctx, selected);
+            try panel.commandLine(&surface, screen_row, row_text, ctx, selected, p);
         }
-        panel.drawViewportScrollbar(&surface, viewport, @intCast(items.len));
+        panel.drawViewportScrollbar(&surface, viewport, @intCast(items.len), p);
         if (height > 1) {
             if (self.state.selectedUrl()) |url| {
                 if (text_fit.measure(url) > width -| 4) {
-                    panel.drawDetailFooter(&surface, ctx, height - 1, url);
+                    panel.drawDetailFooter(&surface, ctx, height - 1, url, p);
                 } else {
                     panel.lineStyledAt(&surface, height - 1, "  Enter/y: copy · o: open · Esc: close", ctx, 1, p.muted) catch {};
                 }

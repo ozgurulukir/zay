@@ -675,18 +675,7 @@ pub fn buildMonochromePalette() Palette {
     };
 }
 
-pub var active_is_no_color: bool = false;
-
-pub fn setNoColor(no_color: bool) void {
-    active_is_no_color = no_color;
-    if (no_color) {
-        active = buildMonochromePalette();
-    }
-}
-
-pub fn getNoColor() bool {
-    return active_is_no_color;
-}
+pub const default_palette: Palette = buildPalette(default_theme);
 
 pub fn isNoColorActive(config_switch: bool, env_map: ?*const std.process.Environ.Map) bool {
     if (config_switch) return true;
@@ -702,38 +691,14 @@ pub fn isNoColorActive(config_switch: bool, env_map: ?*const std.process.Environ
     return false;
 }
 
-/// The active runtime palette, installed once at startup by `tui.run`.
-///
-/// Thread Safety Invariant:
-/// - `active` is a mutable global read and written EXCLUSIVELY on the main UI/event-loop thread.
-/// - Background workers, lanes, and HTTP streams MUST NOT read or mutate `active`.
-/// - Render passes are synchronous on the UI thread and consume `activePalette()`.
-/// - Unit tests modifying `active` via `setActive` MUST restore `default_theme` via `defer setActive(default_theme)`.
-pub var active: Palette = buildPalette(default_theme);
-
-/// Fetch a pointer to the active palette for reading during UI draw passes.
-/// Must only be called from the UI thread.
-pub fn activePalette() *const Palette {
-    return &active;
-}
-
-/// Rebuild the active palette from a theme. Called on the UI thread only.
-pub fn setActive(theme: Theme) void {
-    if (active_is_no_color) {
-        active = buildMonochromePalette();
-    } else {
-        active = buildPalette(theme);
-    }
-}
-
 /// Merge a selection background into a row style when the row is selected.
-pub fn onSelectionBg(style: vaxis.Style, selected: bool) vaxis.Style {
+pub fn onSelectionBg(style: vaxis.Style, selected: bool, palette: *const Palette) vaxis.Style {
     var merged = style;
     if (selected) {
-        if (active_is_no_color) {
+        if (palette.selected.reverse) {
             merged.reverse = true;
         } else {
-            merged.bg = active.selected.bg;
+            merged.bg = palette.selected.bg;
         }
     }
     return merged;
@@ -1113,25 +1078,18 @@ test "isLight correctly distinguishes light and dark themes" {
 }
 
 test "monochrome palette and NO_COLOR mode" {
-    defer {
-        setNoColor(false);
-        setActive(default_theme);
-    }
-
     const mono = buildMonochromePalette();
     try std.testing.expect(mono.selected.reverse);
     try std.testing.expect(mono.user.bold);
     try std.testing.expect(mono.error_style.reverse);
 
-    setNoColor(true);
-    try std.testing.expect(getNoColor());
-    setActive(tokyo_night);
-    const act = activePalette();
-    try std.testing.expect(act.selected.reverse);
+    const sel_mono = onSelectionBg(.{}, true, &mono);
+    try std.testing.expect(sel_mono.reverse);
 
-    setNoColor(false);
-    setActive(tokyo_night);
-    try std.testing.expect(!activePalette().selected.reverse);
+    const color = buildPalette(tokyo_night);
+    try std.testing.expect(!color.selected.reverse);
+    const sel_color = onSelectionBg(.{}, true, &color);
+    try std.testing.expect(!sel_color.reverse);
 }
 
 test "ThemeRegistry.resolveWithScheme resolves auto to light or dark theme" {

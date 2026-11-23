@@ -225,6 +225,7 @@ test "help scroll saturates at the visible body rows across overlay heights" {
 
 pub const Content = struct {
     state: *State,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -232,12 +233,12 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         if (width == 0 or height == 0) return surface;
-        panel.fillBackground(&surface);
+        panel.fillBackground(&surface, p);
 
         // Reserve last row for bottom hint bar. The border consumed 2 rows
         // upstream, so `height` is the inner panel and `height -| 1` equals
@@ -274,7 +275,7 @@ pub const Content = struct {
 
         // Draw scrollbar on rightmost column if content exceeds body height.
         if (total_count > body_height and body_height > 2) {
-            panel.drawScrollbar(&surface, body_height, self.state.scroll, total_count);
+            panel.drawScrollbar(&surface, body_height, self.state.scroll, total_count, p);
         }
 
         // Draw bottom hint bar.

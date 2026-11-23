@@ -244,6 +244,7 @@ pub const StatusBarWidget = struct {
     skill_inventory: []const []const u8 = &.{},
     /// Custom candidate segments overriding the default layout when non-empty.
     custom_segments: []const BarSegment = &.{},
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *StatusBarWidget) vxfw.Widget {
         return .{
@@ -255,7 +256,7 @@ pub const StatusBarWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *StatusBarWidget = @ptrCast(@alignCast(ptr));
         const max_width = ctx.max.width orelse ctx.min.width;
-        const p = tui_style.activePalette();
+        const p = self.palette;
 
         const available_width = max_width -| 2;
         var status = self.status_text;

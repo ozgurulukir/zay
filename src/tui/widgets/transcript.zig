@@ -51,6 +51,8 @@ pub const TranscriptProps = struct {
     body_selection: ?transcript_mod.BodySelection = null,
     /// Write-back: hit-test geometry for the "↓ new output" pill.
     new_output_rect_out: ?*?app_state.ChipRect = null,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
+    presentation: tui_metrics.PresentationConfig = .{},
 };
 
 pub const TranscriptWidget = struct {
@@ -75,6 +77,8 @@ pub const TranscriptWidget = struct {
     body_selection: ?transcript_mod.BodySelection = null,
     /// Write-back: hit-test geometry for the "↓ new output" pill.
     new_output_rect_out: ?*?app_state.ChipRect = null,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
+    presentation: tui_metrics.PresentationConfig = .{},
 
     pub fn fromProps(props: TranscriptProps) TranscriptWidget {
         return .{
@@ -90,6 +94,8 @@ pub const TranscriptWidget = struct {
             .now_ms = props.now_ms,
             .body_selection = props.body_selection,
             .new_output_rect_out = props.new_output_rect_out,
+            .palette = props.palette,
+            .presentation = props.presentation,
         };
     }
 
@@ -124,6 +130,8 @@ pub const TranscriptWidget = struct {
             .active_search_hit = self.active_search_hit,
             .now_ms = self.now_ms,
             .body_selection = self.thread.transcript.body_selection,
+            .palette = self.palette,
+            .presentation = self.presentation,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
         self.thread.transcript_list.item_count = @intCast(messages.len);
@@ -131,7 +139,7 @@ pub const TranscriptWidget = struct {
 
         var list_padding: vxfw.Padding = .{
             .child = self.thread.transcript_list.widget(),
-            .padding = ConversationLayout.verticalPadding(),
+            .padding = ConversationLayout.verticalPadding(self.presentation),
         };
         var surface = try list_padding.widget().draw(ctx);
         self.updateBlackholeVisibility();
@@ -164,9 +172,10 @@ pub const TranscriptWidget = struct {
                 self.thread.transcript_list.scroll.offset,
                 view_height,
                 view_width,
+                self.presentation,
             );
             var sb_surf = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = 1, .height = view_height });
-            panel.drawScrollbar(&sb_surf, view_height, sb_metrics.scroll_pos, sb_metrics.total);
+            panel.drawScrollbar(&sb_surf, view_height, sb_metrics.scroll_pos, sb_metrics.total, self.palette);
             new_children[idx] = .{
                 .origin = .{ .row = 0, .col = @intCast(view_width -| 1) },
                 .surface = sb_surf,
@@ -176,7 +185,7 @@ pub const TranscriptWidget = struct {
         }
 
         if (needs_pill) {
-            const p = tui_style.activePalette();
+            const p = self.palette;
             const pill_row = view_height -| 2;
             const pill_col = view_width -| pill_len -| 2;
             var pill_surf = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = pill_len, .height = 1 });
@@ -237,7 +246,7 @@ pub const TranscriptWidget = struct {
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message_height = messageRowsCached(&self.thread.transcript.messages.items[cursor], ConversationLayout.contentWidth(max_width));
+        const message_height = messageRowsCached(&self.thread.transcript.messages.items[cursor], ConversationLayout.contentWidth(max_width, self.presentation.max_content_width), self.presentation);
         self.thread.transcript_list.scroll.top = cursor;
         self.thread.transcript_list.scroll.pending_lines = 0;
         self.thread.transcript_list.scroll.wants_cursor = false;
@@ -264,6 +273,8 @@ pub const MessageListBuilder = struct {
     active_search_hit: ?SearchHit = null,
     now_ms: i64 = 0,
     body_selection: ?transcript_mod.BodySelection = null,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
+    presentation: tui_metrics.PresentationConfig = .{},
 
     pub fn build(ptr: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
         _ = cursor;
@@ -292,6 +303,8 @@ pub const MessageListBuilder = struct {
                 if (selection.message_index != idx) break :selection_range null;
                 break :selection_range selection.range();
             },
+            .palette = self.palette,
+            .presentation = self.presentation,
         };
         return body.widget();
     }
@@ -409,16 +422,17 @@ fn scrollbarMetrics(
     scroll_offset: i17,
     view_height: u16,
     view_width: u16,
+    presentation: tui_metrics.PresentationConfig,
 ) struct { scroll_pos: u16, total: u16 } {
-    const content_width = ConversationLayout.contentWidth(view_width);
+    const content_width = ConversationLayout.contentWidth(view_width, presentation.max_content_width);
     var total_rows: usize = 0;
     for (messages) |*msg| {
-        total_rows += messageRowsCached(msg, content_width);
+        total_rows += messageRowsCached(msg, content_width, presentation);
     }
     const top_index = @min(messages.len, scroll_top);
     var scroll_row: usize = @intCast(@max(0, scroll_offset));
     for (messages[0..top_index]) |*msg| {
-        scroll_row += messageRowsCached(msg, content_width);
+        scroll_row += messageRowsCached(msg, content_width, presentation);
     }
     const max_u16 = std.math.maxInt(u16);
     const total: u16 = @intCast(@min(max_u16, @max(total_rows, @as(usize, view_height) + 1)));
@@ -434,10 +448,10 @@ test "TranscriptWidget scrollbar reflects visual rows for a single long message"
     const long_msg = "line\n" ** 20;
     _ = try transcript.append(gpa, .user, "user", long_msg);
 
-    const m_mid = scrollbarMetrics(transcript.messages.items, 0, 10, 6, 40);
+    const m_mid = scrollbarMetrics(transcript.messages.items, 0, 10, 6, 40, .{});
     try std.testing.expectEqual(@as(u16, 22), m_mid.total);
     try std.testing.expectEqual(@as(u16, 10), m_mid.scroll_pos);
 
-    const m_top = scrollbarMetrics(transcript.messages.items, 0, 0, 6, 40);
+    const m_top = scrollbarMetrics(transcript.messages.items, 0, 0, 6, 40, .{});
     try std.testing.expectEqual(@as(u16, 0), m_top.scroll_pos);
 }

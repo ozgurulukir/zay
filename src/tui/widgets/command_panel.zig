@@ -23,6 +23,7 @@ pub const Content = struct {
     selection: u32,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -34,14 +35,14 @@ pub const Content = struct {
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
         if (width == 0 or height == 0) return surface;
-        panel.fillBackground(&surface);
+        panel.fillBackground(&surface, self.palette);
 
         try self.drawEntries(&surface, ctx);
         return surface;
     }
 
     fn drawEntries(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const height = surface.size.height;
         if (height == 0) return;
 
@@ -93,9 +94,10 @@ pub const Content = struct {
                 .trailing_mark = if (entry.description.len > 0 and surface.size.width > 24) entry.description else null,
                 .highlight_enabled = self.highlight_enabled,
                 .highlight_style = self.highlight_style,
+                .palette = p,
             });
         }
-        panel.drawViewportScrollbar(surface, viewport, total_matches);
+        panel.drawViewportScrollbar(surface, viewport, total_matches, p);
     }
 };
 

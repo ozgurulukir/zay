@@ -26,7 +26,7 @@ pub const diff_hint_line1: []const u8 = "↑↓ Move" ++ symbols.separator_dot_p
 pub const diff_hint_line2: []const u8 = "^W Comment" ++ symbols.separator_dot_padded ++ "^E Edit" ++ symbols.separator_dot_padded ++ "^D Delete" ++ symbols.separator_dot_padded ++ "^S Save & send" ++ symbols.separator_dot_padded ++ "Esc Exit";
 
 pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-    const p = tui_style.activePalette();
+    const p = &app.palette;
     const w = ctx.max.width orelse ctx.min.width;
     const h = ctx.max.height orelse ctx.min.height;
     var surface = try vxfw.Surface.init(ctx.arena, root_widget, .{ .width = w, .height = h });
@@ -45,7 +45,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
         // Cold start: navigated in, diff still fetching in the background.
         panel.lineStyledAt(&surface, body_top + body_h / 2, "Loading diff…", ctx, 2, p.model_status) catch {};
     } else {
-        var body: diff.DiffBodyWidget = .{ .state = &app.diff };
+        var body: diff.DiffBodyWidget = .{ .state = &app.diff, .palette = p };
         subs[n] = .{
             .origin = .{ .row = body_top, .col = 0 },
             .z_index = 0,
@@ -58,7 +58,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
     }
 
     if (editing) {
-        var editor: diff.DiffCommentEditor = .{ .state = &app.diff, .comment_input = &app.inputs.comment };
+        var editor: diff.DiffCommentEditor = .{ .state = &app.diff, .comment_input = &app.inputs.comment, .palette = p };
         subs[n] = .{
             .origin = .{ .row = h -| footer_h, .col = 0 },
             .z_index = 1,
@@ -94,7 +94,7 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
         const result_rows: u16 = @intCast(@max(@as(usize, 1), @min(app.diff.search_matches.items.len, 10)));
         const ph: u16 = @min(h, result_rows + 4);
         // Center the search popup on screen.
-        var search: diff.DiffSearchWidget = .{ .state = &app.diff, .palette_input = &app.inputs.palette };
+        var search: diff.DiffSearchWidget = .{ .state = &app.diff, .palette_input = &app.inputs.palette, .palette = p };
         subs[n] = .{
             .origin = .{ .row = (h -| ph) / 2, .col = (w -| pw) / 2 },
             .z_index = 2,
