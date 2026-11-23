@@ -63,12 +63,13 @@ pub const ViewportWindow = struct {
             return .{ .scroll_top = 0, .start_index = 0, .end_index = 0, .visible_height = 0 };
         }
 
+        const clamped_sel = @min(selection, total_count - 1);
         const max_scroll = total_count -| visible_height;
         var scroll_top = @min(scroll_state.scroll_top, max_scroll);
-        if (selection < scroll_top) {
-            scroll_top = selection;
-        } else if (selection >= scroll_top + visible_height) {
-            scroll_top = selection - visible_height + 1;
+        if (clamped_sel < scroll_top) {
+            scroll_top = clamped_sel;
+        } else if (clamped_sel >= scroll_top + visible_height) {
+            scroll_top = clamped_sel - visible_height + 1;
         }
         scroll_state.scroll_top = scroll_top;
 
@@ -92,7 +93,32 @@ pub fn secondaryColumn(width: u16) u16 {
 
 pub fn drawViewportScrollbar(surface: *vxfw.Surface, viewport: ViewportWindow, total_count: u32) void {
     if (total_count <= viewport.visible_height or viewport.visible_height == 0) return;
-    drawScrollbarAt(surface, 0, @intCast(viewport.visible_height), @intCast(viewport.scroll_top), @intCast(total_count));
+    drawViewportScrollbarAt(surface, 0, @intCast(viewport.visible_height), viewport, total_count);
+}
+
+pub fn drawViewportScrollbarAt(surface: *vxfw.Surface, start_row: u16, track_height: u16, viewport: ViewportWindow, total_count: u32) void {
+    if (surface.buffer.len == 0 or surface.size.width == 0 or surface.size.height == 0 or track_height == 0) return;
+    if (total_count <= viewport.visible_height or viewport.visible_height == 0) return;
+    const p = tui_style.activePalette();
+    const col = surface.size.width -| 1;
+    const max_s = total_count -| viewport.visible_height;
+    if (max_s == 0) return;
+
+    const bar_height: usize = @max(1, @as(usize, track_height) * @as(usize, viewport.visible_height) / @as(usize, total_count));
+    const max_top = track_height -| @as(u16, @intCast(bar_height));
+    const clamped_scroll = @min(viewport.scroll_top, max_s);
+    const top: u16 = @intCast(@as(usize, clamped_scroll) * @as(usize, max_top) / @as(usize, max_s));
+
+    var r: u16 = 0;
+    while (r < track_height and start_row + r < surface.size.height) : (r += 1) {
+        const is_thumb = r >= top and r < top + bar_height;
+        const grapheme: []const u8 = if (r == 0) "▲" else if (r == track_height - 1) "▼" else if (is_thumb) "█" else "│";
+        const style: vaxis.Style = if (is_thumb) p.border_label else p.border;
+        surface.writeCell(col, start_row + r, .{
+            .char = .{ .grapheme = grapheme, .width = 1 },
+            .style = style,
+        });
+    }
 }
 
 pub fn drawScrollbar(surface: *vxfw.Surface, height: u16, scroll: u16, total: u16) void {

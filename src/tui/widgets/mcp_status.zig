@@ -114,7 +114,7 @@ pub const Content = struct {
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
         }
         if (total_items > visible_items) {
-            panel.drawScrollbarAt(&surface, list_start_row, avail_rows, @intCast(viewport.scroll_top), @intCast(total_items));
+            panel.drawViewportScrollbarAt(&surface, list_start_row, avail_rows, viewport, total_items);
         }
 
         try panel.lineStyledAt(&surface, height -| 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, p.muted);

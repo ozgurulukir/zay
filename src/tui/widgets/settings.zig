@@ -327,7 +327,7 @@ pub const Content = struct {
             }
         }
         if (general_item_count > visible_items) {
-            panel.drawScrollbarAt(surface, list_start_row, avail_rows, @intCast(viewport.scroll_top), general_item_count);
+            panel.drawViewportScrollbarAt(surface, list_start_row, avail_rows, viewport, general_item_count);
         }
     }
 
