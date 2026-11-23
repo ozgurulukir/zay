@@ -1,44 +1,36 @@
-//! Mode overlay popup: the centered bordered box shown in command, session,
-//! provider, model, tree, save-message, and lanes modes.
+//! Pure overlay chrome and widget composition (INV-WIDGET-1).
 //!
-//! Pulled out of `tui.zig` (R7.1 of `_pm/Projects/tui-split`) — the overlay
-//! widget delegates the inner content to the per-mode picker widgets via
-//! `OverlayInner.drawInner`, which is a mode switch over `App.mode` that
-//! instantiates the right picker. The border label is set by `overlayLabel`,
-//! and the popup size by `overlaySize`.
-//!
-//! Instantiated by `drawRoot` in `tui/root_layout.zig` and published as
-//! `pub const OverlayWidget` via `tui.zig` re-export.
+//! `SearchableOverlayChrome` renders a bordered popup with an optional `>`
+//! search `TextField` + `─` separator and an arbitrary child `vxfw.Widget`.
+//! `OverlayWidget` composes `SearchableOverlayChrome` with the pure per-mode
+//! leaf widget view models built at the frame boundary by `overlay_builder.zig`.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const ai = @import("../../ai.zig");
-const tui = @import("../../tui.zig");
+const app_state = @import("../app_state.zig");
 const tui_style = @import("../style.zig");
-const panel = @import("panel.zig");
 const command_panel = @import("command_panel.zig");
 const help_picker = @import("help_picker.zig");
 const lanes_picker = @import("lanes_picker.zig");
-const search_widget = @import("search.zig");
+const links_picker = @import("links_picker.zig");
+const mcp_status = @import("mcp_status.zig");
 const model_picker = @import("model_picker.zig");
-const model_loader = @import("../model_loader.zig");
+const panel = @import("panel.zig");
+const plugins_status = @import("plugins_status.zig");
 const provider_picker = @import("provider_picker.zig");
 const resume_picker = @import("resume_picker.zig");
-const tree_selector = @import("tree_selector.zig");
-const links_picker = @import("links_picker.zig");
-const tui_status = @import("../status.zig");
-const codex = @import("../../auth/codex.zig");
+const search_widget = @import("search.zig");
 const settings_widget = @import("settings.zig");
 const theme_picker = @import("theme_picker.zig");
-const plugin_store_job = @import("../plugin_store_job.zig");
+const tree_selector = @import("tree_selector.zig");
 
-const App = tui.App;
+const Mode = app_state.Mode;
 
 pub const OverlaySize = struct { width: u16, height: u16 };
 
-pub fn preferredOverlaySize(mode: App.Mode) OverlaySize {
+pub fn preferredOverlaySize(mode: Mode) OverlaySize {
     return switch (mode) {
         .normal => .{ .width = 0, .height = 0 },
         .command => .{ .width = 64, .height = 16 },
@@ -59,14 +51,14 @@ pub fn preferredOverlaySize(mode: App.Mode) OverlaySize {
     };
 }
 
-pub fn isListPicker(mode: App.Mode) bool {
+pub fn isListPicker(mode: Mode) bool {
     return switch (mode) {
         .command, .session_picker, .model_picker, .tree_picker, .lanes, .help, .mcp, .plugins, .search, .theme_picker, .link_picker => true,
         else => false,
     };
 }
 
-pub fn overlaySize(mode: App.Mode, max_cols: u16, max_rows: u16) OverlaySize {
+pub fn overlaySize(mode: Mode, max_cols: u16, max_rows: u16) OverlaySize {
     if (mode == .normal or mode == .diff_viewer) return .{ .width = 0, .height = 0 };
 
     if (mode == .save_message) {
@@ -105,60 +97,37 @@ pub fn overlaySize(mode: App.Mode, max_cols: u16, max_rows: u16) OverlaySize {
     return .{ .width = width, .height = height };
 }
 
-fn overlayLabel(app: *const App) []const u8 {
-    return switch (app.mode) {
-        .normal => "",
-        .command => "Command",
-        .session_picker => switch (app.nav.session_action) {
-            .browsing => "Search for Sessions",
-            .renaming => "Rename Session",
-            .deleting => "Delete Session",
-            .blocked => "Cannot Delete Active Session",
-            .locating_project => "Set Local Project Root",
-        },
-        .provider_picker => "Connect to Provider",
-        .model_picker => "Select Model",
-        .tree_picker => "Session Timeline",
-        .save_message => "Commit Message",
-        .help => "Help & Keyboard Shortcuts",
-        .settings => "Settings",
-        .mcp => "Model Context Protocol (MCP)",
-        .plugins => "Lua Plugins",
-        .search => "Search Transcript",
-        .theme_picker => "Select Theme",
-        .link_picker => "Links in Message",
-        .lanes => switch (app.nav.lanes_purpose) {
-            .manage => "Parallel Lanes",
-            .merge_dest => "Merge Into",
-        },
-        .diff_viewer => "",
-    };
-}
+/// Pure searchable overlay chrome: border + label + optional `>` search
+/// `TextField` + `─` separator + child `vxfw.Widget`. Zero `*App` dependency.
+pub const SearchableOverlayChrome = struct {
+    label: []const u8,
+    width: u16,
+    height: u16,
+    full_panel: bool = false,
+    palette_input: ?*vxfw.TextField = null,
+    fill_background: bool = true,
+    content: vxfw.Widget,
 
-pub const OverlayWidget = struct {
-    app: *App,
-
-    pub fn widget(self: *OverlayWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawOverlay };
+    pub fn widget(self: *SearchableOverlayChrome) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = draw };
     }
 
-    fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
+    fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *SearchableOverlayChrome = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
         const max_w: u16 = ctx.max.width orelse 80;
         const max_h: u16 = ctx.max.height orelse 24;
-        const size = if (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form)
-            OverlaySize{ .width = @min(max_w, @max(@min(@as(u16, 40), max_w), (max_w * 9) / 10)), .height = @min(max_h, 12) }
-        else
-            overlaySize(self.app.mode, max_w, max_h);
-        const total_w: u16 = @min(size.width, max_w);
-        const total_h: u16 = @min(size.height, max_h);
-        self.app.drawn_overlay_width = total_w;
-        self.app.drawn_overlay_height = total_h;
-        var inner: OverlayInner = .{ .app = self.app };
-        const label_text = overlayLabel(self.app);
-        const border_labels: []const vxfw.Border.BorderLabel = if (label_text.len > 0)
-            &.{.{ .text = label_text, .alignment = .top_left }}
+        const total_w: u16 = @min(self.width, max_w);
+        const total_h: u16 = @min(self.height, max_h);
+
+        var inner: ChromeInner = .{
+            .full_panel = self.full_panel or self.palette_input == null,
+            .palette_input = self.palette_input,
+            .fill_background = self.fill_background,
+            .content = self.content,
+        };
+        const border_labels: []const vxfw.Border.BorderLabel = if (self.label.len > 0)
+            &.{.{ .text = self.label, .alignment = .top_left }}
         else
             &.{};
         var border: vxfw.Border = .{
@@ -173,36 +142,31 @@ pub const OverlayWidget = struct {
     }
 };
 
-const OverlayInner = struct {
-    app: *App,
+const ChromeInner = struct {
+    full_panel: bool,
+    palette_input: ?*vxfw.TextField,
+    fill_background: bool,
+    content: vxfw.Widget,
 
-    fn widget(self: *OverlayInner) vxfw.Widget {
+    fn widget(self: *ChromeInner) vxfw.Widget {
         return .{ .userdata = self, .drawFn = drawInner };
     }
 
     fn drawInner(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *OverlayInner = @ptrCast(@alignCast(ptr));
+        const self: *ChromeInner = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
         const iw: u16 = ctx.max.width orelse 0;
         const ih: u16 = ctx.max.height orelse 0;
 
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
-        panel.fillBackground(&surface);
+        if (self.fill_background) panel.fillBackground(&surface);
 
-        // The provider setup form, the settings panel, and the help modal host
-        // their own headers/navigation, so they skip the shared search row
-        // entirely and fill the panel from the top. `.plugins` matches: its
-        // focus stays on root (syncFocus routes it there), so a drawn palette
-        // filter row could never receive focus or text.
-        const is_full_panel = (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) or
-            self.app.mode == .settings or self.app.mode == .help or self.app.mode == .mcp or
-            self.app.mode == .plugins;
-        if (is_full_panel) {
+        if (self.full_panel or self.palette_input == null) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
                 .origin = .{ .row = 0, .col = 0 },
                 .z_index = 0,
-                .surface = try drawContent(self.app, ctx.withConstraints(
+                .surface = try self.content.draw(ctx.withConstraints(
                     .{ .width = iw, .height = ih },
                     .{ .width = iw, .height = ih },
                 )),
@@ -225,7 +189,7 @@ const OverlayInner = struct {
         // Row 0: prompt + shared overlay search input.
         var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
-        var input_box: vxfw.SizedBox = .{ .child = self.app.inputs.palette.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
+        var input_box: vxfw.SizedBox = .{ .child = self.palette_input.?.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
         var search_row: vxfw.FlexRow = .{ .children = &.{
             .{ .widget = prompt_box.widget(), .flex = 0 },
             .{ .widget = input_box.widget(), .flex = 1 },
@@ -248,326 +212,69 @@ const OverlayInner = struct {
         children[1] = .{
             .origin = .{ .row = 2, .col = 0 },
             .z_index = 0,
-            .surface = try drawContent(self.app, content_ctx),
+            .surface = try self.content.draw(content_ctx),
         };
 
         surface.children = children;
         return surface;
     }
+};
 
-    const mcp_status = @import("mcp_status.zig");
-    const plugins_status = @import("plugins_status.zig");
+pub const OverlayContent = union(enum) {
+    command: command_panel.Content,
+    session: resume_picker.Content,
+    provider: provider_picker.Content,
+    model: model_picker.Content,
+    tree: tree_selector.Content,
+    save_message: vxfw.Text,
+    lanes: lanes_picker.Content,
+    help: help_picker.Content,
+    settings: settings_widget.Content,
+    mcp: mcp_status.Content,
+    plugins: plugins_status.Content,
+    search: search_widget.Content,
+    theme: theme_picker.Content,
+    links: links_picker.Content,
 
-    fn drawContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        return switch (app.mode) {
-            .command => drawCommandContent(app, ctx),
-            .session_picker => drawSessionContent(app, ctx),
-            .provider_picker => drawProviderContent(app, ctx),
-            .model_picker => drawModelContent(app, ctx),
-            .tree_picker => drawTreeContent(app, ctx),
-            .save_message => drawSaveMessageContent(app, ctx),
-            .lanes => drawLanesContent(app, ctx),
-            .help => drawHelpContent(app, ctx),
-            .settings => drawSettingsContent(app, ctx),
-            .mcp => drawMcpContent(app, ctx),
-            .plugins => drawPluginsContent(app, ctx),
-            .search => drawSearchContent(app, ctx),
-            .theme_picker => drawThemeContent(app, ctx),
-            .link_picker => drawLinksContent(app, ctx),
-            // The diff viewer is full-screen — `drawRoot` returns before the
-            // overlay path, so this is never reached.
-            .normal, .diff_viewer => unreachable,
+    pub fn widget(self: *OverlayContent) vxfw.Widget {
+        return switch (self.*) {
+            inline else => |*c| c.widget(),
         };
     }
+};
 
-    fn drawLinksContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: links_picker.Content = .{ .state = &app.pickers.links };
-        return content.widget().draw(ctx);
+pub const OverlayWidget = struct {
+    label: []const u8,
+    width: u16,
+    height: u16,
+    full_panel: bool,
+    palette_input: ?*vxfw.TextField,
+    content: OverlayContent,
+
+    pub fn widget(self: *OverlayWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawOverlay };
     }
 
-    fn drawSearchContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: search_widget.Content = .{ .state = &app.pickers.search };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawThemeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInputArena(ctx.arena);
-        const active_name = app.theme_registry.resolveWithScheme(
-            app.cached_config.theme,
-            app.terminal_color_scheme,
-            app.cached_config.tui.effectiveLightTheme(),
-            app.cached_config.tui.effectiveDarkTheme(),
-        ).name;
-        var content: theme_picker.Content = .{
-            .themes = app.theme_registry.slice(),
-            .selection = app.pickers.theme.selection,
-            .active_name = active_name,
-            .filter = filter,
-            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
-            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+    fn drawOverlay(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *OverlayWidget = @ptrCast(@alignCast(ptr));
+        var chrome: SearchableOverlayChrome = .{
+            .label = self.label,
+            .width = self.width,
+            .height = self.height,
+            .full_panel = self.full_panel,
+            .palette_input = self.palette_input,
+            .fill_background = true,
+            .content = self.content.widget(),
         };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawMcpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: mcp_status.Content = .{
-            .state = &app.pickers.mcp,
-            .manager = &app.mcp_manager,
-            .url_input = app.input_buffers.mcp_url.items,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawPluginsContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        // Build both render snapshots from already-owned UI state. The draw
-        // path never refreshes a catalog or mutates the live plugin manager.
-        const installed_plugins = try plugin_store_job.installedPlugins(app.gpa, app);
-        defer app.gpa.free(installed_plugins);
-        var entries: std.ArrayList(plugins_status.PluginEntry) = .empty;
-        defer entries.deinit(app.gpa);
-        for (installed_plugins) |plugin| try entries.append(app.gpa, .{
-            .name = plugin.name,
-            .active = plugin.active,
-            .enabled = plugin.enabled,
-            .missing = plugin.path.len == 0,
-            .failed = plugin.diagnostic != null and plugin.path.len > 0,
-            .shadowed = plugin.shadowed,
-        });
-
-        var available: std.ArrayList(plugins_status.StoreEntry) = .empty;
-        defer available.deinit(ctx.arena);
-        if (app.plugin_store.catalogs) |*catalogs| {
-            var i: usize = 0;
-            while (i < catalogs.entryCount()) : (i += 1) {
-                const entry = catalogs.entryAt(i) orelse continue;
-                try available.append(ctx.arena, .{
-                    .name = entry.plugin.name,
-                    .version = entry.plugin.version,
-                    .store = entry.store_name,
-                    .installed = plugin_store_job.isInstalled(app, entry.catalog_source, entry.plugin.id),
-                    .stale = catalogs.catalogs[entry.catalog_index].stale,
-                });
-            }
-        }
-
-        var sources: std.ArrayList(plugins_status.StoreSourceEntry) = .empty;
-        defer sources.deinit(ctx.arena);
-        if (app.plugin_store.catalogs) |*catalogs| {
-            for (catalogs.stores) |source| try sources.append(ctx.arena, .{
-                .url = source.url,
-                .enabled = source.enabled,
-                .catalog_name = source.catalog_name,
-                .stale = source.stale,
-                .failure = source.failure,
-            });
-        }
-
-        const selected = app.pickers.plugins.selection;
-        const details = if (app.pickers.plugins.view == .installed and selected < installed_plugins.len) blk: {
-            const row = installed_plugins[selected];
-            var requested: std.ArrayList([]const u8) = .empty;
-            defer requested.deinit(ctx.arena);
-            if (row.permissions.file_access) try requested.append(ctx.arena, "file");
-            if (row.permissions.network_access) try requested.append(ctx.arena, "network");
-            if (row.permissions.allow_os_execute) try requested.append(ctx.arena, "os.execute");
-            if (row.permissions.allow_os_remove) try requested.append(ctx.arena, "os.remove/rename");
-            if (row.permissions.allow_env) try requested.append(ctx.arena, "env");
-            if (row.permissions.full_access) try requested.append(ctx.arena, "full Lua access");
-            const permission_summary = if (requested.items.len == 0) "no extra permissions requested" else try std.mem.join(ctx.arena, ", ", requested.items);
-            break :blk try std.fmt.allocPrint(ctx.arena, "v{s} · {s} · {s} · manifest requests: {s} · {s}", .{ row.version, row.origin, if (row.managed) "Store-managed" else "manual", permission_summary, row.diagnostic orelse row.path });
-        } else if (app.pickers.plugins.view == .store and app.plugin_store.catalogs != null) blk: {
-            const entry = app.plugin_store.catalogs.?.entryAt(selected) orelse break :blk "";
-            break :blk try std.fmt.allocPrint(ctx.arena, "{s} · {s} · {s}", .{ entry.plugin.description, entry.catalog_source, if (plugin_store_job.verified(entry.plugin)) "verified files" else "unverified files" });
-        } else if (app.pickers.plugins.view == .sources and selected < sources.items.len) blk: {
-            const source = sources.items[selected];
-            break :blk source.failure orelse source.catalog_name orelse source.url;
-        } else "";
-        var content: plugins_status.Content = .{
-            .state = &app.pickers.plugins,
-            .plugins = entries.items,
-            .available = available.items,
-            .sources = sources.items,
-            .store_url_input = app.input_buffers.plugin_store_url.items,
-            .notice = app.plugin_store.notice,
-            .installing = app.plugin_store.operation == .installing,
-            .uninstalling = app.plugin_store.operation == .uninstalling,
-            .refreshing = app.plugin_store.operation == .refreshing or app.plugin_store.operation == .scanning,
-            .details = details,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawHelpContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: help_picker.Content = .{ .state = &app.pickers.help };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawSettingsContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const runtime = app.liveRuntime();
-        var content: settings_widget.Content = .{
-            .state = &app.pickers.settings,
-            .config = &app.cached_config,
-            .home_dir = if (runtime) |r| r.home_dir else "",
-            .cwd = if (runtime) |r| r.cwd else ".",
-            .system_prompt_input = app.input_buffers.settings_text.items,
-            .bash_classifier_input = app.input_buffers.settings_text.items,
-            .max_content_width_input = app.input_buffers.settings_text.items,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawSaveMessageContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        _ = app;
-        // No body — the border label ("Commit Message") and the input row say it all.
-        var text: vxfw.Text = .{ .text = "" };
-        return text.widget().draw(ctx);
-    }
-
-    fn drawTreeContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        var content: tree_selector.Content = .{
-            .state = &app.pickers.tree,
-            .list = &app.list_widgets.tree_list,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawLanesContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const entries = try app.buildLaneEntries(ctx.arena);
-        var content: lanes_picker.Content = .{
-            .list = &app.list_widgets.lanes_list,
-            .entries = entries,
-            .selection = app.nav.lanes_selection,
-            .empty_message = switch (app.nav.lanes_purpose) {
-                .manage => "  No parked lanes.",
-                .merge_dest => "  No lanes to merge into.",
-            },
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawCommandContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        // The filter lives only for this frame's draw; the frame arena bounds
-        // its lifetime, so skip the per-frame gpa alloc + free.
-        const filter = try app.peekPaletteInputArena(ctx.arena);
-        // Build the visible entry list (lane commands appear only with >1 lane);
-        // resolveCommand applies the same visibility + filter, so indices align.
-        var buf: [tui.commands.len]command_panel.Entry = undefined;
-        var n: usize = 0;
-        for (tui.commands) |entry| {
-            if (!tui.commandVisible(app, entry)) continue;
-            buf[n] = .{ .name = entry.name, .description = entry.description };
-            n += 1;
-        }
-        var content: command_panel.Content = .{
-            .entries = buf[0..n],
-            .filter = filter,
-            .selection = app.nav.command_selection,
-            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
-            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawSessionContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInputArena(ctx.arena);
-        var content: resume_picker.Content = .{
-            .io = app.io,
-            .list = &app.list_widgets.resume_list,
-            .summaries = app.resume_summaries.items,
-            .selection = app.nav.resume_selection,
-            .folded_projects = app.resume_folded_projects.items,
-            .filter = filter,
-            .group_by = app.nav.resume_group_by,
-            .action = app.nav.session_action,
-            .rename_text = app.input_buffers.session_rename_text.items,
-            .project_root_text = app.input_buffers.project_root_text.items,
-            .project_root_error = app.project_root_error,
-            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
-            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInputArena(ctx.arena);
-        var content: provider_picker.Content = .{
-            .state = app.pickers.provider,
-            .codex_signed_in = app.isCodexSignedIn(),
-            // `conn_status` is indexed by `catalogueProviders()` order, exactly
-            // how the picker iterates its rows.
-            .statuses = &app.provider_state.conn_status,
-            .key_input = app.input_buffers.provider_key.items,
-            .api_keys = &app.provider_state.api_keys,
-            .filter = filter,
-            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
-            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    fn drawModelContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const filter = try app.peekPaletteInputArena(ctx.arena);
-        const status = tui_status.modelStatus(app.liveRuntime(), app.cached_config);
-        // Project the consolidated entries into the parallel slices the picker
-        // widget consumes. Arena-allocated, rebuilt each draw — cheap, and it
-        // keeps the picker decoupled from the catalogue's internal layout.
-        const entries = app.pickers.models.entries.items;
-        const picker_models = try ctx.arena.alloc(codex.Model, entries.len);
-        const picker_sources = try ctx.arena.alloc(model_loader.ModelSource, entries.len);
-        const picker_reasoning = try ctx.arena.alloc(u32, entries.len);
-        for (entries, 0..) |entry, i| {
-            picker_models[i] = entry.model;
-            picker_sources[i] = entry.source;
-            picker_reasoning[i] = entry.reasoning_index;
-        }
-        var content: model_picker.Content = .{
-            .models = picker_models,
-            .sources = picker_sources,
-            .list = &app.list_widgets.model_list,
-            .selection = app.pickers.models.model_selection,
-            .column = app.pickers.models.model_column,
-            .active_model = if (status) |value| value.model else null,
-            .reasoning_options = tui.activeReasoningOptions(app),
-            .reasoning_indexes = picker_reasoning,
-            .footer = try buildModelPickerFooter(app, ctx.arena, status),
-            .filter = filter,
-            .loading = app.pickers.models.load == .loading,
-            .error_message = if (app.pickers.models.load == .failed) app.pickers.models.load.failed.message else null,
-            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
-            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
-        };
-        return content.widget().draw(ctx);
-    }
-
-    /// Footer status line for the model picker: the save scope (moved out of
-    /// the table, cycled with Ctrl+S) and the wire parameter the selected
-    /// model+effort would actually emit (dialect-aware — DashScope uses
-    /// `enable_thinking`, everything else `reasoning_effort`).
-    fn buildModelPickerFooter(app: *App, arena: std.mem.Allocator, status: ?tui_status.ModelStatus) std.mem.Allocator.Error![]const u8 {
-        const scope_text = switch (app.pickers.models.model_scope) {
-            .global => "Global",
-            .project => "Project",
-            .session => "Session",
-        };
-        const opts = tui.activeReasoningOptions(app);
-        const r_index: u32 = if (app.pickers.models.model_selection < app.pickers.models.entries.items.len)
-            app.pickers.models.entries.items[app.pickers.models.model_selection].reasoning_index
-        else
-            0;
-        const effort_label = if (r_index < opts.len) opts[r_index].label else "medium";
-        const dialect = if (app.liveRuntime()) |rt| rt.wire_dialect else ai.WireDialect.minimal;
-        const wire_param: []const u8 = if (dialect.usesEnableThinking()) "enable_thinking" else "reasoning_effort";
-        const provider = if (status) |s| s.provider else "unknown provider";
-        const refresh = if (app.pickers.models.load == .loading) "  ⟳ refreshing…" else "";
-        return std.fmt.allocPrint(arena, "  Scope: {s}  │  Ctrl+S to change      →  {s}:\"{s}\" ({s}){s}", .{ scope_text, wire_param, effort_label, provider, refresh });
+        return chrome.widget().draw(ctx);
     }
 };
 
 test "overlaySize gives every mode a panel and zeroes the chromeless ones" {
     // Exhaustive over the Mode enum: a mode added without an overlay size
     // must fail here, not show up as a zero-sized popup at runtime.
-    inline for (std.meta.fields(App.Mode)) |field| {
-        const mode: App.Mode = @enumFromInt(field.value);
+    inline for (std.meta.fields(Mode)) |field| {
+        const mode: Mode = @enumFromInt(field.value);
         const size = overlaySize(mode, 100, 30);
         switch (mode) {
             // Rendered inline, no overlay panel.
@@ -585,37 +292,31 @@ test "overlaySize gives every mode a panel and zeroes the chromeless ones" {
 }
 
 test "overlaySize pins known panel dimensions on standard terminal" {
-    // The exact grid the root layout clamps against — these are load-bearing
-    // numbers (a screen smaller than a panel must still fit).
     try std.testing.expectEqual(@as(u16, 64), overlaySize(.command, 100, 30).width);
     try std.testing.expectEqual(@as(u16, 90), overlaySize(.settings, 100, 40).width);
     try std.testing.expectEqual(@as(u16, 25), overlaySize(.settings, 100, 40).height);
     try std.testing.expectEqual(@as(u16, 20), overlaySize(.tree_picker, 100, 30).height);
-    // The commit-message box is a one-line input, deliberately tiny.
     try std.testing.expectEqual(@as(u16, 3), overlaySize(.save_message, 100, 30).height);
 }
 
 test "overlaySize table-driven across heights 5..80 and widths 20..200" {
     const heights = [_]u16{ 5, 8, 12, 24, 40, 60, 80 };
     const widths = [_]u16{ 20, 35, 50, 80, 100, 160, 200 };
-    const modes = [_]App.Mode{ .command, .session_picker, .tree_picker, .help, .settings, .save_message };
+    const modes = [_]Mode{ .command, .session_picker, .tree_picker, .help, .settings, .save_message };
 
     for (heights) |h| {
         for (widths) |w| {
             for (modes) |m| {
                 const s = overlaySize(m, w, h);
-                // 1. Output size must never exceed terminal boundaries
                 try std.testing.expect(s.width <= w);
                 try std.testing.expect(s.height <= h);
 
                 if (m == .save_message) {
                     try std.testing.expect(s.height <= 3);
                 } else {
-                    // 2. On tall terminals (e.g. h=80), list pickers grow to ~70% of rows
                     if (h >= 40) {
                         try std.testing.expect(s.height >= 20);
                     }
-                    // 3. Last item reachability: width and height are positive
                     try std.testing.expect(s.width > 0);
                     try std.testing.expect(s.height > 0);
                 }

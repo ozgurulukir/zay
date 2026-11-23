@@ -11,6 +11,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui_style = @import("../style.zig");
+const overlay = @import("overlay.zig");
 const panel = @import("panel.zig");
 const diff_viewer = @import("../diff_viewer.zig");
 
@@ -470,76 +471,50 @@ pub const DiffSearchWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *DiffSearchWidget = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
-        var inner: DiffSearchInner = .{ .state = self.state, .palette_input = self.palette_input };
-        var border: vxfw.Border = .{
-            .child = inner.widget(),
-            .style = p.thinking_body,
-            .labels = &.{.{ .text = "Jump to file", .alignment = .top_left }},
+        var list: DiffSearchList = .{ .state = self.state };
+        var chrome: overlay.SearchableOverlayChrome = .{
+            .label = "Jump to file",
+            .width = ctx.max.width orelse 80,
+            .height = ctx.max.height orelse 24,
+            .full_panel = false,
+            .palette_input = self.palette_input,
+            .fill_background = false,
+            .content = list.widget(),
         };
-        return border.widget().draw(ctx);
+        return chrome.widget().draw(ctx);
     }
 };
 
-const DiffSearchInner = struct {
+const DiffSearchList = struct {
     state: *diff_viewer.State,
-    palette_input: *vxfw.TextField,
 
-    fn widget(self: *DiffSearchInner) vxfw.Widget {
+    fn widget(self: *DiffSearchList) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
     }
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *DiffSearchInner = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const self: *DiffSearchList = @ptrCast(@alignCast(ptr));
         const state = self.state;
-        const palette_input = self.palette_input;
         const iw: u16 = ctx.max.width orelse 0;
         const ih: u16 = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
         if (iw == 0 or ih == 0) return surface;
 
-        // Separator under the search row.
-        var sep_col: u16 = 0;
-        while (sep_col < iw) : (sep_col += 1) {
-            surface.writeCell(sep_col, 1, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = p.thinking_body });
-        }
-
-        // Row 0: prompt + the search text field.
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-        var prompt_text: vxfw.Text = .{ .text = ">", .softwrap = false, .width_basis = .parent };
-        var prompt_box: vxfw.SizedBox = .{ .child = prompt_text.widget(), .size = .{ .width = 2, .height = 1 } };
-        var input_box: vxfw.SizedBox = .{ .child = palette_input.widget(), .size = .{ .width = iw -| 2, .height = 1 } };
-        var search_row: vxfw.FlexRow = .{ .children = &.{
-            .{ .widget = prompt_box.widget(), .flex = 0 },
-            .{ .widget = input_box.widget(), .flex = 1 },
-        } };
-        children[0] = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .z_index = 0,
-            .surface = try search_row.widget().draw(ctx.withConstraints(
-                .{ .width = iw, .height = 1 },
-                .{ .width = iw, .height = 1 },
-            )),
-        };
-        surface.children = children;
-
-        // Rows 2..: filtered file list (drawn straight onto the base buffer).
+        // Filtered file list (drawn straight onto the base buffer).
         const matches = state.search_matches.items;
         const files = state.files.items;
-        const visible: u16 = ih -| 2;
         if (matches.len == 0) {
-            panel.lineAt(&surface, 2, "No matching files", ctx, false, 0) catch {};
+            panel.lineAt(&surface, 0, "No matching files", ctx, false, 0) catch {};
             return surface;
         }
         const count: u32 = @intCast(matches.len);
-        const viewport = panel.ViewportWindow.compute(state.search_sel, count, visible);
+        const viewport = panel.ViewportWindow.compute(state.search_sel, count, ih);
         var r: u16 = 0;
         while (r < viewport.visible_height and viewport.start_index + r < count) : (r += 1) {
             const index = viewport.start_index + r;
             const selected = index == state.search_sel;
             const text = std.fmt.allocPrint(ctx.arena, "  {s}", .{files[matches[index]].path}) catch files[matches[index]].path;
-            panel.lineAt(&surface, 2 + r, text, ctx, selected, 0) catch {};
+            panel.lineAt(&surface, r, text, ctx, selected, 0) catch {};
         }
         return surface;
     }

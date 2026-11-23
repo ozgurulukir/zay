@@ -4712,3 +4712,20 @@ test "setMode and handleColorSchemeChange preserve theme preview invariants (#56
     try std.testing.expect(app.theme_preview_original == null);
     try std.testing.expect(style_mod.buildPalette(light_theme).background.eql(style_mod.active.background));
 }
+
+test "INV-WIDGET-1: no file under src/tui/widgets/ references *App or *tui.App (#569)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "src/tui/widgets", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        const content = try dir.readFileAlloc(io, entry.name, gpa, .limited(512 * 1024));
+        defer gpa.free(content);
+        if (std.mem.indexOf(u8, content, "*App") != null or std.mem.indexOf(u8, content, "*tui.App") != null) {
+            std.debug.print("INV-WIDGET-1 violation in src/tui/widgets/{s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}

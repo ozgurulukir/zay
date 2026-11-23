@@ -3,7 +3,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
-const message = @import("message.zig");
 const tui_style = @import("../style.zig");
 const auth = @import("../../auth/store.zig");
 const config_mod = @import("../../config/config.zig");
@@ -301,7 +300,7 @@ pub const Content = struct {
             .query = self.filter,
             .selected = row_selected,
             .base_style = base_style,
-            .start_col = message.ConversationLayout.left -| 1,
+            .start_col = panel.panel_margin_x,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
         });
@@ -343,7 +342,7 @@ pub const Content = struct {
             .unknown => unreachable,
         };
         const text_width = ctx.stringWidth(prefix) + ctx.stringWidth(display_name);
-        const badge_col: u16 = (message.ConversationLayout.left -| 1) +
+        const badge_col: u16 = panel.panel_margin_x +
             @as(u16, @intCast(@min(text_width, @as(usize, std.math.maxInt(u16)))));
         try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, row_selected));
     }
@@ -366,13 +365,13 @@ pub const Content = struct {
             .query = self.filter,
             .selected = row_selected,
             .base_style = base_style,
-            .start_col = message.ConversationLayout.left -| 1,
+            .start_col = panel.panel_margin_x,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
         });
 
         if (self.codex_signed_in) {
-            const badge_col: u16 = (message.ConversationLayout.left -| 1) +
+            const badge_col: u16 = panel.panel_margin_x +
                 @as(u16, @intCast(@min(ctx.stringWidth("  OpenAI Codex"), @as(usize, std.math.maxInt(u16)))));
             try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(p.success, row_selected));
             try self.drawSignOut(surface, ctx, row, row_selected);
@@ -399,7 +398,7 @@ pub const Content = struct {
         const base_url = handle.defaultBaseUrl();
         const requires_key = handle.requiresApiKey();
 
-        const start_col = message.ConversationLayout.left -| 1;
+        const start_col = panel.panel_margin_x;
         try panel.lineStyledAt(surface, 1, display_name, ctx, start_col, p.model_status);
 
         try panel.lineStyledAt(surface, 2, desc, ctx, start_col, p.thinking_body);
@@ -500,7 +499,7 @@ test "provider picker keeps codex text visible when sign out is focused" {
     };
     const surface = try content.widget().draw(ctx);
 
-    try std.testing.expectEqualStrings("O", surface.readCell(message.ConversationLayout.left + 1, 0).char.grapheme);
+    try std.testing.expectEqualStrings("O", surface.readCell(panel.panel_margin_x + 2, 0).char.grapheme);
     try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
     try std.testing.expectEqual(tui_style.activePalette().selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }

@@ -4,7 +4,6 @@ const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
 const app_state = @import("../app_state.zig");
-const message = @import("message.zig");
 const panel = @import("panel.zig");
 const text_fit = @import("../text_fit.zig");
 const tui_style = @import("../style.zig");
@@ -88,7 +87,7 @@ pub const Content = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        const col = message.ConversationLayout.left -| 1;
+        const col = panel.panel_margin_x;
         if (self.summaries.len == 0) {
             try panel.lineStyledAt(&surface, 0, "No sessions yet.", ctx, col, p.panel_header);
             try panel.lineStyledAt(&surface, 1, "Start a conversation and it will show up here.", ctx, col, p.notice);
@@ -393,7 +392,7 @@ const Row = struct {
         if (self.selected) panel.fillRow(surface, 0, p.selected);
 
         const marker = "  ";
-        const start_col = message.ConversationLayout.left -| 1;
+        const start_col = panel.panel_margin_x;
         const marker_style = if (self.selected)
             p.selected_item
         else
@@ -436,7 +435,7 @@ const Row = struct {
             .text = title,
             .query = self.filter,
             .selected = self.selected,
-            .start_col = message.ConversationLayout.left -| 1,
+            .start_col = panel.panel_margin_x,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
         });
@@ -626,8 +625,8 @@ fn baseName(path: []const u8) []const u8 {
 }
 
 fn resumeLeftWidth(ctx: vxfw.DrawContext, row_width: u16, modified: []const u8) usize {
-    const start_col = message.ConversationLayout.left -| 1;
-    const end_col = row_width -| message.ConversationLayout.right;
+    const start_col = panel.panel_margin_x;
+    const end_col = row_width -| panel.panel_margin_right;
     const date_width = ctx.stringWidth(modified);
     if (end_col <= start_col) return 0;
     if (date_width + 1 >= end_col - start_col) return 0;
@@ -654,7 +653,7 @@ test "resume picker shows a first-run empty state when there are no sessions" {
     };
     const surface = try content.widget().draw(ctx);
 
-    try std.testing.expectEqualStrings("N", surface.readCell(message.ConversationLayout.left -| 1, 0).char.grapheme);
+    try std.testing.expectEqualStrings("N", surface.readCell(panel.panel_margin_x, 0).char.grapheme);
 }
 
 test "resume picker shows a no-match empty state when the filter filters everything out" {
@@ -679,8 +678,8 @@ test "resume picker shows a no-match empty state when the filter filters everyth
     };
     const surface = try content.widget().draw(ctx);
 
-    try std.testing.expectEqualStrings("N", surface.readCell(message.ConversationLayout.left -| 1, 0).char.grapheme);
-    const row1 = surface.readCell(message.ConversationLayout.left -| 1, 1).char.grapheme;
+    try std.testing.expectEqualStrings("N", surface.readCell(panel.panel_margin_x, 0).char.grapheme);
+    const row1 = surface.readCell(panel.panel_margin_x, 1).char.grapheme;
     try std.testing.expect(std.mem.eql(u8, row1, "A")); // "Adjust the search text above."
 }
 

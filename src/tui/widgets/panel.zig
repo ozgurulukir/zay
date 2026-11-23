@@ -3,12 +3,13 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const c = @import("c");
 
-const message = @import("message.zig");
 const text_fit = @import("../text_fit.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
 const tools_common = @import("../../tools/common.zig");
 
+pub const panel_margin_x: u16 = 1;
+pub const panel_margin_right: u16 = 2;
 const secondary_column: u16 = 52;
 
 pub const Shell = struct {
@@ -149,7 +150,7 @@ pub fn drawScrollbarAt(surface: *vxfw.Surface, start_row: u16, height: u16, scro
 }
 
 pub fn commandLine(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, selected: bool) !void {
-    try lineAt(surface, row, text, ctx, selected, message.ConversationLayout.left -| 1);
+    try lineAt(surface, row, text, ctx, selected, panel_margin_x);
 }
 
 pub fn fillRow(surface: *vxfw.Surface, row: u16, style: vaxis.Style) void {
@@ -222,7 +223,7 @@ pub fn right(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawC
 pub fn rightStyled(surface: *vxfw.Surface, row: u16, text: []const u8, ctx: vxfw.DrawContext, active_style: vaxis.Style) !void {
     if (row >= surface.size.height) return;
     const stable_text = try ctx.arena.dupe(u8, text);
-    const end_col = surface.size.width -| message.ConversationLayout.right;
+    const end_col = surface.size.width -| panel_margin_right;
     if (end_col == 0) return;
     const fit = try text_fit.truncateStart(ctx.arena, stable_text, end_col);
     const display_width = text_fit.measure(fit.text);
