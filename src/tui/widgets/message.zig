@@ -498,12 +498,26 @@ pub const MessageWidget = struct {
             if (col >= col_limit) return;
             // The hot `*` accent follows the theme; the rest of the brightness
             // ramp stays artistically fixed so the accretion-disk shape is kept.
-            const rgb: ?blackhole.Rgb = if (byte == '*') p.intro_accent.fg.rgb else blackhole.colorAt(byte);
-            if (rgb) |rgb_val| {
-                MessageWidget.writeCellOnCard(surface, col, row, .{
-                    .char = .{ .grapheme = line[i .. i + 1], .width = 1 },
-                    .style = .{ .fg = .{ .rgb = rgb_val } },
-                });
+            // Under NO_COLOR (`intro_accent.fg != .rgb`), render monochrome
+            // attributes without touching `.fg.rgb` or raw RGB literals.
+            switch (p.intro_accent.fg) {
+                .rgb => |accent_rgb| {
+                    const rgb: ?blackhole.Rgb = if (byte == '*') accent_rgb else blackhole.colorAt(byte);
+                    if (rgb) |rgb_val| {
+                        MessageWidget.writeCellOnCard(surface, col, row, .{
+                            .char = .{ .grapheme = line[i .. i + 1], .width = 1 },
+                            .style = .{ .fg = .{ .rgb = rgb_val } },
+                        });
+                    }
+                },
+                else => {
+                    if (byte == '*' or blackhole.colorAt(byte) != null) {
+                        MessageWidget.writeCellOnCard(surface, col, row, .{
+                            .char = .{ .grapheme = line[i .. i + 1], .width = 1 },
+                            .style = if (byte == '*') p.intro_accent else p.muted,
+                        });
+                    }
+                },
             }
             col += 1;
         }
@@ -523,7 +537,7 @@ pub const MessageWidget = struct {
             if (col + width > col_limit) return;
             MessageWidget.writeCellOnCard(surface, col, row, .{
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
-                .style = .{ .fg = .{ .rgb = p.intro_accent.fg.rgb } },
+                .style = p.intro_accent,
             });
             col += width;
         }
@@ -1724,4 +1738,35 @@ test "MessageWidget highlights multiple search matches within one markdown span"
     try std.testing.expect(surface.readCell(ConversationLayout.left + 0, ConversationLayout.top).style.bold);
     try std.testing.expect(surface.readCell(ConversationLayout.left + 8, ConversationLayout.top).style.bold);
     try std.testing.expect(!surface.readCell(ConversationLayout.left + 4, ConversationLayout.top).style.bold);
+}
+
+test "MessageWidget renders logo with monochrome NO_COLOR palette without panicking" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    const index = try transcript.append(gpa, .logo, "zay", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const mono = tui_style.buildMonochromePalette();
+    var message_widget: MessageWidget = .{
+        .message = &transcript.messages.items[index],
+        .selected = false,
+        .loading_frame = 0,
+        .blackhole_frame = 0,
+        .has_model_configured = false,
+        .palette = &mono,
+        .gpa = gpa,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try message_widget.widget().draw(ctx);
+    for (surface.buffer) |cell| {
+        try std.testing.expect(cell.style.fg != .rgb);
+        try std.testing.expect(cell.style.bg != .rgb);
+    }
 }

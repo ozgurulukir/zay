@@ -49,6 +49,7 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
             // list. Stays in sync with the `.command` clamp in event_callbacks.
             const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
+            theme_lifecycle.previewSelected(app);
         }
         if (app.mode == .provider_picker and app.pickers.provider.stage == .list) {
             const count = provider_picker.countMatching(app.pickers.provider.entries, value);

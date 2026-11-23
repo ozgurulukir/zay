@@ -167,6 +167,7 @@ pub const Content = struct {
             .selection = self.selection,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .palette = self.palette,
             .now_ms = self.now_ms,
         };
         try builder.build();
@@ -190,6 +191,7 @@ const RowBuilder = struct {
     selection: u32,
     highlight_enabled: bool,
     highlight_style: config_mod.FuzzyHighlightStyle,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
     index: u32 = 0,
 
     fn build(self: *RowBuilder) !void {
@@ -268,6 +270,7 @@ const RowBuilder = struct {
             .io = self.io,
             .kind = .{ .date_header = .{ .label = label, .count = @intCast(@min(count, std.math.maxInt(u32))) } },
             .selected = false,
+            .palette = self.palette,
         };
         self.widgets[self.index] = self.rows[self.index].widget();
         self.index += 1;
@@ -297,6 +300,7 @@ const RowBuilder = struct {
             .io = self.io,
             .kind = .{ .project = .{ .label = label, .session_count = @intCast(@min(group.len, std.math.maxInt(u32))), .folded = folded, .prefix = prefix } },
             .selected = self.index == self.selection,
+            .palette = self.palette,
         };
         self.widgets[self.index] = self.rows[self.index].widget();
         self.index += 1;
@@ -315,6 +319,7 @@ const RowBuilder = struct {
             .filter = self.filter,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .palette = self.palette,
         };
         self.widgets[self.index] = self.rows[self.index].widget();
         self.index += 1;
@@ -714,4 +719,42 @@ fn truncateText(ctx: vxfw.DrawContext, text: []const u8, width: usize) ![]const 
     if (width == 0) return ctx.arena.dupe(u8, "");
     const fit = try text_fit.truncateEnd(ctx.arena, text, @intCast(width));
     return fit.text;
+}
+
+fn expectNoRgbCells(surface: vxfw.Surface) !void {
+    for (surface.buffer) |cell| {
+        try std.testing.expect(cell.style.fg != .rgb);
+        try std.testing.expect(cell.style.bg != .rgb);
+    }
+    for (surface.children) |child| {
+        try expectNoRgbCells(child.surface);
+    }
+}
+
+test "resume_picker renders rows with monochrome palette without rgb cells" {
+    const mono = tui_style.buildMonochromePalette();
+    var list: vxfw.ListView = .{ .children = .{ .slice = &.{} }, .draw_cursor = false };
+    var summaries = [_]session_mod.SessionSummary{
+        .{ .id = @constCast("1"), .title = @constCast("one"), .cwd = @constCast("/repo/a"), .created_at_ms = 0, .updated_at_ms = 2, .leaf_entry_id = null, .model_provider = null, .model_id = null, .reasoning_effort = null },
+    };
+    var content: Content = .{
+        .io = std.testing.io,
+        .list = &list,
+        .summaries = &summaries,
+        .selection = 0,
+        .folded_projects = &.{},
+        .filter = "",
+        .group_by = .project,
+        .palette = &mono,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+    try expectNoRgbCells(surface);
 }

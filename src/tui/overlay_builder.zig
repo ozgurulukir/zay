@@ -141,12 +141,17 @@ fn buildOverlayContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
 
 fn buildThemeContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Error!theme_picker.Content {
     const filter = try app.peekPaletteInputArena(arena);
-    const active_name = app.theme_registry.resolveWithScheme(
-        app.cached_config.theme,
-        app.terminal_color_scheme,
-        app.cached_config.tui.effectiveLightTheme(),
-        app.cached_config.tui.effectiveDarkTheme(),
-    ).name;
+    const cur_theme = app.cached_config.theme orelse "";
+    const is_auto = std.ascii.eqlIgnoreCase(std.mem.trim(u8, cur_theme, " \t\r\n"), "auto");
+    const active_name = if (is_auto)
+        theme_picker.auto_name
+    else
+        app.theme_registry.resolveWithScheme(
+            app.cached_config.theme,
+            app.terminal_color_scheme,
+            app.cached_config.tui.effectiveLightTheme(),
+            app.cached_config.tui.effectiveDarkTheme(),
+        ).name;
     return .{
         .themes = app.theme_registry.slice(),
         .selection = app.pickers.theme.selection,
