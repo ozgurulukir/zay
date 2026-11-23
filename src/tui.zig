@@ -448,18 +448,28 @@ pub const App = struct {
         // custom slugs so a config with `"theme": "<custom>"` is applied at
         // startup instead of silently falling back to `default`.
         try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
-        tui_style.setNoColor(tui_style.isNoColorActive(app.cached_config.tui.no_color, environ_map));
-        tui_metrics.readable_measure_max = app.cached_config.tui.max_content_width;
-        tui_metrics.transcript_density = app.cached_config.tui.density;
-        tui_metrics.show_turn_timestamps = app.cached_config.tui.show_turn_timestamps;
-        const active_theme = app.theme_registry.resolveWithScheme(
-            app.cached_config.theme,
-            app.terminal_color_scheme,
-            app.cached_config.tui.effectiveLightTheme(),
-            app.cached_config.tui.effectiveDarkTheme(),
+        app.syncPresentationConfig();
+        return app;
+    }
+
+    /// Apply `cached_config`'s `no_color`, `tui_metrics`, and `theme` to the
+    /// active presentation state and invalidate all lane row caches if metrics
+    /// changed. Called on startup (`initRuntime`) and cross-project resume.
+    pub fn syncPresentationConfig(self: *App) void {
+        tui_style.setNoColor(tui_style.isNoColorActive(self.cached_config.tui.no_color, self.environ_map));
+        settings_lifecycle.syncLiveTranscriptMetrics(
+            self,
+            self.cached_config.tui.max_content_width,
+            self.cached_config.tui.density,
+            self.cached_config.tui.show_turn_timestamps,
+        );
+        const active_theme = self.theme_registry.resolveWithScheme(
+            self.cached_config.theme,
+            self.terminal_color_scheme,
+            self.cached_config.tui.effectiveLightTheme(),
+            self.cached_config.tui.effectiveDarkTheme(),
         );
         tui_style.setActive(active_theme);
-        return app;
     }
 
     /// Test seam mirroring root.zig's hand-off: install a caller-owned
@@ -991,6 +1001,9 @@ pub const App = struct {
     /// and test fixtures, no code writes `mode` directly (#292: the
     /// transition owns its follow-up duties).
     pub fn setMode(self: *App, mode: App.Mode) void {
+        if (self.mode == .theme_picker and mode != .theme_picker) {
+            theme_lifecycle.revertThemePreview(self);
+        }
         self.mode = mode;
         self.clearInput();
         self.clearPaletteInput();
@@ -1000,6 +1013,9 @@ pub const App = struct {
     /// the content being edited across the flip (the palette text mirrored
     /// in `syncModeWithInput`). Same contract as `setMode` otherwise.
     pub fn setModeKeepInput(self: *App, mode: App.Mode) void {
+        if (self.mode == .theme_picker and mode != .theme_picker) {
+            theme_lifecycle.revertThemePreview(self);
+        }
         self.mode = mode;
     }
 

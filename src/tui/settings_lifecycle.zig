@@ -141,7 +141,7 @@ pub fn closeSettings(app: *App) void {
     app.setMode(.normal);
 }
 
-fn syncLiveTranscriptMetrics(
+pub fn syncLiveTranscriptMetrics(
     app: *App,
     max_content_width: u16,
     density: config_mod.TranscriptDensity,
@@ -155,7 +155,9 @@ fn syncLiveTranscriptMetrics(
     metrics.transcript_density = density;
     metrics.show_turn_timestamps = show_turn_timestamps;
     if (changed) {
-        app.thread.transcript.invalidateAllRowCaches();
+        for (app.threads.slice()) |lane| {
+            lane.transcript.invalidateAllRowCaches();
+        }
     }
 }
 

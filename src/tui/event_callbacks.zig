@@ -1,6 +1,7 @@
 //! Event callbacks for vxfw text input change notifications. Free functions
 //! that receive `?*anyopaque` (the `App` pointer) from the framework.
 
+const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -23,6 +24,7 @@ pub fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []con
     }
     if (app.mode == .normal) {
         try app.updateAtSearch();
+        _ = app.input_undo.observe(app, std.Io.Clock.now(.awake, app.getIo()).toMilliseconds());
     } else {
         app.closeAtSearch();
     }

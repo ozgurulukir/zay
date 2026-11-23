@@ -235,9 +235,6 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
 
     var visible_change = try serviceGitLabelRefresh(root.app);
     visible_change = try drainAgentEvents(root, ctx) or visible_change;
-    // Prompt undo snapshots (issue #486): diff the buffer on the tick so no
-    // edit path needs interception.
-    visible_change = root.app.input_undo.observe(root.app, std.Io.Clock.now(.awake, root.app.getIo()).toMilliseconds()) or visible_change;
     // Converge interrupted turns whose async teardown finished (after events,
     // so the worker's terminal event drives the machine's own transition when
     // it wins the race; the drain then only checkpoints and restarts).
@@ -406,13 +403,33 @@ fn drainBackgroundAndLanes(root: *RootWidget) !bool {
     return visible_change;
 }
 
-/// Advance spinner frames when a turn or manual compaction is active.
+/// Return true when `lane` is currently visible in the viewport (either the
+/// active tab or one of the tiled split-pane columns).
+pub fn isLaneVisible(app: *const App, lane: *const Thread) bool {
+    if (lane == app.thread) return true;
+    const threads = app.threads.slice();
+    for (app.split_rects[0..app.split_rect_count]) |rect| {
+        if (rect.lane_index < threads.len and threads[rect.lane_index] == lane) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Advance spinner frames when a visible lane turn or manual compaction is active.
 fn advanceAnimations(root: *RootWidget, visible_change: *bool) !void {
     if (root.app.cached_config.tui.animations == .off) {
         root.spinner_tick_accum = 0;
         return;
     }
-    const spinner_active = root.app.anyTurnActive() or
+    var visible_turn_active = false;
+    for (root.app.threads.slice()) |lane| {
+        if (isLaneVisible(root.app, lane) and lane.turn.isActive()) {
+            visible_turn_active = true;
+            break;
+        }
+    }
+    const spinner_active = visible_turn_active or
         compaction_lifecycle.manualCompactActive(root.app) or
         lane_lifecycle.anyAsyncWorktreeActive(root.app) or
         root.app.at_search == .indexing;
@@ -513,7 +530,7 @@ pub fn cancelAllJobs(app: *App) void {
 
 /// Decide whether another tick should be scheduled.  Each named variable
 /// corresponds to one logical reason for continued polling.
-fn decideShouldTick(root: *RootWidget) bool {
+pub fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
     const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
     const any_job_active = anyJobActive(root.app);
@@ -629,8 +646,17 @@ pub fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                     log.warn("drain: applyAgentEvent failed: {s}", .{@errorName(err)});
                     continue;
                 };
-                if (lane != active) continue; // a background lane never touches the view
-                if (changed) visible_change = true;
+                const visible = isLaneVisible(root.app, lane);
+                if (changed and visible) visible_change = true;
+                if (lane != active) {
+                    if (visible and lane.turn_view.awaitingOutput()) {
+                        ensureTick(root, ctx) catch |err| {
+                            root.app.metrics.loading_tick_active = false;
+                            log.warn("drain: re-tick scheduling failed: {s}", .{@errorName(err)});
+                        };
+                    }
+                    continue;
+                }
                 switch (event_ptr.*) {
                     .tool_call_finished => {
                         refresh_diff = true;
@@ -1002,4 +1028,73 @@ test "updateTerminalTitleAndAttention emits title command and notifies when unfo
         if (cmd == .notify) found_notify = true;
     }
     try std.testing.expect(found_notify);
+}
+
+test "idle key event does not arm loading_tick_active (#566)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // Ensure blackhole_visible, initial git label refresh, and stale global toasts do not keep decideShouldTick true.
+    toast.global.count = 0;
+    toast.global.head = 0;
+    app.git_label_dirty = false;
+    app.metrics.blackhole_visible = false;
+    app.metrics.loading_tick_active = false;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    try std.testing.expect(!decideShouldTick(&root));
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try @import("event_router.zig").captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'a' } });
+    try std.testing.expect(!app.metrics.loading_tick_active);
+}
+
+test "streamed delta on visible dual worker lane marks visible_change = true (#566)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const worker_lane = try gpa.create(Thread);
+    worker_lane.* = .{
+        .title = try gpa.dupe(u8, "worker"),
+        .agent = &agent,
+        .engine = .{ .idle = .{ .working = .{ .branch = try gpa.dupe(u8, "zay/w1"), .path = try gpa.dupe(u8, "/tmp/w1") } } },
+        .worker_context = .{ .gpa = gpa, .io = io },
+    };
+    try app.threads.append(worker_lane);
+
+    // .tab mode: worker_lane is off-screen.
+    app.split_mode = .tab;
+    app.split_rect_count = 0;
+    try std.testing.expect(!isLaneVisible(&app, worker_lane));
+
+    // .dual mode: worker_lane is in split_rects[1].
+    app.split_mode = .dual;
+    app.split_rects[0] = .{ .row = 0, .col = 0, .width = 80, .height = 20, .lane_index = 0 };
+    app.split_rects[1] = .{ .row = 0, .col = 80, .width = 80, .height = 20, .lane_index = 1 };
+    app.split_rect_count = 2;
+    try std.testing.expect(isLaneVisible(&app, worker_lane));
+
+    // Start an active turn on worker_lane and push a streamed response delta.
+    _ = worker_lane.turn.submit();
+    const ev = try gpa.create(agent_mod.Agent.Event);
+    ev.* = .{ .response_delta = try gpa.dupe(u8, "hello") };
+    try worker_lane.worker_context.?.queue.push(io, gpa, ev);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const changed = try drainAgentEvents(&root, &ctx);
+    try std.testing.expect(changed);
 }
