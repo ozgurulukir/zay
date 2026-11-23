@@ -193,13 +193,25 @@ pub fn applyLineRange(content: []const u8, start_line: ?u32, end_line: ?u32) []c
     return content[line_start..line_end];
 }
 
-/// Count lines in text.
+/// Count lines in text: the number of newlines plus one, so a trailing
+/// newline opens an empty final line and empty text counts as one line.
 pub fn countLines(text: []const u8) u32 {
     var count: u32 = 1;
     for (text) |ch| {
         if (ch == '\n') count += 1;
     }
     return count;
+}
+
+/// Count the lines a line-numbered reader can address in `text`: every
+/// newline-terminated line, plus an unterminated final line when present.
+/// A trailing newline closes its line without opening another, so `""` is
+/// zero lines and `"a\n"` is one — unlike `countLines`.
+pub fn countNumberedLines(text: []const u8) u32 {
+    if (text.len == 0) return 0;
+    const terminated: u32 = countLines(text) - 1;
+    const unterminated_tail: u32 = @intFromBool(text[text.len - 1] != '\n');
+    return terminated + unterminated_tail;
 }
 
 /// Detect programming language from file extension.
@@ -267,6 +279,19 @@ test "countLines_returnsLineCount_forVariousTextFormats" {
     try std.testing.expectEqual(1, countLines("single line"));
     try std.testing.expectEqual(3, countLines("line 1\nline 2\nline 3"));
     try std.testing.expectEqual(2, countLines("line 1\n"));
+}
+
+test "countNumberedLines_countsAddressableLines_forEveryTerminationShape" {
+    // A trailing newline closes its line; only an unterminated tail adds one.
+    try std.testing.expectEqual(0, countNumberedLines(""));
+    try std.testing.expectEqual(1, countNumberedLines("a"));
+    try std.testing.expectEqual(1, countNumberedLines("a\n"));
+    try std.testing.expectEqual(2, countNumberedLines("a\nb"));
+    try std.testing.expectEqual(2, countNumberedLines("a\n\n"));
+    try std.testing.expectEqual(2, countNumberedLines("\nb\n"));
+    try std.testing.expectEqual(3, countNumberedLines("a\n\nb\n"));
+    // The two counts agree exactly when the text has no trailing newline.
+    try std.testing.expectEqual(countLines("a\nb\nc"), countNumberedLines("a\nb\nc"));
 }
 
 test "applyLineRange_slicesContentCorrectly_forLineRanges" {

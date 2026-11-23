@@ -24,6 +24,7 @@ pub const writeFileAtomic = fs_ops.writeFileAtomic;
 pub const deleteFileBestEffort = fs_ops.deleteFileBestEffort;
 pub const applyLineRange = fs_ops.applyLineRange;
 pub const countLines = fs_ops.countLines;
+pub const countNumberedLines = fs_ops.countNumberedLines;
 pub const detectLanguage = fs_ops.detectLanguage;
 pub const getMimeType = fs_ops.getMimeType;
 pub const getExtension = fs_ops.getExtension;
@@ -35,7 +36,13 @@ fn getIo(L: *c.lua_State) std.Io {
 /// ── zay.read_file(path, opts?) ──────────────────────────────────────
 ///
 /// Reads a file and returns a table with:
-///   { content, size, lines, language, mime_type, path }
+///   { content, size, lines, total_lines, language, mime_type, path, truncated, full_size }
+///
+/// `size` and `lines` describe `content`; `total_lines` counts the lines of
+/// the whole read body before `start_line`/`end_line` slice it, numbered the
+/// way a paged reader addresses them (a trailing newline closes its line).
+/// `truncated` is set only when the read cap clipped the file — a line
+/// range is a slice of what was read, not a truncation.
 ///
 /// Optional `opts` table fields:
 ///   start_line (number) — first line to return (1-indexed)
@@ -81,7 +88,11 @@ pub fn readFile(L: ?*c.lua_State) callconv(.c) c_int {
     defer std.heap.page_allocator.free(content);
 
     // Expose truncation so plugins can detect (and page around) the 1 MB cap.
+    // Only the cap sets it: `full_size` is the on-disk size, so it exceeds
+    // the read body exactly when the cap clipped the file, whatever slice
+    // `start_line`/`end_line` then take out of that body.
     const full_size = statFileSize(io, clean_path) catch @as(u64, content.len);
+    const total_lines = countNumberedLines(content);
 
     const final_content = if (start_line != null or end_line != null)
         applyLineRange(content, start_line, end_line)
@@ -97,7 +108,9 @@ pub fn readFile(L: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_setfield(L_ptr, -2, "size");
     state.pushInteger(@as(i64, @intCast(countLines(final_content))));
     _ = c.lua_setfield(L_ptr, -2, "lines");
-    state.pushBoolean(full_size > final_content.len);
+    state.pushInteger(@as(i64, total_lines));
+    _ = c.lua_setfield(L_ptr, -2, "total_lines");
+    state.pushBoolean(full_size > content.len);
     _ = c.lua_setfield(L_ptr, -2, "truncated");
     state.pushInteger(@as(i64, @intCast(full_size)));
     _ = c.lua_setfield(L_ptr, -2, "full_size");
@@ -571,4 +584,48 @@ test "bridges.fs: list_dir returns nil + error for a missing directory" {
         \\assert(err ~= nil, "error message present")
         \\return "OK"
     ));
+}
+
+test "bridges.fs: read_file line range reports total_lines and is not a truncation" {
+    const io = std.testing.io;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Three addressable lines ("one", "", "three"); the final newline closes
+    // the last one instead of opening a fourth.
+    try tmp.dir.writeFile(io, .{ .sub_path = "lines.txt", .data = "one\n\nthree\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    execution.setDispatchCtx(L.handle, .{ .cwd = root_buf[0..root_len] });
+
+    // Report Lua's own message: a bare `expect(doString(...))` only says false.
+    const ok = L.doString(
+        \\local whole = zay.read_file("./lines.txt")
+        \\assert(whole.truncated == false, "an uncapped whole-file read is not truncated")
+        \\assert(whole.total_lines == 3, "whole read counts every line, got " .. tostring(whole.total_lines))
+        \\-- A range is a slice: the same file, the same total, still no truncation.
+        \\local middle = zay.read_file("./lines.txt", { start_line = 2, end_line = 2 })
+        \\assert(middle.content == "", "the blank middle line is an empty slice")
+        \\assert(middle.total_lines == 3, "a range keeps the whole-body line count")
+        \\assert(middle.truncated == false, "a line range must not report truncation")
+        \\assert(middle.size == 0, "size describes the returned slice")
+        \\-- A range reaching past the end returns the tail without inventing lines.
+        \\local tail = zay.read_file("./lines.txt", { start_line = 3, end_line = 99 })
+        \\assert(tail.content == "three", "tail slice drops the terminator of its last line")
+        \\assert(tail.truncated == false, "a range past EOF is still not truncation")
+        \\local past_end = zay.read_file("./lines.txt", { start_line = 4 })
+        \\assert(past_end.content == "", "nothing is addressable past the last line")
+        \\-- Negative space: the cap is the one thing that sets `truncated`.
+        \\local capped = zay.read_file("./lines.txt", { max_size = 4 })
+        \\assert(capped.content == "one\n", "max_size clips the body")
+        \\assert(capped.truncated == true, "the read cap reports truncation")
+        \\assert(capped.full_size == 11, "full_size stays the on-disk size")
+        \\assert(capped.total_lines == 1, "total_lines counts the clipped body")
+        \\return "OK"
+    );
+    if (!ok) std.debug.print("Lua error: {s}\n", .{L.getErrorMessage() orelse "unknown"});
+    try std.testing.expect(ok);
 }

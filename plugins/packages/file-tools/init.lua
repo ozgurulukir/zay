@@ -49,47 +49,36 @@ end
 -- Deterministic line splitter. `gmatch("[^\n]*")` cannot count empty lines
 -- reliably in Lua 5.4, so walk explicitly. A trailing "\n" TERMINATES the last
 -- line (so "a\n" -> 1 line, "a\n\n" -> 2 lines, "" -> 0 lines).
+-- Advances one cursor instead of re-slicing the tail: `rest = rest:sub(nl + 1)`
+-- copies every remaining byte on every line, which is O(N^2) on a file with
+-- thousands of lines and can exhaust the sandbox's memory and time budget.
 local function split_lines(text)
   if text == "" then return {} end
-  local lines, rest = {}, text
+  local lines = {}
+  local start, pos = 1, 1
   while true do
-    local nl = rest:find("\n", 1, true)
+    local nl = text:find("\n", pos, true)
     if not nl then
-      table.insert(lines, rest) -- final segment (may be "")
+      table.insert(lines, text:sub(start)) -- final segment (may be "")
       break
     end
-    table.insert(lines, rest:sub(1, nl - 1))
-    rest = rest:sub(nl + 1)
+    table.insert(lines, text:sub(start, nl - 1))
+    start = nl + 1
+    pos = start
   end
   -- A trailing "\n" TERMINATES the last line; drop the artifact it leaves.
   if lines[#lines] == "" and text:sub(-1) == "\n" then table.remove(lines) end
   return lines
 end
 
--- Truncate output to a byte/line budget, appending a clear marker. Mirrors
--- OpenCode's central truncation: keep the head, report how much was dropped.
-local function truncate(text, max_lines, max_bytes)
-  max_lines = max_lines or 2000
-  max_bytes = max_bytes or 50000
-  local lines = split_lines(text)
-
-  local kept, bytes = {}, 0
-  for _, line in ipairs(lines) do
-    if #kept >= max_lines then break end
-    if bytes + #line + 1 > max_bytes then break end
-    table.insert(kept, line)
-    bytes = bytes + #line + 1
-  end
-
-  local dropped_lines = #lines - #kept
-  local dropped_bytes = #text - bytes
-  local out = table.concat(kept, "\n")
-  if dropped_lines > 0 or dropped_bytes > 0 then
-    local unit = dropped_lines > 0 and (dropped_lines .. " lines") or (dropped_bytes .. " bytes")
-    out = out .. "\n\n... " .. unit .. " truncated ..."
-  end
-  return out, #lines
-end
+-- One read's output budget, mirroring OpenCode's central truncation: keep the
+-- head of the window and say how much was dropped, so wide lines cannot
+-- return megabytes. Bytes count the line text plus its newline.
+local READ_DEFAULT_LIMIT = 2000
+local READ_LINE_BUDGET = 2000
+local READ_BYTE_BUDGET = 50000
+-- Largest line number `zay.read_file` accepts for start_line/end_line.
+local MAX_LINE = 2147483647
 
 -- ── read ────────────────────────────────────────────────────────────
 
@@ -113,10 +102,14 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    local limit = math.max(1, math.floor(params.limit or 2000))
-    local offset = math.max(1, math.floor(params.offset or 1))
+    local limit = math.max(1, math.min(math.floor(params.limit or READ_DEFAULT_LIMIT), MAX_LINE))
+    local offset = math.max(1, math.min(math.floor(params.offset or 1), MAX_LINE))
 
-    local result, err = zay.read_file(params.path, {})
+    -- Let the bridge slice the window in Zig instead of splitting the whole
+    -- file into Lua strings. One sentinel line beyond the window says whether
+    -- more lines follow, so the footer needs no second pass over the file.
+    local window_end = math.min(offset + limit, MAX_LINE)
+    local result, err = zay.read_file(params.path, { start_line = offset, end_line = window_end })
     if result == nil then
       return fail("could not read " .. params.path .. ": " .. tostring(err or "unknown error"))
     end
@@ -127,27 +120,43 @@ zay.register_tool({
       return fail("cannot read binary file: " .. result.path)
     end
 
-    -- Split into numbered lines, applying offset/limit.
     local lines = split_lines(result.content)
-    local total = #lines
-
-    local out = {}
-    local last = math.min(offset + limit - 1, total)
-    for i = offset, last do
-      table.insert(out, string.format("%d: %s", i, lines[i]))
+    local total = result.total_lines
+    if total ~= nil and #lines <= limit and offset + #lines == total then
+      -- A window that reaches the end of the file drops a blank final line:
+      -- the bridge strips the newline after its last line, and a blank line
+      -- has no other bytes to return. `total_lines` says it exists.
+      table.insert(lines, "")
     end
+    local has_more = #lines > limit
+    if has_more then table.remove(lines) end -- drop the sentinel
+    local last = offset + #lines - 1
+    -- Bridges without `total_lines` (and test doubles) only know the window.
+    total = total or last
 
+    -- Number the window under the output budget in a single pass.
+    local out, shown, bytes = {}, 0, 0
+    for index, line in ipairs(lines) do
+      if shown >= READ_LINE_BUDGET or bytes + #line + 1 > READ_BYTE_BUDGET then break end
+      table.insert(out, string.format("%d: %s", offset + index - 1, line))
+      shown = shown + 1
+      bytes = bytes + #line + 1
+    end
     local body = table.concat(out, "\n")
-    -- Apply the byte/line budget to the window (mirrors OpenCode's central
-    -- truncation) so wide lines cannot return megabytes.
-    local truncated_body = truncate(body, 2000, 50000)
+    if shown < #lines then
+      body = body .. string.format("\n\n... %d lines truncated ...", #lines - shown)
+    end
 
     -- Context-aware footer so the model knows whether to page further.
     local footer
-    if last >= total then
-      footer = string.format("\n(Showing lines %d-%d of %d. End of file.)", offset, last, total)
-    else
+    if total == 0 then
+      footer = "\n(Empty file.)"
+    elseif #lines == 0 then
+      footer = string.format("\n(No lines at offset %d; the file has %d lines.)", offset, total)
+    elseif has_more then
       footer = string.format("\n(Showing lines %d-%d of %d. Use offset=%d to continue.)", offset, last, total, last + 1)
+    else
+      footer = string.format("\n(Showing lines %d-%d of %d. End of file.)", offset, last, total)
     end
 
     -- Expose the bridge's 1 MB read cap so the model knows to page via bash.
@@ -156,7 +165,7 @@ zay.register_tool({
     end
 
     local header = string.format("<path>%s</path>\n", result.path)
-    return header .. truncated_body .. footer
+    return header .. body .. footer
   end,
 })
 
@@ -252,6 +261,13 @@ zay.register_tool({
     local result, read_err = zay.read_file(params.path, {})
     if result == nil then
       return fail("could not read " .. params.path .. " (read the file before editing): " .. tostring(read_err or "unknown error"))
+    end
+    -- A capped read holds only the first 1 MB. Rewriting that prefix would
+    -- destroy everything past the cap, so refuse before any write — in either
+    -- mode (`zay.edit_file` refuses on its own; the replace_all write below
+    -- did not).
+    if result.truncated then
+      return fail("cannot edit " .. params.path .. ": the file exceeds the 1 MB read limit (FileTooLarge); edit it with a script through bash instead")
     end
     local content = result.content
 

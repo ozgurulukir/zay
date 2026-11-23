@@ -42,6 +42,9 @@ that file as instructions.
 - **Edit failure modes.** The edit FAILS if `old_string` is not found, and
   (unless `replace_all`) FAILS if `old_string` appears multiple times. Provide
   more surrounding lines to disambiguate, or set `replace_all=true`.
+- **1 MB edit cap.** `edit` refuses files larger than 1 MB in either mode —
+  it can only read the first megabyte and would otherwise drop the rest.
+  Edit such a file with a script through `bash` (`sed -i`, `python`).
 - **Never proactively create documentation files** (`*.md`, `README`) unless
   the user explicitly asks.
 - **For large files**, pass `offset` to page through sections; the footer
