@@ -75,6 +75,7 @@ const PermissionInner = struct {
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
         if (width == 0 or height == 0) return surface;
+        panel.fillBackground(&surface, p);
 
         const tool = self.snapshot.tool_name orelse "bash";
         const lane = self.snapshot.lane_id orelse "1";

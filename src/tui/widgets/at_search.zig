@@ -55,7 +55,7 @@ pub const Content = struct {
         var body: Body = .{ .content = self };
         var border: vxfw.Border = .{
             .child = body.widget(),
-            .style = p.thinking_body,
+            .style = p.border,
             .labels = &.{.{ .text = self.title, .alignment = .top_left }},
         };
         return border.widget().draw(ctx);
@@ -184,4 +184,35 @@ test "rendersNotice_whenResultsPresentAndNoticePresent" {
     // Row 0 and 1 have results, row 2 has the notice.
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("! Search error: timeout", std.mem.trimEnd(u8, panel.readRow(&inner_surface, 2, &buf), " "));
+}
+
+fn expectNoRgbCells(surface: vxfw.Surface) !void {
+    for (surface.buffer) |cell| {
+        try std.testing.expect(cell.style.fg != .rgb);
+        try std.testing.expect(cell.style.bg != .rgb);
+    }
+    for (surface.children) |child| {
+        try expectNoRgbCells(child.surface);
+    }
+}
+
+test "at_search renders with monochrome palette without rgb cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const mono = tui_style.buildMonochromePalette();
+    const results = [_][]const u8{"src/agent.zig"};
+    var content: Content = .{
+        .results = &results,
+        .selection = 0,
+        .query = "src",
+        .palette = &mono,
+    };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+    try expectNoRgbCells(surface);
 }

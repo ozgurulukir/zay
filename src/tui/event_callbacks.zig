@@ -70,8 +70,10 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
         },
         .theme_picker => {
             const theme_picker = @import("widgets/theme_picker.zig");
+            const theme_lifecycle = @import("theme_lifecycle.zig");
             const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
+            theme_lifecycle.previewSelected(app);
         },
         .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins, .link_picker => {},
     }

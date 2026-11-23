@@ -623,7 +623,7 @@ pub const InputWidget = struct {
         var row_box: vxfw.SizedBox = .{ .child = row.widget(), .size = .{ .width = max_width -| 2, .height = text_rows } };
         var border: vxfw.Border = .{
             .child = row_box.widget(),
-            .style = p.thinking_body,
+            .style = p.border,
         };
         var box: vxfw.SizedBox = .{ .child = border.widget(), .size = .{ .width = max_width, .height = border_height } };
         const border_surface = try box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = border_height }, .{ .width = max_width, .height = border_height }));

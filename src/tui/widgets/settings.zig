@@ -515,7 +515,7 @@ fn drawHorizontalRule(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, p
     while (col < surface.size.width) : (col += 1) {
         surface.writeCell(col, row, .{
             .char = .{ .grapheme = "─", .width = 1 },
-            .style = p.thinking_body,
+            .style = p.border,
         });
     }
 }

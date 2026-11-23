@@ -477,7 +477,7 @@ pub const DiffSearchWidget = struct {
             .height = ctx.max.height orelse 24,
             .full_panel = false,
             .palette_input = self.palette_input,
-            .fill_background = false,
+            .fill_background = true,
             .palette = self.palette,
             .content = list.widget(),
         };

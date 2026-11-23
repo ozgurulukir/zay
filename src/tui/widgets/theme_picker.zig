@@ -59,6 +59,9 @@ pub const Content = struct {
                 try matching_themes.append(ctx.arena, .{ .idx = idx, .score = s });
             }
         }
+        if (scoreAuto(self.filter)) |s| {
+            try matching_themes.append(ctx.arena, .{ .idx = self.themes.len, .score = s });
+        }
 
         const total_matches: u32 = @intCast(matching_themes.items.len);
         if (total_matches == 0) {
@@ -72,18 +75,24 @@ pub const Content = struct {
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
             const theme_idx = matching_themes.items[match_idx].idx;
-            const theme = self.themes[theme_idx];
             const selected = match_idx == self.selection;
             const screen_row = viewport.screenRow(match_idx);
 
-            const mark: ?[]const u8 = if (std.mem.eql(u8, theme.name, self.active_name))
-                (if (tui_style.isLight(theme)) "  [light]  ✓ current" else "  [dark]  ✓ current")
-            else
-                (if (tui_style.isLight(theme)) "  [light]" else "  [dark]");
+            const is_auto = theme_idx == self.themes.len;
+            const name: []const u8 = if (is_auto) auto_name else self.themes[theme_idx].name;
+            const mark: ?[]const u8 = if (is_auto)
+                (if (std.ascii.eqlIgnoreCase(self.active_name, auto_name)) "  [auto]  ✓ current" else "  [auto]")
+            else blk: {
+                const theme = self.themes[theme_idx];
+                break :blk if (std.mem.eql(u8, theme.name, self.active_name))
+                    (if (tui_style.isLight(theme)) "  [light]  ✓ current" else "  [dark]  ✓ current")
+                else
+                    (if (tui_style.isLight(theme)) "  [light]" else "  [dark]");
+            };
 
             try panel.drawFuzzyListRow(surface, screen_row, ctx, .{
                 .prefix = "  ./",
-                .text = theme.name,
+                .text = name,
                 .query = self.filter,
                 .selected = selected,
                 .start_col = 1,
@@ -108,6 +117,14 @@ const ScoredTheme = struct {
     }
 };
 
+pub const auto_name = "auto";
+
+/// Score the virtual `"auto"` entry against the picker filter.
+fn scoreAuto(filter: []const u8) ?f64 {
+    if (filter.len == 0) return 0.0;
+    return panel.fzyScore(filter, auto_name);
+}
+
 /// Score a theme against the picker filter. Empty filter matches all with score 0;
 /// otherwise a ranked fuzzy match on the theme slug.
 fn scoreTheme(theme: tui_style.Theme, filter: []const u8) ?f64 {
@@ -127,6 +144,7 @@ pub fn countMatching(themes: []const tui_style.Theme, filter: []const u8) u32 {
     for (themes) |theme| {
         if (matchesTheme(theme, filter)) count += 1;
     }
+    if (scoreAuto(filter) != null) count += 1;
     return count;
 }
 
@@ -144,10 +162,17 @@ pub fn selectedName(themes: []const tui_style.Theme, filter: []const u8, selecti
             }
         }
     }
+    if (scoreAuto(filter)) |s| {
+        if (count < buf.len) {
+            buf[count] = .{ .idx = themes.len, .score = s };
+            count += 1;
+        }
+    }
     if (selection >= count) return null;
 
     std.mem.sort(ScoredTheme, buf[0..count], {}, ScoredTheme.lessThan);
-    return themes[buf[selection].idx].name;
+    const idx = buf[selection].idx;
+    return if (idx == themes.len) auto_name else themes[idx].name;
 }
 
 test "countMatching returns 0 for a filter matching nothing" {
@@ -160,13 +185,14 @@ test "countMatching counts partial matches" {
 }
 
 test "countMatching returns the full count for an empty filter" {
-    try std.testing.expectEqual(@as(u32, @intCast(tui_style.allThemes().len)), countMatching(tui_style.allThemes(), ""));
+    try std.testing.expectEqual(@as(u32, @intCast(tui_style.allThemes().len + 1)), countMatching(tui_style.allThemes(), ""));
 }
 
 test "selectedName maps a selection into the filtered list" {
     const themes = tui_style.allThemes();
-    // An empty filter lists all themes in canonical order.
+    // An empty filter lists all themes in canonical order, plus "auto" at the end.
     try std.testing.expectEqualStrings("tokyo_night", selectedName(themes, "", 2).?);
+    try std.testing.expectEqualStrings("auto", selectedName(themes, "", @intCast(themes.len)).?);
     // A filtering selection points at the Nth matching row.
     try std.testing.expectEqualStrings("tokyo_night", selectedName(themes, "to", 0).?);
     // An out-of-range selection yields null.

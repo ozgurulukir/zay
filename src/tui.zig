@@ -1756,6 +1756,7 @@ pub fn buildAtSearchContent(app: *const App) at_search.Content {
         // popup (the old App-aware widget left these at defaults).
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
     };
 }
 

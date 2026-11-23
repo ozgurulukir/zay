@@ -11,6 +11,7 @@ const log = std.log.scoped(.tui);
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
 const tui_style = @import("style.zig");
+const theme_picker = @import("widgets/theme_picker.zig");
 const agent_mod = @import("../agent.zig");
 const runtime_mod = @import("../runtime.zig");
 
@@ -31,11 +32,36 @@ pub fn openThemePicker(app: *App) void {
     app.theme_preview_original = active;
     const active_name = active.name;
     app.pickers.theme.selection = 0;
-    for (app.theme_registry.slice(), 0..) |theme, index| {
-        if (std.mem.eql(u8, theme.name, active_name)) {
-            app.pickers.theme.selection = @intCast(index);
-            break;
+    const cur_theme = app.cached_config.theme orelse "";
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, cur_theme, " \t\r\n"), "auto")) {
+        app.pickers.theme.selection = @intCast(app.theme_registry.slice().len);
+    } else {
+        for (app.theme_registry.slice(), 0..) |theme, index| {
+            if (std.mem.eql(u8, theme.name, active_name)) {
+                app.pickers.theme.selection = @intCast(index);
+                break;
+            }
         }
+    }
+}
+
+/// Live-recolor to the currently selected theme when `tui.theme_live_preview`
+/// is enabled. No-op otherwise (and when the selection doesn't resolve).
+pub fn previewSelected(app: *App) void {
+    if (!app.cached_config.tui.theme_live_preview) return;
+    const filter = app.peekPaletteInput() catch return;
+    defer app.gpa.free(filter);
+    if (theme_picker.selectedName(app.theme_registry.slice(), filter, app.pickers.theme.selection)) |name| {
+        const theme = if (std.ascii.eqlIgnoreCase(name, "auto"))
+            app.theme_registry.resolveWithScheme(
+                "auto",
+                app.terminal_color_scheme,
+                app.cached_config.tui.effectiveLightTheme(),
+                app.cached_config.tui.effectiveDarkTheme(),
+            )
+        else
+            app.theme_registry.resolve(name);
+        previewTheme(app, theme);
     }
 }
 
@@ -505,4 +531,33 @@ test "openThemePicker snapshots the active theme for revert" {
     try std.testing.expect(app.theme_preview_original != null);
     try std.testing.expectEqualStrings("dracula", app.theme_preview_original.?.name);
     try std.testing.expectEqual(App.Mode.theme_picker, app.mode);
+}
+
+test "filtering in theme_picker updates live preview to newly selected top match" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.tui.theme_live_preview = true;
+    openThemePicker(&app);
+    app.pickers.theme.selection = 3; // dracula
+    try app.inputs.palette.buf.insertSliceAtCursor("gru");
+    try app.syncModeWithInput("gru");
+
+    try std.testing.expectEqual(@as(u32, 0), app.pickers.theme.selection);
+    try std.testing.expectEqual(tui_style.gruvbox_dark.body, app.activePalette().body.fg.rgb);
+}
+
+test "openThemePicker selects auto entry when cached_config.theme is auto" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.theme = @constCast("auto");
+    openThemePicker(&app);
+    try std.testing.expectEqual(@as(u32, @intCast(app.theme_registry.slice().len)), app.pickers.theme.selection);
 }
