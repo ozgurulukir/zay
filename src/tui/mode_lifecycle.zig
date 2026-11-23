@@ -634,9 +634,14 @@ pub fn submitMode(app: *App) !bool {
             app.setMode(.normal);
             return true;
         },
+        .help => {
+            app.setMode(.normal);
+            app.pickers.help.reset();
+            return true;
+        },
         // Modes with no Enter action: the switch is exhaustive, so these must
         // be listed to compile. (This is the old fall-through `return false`.)
-        .normal, .diff_viewer, .help => return false,
+        .normal, .diff_viewer => return false,
     }
 }
 
@@ -673,40 +678,23 @@ const command_panel = @import("widgets/command_panel.zig");
 const panel = @import("widgets/panel.zig");
 
 pub fn resolveCommand(app: *App, filter: []const u8) ?Command {
-    const Scored = struct {
-        command: Command,
-        score: f64,
-        idx: usize,
-    };
-    var buf: [commands.len]Scored = undefined;
+    var visible_entries: [commands.len]command_panel.Entry = undefined;
+    var visible_cmds: [commands.len]Command = undefined;
     var count: usize = 0;
 
-    for (commands, 0..) |entry, idx| {
+    for (commands) |entry| {
         if (!tui.commandVisible(app, entry)) continue;
-        if (panel.scoreCandidate(filter, entry.name, entry.description)) |score| {
-            buf[count] = .{ .command = entry.command, .score = score, .idx = idx };
-            count += 1;
-        }
+        visible_entries[count] = .{
+            .name = entry.name,
+            .description = entry.description,
+            .category = entry.category,
+        };
+        visible_cmds[count] = entry.command;
+        count += 1;
     }
 
-    if (count == 0) return null;
-    const ranked = buf[0..count];
-
-    const Sorter = struct {
-        fn lessThan(_: void, a: Scored, b: Scored) bool {
-            if (a.score != b.score) return a.score > b.score;
-            return a.idx < b.idx;
-        }
-    };
-    std.mem.sort(Scored, ranked, {}, Sorter.lessThan);
-
-    if (app.nav.command_selection < ranked.len) {
-        return ranked[app.nav.command_selection].command;
-    }
-    if (ranked.len == 1) {
-        return ranked[0].command;
-    }
-    return null;
+    const idx = command_panel.selectedEntryIndex(visible_entries[0..count], filter, app.nav.command_selection) orelse return null;
+    return visible_cmds[idx];
 }
 
 pub fn commandMatchesCount(app: *App) u32 {

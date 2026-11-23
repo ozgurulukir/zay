@@ -1506,3 +1506,24 @@ test "isClipboardPasteChord recognizes all three paste chords and rejects lookal
         try std.testing.expectEqual(case.expected, isClipboardPasteChord(case.key));
     }
 }
+
+test "help overlay Enter closes help without submitting prompt input" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try app.inputs.input.insertSliceAtCursor("do not submit");
+    app.mode = .help;
+
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
+    try std.testing.expectEqual(App.Mode.normal, app.getMode());
+    try std.testing.expectEqual(@as(usize, 0), app.thread.transcript.messages.items.len);
+}

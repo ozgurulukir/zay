@@ -18,6 +18,7 @@ const blackhole = @import("../tui/blackhole.zig");
 const provider_model = @import("provider_model.zig");
 const registry_job = @import("registry_job.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
+const mode_lifecycle = @import("mode_lifecycle.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const lane_recovery = @import("lanes/recovery.zig");
@@ -759,38 +760,25 @@ pub fn transitionMode(root: *RootWidget, ctx: *vxfw.EventContext, action: ModeAc
     return true;
 }
 
-/// Route focus to the correct widget for the current mode. The provider
-/// setup form keeps focus on root (it draws its own editor); the diff
-/// viewer routes by sub-state (comment editor / file search / browse).
+/// Route focus to the correct widget for the current mode, derived from
+/// `mode_lifecycle.modeTextInputSlot` so focus targeting and text-input slot
+/// routing share one exhaustive classifier.
 pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     const app = root.app;
-    // The provider setup form draws its own inline editor and intentionally
-    // omits the overlay search field. Focusing the (undrawn) palette input
-    // would leave the focus path empty and panic on the next event, so keep
-    // focus on the root widget — it owns key handling via captureEvent anyway.
-    if (app.mode == .provider_picker and app.pickers.provider.stage == .form) {
-        try ctx.requestFocus(root.widget());
-        return;
-    }
-    const target = switch (app.mode) {
-        .command, .provider_picker, .model_picker, .tree_picker, .save_message, .search, .theme_picker => app.inputs.palette.widget(),
-        // The session picker uses the palette input for filtering while
-        // browsing, but sub-states (rename/delete/project-root bind) handle
-        // keys via the command router — focus stays on root so the palette
-        // input doesn't swallow printable keys meant for the sub-state buffer.
-        .session_picker => switch (app.nav.session_action) {
-            .browsing => app.inputs.palette.widget(),
-            .renaming, .deleting, .blocked, .locating_project => root.widget(),
-        },
-        // The diff viewer routes focus by sub-state: the comment editor and
-        // the file-search field each host a drawn TextField; while browsing
-        // the root widget owns every key. The mapping itself lives with the
-        // diff-key handlers (#293).
-        .diff_viewer => diff_lifecycle.diffFocusTarget(root),
-        // The lanes overlay owns its keys via captureEvent; the palette input
-        // is unused, so keep focus on the root (typed keys are ignored).
-        .lanes, .help, .settings, .mcp, .plugins, .link_picker => root.widget(),
-        .normal => app.inputs.input.widget(),
+    const target = switch (mode_lifecycle.modeTextInputSlot(app)) {
+        .prompt => app.inputs.input.widget(),
+        .palette => if (app.mode == .session_picker and app.nav.session_action != .browsing)
+            // Session sub-states (rename/delete/blocked/project-root) handle
+            // keys via the command router — keep focus on root so the palette
+            // input doesn't swallow printable keys.
+            root.widget()
+        else
+            app.inputs.palette.widget(),
+        .diff_comment => diff_lifecycle.diffFocusTarget(root),
+        // Inline form buffers and non-text overlays keep focus on root (it
+        // owns key handling via captureEvent and avoids focusing an undrawn
+        // palette input).
+        .provider_key, .settings_value, .session_rename, .session_project_root, .mcp_url, .plugin_store_url, .none => root.widget(),
     };
     try ctx.requestFocus(target);
 }
