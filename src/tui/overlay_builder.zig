@@ -67,10 +67,12 @@ pub fn buildOverlayWidget(
     max_w: u16,
     max_h: u16,
 ) std.mem.Allocator.Error!overlay.OverlayWidget {
-    const size = if (app.mode == .provider_picker and app.pickers.provider.stage == .form)
-        overlay.OverlaySize{ .width = @min(max_w, @max(@min(@as(u16, 40), max_w), (max_w * 9) / 10)), .height = @min(max_h, 12) }
-    else
-        overlay.overlaySize(app.mode, max_w, max_h);
+    const size = overlay.overlaySizeFor(
+        app.mode,
+        app.pickers.provider.stage == .form,
+        max_w,
+        max_h,
+    );
     const total_w: u16 = @min(size.width, max_w);
     const total_h: u16 = @min(size.height, max_h);
 
