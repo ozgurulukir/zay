@@ -19,12 +19,14 @@ const config_mod = @import("../../config/config.zig");
 /// Selection state kept on `App` — mirrors `model_selection`/`command_selection`.
 pub const State = struct {
     selection: u32 = 0,
+    scroll: panel.ListScrollState = .{},
 };
 
 /// Per-frame presentation data for the overlay draw.
 pub const Content = struct {
     themes: []const tui_style.Theme,
     selection: u32,
+    scroll: ?*panel.ListScrollState = null,
     active_name: []const u8,
     filter: []const u8,
     highlight_enabled: bool = true,
@@ -71,7 +73,10 @@ pub const Content = struct {
 
         std.mem.sort(ScoredTheme, matching_themes.items, {}, ScoredTheme.lessThan);
 
-        const viewport = panel.ViewportWindow.compute(self.selection, total_matches, height);
+        const viewport = if (self.scroll) |s|
+            panel.ViewportWindow.computeStateful(self.selection, total_matches, height, s)
+        else
+            panel.ViewportWindow.compute(self.selection, total_matches, height);
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
             const theme_idx = matching_themes.items[match_idx].idx;

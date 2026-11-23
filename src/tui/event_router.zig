@@ -43,17 +43,25 @@ const toast = @import("toast.zig");
 fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) bool {
     if (mouse_row < 0) return false;
     const m_row: u16 = @intCast(mouse_row);
-    // `rect` is the Border surface: row +0 is the top border, +1 is `>`,
-    // +2 is `─`, +3..height-2 are list rows, and height-1 is the bottom border.
-    if (rect.height < 5) return false;
-    if (m_row < rect.row + 3 or m_row >= rect.row + rect.height - 1) return false;
-    const clicked_row: u32 = m_row - (rect.row + 3);
-    const content_h: u16 = rect.height - 4;
+    const mode = app.getMode();
+    const full_panel = (mode == .provider_picker and app.pickers.provider.stage == .form) or
+        mode == .settings or mode == .help or mode == .mcp or
+        mode == .plugins or mode == .lanes or mode == .link_picker;
+    // `rect` is the Border surface: row +0 is the top border, and height-1 is
+    // the bottom border. Searchable overlays have `>` at +1 and `─` at +2,
+    // so list rows start at +3 (chrome_rows = 4); `full_panel` overlays start
+    // list rows directly at +1 (chrome_rows = 2).
+    const header_offset: u16 = if (full_panel) 1 else 3;
+    const chrome_rows: u16 = if (full_panel) 2 else 4;
+    if (rect.height < chrome_rows + 1) return false;
+    if (m_row < rect.row + header_offset or m_row >= rect.row + rect.height - 1) return false;
+    const clicked_row: u32 = m_row - (rect.row + header_offset);
+    const content_h: u16 = rect.height - chrome_rows;
 
-    switch (app.getMode()) {
+    switch (mode) {
         .command => {
             const total = tui.commandMatchesCount(app);
-            const vp = panel.ViewportWindow.compute(app.nav.command_selection, total, content_h);
+            const vp = panel.ViewportWindow.computeStateful(app.nav.command_selection, total, content_h, &app.nav.command_scroll);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.nav.command_selection = target;
@@ -63,7 +71,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
             const filter = app.peekPaletteInput() catch return false;
             defer app.gpa.free(filter);
             const total = theme_picker.countMatching(app.theme_registry.slice(), filter);
-            const vp = panel.ViewportWindow.compute(app.pickers.theme.selection, total, content_h);
+            const vp = panel.ViewportWindow.computeStateful(app.pickers.theme.selection, total, content_h, &app.pickers.theme.scroll);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.theme.selection = target;
@@ -71,7 +79,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
         },
         .search => {
             const total: u32 = @intCast(app.pickers.search.matches.items.len);
-            const vp = panel.ViewportWindow.compute(app.pickers.search.selection, total, content_h);
+            const vp = panel.ViewportWindow.computeStateful(app.pickers.search.selection, total, content_h, &app.pickers.search.scroll);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.search.selection = target;
@@ -81,7 +89,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
             const list_h: u16 = if (content_h > 1) content_h - 1 else content_h;
             if (clicked_row >= list_h) return false;
             const total: u32 = @intCast(app.pickers.links.items.items.len);
-            const vp = panel.ViewportWindow.compute(app.pickers.links.selection, total, list_h);
+            const vp = panel.ViewportWindow.computeStateful(app.pickers.links.selection, total, list_h, &app.pickers.links.scroll);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.links.selection = target;
@@ -90,15 +98,18 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
         .provider_picker => {
             if (app.pickers.provider.stage != .list) return false;
             const total: u32 = @intCast(app.pickers.provider.entries.len);
-            const vp = panel.ViewportWindow.compute(app.pickers.provider.selection, total, content_h);
+            const vp = panel.ViewportWindow.computeStateful(app.pickers.provider.selection, total, content_h, &app.pickers.provider.scroll);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.provider.selection = target;
             return true;
         },
         .model_picker => {
-            const target = app.list_widgets.model_list.scroll.top + clicked_row;
-            if (app.list_widgets.model_list.item_count) |c| if (target >= c) return false;
+            // `model_picker` prepends a 1-row `Header` widget at widgets[0].
+            const widget_idx = app.list_widgets.model_list.scroll.top + clicked_row;
+            if (widget_idx == 0) return false;
+            const target = widget_idx - 1;
+            if (app.list_widgets.model_list.item_count) |c| if (widget_idx >= c) return false;
             app.pickers.models.model_selection = target;
             return true;
         },
@@ -110,7 +121,9 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
             return true;
         },
         .tree_picker => {
-            const target = app.list_widgets.tree_list.scroll.top + clicked_row;
+            // `tree_selector` draws a 2-row "Filter: ..." header above the ListView.
+            if (clicked_row < 2) return false;
+            const target = app.list_widgets.tree_list.scroll.top + (clicked_row - 2);
             if (app.list_widgets.tree_list.item_count) |c| if (target >= c) return false;
             app.pickers.tree.selection = target;
             return true;
@@ -1526,4 +1539,88 @@ test "help overlay Enter closes help without submitting prompt input" {
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
     try std.testing.expectEqual(App.Mode.normal, app.getMode());
     try std.testing.expectEqual(@as(usize, 0), app.thread.transcript.messages.items.len);
+}
+
+test "selectOverlayRowAt maps rendered screen row to item k across all selectable overlay modes" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    // Seed data for every selectable overlay mode so item k=2 exists.
+    try app.pickers.search.matches.appendSlice(gpa, &.{
+        .{ .message_index = 0, .role = "user", .start = 0, .end = 1, .snippet = try gpa.dupe(u8, "a") },
+        .{ .message_index = 0, .role = "user", .start = 0, .end = 1, .snippet = try gpa.dupe(u8, "b") },
+        .{ .message_index = 0, .role = "user", .start = 0, .end = 1, .snippet = try gpa.dupe(u8, "c") },
+    });
+    try app.pickers.links.items.appendSlice(gpa, &.{
+        .{ .label = try gpa.dupe(u8, "l0"), .url = try gpa.dupe(u8, "https://0") },
+        .{ .label = try gpa.dupe(u8, "l1"), .url = try gpa.dupe(u8, "https://1") },
+        .{ .label = try gpa.dupe(u8, "l2"), .url = try gpa.dupe(u8, "https://2") },
+    });
+    const provider_picker = @import("widgets/provider_picker.zig");
+    const provider_entries = [_]provider_picker.ProviderHandle{
+        .{ .builtin = .openai },
+        .{ .builtin = .anthropic },
+        .{ .builtin = .ollama },
+    };
+    app.pickers.provider.entries = &provider_entries;
+    app.list_widgets.model_list.item_count = 5; // Header + 4 models
+    app.list_widgets.model_list.scroll.top = 0;
+    app.list_widgets.resume_list.item_count = 4;
+    app.list_widgets.resume_list.scroll.top = 0;
+    app.list_widgets.tree_list.item_count = 4;
+    app.list_widgets.tree_list.scroll.top = 0;
+    app.list_widgets.lanes_list.item_count = 4;
+    app.list_widgets.lanes_list.scroll.top = 0;
+
+    const rect: app_state_mod.ChipRect = .{ .row = 5, .col = 10, .width = 60, .height = 15 };
+    const k: u32 = 2;
+
+    const Case = struct {
+        mode: App.Mode,
+        click_row: i16,
+    };
+    const cases = [_]Case{
+        // Searchable overlays: border(+0), >(+1), ─(+2), list starts at rect.row + 3 = 8.
+        .{ .mode = .command, .click_row = 8 + k },
+        .{ .mode = .theme_picker, .click_row = 8 + k },
+        .{ .mode = .provider_picker, .click_row = 8 + k },
+        .{ .mode = .search, .click_row = 8 + k },
+        .{ .mode = .session_picker, .click_row = 8 + k },
+        // model_picker has 1-row Header at +0 inside list -> item k=2 is at 8 + 1 + 2 = 11.
+        .{ .mode = .model_picker, .click_row = 8 + 1 + k },
+        // tree_picker has 2-row "Filter: ..." header above list -> item k=2 is at 8 + 2 + 2 = 12.
+        .{ .mode = .tree_picker, .click_row = 8 + 2 + k },
+        // full_panel overlays: border(+0), list starts at rect.row + 1 = 6.
+        .{ .mode = .lanes, .click_row = 6 + k },
+        .{ .mode = .link_picker, .click_row = 6 + k },
+    };
+
+    for (cases) |c| {
+        app.mode = c.mode;
+        try std.testing.expect(selectOverlayRowAt(&app, rect, c.click_row));
+        const actual: u32 = switch (c.mode) {
+            .command => app.nav.command_selection,
+            .theme_picker => app.pickers.theme.selection,
+            .provider_picker => app.pickers.provider.selection,
+            .search => app.pickers.search.selection,
+            .session_picker => app.nav.resume_selection,
+            .model_picker => app.pickers.models.model_selection,
+            .tree_picker => app.pickers.tree.selection,
+            .lanes => app.nav.lanes_selection,
+            .link_picker => app.pickers.links.selection,
+            else => unreachable,
+        };
+        try std.testing.expectEqual(k, actual);
+    }
+
+    // Header rows in model_picker and tree_picker must not select item 0.
+    app.mode = .model_picker;
+    try std.testing.expect(!selectOverlayRowAt(&app, rect, 8));
+    app.mode = .tree_picker;
+    try std.testing.expect(!selectOverlayRowAt(&app, rect, 8));
+    try std.testing.expect(!selectOverlayRowAt(&app, rect, 9));
 }

@@ -20,6 +20,7 @@ pub const LinkItem = struct {
 pub const State = struct {
     items: std.ArrayList(LinkItem) = .empty,
     selection: u32 = 0,
+    scroll: panel.ListScrollState = .{},
 
     pub fn reset(self: *State, gpa: std.mem.Allocator) void {
         for (self.items.items) |*item| {
@@ -28,6 +29,7 @@ pub const State = struct {
         }
         self.items.clearRetainingCapacity();
         self.selection = 0;
+        self.scroll = .{};
     }
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
@@ -135,7 +137,7 @@ pub const Content = struct {
         }
 
         const list_height = if (height > 1) height - 1 else height;
-        const viewport = panel.ViewportWindow.compute(self.state.selection, @intCast(items.len), list_height);
+        const viewport = panel.ViewportWindow.computeStateful(self.state.selection, @intCast(items.len), list_height, &self.state.scroll);
         var idx = viewport.start_index;
         while (idx < viewport.end_index) : (idx += 1) {
             const item = items[idx];

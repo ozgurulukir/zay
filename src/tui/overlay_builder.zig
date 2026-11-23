@@ -14,6 +14,7 @@ const model_loader = @import("model_loader.zig");
 const plugin_store_job = @import("plugin_store_job.zig");
 const tui_status = @import("status.zig");
 
+const at_search = @import("widgets/at_search.zig");
 const command_panel = @import("widgets/command_panel.zig");
 const help_picker = @import("widgets/help_picker.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
@@ -78,7 +79,7 @@ pub fn buildOverlayWidget(
 
     const full_panel = (app.mode == .provider_picker and app.pickers.provider.stage == .form) or
         app.mode == .settings or app.mode == .help or app.mode == .mcp or
-        app.mode == .plugins;
+        app.mode == .plugins or app.mode == .lanes or app.mode == .link_picker;
 
     return .{
         .label = overlayLabel(app),
@@ -127,12 +128,7 @@ fn buildOverlayContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
                 .palette = &app.palette,
             } };
         },
-        .mcp => .{ .mcp = .{
-            .state = &app.pickers.mcp,
-            .manager = &app.mcp_manager,
-            .url_input = app.input_buffers.mcp_url.items,
-            .palette = &app.palette,
-        } },
+        .mcp => .{ .mcp = try buildMcpContent(app, arena) },
         .plugins => .{ .plugins = try buildPluginsContent(app, arena) },
         .search => .{ .search = .{ .state = &app.pickers.search, .palette = &app.palette } },
         .theme_picker => .{ .theme = try buildThemeContent(app, arena) },
@@ -157,8 +153,61 @@ fn buildThemeContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Erro
     return .{
         .themes = app.theme_registry.slice(),
         .selection = app.pickers.theme.selection,
+        .scroll = &app.pickers.theme.scroll,
         .active_name = active_name,
         .filter = filter,
+        .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
+        .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
+    };
+}
+
+fn buildMcpContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Error!mcp_status.Content {
+    const clients = app.mcp_manager.clients.items;
+    var entries: std.ArrayList(mcp_status.ServerEntry) = .empty;
+    for (clients) |client| {
+        try entries.append(arena, .{
+            .badge = client.status().label(),
+            .name = client.name,
+            .transport_tag = switch (client.transport) {
+                .stdio => "stdio",
+                .sse => "remote",
+            },
+            .tool_count = client.discovery.tools.items.len,
+            .latency_ms = client.latency_ms,
+            .error_reason = if (client.lifecycle == .failed) client.lifecycle.failed.reason else null,
+        });
+    }
+    return .{
+        .state = &app.pickers.mcp,
+        .servers = entries.items,
+        .active_server_count = app.mcp_manager.activeServerCount(),
+        .total_active_tools = app.mcp_manager.totalActiveTools(),
+        .url_input = app.input_buffers.mcp_url.items,
+        .palette = &app.palette,
+    };
+}
+
+/// Builds the floating `@`-results panel's per-frame view model from app
+/// state (INV-WIDGET-1): every fact the widget renders, computed here so
+/// the widget is a pure function of its props.
+pub fn buildAtSearchContent(app: *const App) at_search.Content {
+    const kind = app.at_search.kind();
+    const indexing = app.at_search == .indexing;
+    return .{
+        .results = app.at_search.results(),
+        .selection = app.getAtSelection(),
+        .query = switch (app.at_search) {
+            .open => |o| o.query,
+            else => "",
+        },
+        .indexing = indexing,
+        .sigil = if (kind == .file) '@' else '$',
+        .title = if (kind == .file) "Files" else "Skills",
+        .notice = switch (app.at_search) {
+            .open => |o| o.notice orelse "",
+            else => "",
+        },
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         .palette = &app.palette,
@@ -251,6 +300,7 @@ fn buildCommandContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .entries = try arena.dupe(command_panel.Entry, buf[0..n]),
         .filter = filter,
         .selection = app.nav.command_selection,
+        .scroll = &app.nav.command_scroll,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         .palette = &app.palette,
@@ -282,6 +332,7 @@ fn buildProviderContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.E
     const filter = try app.peekPaletteInputArena(arena);
     return .{
         .state = app.pickers.provider,
+        .scroll = &app.pickers.provider.scroll,
         .codex_signed_in = app.isCodexSignedIn(),
         .statuses = &app.provider_state.conn_status,
         .key_input = app.input_buffers.provider_key.items,

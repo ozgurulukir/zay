@@ -210,6 +210,7 @@ pub const NavState = struct {
     mouse_last_click_row: u16 = 0,
     mouse_last_click_col: u16 = 0,
     command_selection: u32 = 0,
+    command_scroll: @import("widgets/panel.zig").ListScrollState = .{},
     resume_selection: u32 = 0,
     /// How the resume picker groups sessions. Cycles through flat (current
     /// project, no grouping), project (all projects, grouped by project), and

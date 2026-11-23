@@ -62,6 +62,21 @@ pub const Content = struct {
     }
 };
 
+/// Floating `@`-results panel. Presentational only: renders the prepared
+/// `Content` built by `overlay_builder.buildAtSearchContent`; the main input keeps focus.
+pub const AtSearchWidget = struct {
+    content: Content,
+
+    pub fn widget(self: *AtSearchWidget) vxfw.Widget {
+        return .{ .userdata = self, .drawFn = drawAtSearch };
+    }
+
+    fn drawAtSearch(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
+        return self.content.widget().draw(ctx);
+    }
+};
+
 const Body = struct {
     content: *Content,
 

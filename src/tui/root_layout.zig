@@ -163,7 +163,10 @@ pub fn buildTranscriptProps(app: *App, lane: *tui.Thread, now_ms: i64) tx_widget
     const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
     const active_hit = app.pickers.search.activeHit();
     return .{
-        .thread = lane,
+        .messages = lane.transcript.messages.items,
+        .selected = lane.transcript.selected,
+        .auto_scroll = lane.auto_scroll,
+        .transcript_list = &lane.transcript_list,
         .has_model_configured = has_model,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
@@ -469,8 +472,8 @@ fn buildOverlayChildren(
         // (`at_search.drainAtSearch` polls the async backend and promotes
         // failures into the notice on the tick). Draw builds the view from
         // prepared state only — no polling, no backend reads.
-        const at_content = tui.buildAtSearchContent(app);
-        var at_view: tui.AtSearchWidget = .{ .content = at_content };
+        const at_content = overlay_builder.buildAtSearchContent(app);
+        var at_view: at_search.AtSearchWidget = .{ .content = at_content };
         const panel_height = at_search.panelHeight(at_content.results.len, at_content.notice.len > 0);
         const panel_width = @min(@as(u16, 72), max_width);
         children[idx] = .{
