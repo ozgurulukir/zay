@@ -42,10 +42,25 @@ pub fn jumpTranscriptToTop(app: *App) void {
     }
 }
 
+fn viewportSize(app: *const App) struct { width: u16, height: u16 } {
+    if (app.frame_geometry.terminal_width > 0) {
+        const vp = app.frame_geometry.focusedTranscriptViewport(app.focused_worker_index);
+        return .{
+            .width = if (vp.width > 0) vp.width else app.thread.transcript_view_width,
+            .height = if (vp.height > 0) vp.height else app.thread.transcript_view_height,
+        };
+    }
+    return .{
+        .width = app.thread.transcript_view_width,
+        .height = app.thread.transcript_view_height,
+    };
+}
+
 pub fn pageTranscript(app: *App, direction: TranscriptNavigation) bool {
     app.setBlockNav(true);
     app.thread.auto_scroll = false;
-    const height = app.thread.transcript_view_height;
+    const vp = viewportSize(app);
+    const height = vp.height;
     const page_step: u16 = @max(1, height / 2);
 
     const selected = app.thread.transcript.selected orelse {
@@ -57,7 +72,7 @@ pub fn pageTranscript(app: *App, direction: TranscriptNavigation) bool {
     };
 
     if (selected < app.thread.transcript.messages.items.len) {
-        const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
+        const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(vp.width, app.presentation.max_content_width), app.presentation);
         if (rows > height) {
             const rows_hidden = rows - height;
             const offset = selectedMessageOffset(app, selected);
@@ -110,8 +125,9 @@ pub fn navigateTranscript(app: *App, direction: TranscriptNavigation) bool {
 fn scrollSelectedLongMessage(app: *App, direction: TranscriptNavigation) bool {
     const selected = app.thread.transcript.selected orelse return false;
     if (selected >= app.thread.transcript.messages.items.len) return false;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
-    const height = app.thread.transcript_view_height;
+    const vp = viewportSize(app);
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(vp.width, app.presentation.max_content_width), app.presentation);
+    const height = vp.height;
     if (rows <= height) return false;
     const rows_hidden = rows - height;
     const step = scrollStepRows(height);
@@ -135,15 +151,17 @@ fn scrollSelectedLongMessage(app: *App, direction: TranscriptNavigation) bool {
 pub fn selectedMessageIsLong(app: *const App) bool {
     const selected = app.thread.transcript.selected orelse return false;
     if (selected >= app.thread.transcript.messages.items.len) return false;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
-    return rows > app.thread.transcript_view_height;
+    const vp = viewportSize(app);
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(vp.width, app.presentation.max_content_width), app.presentation);
+    return rows > vp.height;
 }
 
 pub fn selectedMessageCanScrollDown(app: *const App) bool {
     const selected = app.thread.transcript.selected orelse return false;
     if (selected >= app.thread.transcript.messages.items.len) return false;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
-    const height = app.thread.transcript_view_height;
+    const vp = viewportSize(app);
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(vp.width, app.presentation.max_content_width), app.presentation);
+    const height = vp.height;
     if (rows <= height) return false;
     return selectedMessageOffset(app, selected) < rows - height;
 }
@@ -151,8 +169,9 @@ pub fn selectedMessageCanScrollDown(app: *const App) bool {
 fn anchorSelectedLongMessage(app: *App, direction: TranscriptNavigation) void {
     const selected = app.thread.transcript.selected orelse return;
     if (selected >= app.thread.transcript.messages.items.len) return;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
-    const height = app.thread.transcript_view_height;
+    const vp = viewportSize(app);
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(vp.width, app.presentation.max_content_width), app.presentation);
+    const height = vp.height;
     if (rows <= height) return;
     const offset = switch (direction) {
         .next => 0,
@@ -172,4 +191,39 @@ pub fn setSelectedMessageOffset(app: *App, selected: u32, offset: u16) void {
     app.thread.transcript_list.scroll.offset = @intCast(offset);
     app.thread.transcript_list.scroll.pending_lines = 0;
     app.thread.transcript_list.scroll.wants_cursor = false;
+}
+
+test "pageTranscript steps by FrameGeometry transcript_height / 2" {
+    const std = @import("std");
+    const agent_mod = @import("../agent.zig");
+    const frame_geometry = @import("frame_geometry.zig");
+    const vxfw = @import("vaxis").vxfw;
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var long_body: std.ArrayListUnmanaged(u8) = .empty;
+    defer long_body.deinit(gpa);
+    for (0..80) |_| {
+        try long_body.appendSlice(gpa, "line of text for paging\n");
+    }
+    _ = try app.thread.transcript.append(gpa, .user, "you", long_body.items);
+    app.thread.transcript.selected = 0;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    app.frame_geometry = frame_geometry.computeFrameGeometry(&app, ctx, 120, 40, "");
+
+    const expected_step = @max(@as(u16, 1), app.frame_geometry.layout.transcript_height / 2);
+    try std.testing.expect(expected_step > 1);
+    try std.testing.expect(pageTranscript(&app, .next));
+    try std.testing.expectEqual(@as(i32, expected_step), app.thread.transcript_list.scroll.offset);
 }

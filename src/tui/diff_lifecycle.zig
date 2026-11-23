@@ -288,10 +288,6 @@ pub fn openDiffViewer(app: *App) !void {
 
 pub fn enterDiffMode(app: *App) void {
     app.setMode(.diff_viewer);
-    // The diff viewer never draws the transcript, so the black-hole visibility
-    // (recomputed only there) would stay stuck true and drive a pointless
-    // continuous redraw/tick loop. Park it off while in the viewer.
-    app.metrics.blackhole_visible = false;
     app.inputs.comment.clearRetainingCapacity();
 }
 

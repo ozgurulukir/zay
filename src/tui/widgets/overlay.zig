@@ -59,7 +59,18 @@ pub fn isListPicker(mode: Mode) bool {
 }
 
 pub fn overlaySize(mode: Mode, max_cols: u16, max_rows: u16) OverlaySize {
+    return overlaySizeFor(mode, false, max_cols, max_rows);
+}
+
+pub fn overlaySizeFor(mode: Mode, provider_form: bool, max_cols: u16, max_rows: u16) OverlaySize {
     if (mode == .normal or mode == .diff_viewer) return .{ .width = 0, .height = 0 };
+
+    if (mode == .provider_picker and provider_form) {
+        return .{
+            .width = @min(max_cols, @max(@min(@as(u16, 40), max_cols), (max_cols * 9) / 10)),
+            .height = @min(max_rows, 12),
+        };
+    }
 
     if (mode == .save_message) {
         const min_w = @min(@as(u16, 40), max_cols);

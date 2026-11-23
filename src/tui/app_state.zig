@@ -223,11 +223,6 @@ pub const NavState = struct {
     /// waiting for a released second press within the window) -> confirmed
     /// (a slash exit command was issued; the next event loop drains it).
     quit: QuitState = .none,
-    lanes_chip_rect: ?tui.ChipRect = null,
-    new_output_rect: ?tui.ChipRect = null,
-    permission_buttons: ?[4]PermissionButton = null,
-    permission_panel_rect: ?tui.ChipRect = null,
-    overlay_panel_rect: ?tui.ChipRect = null,
 };
 
 /// State for the Ctrl+O background-jobs modal: the open flag, the
@@ -397,7 +392,6 @@ pub const MetricsState = struct {
     loading_frame: u8 = 0,
     loading_tick_active: bool = false,
     blackhole_frame: u16 = 0,
-    blackhole_visible: bool = true,
     git_label: []const u8 = "",
     context_tokens_used: u32 = 0,
     context_tokens_max: u32 = 128000,

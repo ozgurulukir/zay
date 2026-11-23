@@ -69,6 +69,11 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
         }
         if (!matched_driver) return null;
     } else {
+        if (app.frame_geometry.terminal_width > 0 and app.frame_geometry.layout.transcript_height > 0) {
+            view_width = app.frame_geometry.terminal_width;
+            view_height = app.frame_geometry.layout.transcript_height;
+            list_bottom = view_height -| list_bottom_pad;
+        }
         if (row >= list_bottom or col >= view_width) return null;
     }
 
@@ -224,4 +229,37 @@ test "hitTestTranscript accounts for vertical list padding, indent, wrapping, an
     const hit2 = hitTestTranscript(&app, 2, 4).?;
     try std.testing.expectEqual(@as(u32, 0), hit2.message_index);
     try std.testing.expectEqual(@as(usize, "alpha beta ".len), hit2.byte_offset);
+}
+
+test "hitTestTranscript succeeds on row 15 in single-pane mode using FrameGeometry" {
+    const agent_mod = @import("../agent.zig");
+    const frame_geometry = @import("frame_geometry.zig");
+    const vxfw = @import("vaxis").vxfw;
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Multi-line message tall enough to span past row 15 even with default 80x1 transcript_view_*.
+    var long_body: std.ArrayListUnmanaged(u8) = .empty;
+    defer long_body.deinit(gpa);
+    for (0..25) |_| {
+        try long_body.appendSlice(gpa, "line of text for single-pane hit test\n");
+    }
+    _ = try app.thread.transcript.append(gpa, .user, "you", long_body.items);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    app.frame_geometry = frame_geometry.computeFrameGeometry(&app, ctx, 120, 40, "");
+
+    const hit = hitTestTranscript(&app, 15, 4);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(@as(u32, 0), hit.?.message_index);
 }

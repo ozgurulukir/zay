@@ -87,7 +87,12 @@ fn scrollMatchIntoView(app: *App, match: search_widget.Match) void {
         else => return,
     };
     if (match.start > body.len) return;
-    const width = ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width);
+    const vp_w = if (app.frame_geometry.terminal_width > 0)
+        app.frame_geometry.focusedTranscriptViewport(app.focused_worker_index).width
+    else
+        app.thread.transcript_view_width;
+    const view_width = if (vp_w > 0) vp_w else app.thread.transcript_view_width;
+    const width = ConversationLayout.contentWidth(view_width, app.presentation.max_content_width);
     var rows_before: u16 = switch (message.*) {
         .agent => terminal_markdown.countRows(std.heap.page_allocator, body[0..match.start], width),
         else => tui_metrics.textRows(body[0..match.start], width),

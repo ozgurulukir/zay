@@ -39,6 +39,20 @@ pub const FrameGeometry = struct {
         .loading_row = 0,
         .input_row = 0,
     },
+
+    /// Return the live transcript viewport dimensions for `focused_lane_index`
+    /// (the matching split column when split, or the single-pane transcript
+    /// surface otherwise). Returns 0x0 if `computeFrameGeometry` has not run yet.
+    pub fn focusedTranscriptViewport(self: FrameGeometry, focused_lane_index: usize) struct { width: u16, height: u16 } {
+        if (self.split_rect_count > 0) {
+            for (self.split_rects[0..self.split_rect_count]) |rect| {
+                if (rect.lane_index == focused_lane_index) {
+                    return .{ .width = rect.width, .height = rect.height };
+                }
+            }
+        }
+        return .{ .width = self.terminal_width, .height = self.layout.transcript_height };
+    }
 };
 
 pub fn computeFrameGeometry(
@@ -104,9 +118,7 @@ pub fn computeFrameGeometry(
 
     const show_lanes_chip = app.split_mode == .tab and app.threads.len() > 1;
     if (show_lanes_chip) {
-        const queued_visible = app.thread.queued.items.len > 0;
-        const text_rows: u16 = @min(@max(raw_text_rows, 1), 6);
-        const base_row: u16 = (if (queued_visible) @as(u16, 1) else 0) + (text_rows + 2);
+        const base_row: u16 = root_lay.input_height -| 1;
         var buf: [32]u8 = undefined;
         const pill = std.fmt.bufPrint(&buf, " {d} Lanes ", .{app.threads.len()}) catch "";
         const lanes_width: u16 = @min(@as(u16, @intCast(pill.len)), width -| 2);
@@ -119,13 +131,12 @@ pub fn computeFrameGeometry(
 
     const overlay_visible = app.mode != .normal;
     if (overlay_visible) {
-        const size = if (app.mode == .provider_picker and app.pickers.provider.stage == .form)
-            overlay_mod.OverlaySize{
-                .width = @min(width, @max(@min(@as(u16, 40), width), (width * 9) / 10)),
-                .height = @min(root_lay.transcript_height, 12),
-            }
-        else
-            overlay_mod.overlaySize(app.mode, width, root_lay.transcript_height);
+        const size = overlay_mod.overlaySizeFor(
+            app.mode,
+            app.pickers.provider.stage == .form,
+            width,
+            root_lay.transcript_height,
+        );
         const total_w: u16 = @min(size.width, width);
         const total_h: u16 = @min(size.height, root_lay.transcript_height);
         geom.drawn_overlay_width = total_w;
@@ -210,4 +221,41 @@ fn computePermissionButtons(
         col += label_width + 2;
     }
     return recorded;
+}
+
+test "computeFrameGeometry lanes_chip_rect.row matches input base_row across terminal heights and line counts" {
+    const agent_mod = @import("../agent.zig");
+    const test_helpers = @import("test_helpers.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Ensure at least 2 lanes in .tab mode so lanes_chip_rect is populated.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "2");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var lines_buf: [60]u8 = undefined;
+    var h: u16 = 10;
+    while (h <= 80) : (h += 10) {
+        var r: usize = 1;
+        while (r <= 30) : (r += 5) {
+            const len = @min(lines_buf.len, (r - 1) * 2);
+            for (0..len) |i| {
+                lines_buf[i] = if (i % 2 == 0) 'a' else '\n';
+            }
+            const ctx: vxfw.DrawContext = .{
+                .arena = arena.allocator(),
+                .min = .{},
+                .max = .{ .width = 80, .height = h },
+                .cell_size = .{ .width = 10, .height = 20 },
+            };
+            const geom = computeFrameGeometry(&app, ctx, 80, h, lines_buf[0..len]);
+            try std.testing.expect(geom.lanes_chip_rect != null);
+            try std.testing.expectEqual(geom.layout.input_row + (geom.layout.input_height -| 1), geom.lanes_chip_rect.?.row);
+        }
+    }
 }
