@@ -1731,7 +1731,6 @@ test "MessageWidget renders logo with monochrome NO_COLOR palette without panick
         .blackhole_frame = 0,
         .has_model_configured = false,
         .palette = &mono,
-        .gpa = gpa,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
