@@ -4,7 +4,6 @@ const vxfw = vaxis.vxfw;
 
 const ai = @import("../../ai.zig");
 const codex = @import("../../auth/codex.zig");
-const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
@@ -159,7 +158,7 @@ pub const Content = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try panel.lineStyledAt(&surface, 0, text, ctx, message.ConversationLayout.left -| 1, style);
+        try panel.lineStyledAt(&surface, 0, text, ctx, panel.panel_margin_x, style);
         return surface;
     }
 
@@ -168,7 +167,7 @@ pub const Content = struct {
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
-        try panel.lineStyledAt(&surface, 0, "No provider models available. Run /connect first.", ctx, message.ConversationLayout.left -| 1, p.notice);
+        try panel.lineStyledAt(&surface, 0, "No provider models available. Run /connect first.", ctx, panel.panel_margin_x, p.notice);
         return surface;
     }
 
@@ -243,7 +242,7 @@ const Header = struct {
         const p = tui_style.activePalette();
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try panel.lineStyledAt(&surface, 0, "NAME", ctx, message.ConversationLayout.left + 1, p.panel_header);
+        try panel.lineStyledAt(&surface, 0, "NAME", ctx, panel.panel_margin_x + 2, p.panel_header);
         try panel.lineStyledAt(&surface, 0, "REASONING EFFORT", ctx, panel.secondaryColumn(surface.size.width) + 2, p.panel_header);
         return surface;
     }
@@ -431,7 +430,7 @@ pub const Row = struct {
 
         const model_focused = self.selected and self.column == .model;
         const prefix = "  ";
-        const start_col = message.ConversationLayout.left -| 1;
+        const start_col = panel.panel_margin_x;
         // The model-label line migrates to drawFuzzyListRow (base_style
         // preserves columnStyle's column-focus semantics, M6).
         try panel.drawFuzzyListRow(&surface, 0, ctx, .{

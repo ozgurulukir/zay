@@ -32,6 +32,7 @@ const permission = @import("widgets/permission.zig");
 const background_jobs = @import("widgets/background_jobs.zig");
 const at_search = @import("widgets/at_search.zig");
 const overlay = @import("widgets/overlay.zig");
+const overlay_builder = @import("overlay_builder.zig");
 const toast = @import("toast.zig");
 const permission_mod = @import("permission.zig");
 const lanes_util = @import("lanes.zig");
@@ -544,7 +545,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
 
     const modal_layer = activeModalLayer(app);
     const toast_visible = toast.global.hasToasts();
-    var overlay_view: overlay.OverlayWidget = .{ .app = app };
+    var overlay_view: overlay.OverlayWidget = undefined;
 
     if (app.mode == .diff_viewer) {
         app.split_rect_count = 0;
@@ -608,6 +609,9 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .loading_frame = app.metrics.loading_frame,
     };
     var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
+    if (modal_layer == .overlay) {
+        overlay_view = try overlay_builder.buildOverlayWidget(app, ctx.arena, max_width, layout.transcript_height);
+    }
 
     var top_bufs: TopWidgetBuffers = .{};
     const top_widget = buildTopWidget(app, split, split_cols, max_width, layout.transcript_height, now_ms, &transcript_view, &top_bufs);

@@ -3,7 +3,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
-const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const tree_art = @import("tree_art.zig");
@@ -576,7 +575,7 @@ pub const Content = struct {
         // the right (justify-between). Row 1 is blank padding; the scrollable
         // list starts at row 2.
         const white = p.panel_header;
-        const start_col = message.ConversationLayout.left -| 1;
+        const start_col = panel.panel_margin_x;
         const mode_label = try std.fmt.allocPrint(ctx.arena, "Filter: {s}", .{self.state.filter_mode.label()});
         try panel.lineStyledAt(&surface, 0, mode_label, ctx, start_col, white);
         const position = if (self.state.visible.len == 0) 0 else self.state.selection + 1;
@@ -641,7 +640,7 @@ const Row = struct {
         if (self.selected) panel.fillRow(&surface, 0, p.selected);
 
         // Tree rows anchor at the same left column as the "Filter:" header.
-        var col = message.ConversationLayout.left -| 1;
+        var col = panel.panel_margin_x;
         try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(p.thinking_body, self.selected));
         col += @intCast(ctx.stringWidth(self.node.prefix));
 
