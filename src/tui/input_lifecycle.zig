@@ -50,7 +50,7 @@ pub fn moveInputCursorVertical(app: *App, move: input_mod.VerticalMove) !bool {
     const cur = app.inputs.input.buf.firstHalf().len;
     // Before the first draw (only in tests) the width is unknown; a wide
     // sentinel keeps every logical line on one visual row.
-    const width: u16 = if (app.input_wrap_width == 0) 4096 else app.input_wrap_width;
+    const width: u16 = if (app.frame_geometry.input_wrap_width == 0) 4096 else app.frame_geometry.input_wrap_width;
 
     const pos = input_mod.wrappedPosition(text, cur, width);
     const target_row: u16 = switch (move) {

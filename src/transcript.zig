@@ -3,6 +3,7 @@ const std = @import("std");
 const parts_mod = @import("tools/parts.zig");
 const tools_common = @import("tools/common.zig");
 const terminal_markdown = @import("terminal_markdown");
+const token_scan = @import("tui/token_scan.zig");
 
 const assert = std.debug.assert;
 
@@ -63,6 +64,56 @@ pub const RowCache = struct {
     rows: u16 = 0,
 };
 
+/// Memoized token-scan spans for a message body, invalidated on mutation and
+/// freed with the message so `draw` never re-scans unchanged bodies.
+pub const ScanCache = struct {
+    path_valid: bool = false,
+    path_text_ptr: usize = 0,
+    path_text_len: usize = 0,
+    path_tokens: []const token_scan.PathLineToken = &.{},
+    shell_valid: bool = false,
+    shell_text_ptr: usize = 0,
+    shell_text_len: usize = 0,
+    shell_tokens: []const token_scan.Token = &.{},
+
+    pub fn ensurePathTokens(self: *ScanCache, gpa: std.mem.Allocator, text: []const u8) []const token_scan.PathLineToken {
+        const ptr = if (text.len > 0) @intFromPtr(text.ptr) else 0;
+        if (self.path_valid and self.path_text_ptr == ptr and self.path_text_len == text.len) {
+            return self.path_tokens;
+        }
+        if (self.path_tokens.len > 0) gpa.free(self.path_tokens);
+        self.path_tokens = token_scan.scanPathLineTokens(gpa, text, 64) catch &.{};
+        self.path_text_ptr = ptr;
+        self.path_text_len = text.len;
+        self.path_valid = true;
+        return self.path_tokens;
+    }
+
+    pub fn ensureShellDiagnostics(self: *ScanCache, gpa: std.mem.Allocator, text: []const u8) []const token_scan.Token {
+        const ptr = if (text.len > 0) @intFromPtr(text.ptr) else 0;
+        if (self.shell_valid and self.shell_text_ptr == ptr and self.shell_text_len == text.len) {
+            return self.shell_tokens;
+        }
+        if (self.shell_tokens.len > 0) gpa.free(self.shell_tokens);
+        self.shell_tokens = token_scan.scanShellDiagnostics(gpa, text, 64) catch &.{};
+        self.shell_text_ptr = ptr;
+        self.shell_text_len = text.len;
+        self.shell_valid = true;
+        return self.shell_tokens;
+    }
+
+    pub fn invalidate(self: *ScanCache) void {
+        self.path_valid = false;
+        self.shell_valid = false;
+    }
+
+    pub fn deinit(self: *ScanCache, gpa: std.mem.Allocator) void {
+        if (self.path_tokens.len > 0) gpa.free(self.path_tokens);
+        if (self.shell_tokens.len > 0) gpa.free(self.shell_tokens);
+        self.* = .{};
+    }
+};
+
 /// Payload shared by every non-tool transcript variant (user, agent,
 /// skill, logo, thinking, status, notice, success, info). The fields
 /// that were previously always-present on `Message` — title, body,
@@ -78,6 +129,7 @@ pub const Basic = struct {
     timestamp_s: i64 = 0,
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
+    scan_cache: ScanCache = .{},
 };
 
 /// Tool-specific payload. `running` flips between append (start) and
@@ -112,6 +164,7 @@ pub const ToolView = struct {
     group_items: []GroupItem = &.{},
     row_cache: RowCache = .{},
     render_inc: terminal_markdown.Incremental = .{},
+    scan_cache: ScanCache = .{},
     /// The collapsed-title suffix for a finished tool: " · 1.2s" (duration
     /// when known) and " · exit 2" for non-zero exit codes, or live elapsed
     /// time for a running tool when `now_ms > started_ms > 0` (#503).
@@ -225,12 +278,21 @@ pub const Message = union(enum) {
         };
     }
 
+    /// Convenience: pointer to the `scan_cache` field.
+    pub fn scanCachePtr(self: *Message) *ScanCache {
+        return switch (self.*) {
+            inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| &m.scan_cache,
+            .tool => |*t| &t.scan_cache,
+        };
+    }
+
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
         switch (self.*) {
             inline .user, .agent, .skill, .logo, .thinking, .status, .notice, .success, .info => |*m| {
                 gpa.free(m.title);
                 gpa.free(m.body);
                 m.render_inc.deinit(gpa);
+                m.scan_cache.deinit(gpa);
             },
             .tool => |*t| {
                 gpa.free(t.title);
@@ -247,6 +309,7 @@ pub const Message = union(enum) {
                 }
                 if (t.group_items.len > 0) gpa.free(t.group_items);
                 t.render_inc.deinit(gpa);
+                t.scan_cache.deinit(gpa);
             },
         }
         self.* = undefined;
@@ -254,6 +317,7 @@ pub const Message = union(enum) {
 
     pub fn invalidateRowCache(self: *Message) void {
         self.rowCachePtr().valid = false;
+        self.scanCachePtr().invalidate();
     }
 
     /// Test-only flat view of this `Message`. The TUI tests access

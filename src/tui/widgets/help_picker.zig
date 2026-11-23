@@ -246,10 +246,10 @@ pub const Content = struct {
         const body_height: u16 = height -| 1;
         const total_count: u16 = @intCast(help_lines.len);
         const max_s = State.maxScroll(body_height);
-        if (self.state.scroll > max_s) self.state.scroll = max_s;
+        const eff_scroll = @min(self.state.scroll, max_s);
 
         var row: u16 = 0;
-        var line_idx: u16 = self.state.scroll;
+        var line_idx: u16 = eff_scroll;
         while (line_idx < total_count and row < body_height) : (line_idx += 1) {
             const item = help_lines[line_idx];
             if (item.is_header) {

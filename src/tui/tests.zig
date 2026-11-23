@@ -375,7 +375,6 @@ test "lane column props preserve active/focused border and splash suppression" {
     try std.testing.expect(focused_active.transcript.splash_suppressed);
     try std.testing.expectEqualStrings("untitled", focused_active.title);
     try std.testing.expectEqualStrings("·", focused_active.state_glyph);
-    try std.testing.expect(focused_active.transcript.blackhole_visible == &app.metrics.blackhole_visible);
 
     // Unfocused sibling: dim border, no splash suppression, own title.
     const unfocused = draw_root_layout.buildLaneColumnProps(&app, sibling, 40, 10, false, false, 0);
@@ -670,10 +669,10 @@ test "scripted smoke: split lanes render both panes and click-to-focus switches 
     const frame = try renderRootFrame(&app, &arena, 160, 34);
     try std.testing.expect(std.mem.indexOf(u8, frame, "untitled") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "side-lane") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.split_rect_count);
+    try std.testing.expectEqual(@as(usize, 2), app.frame_geometry.split_rect_count);
 
     // Click the right (worker) pane through the REAL mouse route.
-    const right = app.split_rects[1];
+    const right = app.frame_geometry.split_rects[1];
     var root: RootWidget = .{ .app = &app };
     var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
     try RootWidget.captureEvent(&root, &ctx, .{ .mouse = .{
@@ -686,7 +685,7 @@ test "scripted smoke: split lanes render both panes and click-to-focus switches 
     try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
 
     // Clicking the driver pane (lane 0) leaves the focus alone.
-    const left = app.split_rects[0];
+    const left = app.frame_geometry.split_rects[0];
     try RootWidget.captureEvent(&root, &ctx, .{ .mouse = .{
         .col = @intCast(left.col + left.width / 2),
         .row = @intCast(left.row + 1),
@@ -878,7 +877,7 @@ test "vertical navigation follows soft-wrapped visual rows" {
     // two visual rows ("abcdefghij" / "klmnopqrst"), so the cursor must move by
     // visual row — the old '\n'-only logic was stuck on one logical line.
     try app.inputs.input.insertSliceAtCursor("abcdefghijklmnopqrst");
-    app.input_wrap_width = 10;
+    app.frame_geometry.input_wrap_width = 10;
 
     // Cursor sits at the end (second visual row). Up moves to the first row.
     try std.testing.expect(try app.moveInputCursorVertical(.up));
@@ -1225,7 +1224,6 @@ test "up enters selected long message at bottom" {
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
-        .blackhole_visible = &app.metrics.blackhole_visible,
     };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
@@ -1396,15 +1394,15 @@ test "spinner frame only advances for visible lanes when background lane is acti
 
     // Off-screen in .tab mode: idle visible lane does not force spinner redraws.
     app.split_mode = .tab;
-    app.split_rect_count = 0;
+    app.frame_geometry.split_rect_count = 0;
     try lifecycle.handleTick(&root, &ctx);
     try std.testing.expectEqual(@as(u8, 0), app.metrics.loading_frame);
 
     // Visible in .dual mode: active worker pane advances the spinner frame.
     app.split_mode = .dual;
-    app.split_rects[0] = .{ .row = 0, .col = 0, .width = 80, .height = 20, .lane_index = 0 };
-    app.split_rects[1] = .{ .row = 0, .col = 80, .width = 80, .height = 20, .lane_index = 1 };
-    app.split_rect_count = 2;
+    app.frame_geometry.split_rects[0] = .{ .row = 0, .col = 0, .width = 80, .height = 20, .lane_index = 0 };
+    app.frame_geometry.split_rects[1] = .{ .row = 0, .col = 80, .width = 80, .height = 20, .lane_index = 1 };
+    app.frame_geometry.split_rect_count = 2;
     root.spinner_tick_accum = RootWidget.spinner_tick_threshold_ms - 1;
     try lifecycle.handleTick(&root, &ctx);
     try std.testing.expectEqual(@as(u8, 1), app.metrics.loading_frame);
@@ -1647,7 +1645,6 @@ test "queued prompt draws above input at minimum input height" {
         .input_field = &app.inputs.input,
         .input_text = try std.mem.concat(arena.allocator(), u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() }),
         .input_cursor = app.inputs.input.buf.firstHalf().len,
-        .input_wrap_width = &app.input_wrap_width,
         .queued = app.thread.queued.items,
         .queued_selection = app.nav.queued_selection,
     } };
@@ -1700,7 +1697,6 @@ test "alt navigation and ctrl-steer drive the queued message line" {
         .input_field = &app.inputs.input,
         .input_text = try std.mem.concat(arena.allocator(), u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() }),
         .input_cursor = app.inputs.input.buf.firstHalf().len,
-        .input_wrap_width = &app.input_wrap_width,
         .queued = app.thread.queued.items,
         .queued_selection = app.nav.queued_selection,
     } };
@@ -4105,7 +4101,6 @@ fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
-        .blackhole_visible = &app.metrics.blackhole_visible,
     };
 
     // Warm frame: renders + caches markdown for the visible messages.
@@ -4272,7 +4267,6 @@ test "transcript draw width-change re-count stays below a fixed gpa ceiling" {
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
-        .blackhole_visible = &app.metrics.blackhole_visible,
     };
 
     // Warm at width 100 so the visible messages hold populated incremental
@@ -4450,7 +4444,7 @@ test "mouse click on new output pill jumps transcript to bottom" {
     _ = try app.thread.transcript.append(gpa, .agent, "Agent", "M2");
 
     app.thread.auto_scroll = false;
-    app.nav.new_output_rect = .{ .row = 10, .col = 60, .width = 14 };
+    app.frame_geometry.new_output_rect = .{ .row = 10, .col = 60, .width = 14 };
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -4479,7 +4473,7 @@ test "mouse click outside modal overlay dismisses overlay" {
     defer app.deinit();
 
     app.setMode(.command);
-    app.nav.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
+    app.frame_geometry.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -4574,7 +4568,7 @@ test "overlay mouse click selects clicked row before submitting (#564)" {
     defer app.deinit();
 
     app.setMode(.command);
-    app.nav.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
+    app.frame_geometry.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
     app.nav.command_selection = 0;
 
     // `overlay_panel_rect` is the Border surface: row 5 is top border, row 6 is `>`,
@@ -4716,4 +4710,64 @@ test "INV-WIDGET-1: no file under src/tui/widgets/ references *App or *tui.App (
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "drawRoot twice with identical state and constraints yields identical surfaces and leaves state unchanged" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(gpa, .user, "you", "check src/main.zig:12");
+    _ = try app.thread.transcript.append(gpa, .agent, "agent", "Here is **markdown** and `code`.");
+    app.diff.scroll = 3;
+    app.pickers.help.scroll = 4;
+
+    var arena1 = std.heap.ArenaAllocator.init(gpa);
+    defer arena1.deinit();
+    var arena2 = std.heap.ArenaAllocator.init(gpa);
+    defer arena2.deinit();
+
+    const frame1 = try renderRootFrame(&app, &arena1, 80, 24);
+    const geom1 = app.frame_geometry;
+    const diff_scroll_after_1 = app.diff.scroll;
+    const help_scroll_after_1 = app.pickers.help.scroll;
+    const list_top_after_1 = app.thread.transcript_list.scroll.top;
+    const list_offset_after_1 = app.thread.transcript_list.scroll.offset;
+
+    const frame2 = try renderRootFrame(&app, &arena2, 80, 24);
+    try std.testing.expectEqualStrings(frame1, frame2);
+    try std.testing.expectEqual(geom1.input_surface_row, app.frame_geometry.input_surface_row);
+    try std.testing.expectEqual(geom1.input_wrap_width, app.frame_geometry.input_wrap_width);
+    try std.testing.expectEqual(geom1.blackhole_visible, app.frame_geometry.blackhole_visible);
+    try std.testing.expectEqual(diff_scroll_after_1, app.diff.scroll);
+    try std.testing.expectEqual(help_scroll_after_1, app.pickers.help.scroll);
+    try std.testing.expectEqual(list_top_after_1, app.thread.transcript_list.scroll.top);
+    try std.testing.expectEqual(list_offset_after_1, app.thread.transcript_list.scroll.offset);
+}
+
+test "drawRoot performs 0 app.gpa allocations once caches are warm" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var counting_gpa: CountingAllocator = .{ .child = gpa };
+    var agent = agent_mod.Agent.init(counting_gpa.allocator(), io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, counting_gpa.allocator(), &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(counting_gpa.allocator(), .user, "you", "open src/tui/root_layout.zig:1");
+    _ = try app.thread.transcript.append(counting_gpa.allocator(), .agent, "agent", "Rendered **markdown** with `inline` code.");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // Warm caches (markdown incremental + token_scan caches).
+    _ = try renderRootFrame(&app, &arena, 80, 24);
+    _ = arena.reset(.retain_capacity);
+
+    counting_gpa.count = 0;
+    _ = try renderRootFrame(&app, &arena, 80, 24);
+    try std.testing.expectEqual(@as(usize, 0), counting_gpa.count);
 }

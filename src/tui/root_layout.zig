@@ -21,6 +21,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const root_layout = @import("layout.zig");
+const frame_geometry = @import("frame_geometry.zig");
 const lane_column = @import("lane_column.zig");
 const diff_viewer_overlay = @import("diff_viewer_overlay.zig");
 const tui_status = @import("status.zig");
@@ -104,9 +105,6 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
         .input_field = &app.inputs.input,
         .input_text = combined_text,
         .input_cursor = app.inputs.input.buf.firstHalf().len,
-        .input_wrap_width = &app.input_wrap_width,
-        .input_surface_row = app.input_surface_row,
-        .chip_rect_out = &app.nav.lanes_chip_rect,
         .queued = app.thread.queued.items,
         .queued_selection = app.nav.queued_selection,
         .prompt_text = if (app.mode == .normal) ">" else " ",
@@ -170,7 +168,6 @@ pub fn buildTranscriptProps(app: *App, lane: *tui.Thread, now_ms: i64) tx_widget
         .has_model_configured = has_model,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
-        .blackhole_visible = &app.metrics.blackhole_visible,
         // Only the pane whose lane owns the shared input yields its splash;
         // sibling lanes keep theirs until their own first prompt.
         .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
@@ -178,7 +175,6 @@ pub fn buildTranscriptProps(app: *App, lane: *tui.Thread, now_ms: i64) tx_widget
         .active_search_hit = if (active_hit) |h| .{ .message_index = h.message_index, .start = h.start, .end = h.end } else null,
         .now_ms = now_ms,
         .body_selection = lane.transcript.body_selection,
-        .new_output_rect_out = if (lane == app.thread) &app.nav.new_output_rect else null,
         .palette = &app.palette,
         .presentation = app.presentation,
     };
@@ -395,26 +391,16 @@ fn buildOverlayChildren(
             .surface = overlay_surface,
             .z_index = 2,
         };
-        if (overlay_surface.children.len > 0) {
-            const sub = overlay_surface.children[0];
-            app.nav.overlay_panel_rect = .{
-                .row = @intCast(@max(0, sub.origin.row)),
-                .col = @intCast(@max(0, sub.origin.col)),
-                .width = sub.surface.size.width,
-                .height = sub.surface.size.height,
-            };
-        }
         idx += 1;
-    } else {
-        app.drawn_overlay_width = 0;
-        app.drawn_overlay_height = 0;
-        app.nav.overlay_panel_rect = null;
     }
 
     if (flags.permission_visible) {
         const lane = permission_mod.approvalLane(app);
-        const worker = if (lane) |l| if (l.worker_context) |*wc| wc else null else null;
-        const snapshot = if (worker) |w| try w.approval.snapshot(w.io, ctx.arena, app.thread.permission_selection) else null;
+        const snapshot = if (app.cached_approval) |snap| blk: {
+            var s = snap;
+            s.selected = app.thread.permission_selection;
+            break :blk s;
+        } else null;
         const label: []const u8 = if (lane) |l| blk: {
             if (l != app.thread) {
                 const hex_id = if (lanes_util.workingLaneOf(l)) |w| lanes_util.lastPathSegment(w.path) else null;
@@ -426,19 +412,11 @@ fn buildOverlayChildren(
 
         const panel_height: u16 = @min(@as(u16, 12), @max(@as(u16, 5), layout.input_row));
         const panel_row = layout.input_row -| panel_height;
-        app.nav.permission_panel_rect = .{
-            .row = panel_row,
-            .col = 0,
-            .width = max_width,
-            .height = panel_height,
-        };
 
         var permission_view: permission.PermissionWidget = .{
             .snapshot = snapshot,
             .scroll = app.thread.permission_scroll,
             .label = label,
-            .base_screen_row = panel_row,
-            .buttons_out = &app.nav.permission_buttons,
             .palette = &app.palette,
         };
         children[idx] = .{
@@ -450,9 +428,6 @@ fn buildOverlayChildren(
             .z_index = 3,
         };
         idx += 1;
-    } else {
-        app.nav.permission_panel_rect = null;
-        app.nav.permission_buttons = null;
     }
 
     if (flags.background_visible) {
@@ -532,9 +507,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const max_width = ctx.max.width orelse ctx.min.width;
     const max_height = ctx.max.height orelse ctx.min.height;
     if (max_width < root_layout.min_usable_width or max_height < root_layout.min_usable_height) {
-        app.split_rect_count = 0;
-        app.drawn_overlay_width = 0;
-        app.drawn_overlay_height = 0;
+        app.frame_geometry = frame_geometry.computeFrameGeometry(app, ctx, max_width, max_height, "");
         var surface = try vxfw.Surface.init(ctx.arena, root_widget, .{ .width = max_width, .height = max_height });
         @memset(surface.buffer, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{} });
         const warning = "Terminal too small";
@@ -555,9 +528,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     var overlay_view: overlay.OverlayWidget = undefined;
 
     if (app.mode == .diff_viewer) {
-        app.split_rect_count = 0;
-        app.nav.lanes_chip_rect = null;
-        app.nav.new_output_rect = null;
+        app.frame_geometry = frame_geometry.computeFrameGeometry(app, ctx, max_width, max_height, "");
         const diff_layout: root_layout.RootLayout = .{
             .input_height = 0,
             .loading_height = 0,
@@ -587,20 +558,11 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     const split = app.split_mode != .tab and app.threads.len() > 1;
 
     const input_combined = try std.mem.concat(ctx.arena, u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() });
-    const layout = root_layout.rootLayout(max_height, input_mod.wrappedTextRows(ctx, input_combined, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
+    app.frame_geometry = frame_geometry.computeFrameGeometry(app, ctx, max_width, max_height, input_combined);
+    const layout = app.frame_geometry.layout;
+    const split_cols = app.frame_geometry.split_rects[0..app.frame_geometry.split_rect_count];
 
-    var split_cols: []const root_layout.ColumnRect = &.{};
-    var split_rects: [4]root_layout.ColumnRect = undefined;
-    if (split) {
-        split_cols = root_layout.computeSplitLayout(max_width, layout.transcript_height, app.split_mode, app.threads.len(), app.focused_worker_index, app.cached_config.tui.min_split_width, &split_rects);
-        app.split_rects = split_rects;
-    }
-    app.split_rect_count = split_cols.len;
-    app.input_surface_row = layout.input_row;
-    app.nav.lanes_chip_rect = null;
-    app.nav.new_output_rect = null;
-
-    const now_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
+    const now_ms = app.frame_now_ms;
     var transcript_view = tx_widget.TranscriptWidget.fromProps(buildTranscriptProps(app, app.thread, now_ms));
     const stalled = app.thread.last_activity_ms > 0 and (now_ms - app.thread.last_activity_ms >= 15_000);
     var progress_buf: [128]u8 = undefined;

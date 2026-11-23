@@ -37,6 +37,7 @@ pub const Content = struct {
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
     palette: *const tui_style.Palette = &tui_style.default_palette,
+    now_ms: i64 = 0,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -151,7 +152,7 @@ pub const Content = struct {
     }
 
     fn resumeWidgets(self: *Content, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const count = visibleCount(self.io, self.summaries, self.filter, self.folded_projects, self.group_by);
+        const count = visibleCountAt(self.summaries, self.filter, self.folded_projects, self.group_by, self.now_ms);
         const widgets = try ctx.arena.alloc(vxfw.Widget, count);
         const rows = try ctx.arena.alloc(Row, count);
         var builder: RowBuilder = .{
@@ -166,6 +167,7 @@ pub const Content = struct {
             .selection = self.selection,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .now_ms = self.now_ms,
         };
         try builder.build();
         return widgets;
@@ -182,6 +184,7 @@ const RowBuilder = struct {
     filter: []const u8,
     folded_projects: []const []const u8,
     group_by: app_state.NavState.ResumeGroupBy,
+    now_ms: i64 = 0,
     rows: []Row,
     widgets: []vxfw.Widget,
     selection: u32,
@@ -228,7 +231,7 @@ const RowBuilder = struct {
     }
 
     fn buildDate(self: *RowBuilder) !void {
-        const now_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        const now_ms = self.now_ms;
         // Build date buckets: Today, Yesterday, This Week, This Month,
         // This Year, Older. Each bucket gets a header row.
         var buckets: [6]std.ArrayListUnmanaged(*const session_mod.SessionSummary) = .{
@@ -446,10 +449,15 @@ const Row = struct {
 };
 
 pub fn visibleCount(io: std.Io, summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, group_by: app_state.NavState.ResumeGroupBy) u32 {
+    const now_ms = if (group_by == .date) std.Io.Clock.now(.real, io).toMilliseconds() else 0;
+    return visibleCountAt(summaries, filter, folded_projects, group_by, now_ms);
+}
+
+pub fn visibleCountAt(summaries: []const session_mod.SessionSummary, filter: []const u8, folded_projects: []const []const u8, group_by: app_state.NavState.ResumeGroupBy, now_ms: i64) u32 {
     return switch (group_by) {
         .flat => flatVisibleCount(summaries, filter),
         .project => projectVisibleCount(summaries, filter, folded_projects),
-        .date => dateVisibleCount(io, summaries, filter),
+        .date => dateVisibleCount(summaries, filter, now_ms),
     };
 }
 
@@ -473,9 +481,8 @@ fn projectVisibleCount(summaries: []const session_mod.SessionSummary, filter: []
     return count;
 }
 
-fn dateVisibleCount(io: std.Io, summaries: []const session_mod.SessionSummary, filter: []const u8) u32 {
+fn dateVisibleCount(summaries: []const session_mod.SessionSummary, filter: []const u8, now_ms: i64) u32 {
     // Count matching sessions, then add one header per non-empty date bucket.
-    const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
     var seen_buckets: [6]bool = .{false} ** 6;
     var session_count: u32 = 0;
     for (summaries) |*summary| {

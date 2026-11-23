@@ -248,7 +248,7 @@ fn routeMouse(
 
     if (mouse.type == .press and mouse.button == .left) {
         // 1. "↓ new output" pill click
-        if (app.nav.new_output_rect) |rect| {
+        if (app.frame_geometry.new_output_rect) |rect| {
             if (rect.contains(mouse.row, mouse.col)) {
                 app.jumpTranscriptToBottom();
                 ctx.consumeAndRedraw();
@@ -259,8 +259,8 @@ fn routeMouse(
         const layer = root_layout.activeModalLayer(app);
 
         // 2. Permission buttons click
-        if (layer == .permission and app.nav.permission_buttons != null) {
-            for (app.nav.permission_buttons.?) |btn| {
+        if (layer == .permission and app.frame_geometry.permission_buttons != null) {
+            for (app.frame_geometry.permission_buttons.?) |btn| {
                 if (btn.contains(mouse.row, mouse.col)) {
                     switch (btn.choice) {
                         .approve => try app.resolvePermission(.approve),
@@ -276,7 +276,7 @@ fn routeMouse(
 
         // 3. Modal overlay dismiss (click outside) or row activation
         if (layer == .overlay) {
-            if (app.nav.overlay_panel_rect) |rect| {
+            if (app.frame_geometry.overlay_panel_rect) |rect| {
                 if (!rect.contains(mouse.row, mouse.col)) {
                     // Cancel repeatedly until returning to .normal (some pickers
                     // step back to .command on a single cancel) and sync focus (#292).
@@ -318,7 +318,7 @@ fn routeMouse(
         if (mouse.row >= 0 and mouse.col >= 0) {
             const r: u16 = @intCast(mouse.row);
             const c: u16 = @intCast(mouse.col);
-            const cols = app.split_rects[0..app.split_rect_count];
+            const cols = app.frame_geometry.split_rects[0..app.frame_geometry.split_rect_count];
             for (cols) |col| {
                 if (r >= col.row and r < col.row + col.height and c >= col.col and c < col.col + col.width) {
                     if (app.split_mode == .dual and col.lane_index >= 1) {

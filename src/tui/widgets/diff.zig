@@ -61,7 +61,6 @@ pub const DiffBodyWidget = struct {
         } else {
             scroll = 0;
         }
-        state.scroll = scroll;
 
         const sel = state.selection();
         const active = state.activeComment();

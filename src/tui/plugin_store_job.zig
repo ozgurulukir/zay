@@ -94,6 +94,7 @@ pub const State = struct {
     operation: Operation = .idle,
     notice: ?[]u8 = null,
     inventory: package.Inventory = .{},
+    installed_cache: []InstalledPlugin = &.{},
     project_root: []u8 = &.{},
     generation: u64 = 0,
 
@@ -102,10 +103,19 @@ pub const State = struct {
         if (self.catalogs) |*bundle| bundle.deinit(gpa);
         if (self.notice) |message| gpa.free(message);
         self.inventory.deinit(gpa);
+        if (self.installed_cache.len > 0) gpa.free(self.installed_cache);
         if (self.project_root.len > 0) gpa.free(self.project_root);
         self.* = undefined;
     }
 };
+
+pub fn refreshInstalledCache(app: *App) void {
+    const next = installedPlugins(app.gpa, app) catch return;
+    if (app.plugin_store.installed_cache.len > 0) {
+        app.gpa.free(app.plugin_store.installed_cache);
+    }
+    app.plugin_store.installed_cache = next;
+}
 
 /// Build the Installed-tab rows from loaded plugins plus persisted disabled
 /// entries. Disabled plugins are intentionally absent from PluginManager.
@@ -624,6 +634,7 @@ pub fn drain(app: *App) !bool {
                     const selection = refreshedSelection(app, &inventory, if (app.plugin_store.catalogs) |*catalogs| catalogs else null);
                     app.plugin_store.inventory.deinit(app.gpa);
                     app.plugin_store.inventory = inventory;
+                    refreshInstalledCache(app);
                     app.pickers.plugins.reset();
                     app.pickers.plugins.selection = selection;
                     app.pickers.plugins.confirming_uninstall = false;
