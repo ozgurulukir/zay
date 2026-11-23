@@ -32,8 +32,6 @@ pub const SearchHit = struct {
 pub const TranscriptProps = struct {
     /// The lane this pane renders — the active lane today; any lane once tiled.
     thread: *Thread,
-    /// Per-frame scalars computed by the construction site (INV-WIDGET-1).
-    gpa: std.mem.Allocator,
     /// `tui_status.modelStatus(live_runtime, cached_config) != null` —
     /// precomputed so this leaf never touches the App or config modules.
     has_model_configured: bool,
@@ -53,8 +51,6 @@ pub const TranscriptProps = struct {
 pub const TranscriptWidget = struct {
     /// The lane this pane renders — the active lane today; any lane once tiled.
     thread: *Thread,
-    /// Per-frame scalars computed by the construction site (INV-WIDGET-1).
-    gpa: std.mem.Allocator,
     /// `tui_status.modelStatus(live_runtime, cached_config) != null` —
     /// precomputed so this leaf never touches the App or config modules.
     has_model_configured: bool,
@@ -73,7 +69,6 @@ pub const TranscriptWidget = struct {
     pub fn fromProps(props: TranscriptProps) TranscriptWidget {
         return .{
             .thread = props.thread,
-            .gpa = props.gpa,
             .has_model_configured = props.has_model_configured,
             .loading_frame = props.loading_frame,
             .blackhole_frame = props.blackhole_frame,
@@ -110,7 +105,6 @@ pub const TranscriptWidget = struct {
             .selected = self.thread.transcript.selected,
             .loading_frame = self.loading_frame,
             .blackhole_frame = self.blackhole_frame,
-            .gpa = self.gpa,
             .has_model_configured = self.has_model_configured,
             .splash_fills_viewport = splash_fills,
             .splash_viewport_height = splash_viewport_height,
@@ -229,7 +223,6 @@ pub const MessageListBuilder = struct {
     selected: ?u32 = null,
     loading_frame: u8 = 0,
     blackhole_frame: u16 = 0,
-    gpa: std.mem.Allocator,
     has_model_configured: bool = false,
     splash_fills_viewport: bool = false,
     splash_viewport_height: u16 = 0,
@@ -251,7 +244,6 @@ pub const MessageListBuilder = struct {
             .selected = if (self.selected) |selected| selected == idx else false,
             .loading_frame = self.loading_frame,
             .blackhole_frame = self.blackhole_frame,
-            .gpa = self.gpa,
             .has_model_configured = self.has_model_configured,
             .splash_fills_viewport = self.splash_fills_viewport,
             .splash_viewport_height = self.splash_viewport_height,
@@ -289,7 +281,6 @@ test "MessageListBuilder.build returns null for out-of-bounds index" {
         .arena = arena.allocator(),
         .messages = transcript.messages.items,
         .selected = null,
-        .gpa = gpa,
         .has_model_configured = true,
     };
 
@@ -315,7 +306,6 @@ test "MessageListBuilder.build constructs widget with correct message and select
         .selected = 1,
         .loading_frame = 3,
         .blackhole_frame = 7,
-        .gpa = gpa,
         .has_model_configured = true,
     };
 
@@ -343,7 +333,6 @@ test "MessageListBuilder.build handles empty transcript cleanly" {
         .arena = arena.allocator(),
         .messages = &.{},
         .selected = null,
-        .gpa = gpa,
         .has_model_configured = true,
     };
 
@@ -366,7 +355,6 @@ test "MessageListBuilder.build handles out-of-range selection index" {
         .arena = arena.allocator(),
         .messages = transcript.messages.items,
         .selected = 100, // Deliberately out of bounds
-        .gpa = gpa,
         .has_model_configured = true,
     };
 

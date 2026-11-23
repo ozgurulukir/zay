@@ -154,6 +154,7 @@ pub const ApprovalSnapshot = struct {
 const ApprovalGate = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     command: ?[]u8 = null,
     decision: ?ApprovalDecision = null,
     session_approvals: std.ArrayList([]u8) = .empty,
@@ -218,12 +219,14 @@ const ApprovalGate = struct {
         std.debug.assert(self.command == null);
         self.command = owned;
         self.decision = null;
+        _ = self.generation.fetchAdd(1, .release);
 
         while (self.decision == null) {
             self.condition.wait(io, &self.mutex) catch |err| {
                 if (self.command) |command_pending| gpa.free(command_pending);
                 self.command = null;
                 self.decision = null;
+                _ = self.generation.fetchAdd(1, .release);
                 return err;
             };
         }
@@ -231,6 +234,7 @@ const ApprovalGate = struct {
         if (self.command) |command_pending| gpa.free(command_pending);
         self.command = null;
         self.decision = null;
+        _ = self.generation.fetchAdd(1, .release);
 
         switch (decision) {
             .approve => return true,

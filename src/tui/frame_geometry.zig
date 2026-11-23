@@ -179,7 +179,8 @@ pub fn computeFrameGeometry(
     }
 
     const splash_suppressed = app.inputs.input.buf.realLength() > 0;
-    geom.blackhole_visible = messages.len > 0 and
+    geom.blackhole_visible = app.mode == .normal and
+        messages.len > 0 and
         messages[0] == .logo and
         app.thread.transcript_list.scroll.top == 0 and
         !splash_suppressed;

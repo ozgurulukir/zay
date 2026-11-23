@@ -458,6 +458,42 @@ pub const Incremental = struct {
         return out;
     }
 
+    /// Read-only view of `body` at `width` into `arena` without mutating
+    /// `self` or allocating on `gpa` (safe on the draw path). Uses the
+    /// pre-warmed stable cache when valid for `(body, width)`, and renders
+    /// any uncached prefix/tail into `arena`.
+    pub fn rowsArena(
+        self: *const Incremental,
+        arena: std.mem.Allocator,
+        body: []const u8,
+        width: u16,
+    ) ![]const Row {
+        if (body.len <= max_cached_bytes and self.primed and self.width == width and body.len >= self.boundary) {
+            var tail: RowBuilder = .{};
+            var tail_state: BlockState = .{};
+            try renderInto(arena, &tail, body[self.boundary..], width, &tail_state, std.math.maxInt(usize), true);
+
+            const out = try arena.alloc(Row, self.stable.rows.items.len + tail.rows.items.len);
+            for (self.stable.rows.items, 0..) |meta, i| {
+                out[i] = .{ .indent = meta.indent, .spans = self.stable.pool.items[meta.start..][0..meta.len] };
+            }
+            const base = self.stable.rows.items.len;
+            for (tail.rows.items, 0..) |meta, i| {
+                out[base + i] = .{ .indent = meta.indent, .spans = tail.pool.items[meta.start..][0..meta.len] };
+            }
+            return out;
+        }
+        const slice = if (body.len > max_cached_bytes) boundedTailSlice(body) else body;
+        var full: RowBuilder = .{};
+        var state: BlockState = .{};
+        try renderInto(arena, &full, slice, width, &state, std.math.maxInt(usize), true);
+        const out = try arena.alloc(Row, full.rows.items.len);
+        for (full.rows.items, 0..) |meta, i| {
+            out[i] = .{ .indent = meta.indent, .spans = full.pool.items[meta.start..][0..meta.len] };
+        }
+        return out;
+    }
+
     /// Count the visual rows `body` would render at `width` WITHOUT allocating
     /// or mutating the stable cache: the cached stable rows already own their
     /// count, and the unstabilized tail is counted with the allocation-free

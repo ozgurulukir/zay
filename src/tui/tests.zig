@@ -1220,7 +1220,6 @@ test "up enters selected long message at bottom" {
     defer arena.deinit();
     var transcript_widget: tx_widget.TranscriptWidget = .{
         .thread = app.thread,
-        .gpa = app.gpa,
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
@@ -4010,7 +4009,6 @@ test "expanded tool surface height cannot overflow vxfw buffer size" {
         .selected = true,
         .loading_frame = 0,
         .blackhole_frame = 0,
-        .gpa = gpa,
     };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -4097,7 +4095,6 @@ fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
     var counting: CountingAllocator = .{ .child = arena.allocator() };
     var transcript_widget: tx_widget.TranscriptWidget = .{
         .thread = app.thread,
-        .gpa = app.gpa,
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
@@ -4263,7 +4260,6 @@ test "transcript draw width-change re-count stays below a fixed gpa ceiling" {
     var counting: CountingAllocator = .{ .child = arena.allocator() };
     var transcript_widget: tx_widget.TranscriptWidget = .{
         .thread = app.thread,
-        .gpa = app.gpa,
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,

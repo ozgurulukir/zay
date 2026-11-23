@@ -273,12 +273,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     updateTerminalTitleAndAttention(root.app, ctx);
 
     if (decideShouldTick(root)) {
-        const tick_interval: u32 = switch (root.app.cached_config.tui.animations) {
-            .full => RootWidget.drain_tick_ms,
-            .reduced => 120,
-            .off => 250,
-        };
-        try ctx.tick(tick_interval, root.widget());
+        try ctx.tick(decideTickIntervalMs(root), root.widget());
     } else {
         root.app.metrics.loading_tick_active = false;
     }
@@ -366,10 +361,9 @@ fn drainAtSearch(root: *RootWidget) !bool {
     return at_search_mod.drainAtSearch(root.app);
 }
 
-/// Drain the toast bus (UI thread only). Returns true if any toast appeared or expired.
+/// Drain the toast bus (UI thread only). Returns true if any toast expired or remains visible.
 fn drainToasts() !bool {
-    var toast_items: [toast.max_items]toast.Item = undefined;
-    return toast.global.drain(&toast_items) > 0;
+    return toast.global.expire();
 }
 
 /// Service the lane bridge and drain model / MCP notification state.
@@ -783,18 +777,41 @@ pub fn syncFocus(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     try ctx.requestFocus(target);
 }
 
+/// Compute the tick interval in ms. Uses a coarser 250ms cadence when the
+/// tick loop is kept alive solely by background bash jobs with no active turn,
+/// animation, or interactive async work.
+pub fn decideTickIntervalMs(root: *RootWidget) u32 {
+    const base_interval: u32 = switch (root.app.cached_config.tui.animations) {
+        .full => RootWidget.drain_tick_ms,
+        .reduced => 120,
+        .off => 250,
+    };
+    const fast_reason = root.app.anyTurnActive() or
+        turn_lifecycle.turnCancelActive(root.app) or
+        anyJobActive(root.app) or
+        (root.app.frame_geometry.blackhole_visible and root.app.cached_config.tui.animations == .full) or
+        root.diff_refresh_pending or
+        root.app.namingActive() or
+        root.app.mcp_manager.hasPendingConnects() or
+        root.app.mcp_manager.hasPendingRefreshes() or
+        root.app.mcp_manager.hasPendingDestroys() or
+        compaction_lifecycle.manualCompactActive(root.app) or
+        toast.global.hasToasts() or
+        lane_lifecycle.anyAsyncWorktreeActive(root.app) or
+        atSearchActive(root.app);
+    if (!fast_reason and root.app.backgroundActive()) {
+        return @max(base_interval, 250);
+    }
+    return base_interval;
+}
+
 /// Schedule the shared animation/drain tick if one isn't already pending.
 /// Drives the spinner, agent-event draining, and the black-hole intro.
 pub fn ensureTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     if (root.app.metrics.loading_tick_active) return;
     root.app.metrics.loading_tick_active = true;
     root.spinner_tick_accum = 0;
-    const tick_interval: u32 = switch (root.app.cached_config.tui.animations) {
-        .full => RootWidget.drain_tick_ms,
-        .reduced => 120,
-        .off => 250,
-    };
-    try ctx.tick(tick_interval, root.widget());
+    try ctx.tick(decideTickIntervalMs(root), root.widget());
 }
 
 /// Submit the current input: enter closes a picker, command runs the
@@ -1092,4 +1109,55 @@ test "streamed delta on visible dual worker lane marks visible_change = true (#5
 
     const changed = try drainAgentEvents(&root, &ctx);
     try std.testing.expect(changed);
+}
+
+test "blackhole_visible is false when an overlay mode is active" {
+    const frame_geometry = @import("frame_geometry.zig");
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(gpa, .logo, "zay", "");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    app.mode = .normal;
+    try std.testing.expect(frame_geometry.computeFrameGeometry(&app, ctx, 80, 24, "").blackhole_visible);
+
+    app.mode = .settings;
+    try std.testing.expect(!frame_geometry.computeFrameGeometry(&app, ctx, 80, 24, "").blackhole_visible);
+}
+
+test "decideTickIntervalMs uses coarse 250ms cadence when only background jobs are active" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.cached_config.tui.animations = .full;
+    app.frame_geometry.blackhole_visible = false;
+    app.git_label_dirty = false;
+    toast.global.dismiss();
+
+    var root: RootWidget = .{ .app = &app };
+    try std.testing.expectEqual(RootWidget.drain_tick_ms, decideTickIntervalMs(&root));
+
+    // When background work is the only active reason (no active turn or animation),
+    // decideTickIntervalMs backs off to 250ms instead of polling at 30ms.
+    try app.background_modal_state.pending.append(gpa, .{
+        .owner_generation = 0,
+        .notice = try gpa.dupe(u8, "bg"),
+        .message = null,
+    });
+    try std.testing.expectEqual(@as(u32, 250), decideTickIntervalMs(&root));
 }
