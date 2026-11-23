@@ -46,34 +46,15 @@ pub const Content = struct {
         const height = surface.size.height;
         if (height == 0) return;
 
-        // 1. Collect and score matching command entries.
-        const ScoredEntry = struct {
-            idx: usize,
-            score: f64,
-        };
         var matching_entries: std.ArrayList(ScoredEntry) = .empty;
         defer matching_entries.deinit(ctx.arena);
-
-        for (self.entries, 0..) |entry, idx| {
-            if (panel.scoreCandidate(self.filter, entry.name, entry.description)) |score| {
-                try matching_entries.append(ctx.arena, .{ .idx = idx, .score = score });
-            }
-        }
+        try collectAndSortEntries(ctx.arena, self.entries, self.filter, &matching_entries);
 
         const total_matches: u32 = @intCast(matching_entries.items.len);
         if (total_matches == 0) {
             try panel.lineStyledAt(surface, 0, "  No matching commands", ctx, 1, p.muted);
             return;
         }
-
-        // Sort by score descending; stable tie-break on original table order.
-        const Sorter = struct {
-            fn lessThan(_: void, a: ScoredEntry, b: ScoredEntry) bool {
-                if (a.score != b.score) return a.score > b.score;
-                return a.idx < b.idx;
-            }
-        };
-        std.mem.sort(ScoredEntry, matching_entries.items, {}, Sorter.lessThan);
 
         // 2. Viewport window calculation for smooth scrolling.
         const viewport = panel.ViewportWindow.compute(self.selection, total_matches, height);
@@ -100,6 +81,51 @@ pub const Content = struct {
         panel.drawViewportScrollbar(surface, viewport, total_matches, p);
     }
 };
+
+const ScoredEntry = struct {
+    idx: usize,
+    score: f64,
+
+    fn lessThan(_: void, a: ScoredEntry, b: ScoredEntry) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.idx < b.idx;
+    }
+};
+
+fn collectAndSortEntries(
+    arena: std.mem.Allocator,
+    entries: []const Entry,
+    filter: []const u8,
+    out: *std.ArrayList(ScoredEntry),
+) !void {
+    for (entries, 0..) |entry, idx| {
+        if (panel.scoreCandidate(filter, entry.name, entry.description)) |score| {
+            try out.append(arena, .{ .idx = idx, .score = score });
+        }
+    }
+    std.mem.sort(ScoredEntry, out.items, {}, ScoredEntry.lessThan);
+}
+
+/// Resolve the index into `entries` for `selection` under `filter`, sharing
+/// the exact scoring and tie-breaking order used by `Content.drawEntries`.
+pub fn selectedEntryIndex(entries: []const Entry, filter: []const u8, selection: u32) ?usize {
+    var buf: [256]ScoredEntry = undefined;
+    var count: usize = 0;
+    for (entries, 0..) |entry, idx| {
+        if (panel.scoreCandidate(filter, entry.name, entry.description)) |score| {
+            if (count < buf.len) {
+                buf[count] = .{ .idx = idx, .score = score };
+                count += 1;
+            }
+        }
+    }
+    if (count == 0) return null;
+    const ranked = buf[0..count];
+    std.mem.sort(ScoredEntry, ranked, {}, ScoredEntry.lessThan);
+    if (selection < ranked.len) return ranked[selection].idx;
+    if (ranked.len == 1) return ranked[0].idx;
+    return null;
+}
 
 pub fn matchesCommandFilter(name: []const u8, description: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return true;

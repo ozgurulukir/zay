@@ -443,7 +443,7 @@ const CommandMenu = struct {
 const LinkPicker = struct {
     fn handle(app: *App, key: vaxis.Key) !bool {
         const len: u32 = @intCast(app.pickers.links.items.items.len);
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+        if (key.matches('q', .{})) {
             app.pickers.links.reset(app.gpa);
             app.setMode(.normal);
             return true;
@@ -456,7 +456,7 @@ const LinkPicker = struct {
             app.pickers.links.selection = nextIndex(app.pickers.links.selection, len);
             return true;
         }
-        if (isEnterKey(key) or key.matches('y', .{})) {
+        if (key.matches('y', .{})) {
             if (app.pickers.links.selectedUrl()) |url| {
                 try clipboard_helper.copyTextWithNotice(app, url, "Copied link URL");
             }
@@ -712,7 +712,7 @@ pub const HelpPicker = struct {
         // Same body-row derivation `Content.draw` renders with — the keyboard
         // and mouse clamps must agree or the last items become unreachable.
         const body_height: u16 = help_picker.bodyRows(app.drawnOverlayHeight());
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{}) or key.matches('q', .{})) {
+        if (key.matches('q', .{})) {
             app.setMode(.normal);
             app.pickers.help.reset();
             return true;
@@ -795,7 +795,7 @@ const McpMode = struct {
     fn handle(app: *App, key: vaxis.Key) !bool {
         // The add-server form owns all keys until it is submitted or cancelled.
         if (app.pickers.mcp.adding) return handleAddInput(app, key);
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+        if (key.matches('q', .{})) {
             tui.closeMcp(app);
             return true;
         }
@@ -807,7 +807,7 @@ const McpMode = struct {
             app.pickers.mcp.moveDown(app.mcp_manager.clients.items.len);
             return true;
         }
-        if (key.matches(' ', .{}) or key.matches(vaxis.Key.enter, .{})) {
+        if (key.matches(' ', .{})) {
             if (try toggleSelectedMcpClient(app)) return true;
         }
         if (key.matches('r', .{ .ctrl = true }) or key.matches('r', .{})) {
@@ -905,7 +905,7 @@ const PluginsMode = struct {
             return true;
         }
         if (app.pickers.plugins.adding) return handleAddInput(app, key);
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+        if (key.matches('q', .{})) {
             tui.closePlugins(app);
             return true;
         }
@@ -1000,10 +1000,6 @@ const PluginsMode = struct {
                 app.refreshPluginStore() catch |err| log.warn("plugin_store.refresh.failed err={s}", .{@errorName(err)});
                 app.pickers.plugins.selection = 0;
             }
-            return true;
-        }
-        if (app.pickers.plugins.view == .store and isEnterKey(key)) {
-            startStoreInstall(app);
             return true;
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches(' ', .{})) {
