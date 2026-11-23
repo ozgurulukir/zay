@@ -41,6 +41,7 @@ pub const BackgroundJobsWidget = struct {
         log_text: []const u8 = "",
         /// Log panel header: the log path.
         log_note: []const u8 = "",
+        palette: *const tui_style.Palette = &tui_style.default_palette,
     };
 
     pub fn widget(self: *BackgroundJobsWidget) vxfw.Widget {
@@ -49,7 +50,7 @@ pub const BackgroundJobsWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *BackgroundJobsWidget = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.props.palette;
         const inner = try ctx.arena.create(BackgroundJobsInner);
         inner.* = .{
             .views = self.props.views,
@@ -58,6 +59,7 @@ pub const BackgroundJobsWidget = struct {
             .log_expanded = self.props.log_expanded,
             .log_text = self.props.log_text,
             .log_note = self.props.log_note,
+            .palette = p,
         };
         var border: vxfw.Border = .{
             .child = inner.widget(),
@@ -78,6 +80,7 @@ const BackgroundJobsInner = struct {
     log_expanded: bool = false,
     log_text: []const u8 = "",
     log_note: []const u8 = "",
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *BackgroundJobsInner) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -85,7 +88,7 @@ const BackgroundJobsInner = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *BackgroundJobsInner = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
@@ -110,7 +113,7 @@ const BackgroundJobsInner = struct {
                 state,
                 view.command,
             }) catch view.command;
-            panel.lineAt(&surface, 1 + row, line, ctx, selected, 1) catch {};
+            panel.lineAt(&surface, 1 + row, line, ctx, selected, 1, p) catch {};
             // The cancel button sits at the right; highlighted only when the
             // selected row has cancel focus (right-arrow).
             const focused = selected and self.cancel_focus;

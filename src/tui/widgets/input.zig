@@ -102,8 +102,7 @@ test "hintText pins every mode's text" {
     try std.testing.expectEqualStrings("Type prompt, @file, $skill or / for menu" ++ dot ++ "Ctrl+K Menu" ++ dot ++ "Ctrl+O Background" ++ dot ++ "Shift+Tab Lanes" ++ dot ++ "Ctrl+F Search", hintText(.{ .mode = .normal }));
 }
 
-pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts) void {
-    const p = tui_style.activePalette();
+pub fn writeDiffCounts(surface: *vxfw.Surface, ctx: vxfw.DrawContext, counts: DiffCounts, p: *const tui_style.Palette) void {
     const additions = std.fmt.allocPrint(ctx.arena, "+{d}", .{@min(counts.additions, 99999)}) catch return;
     const deletions = std.fmt.allocPrint(ctx.arena, "-{d}", .{@min(counts.deletions, 99999)}) catch return;
     const total_width = additions.len + 1 + deletions.len;
@@ -169,6 +168,7 @@ pub const InputProps = struct {
     meter_style: vaxis.Style = .{},
     velocity_text: []const u8 = "",
     git_label: []const u8 = "",
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 };
 
 pub const CommandInputText = struct {
@@ -627,7 +627,7 @@ pub const InputWidget = struct {
     }
 
     fn drawInputBorder(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16, border_height: u16, text_rows: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.props.palette;
         var prompt: vxfw.Text = .{ .text = self.props.prompt_text, .style = p.user, .softwrap = false, .width_basis = .parent };
         var prompt_box: vxfw.SizedBox = .{ .child = prompt.widget(), .size = .{ .width = 2, .height = 1 } };
         var command_input: CommandInputText = .{ .props = &self.props };
@@ -652,6 +652,7 @@ pub const InputWidget = struct {
             .meter_style = self.props.meter_style,
             .velocity_text = self.props.velocity_text,
             .skill_inventory = self.props.skill_inventory,
+            .palette = self.props.palette,
         };
         var status_box: vxfw.SizedBox = .{ .child = status_bar_w.widget(), .size = .{ .width = max_width, .height = 1 } };
         const status_surface = try status_box.widget().draw(ctx.withConstraints(.{ .width = max_width, .height = 1 }, .{ .width = max_width, .height = 1 }));
@@ -741,7 +742,7 @@ pub const InputWidget = struct {
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.props.palette;
         const items = self.props.queued;
         const sel = @min(self.props.queued_selection, items.len - 1);
         const message = items[sel];
@@ -759,7 +760,7 @@ pub const InputWidget = struct {
     }
 
     fn drawInputHint(self: *InputWidget, ctx: vxfw.DrawContext, children: []vxfw.SubSurface, child_index: usize, row: u16, col: u16, width: u16) std.mem.Allocator.Error!void {
-        const p = tui_style.activePalette();
+        const p = self.props.palette;
         const is_pending_quit = self.props.pending_quit;
         const style = if (is_pending_quit) p.warning else p.thinking_body;
         const text_to_draw = formatWidthAwareHint(self.props.hint_text, width, ctx.arena);
@@ -776,7 +777,7 @@ pub const InputWidget = struct {
     /// affordance; clicking it (mouse) or pressing Ctrl+W restores the split
     /// view.
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.props.palette;
         const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.props.lanes_count});
         var pill_text: vxfw.Text = .{
             .text = text,
@@ -791,7 +792,7 @@ pub const InputWidget = struct {
     /// Bottom-left status pill: live background-job count + the Ctrl+O hint, in
     /// black-on-blue so it reads as a control affordance.
     fn drawBackgroundBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const p = tui_style.activePalette();
+        const p = self.props.palette;
         const count = self.props.background_jobs;
         const text = try std.fmt.allocPrint(ctx.arena, " {d} background job{s} · Ctrl+O ", .{ count, if (count == 1) "" else "s" });
         var pill_text: vxfw.Text = .{
@@ -808,7 +809,7 @@ pub const InputWidget = struct {
         const diff_width: u16 = 13;
         const surface_width = @min(diff_width, width);
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = surface_width, .height = 1 });
-        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.props.diff_counts.?);
+        if (surface_width > 0) writeDiffCounts(&surface, ctx, self.props.diff_counts.?, self.props.palette);
         children[child_index] = .{
             .origin = .{ .row = row, .col = width -| 2 -| surface_width },
             .surface = surface,

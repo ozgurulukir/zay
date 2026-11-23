@@ -109,7 +109,7 @@ test "diff count label is right aligned" {
     };
     var surface = try vxfw.Surface.init(ctx.arena, .{ .userdata = undefined, .drawFn = undefined }, .{ .width = 13, .height = 1 });
 
-    input_mod.writeDiffCounts(&surface, ctx, .{ .additions = 1, .deletions = 12 });
+    input_mod.writeDiffCounts(&surface, ctx, .{ .additions = 1, .deletions = 12 }, &tui_style.default_palette);
 
     try std.testing.expectEqualStrings(" ", surface.readCell(6, 0).char.grapheme);
     try std.testing.expectEqualStrings("+", surface.readCell(7, 0).char.grapheme);
@@ -367,7 +367,7 @@ test "lane column props preserve active/focused border and splash suppression" {
     try app.inputs.input.insertSliceAtCursor("hello");
 
     app.cached_config.tui.highlight_focused_border = true;
-    const accent = @import("style.zig").activePalette().border_label;
+    const accent = app.palette.border_label;
 
     // Focused + knob on: high-contrast accent border, splash suppressed.
     const focused_active = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true, 0);
@@ -1168,7 +1168,7 @@ test "down at latest long message bottom does not loop to top" {
     app.thread.transcript.selected = 0;
     app.thread.transcript_view_width = 80;
     app.thread.transcript_view_height = 4;
-    const offset = messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height;
+    const offset = messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation) - app.thread.transcript_view_height;
     transcript_nav.setSelectedMessageOffset(&app, 0, offset);
 
     const scrolled = app.navigateTranscript(.next);
@@ -1190,7 +1190,7 @@ test "down moves after selected long message bottom is visible" {
     app.thread.transcript.selected = 0;
     app.thread.transcript_view_width = 80;
     app.thread.transcript_view_height = 4;
-    transcript_nav.setSelectedMessageOffset(&app, 0, messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height);
+    transcript_nav.setSelectedMessageOffset(&app, 0, messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation) - app.thread.transcript_view_height);
 
     const scrolled = app.navigateTranscript(.next);
 
@@ -2068,9 +2068,6 @@ test "config mutations overwrite in the App arena without foreign frees (provide
     const arena_state = try app.installConfigArena();
     defer gpa.destroy(arena_state);
     defer arena_state.deinit();
-    // applyTheme mutates the global active palette; restore it for the rest
-    // of the suite (same contract as the theme_lifecycle tests).
-    defer tui_style.setActive(tui_style.default_theme);
 
     // Seed the shapes the mutation sites overwrite: a custom model selection
     // plus the legacy stash fields, all arena-backed like a real load.
@@ -3894,14 +3891,14 @@ test "collapsed thinking and tool rows have stable heights" {
     defer transcript.deinit(gpa);
 
     const thinking_index = try transcript.append(gpa, .thinking, "Thinking...", "short");
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[thinking_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[thinking_index], 80, .{}));
 
     try transcript.appendThinkingDelta(gpa, thinking_index, " ");
     try transcript.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[thinking_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[thinking_index], 80, .{}));
 
     const tool_index = try transcript.startTool(gpa, "pwd");
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[tool_index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[tool_index], 80, .{}));
 }
 
 test "collapsed tool title wraps to visible rows" {
@@ -3911,7 +3908,7 @@ test "collapsed tool title wraps to visible rows" {
 
     const index = try transcript.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
     try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
-    try std.testing.expect(messageRowsCached(&transcript.messages.items[index], 12) > 3);
+    try std.testing.expect(messageRowsCached(&transcript.messages.items[index], 12, .{}) > 3);
 }
 
 test "assistant classification restores every typed answer and reasoning block" {
@@ -3991,7 +3988,7 @@ test "collapsed tool messages render no body text" {
     try transcript.finishTool(gpa, index, "hello", null, false, .plain, 0, 0);
 
     try std.testing.expect(!transcript.messages.items[index].mirror().expanded);
-    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[index], 80));
+    try std.testing.expectEqual(@as(u16, 2), messageRowsCached(&transcript.messages.items[index], 80, .{}));
     transcript.toggleSelected();
     try std.testing.expect(transcript.messages.items[index].mirror().expanded);
     try std.testing.expectEqualStrings("hello", transcript.messages.items[index].mirror().body);
@@ -4656,15 +4653,8 @@ test "syncLiveTranscriptMetrics invalidates row caches across all lanes (#565)" 
     app.thread.transcript.messages.items[idx0].agent.row_cache.valid = true;
     sibling.transcript.messages.items[idx1].agent.row_cache.valid = true;
 
-    const metrics_mod = @import("metrics.zig");
-    const orig_max = metrics_mod.readable_measure_max;
-    const orig_density = metrics_mod.transcript_density;
-    const orig_ts = metrics_mod.show_turn_timestamps;
-    defer {
-        metrics_mod.readable_measure_max = orig_max;
-        metrics_mod.transcript_density = orig_density;
-        metrics_mod.show_turn_timestamps = orig_ts;
-    }
+    const orig_max = app.presentation.max_content_width;
+    const orig_ts = app.presentation.show_turn_timestamps;
 
     @import("settings_lifecycle.zig").syncLiveTranscriptMetrics(&app, orig_max + 10, .compact, !orig_ts);
     try std.testing.expect(!app.thread.transcript.messages.items[idx0].agent.row_cache.valid);
@@ -4681,8 +4671,6 @@ test "setMode and handleColorSchemeChange preserve theme preview invariants (#56
 
     const style_mod = @import("style.zig");
     const theme_lc = @import("theme_lifecycle.zig");
-    const original_theme = app.theme_registry.resolve("default");
-    defer style_mod.setActive(original_theme);
 
     const light_theme = app.theme_registry.resolve("catppuccin_latte");
     const dark_theme = app.theme_registry.resolve("dracula");
@@ -4693,24 +4681,24 @@ test "setMode and handleColorSchemeChange preserve theme preview invariants (#56
     app.cached_config.theme = auto_theme;
     app.mode = .theme_picker;
     app.theme_preview_original = light_theme;
-    style_mod.setActive(dark_theme);
+    app.setActiveTheme(dark_theme);
     theme_lc.handleColorSchemeChange(&app, .dark);
-    try std.testing.expect(style_mod.buildPalette(dark_theme).background.eql(style_mod.active.background));
+    try std.testing.expect(style_mod.buildPalette(dark_theme).background.eql(app.palette.background));
     try std.testing.expect(app.theme_preview_original != null);
 
     // 2. setMode transitioning out of .theme_picker automatically reverts the preview.
     const expected_reverted = app.theme_preview_original.?;
     app.setMode(.normal);
     try std.testing.expect(app.theme_preview_original == null);
-    try std.testing.expect(style_mod.buildPalette(expected_reverted).background.eql(style_mod.active.background));
+    try std.testing.expect(style_mod.buildPalette(expected_reverted).background.eql(app.palette.background));
 
     // 3. setModeKeepInput transitioning out of .theme_picker also reverts the preview.
     app.mode = .theme_picker;
     app.theme_preview_original = light_theme;
-    style_mod.setActive(dark_theme);
+    app.setActiveTheme(dark_theme);
     app.setModeKeepInput(.command);
     try std.testing.expect(app.theme_preview_original == null);
-    try std.testing.expect(style_mod.buildPalette(light_theme).background.eql(style_mod.active.background));
+    try std.testing.expect(style_mod.buildPalette(light_theme).background.eql(app.palette.background));
 }
 
 test "INV-WIDGET-1: no file under src/tui/widgets/ references *App or *tui.App (#569)" {

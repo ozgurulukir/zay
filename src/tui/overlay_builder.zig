@@ -86,6 +86,7 @@ pub fn buildOverlayWidget(
         .height = total_h,
         .full_panel = full_panel,
         .palette_input = if (full_panel) null else &app.inputs.palette,
+        .palette = &app.palette,
         .content = try buildOverlayContent(app, arena),
     };
 }
@@ -99,6 +100,7 @@ fn buildOverlayContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .tree_picker => .{ .tree = .{
             .state = &app.pickers.tree,
             .list = &app.list_widgets.tree_list,
+            .palette = &app.palette,
         } },
         .save_message => .{ .save_message = .{ .text = "" } },
         .lanes => .{ .lanes = .{
@@ -109,8 +111,9 @@ fn buildOverlayContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
                 .manage => "  No parked lanes.",
                 .merge_dest => "  No lanes to merge into.",
             },
+            .palette = &app.palette,
         } },
-        .help => .{ .help = .{ .state = &app.pickers.help } },
+        .help => .{ .help = .{ .state = &app.pickers.help, .palette = &app.palette } },
         .settings => blk: {
             const runtime = app.liveRuntime();
             break :blk .{ .settings = .{
@@ -121,17 +124,19 @@ fn buildOverlayContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
                 .system_prompt_input = app.input_buffers.settings_text.items,
                 .bash_classifier_input = app.input_buffers.settings_text.items,
                 .max_content_width_input = app.input_buffers.settings_text.items,
+                .palette = &app.palette,
             } };
         },
         .mcp => .{ .mcp = .{
             .state = &app.pickers.mcp,
             .manager = &app.mcp_manager,
             .url_input = app.input_buffers.mcp_url.items,
+            .palette = &app.palette,
         } },
         .plugins => .{ .plugins = try buildPluginsContent(app, arena) },
-        .search => .{ .search = .{ .state = &app.pickers.search } },
+        .search => .{ .search = .{ .state = &app.pickers.search, .palette = &app.palette } },
         .theme_picker => .{ .theme = try buildThemeContent(app, arena) },
-        .link_picker => .{ .links = .{ .state = &app.pickers.links } },
+        .link_picker => .{ .links = .{ .state = &app.pickers.links, .palette = &app.palette } },
         .normal, .diff_viewer => unreachable,
     };
 }
@@ -151,6 +156,7 @@ fn buildThemeContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Erro
         .filter = filter,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
     };
 }
 
@@ -224,6 +230,7 @@ fn buildPluginsContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .uninstalling = app.plugin_store.operation == .uninstalling,
         .refreshing = app.plugin_store.operation == .refreshing or app.plugin_store.operation == .scanning,
         .details = details,
+        .palette = &app.palette,
     };
 }
 
@@ -242,6 +249,7 @@ fn buildCommandContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .selection = app.nav.command_selection,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
     };
 }
 
@@ -261,6 +269,7 @@ fn buildSessionContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .project_root_error = app.project_root_error,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
     };
 }
 
@@ -275,6 +284,7 @@ fn buildProviderContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.E
         .filter = filter,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
     };
 }
 
@@ -305,6 +315,7 @@ fn buildModelContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Erro
         .error_message = if (app.pickers.models.load == .failed) app.pickers.models.load.failed.message else null,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
+        .palette = &app.palette,
     };
 }
 

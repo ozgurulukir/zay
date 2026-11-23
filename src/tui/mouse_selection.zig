@@ -78,25 +78,26 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
     const messages = app.thread.transcript.messages.items;
     if (messages.len == 0) return null;
 
-    const content_width = ConversationLayout.contentWidth(view_width);
+    const content_width = ConversationLayout.contentWidth(view_width, app.presentation.max_content_width);
     const top_idx = app.thread.transcript_list.scroll.top;
     if (top_idx >= messages.len) return null;
 
     var y: i32 = @as(i32, list_top_pad) - @as(i32, app.thread.transcript_list.scroll.offset);
     var idx: usize = top_idx;
     while (idx < messages.len) : (idx += 1) {
-        const h: i32 = tui_metrics.messageRowsCached(&messages[idx], content_width);
+        const h: i32 = tui_metrics.messageRowsCached(&messages[idx], content_width, app.presentation);
         if (local_row >= y and local_row < y + h) {
             const msg_row: u16 = @intCast(local_row - y);
             const body = messages[idx].mirror().body;
             const indent = messageBodyIndent(&messages[idx]);
-            const extra_header_rows = messageHeaderRows(&messages[idx]);
+            const extra_header_rows = messageHeaderRows(&messages[idx], app.presentation);
             const byte_off = mapRowColToByteOffset(
                 body,
                 msg_row -| extra_header_rows,
                 local_col,
                 content_width,
                 indent,
+                app.presentation,
             );
             return .{
                 .message_index = @intCast(idx),
@@ -109,9 +110,9 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
     return null;
 }
 
-fn messageHeaderRows(msg: *const transcript_mod.Message) u16 {
+fn messageHeaderRows(msg: *const transcript_mod.Message, pres: tui_metrics.PresentationConfig) u16 {
     return switch (msg.*) {
-        .user => if (tui_metrics.show_turn_timestamps) 1 else 0,
+        .user => if (pres.show_turn_timestamps) 1 else 0,
         .thinking => |m| if (m.expanded) 1 else 0,
         else => 0,
     };
@@ -132,9 +133,10 @@ pub fn mapRowColToByteOffset(
     local_col: u16,
     content_width: u16,
     indent: u16,
+    pres: tui_metrics.PresentationConfig,
 ) usize {
     if (body.len == 0) return 0;
-    const top_pad = ConversationLayout.messageTop();
+    const top_pad = ConversationLayout.messageTop(pres);
     if (msg_row < top_pad) return 0;
     const target_row = msg_row - top_pad;
     const body_left = ConversationLayout.left + indent;
@@ -185,8 +187,8 @@ fn colToByteInSegment(seg: []const u8, seg_start: usize, target_col: u16) usize 
 test "mapRowColToByteOffset handles wrapping and wide graphemes" {
     const body = "hello world";
     // With wrap_width = 6: row 0 = "hello", row 1 = "world"
-    try std.testing.expectEqual(@as(usize, 2), mapRowColToByteOffset(body, 1, ConversationLayout.left + 2, 6, 0));
-    try std.testing.expectEqual(@as(usize, 6), mapRowColToByteOffset(body, 2, ConversationLayout.left + 0, 6, 0));
+    try std.testing.expectEqual(@as(usize, 2), mapRowColToByteOffset(body, 1, ConversationLayout.left + 2, 6, 0, .{}));
+    try std.testing.expectEqual(@as(usize, 6), mapRowColToByteOffset(body, 2, ConversationLayout.left + 0, 6, 0, .{}));
 }
 
 test "wordRange and lineRange select expected slices" {

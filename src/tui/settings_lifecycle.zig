@@ -147,13 +147,12 @@ pub fn syncLiveTranscriptMetrics(
     density: config_mod.TranscriptDensity,
     show_turn_timestamps: bool,
 ) void {
-    const metrics = @import("metrics.zig");
-    const changed = metrics.readable_measure_max != max_content_width or
-        metrics.transcript_density != density or
-        metrics.show_turn_timestamps != show_turn_timestamps;
-    metrics.readable_measure_max = max_content_width;
-    metrics.transcript_density = density;
-    metrics.show_turn_timestamps = show_turn_timestamps;
+    const changed = app.presentation.max_content_width != max_content_width or
+        app.presentation.density != density or
+        app.presentation.show_turn_timestamps != show_turn_timestamps;
+    app.presentation.max_content_width = max_content_width;
+    app.presentation.density = density;
+    app.presentation.show_turn_timestamps = show_turn_timestamps;
     if (changed) {
         for (app.threads.slice()) |lane| {
             lane.transcript.invalidateAllRowCaches();
@@ -1207,17 +1206,6 @@ test "syncClassifierUrls parks while a cancel teardown is still unwinding" {
 test "maxContentWidth, density, and showTurnTimestamps live preview invalidates row caches and restores on close" {
     const gpa = std.testing.allocator;
     const metrics = @import("metrics.zig");
-    const prev_max = metrics.readable_measure_max;
-    const prev_density = metrics.transcript_density;
-    const prev_ts = metrics.show_turn_timestamps;
-    defer {
-        metrics.readable_measure_max = prev_max;
-        metrics.transcript_density = prev_density;
-        metrics.show_turn_timestamps = prev_ts;
-    }
-    metrics.readable_measure_max = 0;
-    metrics.transcript_density = .comfortable;
-    metrics.show_turn_timestamps = false;
 
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -1226,38 +1214,38 @@ test "maxContentWidth, density, and showTurnTimestamps live preview invalidates 
 
     const idx = try app.thread.transcript.append(gpa, .user, "You", "Hello world");
     const msg = &app.thread.transcript.messages.items[idx];
-    const comfortable_rows = metrics.messageRowsCached(msg, 80);
+    const comfortable_rows = metrics.messageRowsCached(msg, 80, app.presentation);
     try std.testing.expectEqual(@as(u16, 2), comfortable_rows);
     try std.testing.expect(msg.rowCachePtr().valid);
 
-    // Edit maxContentWidth -> live preview updates readable_measure_max and invalidates cache.
+    // Edit maxContentWidth -> live preview updates presentation.max_content_width and invalidates cache.
     app.mode = .settings;
     app.pickers.settings.tab = .general;
     app.pickers.settings.edit_target = .max_content_width;
     try app.input_buffers.settings_text.appendSlice(gpa, "80");
     try submitSettings(&app);
     try std.testing.expectEqual(@as(u16, 80), app.pickers.settings.pending_max_content_width.?);
-    try std.testing.expectEqual(@as(u16, 80), metrics.readable_measure_max);
+    try std.testing.expectEqual(@as(u16, 80), app.presentation.max_content_width);
     try std.testing.expect(!msg.rowCachePtr().valid);
 
     // Toggle density -> compact tightens by 1 row.
     app.pickers.settings.selection[0] = 4;
     try submitSettings(&app);
-    try std.testing.expectEqual(config_mod.TranscriptDensity.compact, metrics.transcript_density);
-    const compact_rows = metrics.messageRowsCached(msg, 80);
+    try std.testing.expectEqual(config_mod.TranscriptDensity.compact, app.presentation.density);
+    const compact_rows = metrics.messageRowsCached(msg, 80, app.presentation);
     try std.testing.expectEqual(@as(u16, 1), compact_rows);
 
     // Toggle turn timestamps -> adds 1 row on user message.
     app.pickers.settings.selection[0] = 5;
     try submitSettings(&app);
-    try std.testing.expect(metrics.show_turn_timestamps);
+    try std.testing.expect(app.presentation.show_turn_timestamps);
     try std.testing.expect(!msg.rowCachePtr().valid);
-    try std.testing.expectEqual(@as(u16, 2), metrics.messageRowsCached(msg, 80));
+    try std.testing.expectEqual(@as(u16, 2), metrics.messageRowsCached(msg, 80, app.presentation));
 
-    // Close without saving -> restores globals and invalidates cache.
+    // Close without saving -> restores presentation and invalidates cache.
     closeSettings(&app);
-    try std.testing.expectEqual(@as(u16, 0), metrics.readable_measure_max);
-    try std.testing.expectEqual(config_mod.TranscriptDensity.comfortable, metrics.transcript_density);
-    try std.testing.expect(!metrics.show_turn_timestamps);
+    try std.testing.expectEqual(@as(u16, 0), app.presentation.max_content_width);
+    try std.testing.expectEqual(config_mod.TranscriptDensity.comfortable, app.presentation.density);
+    try std.testing.expect(!app.presentation.show_turn_timestamps);
     try std.testing.expect(!msg.rowCachePtr().valid);
 }

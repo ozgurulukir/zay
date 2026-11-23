@@ -57,7 +57,7 @@ pub fn pageTranscript(app: *App, direction: TranscriptNavigation) bool {
     };
 
     if (selected < app.thread.transcript.messages.items.len) {
-        const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width));
+        const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
         if (rows > height) {
             const rows_hidden = rows - height;
             const offset = selectedMessageOffset(app, selected);
@@ -110,7 +110,7 @@ pub fn navigateTranscript(app: *App, direction: TranscriptNavigation) bool {
 fn scrollSelectedLongMessage(app: *App, direction: TranscriptNavigation) bool {
     const selected = app.thread.transcript.selected orelse return false;
     if (selected >= app.thread.transcript.messages.items.len) return false;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width));
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
     const height = app.thread.transcript_view_height;
     if (rows <= height) return false;
     const rows_hidden = rows - height;
@@ -135,14 +135,14 @@ fn scrollSelectedLongMessage(app: *App, direction: TranscriptNavigation) bool {
 pub fn selectedMessageIsLong(app: *const App) bool {
     const selected = app.thread.transcript.selected orelse return false;
     if (selected >= app.thread.transcript.messages.items.len) return false;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width));
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
     return rows > app.thread.transcript_view_height;
 }
 
 pub fn selectedMessageCanScrollDown(app: *const App) bool {
     const selected = app.thread.transcript.selected orelse return false;
     if (selected >= app.thread.transcript.messages.items.len) return false;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width));
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
     const height = app.thread.transcript_view_height;
     if (rows <= height) return false;
     return selectedMessageOffset(app, selected) < rows - height;
@@ -151,7 +151,7 @@ pub fn selectedMessageCanScrollDown(app: *const App) bool {
 fn anchorSelectedLongMessage(app: *App, direction: TranscriptNavigation) void {
     const selected = app.thread.transcript.selected orelse return;
     if (selected >= app.thread.transcript.messages.items.len) return;
-    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width));
+    const rows = messageRowsCached(&app.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(app.thread.transcript_view_width, app.presentation.max_content_width), app.presentation);
     const height = app.thread.transcript_view_height;
     if (rows <= height) return;
     const offset = switch (direction) {

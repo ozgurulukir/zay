@@ -963,16 +963,15 @@ test "cancelMode on theme_picker reverts the preview and resets mode" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     app.mode = .theme_picker;
     app.theme_preview_original = tui_style.default_theme;
     theme_lifecycle.previewTheme(&app, tui_style.dracula);
-    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.dracula.body, app.activePalette().body.fg.rgb);
 
     try std.testing.expect(try app.cancelMode());
     try std.testing.expectEqual(App.Mode.normal, app.mode);
-    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.default_theme.body, app.activePalette().body.fg.rgb);
     try std.testing.expect(app.theme_preview_original == null);
 }
 
@@ -1006,7 +1005,6 @@ test "syncModeWithInput leading slash from theme_picker reverts before entering 
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     app.mode = .theme_picker;
     app.theme_preview_original = tui_style.default_theme;
@@ -1014,7 +1012,7 @@ test "syncModeWithInput leading slash from theme_picker reverts before entering 
 
     try app.syncModeWithInput("/");
     try std.testing.expectEqual(App.Mode.command, app.mode);
-    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.default_theme.body, app.activePalette().body.fg.rgb);
     try std.testing.expect(app.theme_preview_original == null);
 }
 
@@ -1024,12 +1022,11 @@ test "submitMode on theme_picker with no matching filter reverts the preview" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    defer tui_style.setActive(tui_style.default_theme);
 
     app.mode = .theme_picker;
     app.theme_preview_original = tui_style.default_theme;
     theme_lifecycle.previewTheme(&app, tui_style.dracula);
-    try std.testing.expectEqual(tui_style.dracula.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.dracula.body, app.activePalette().body.fg.rgb);
     // A filter with no matches → selection (0) >= count (0), so nothing to apply.
     try app.inputs.palette.buf.insertSliceAtCursor("zzzz");
     app.pickers.theme.selection = 0;
@@ -1037,7 +1034,7 @@ test "submitMode on theme_picker with no matching filter reverts the preview" {
     try std.testing.expect(try app.submitMode());
     try std.testing.expectEqual(App.Mode.normal, app.mode);
     // The preview is reverted (M2): a non-commit exit must restore the look.
-    try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
+    try std.testing.expectEqual(tui_style.default_theme.body, app.activePalette().body.fg.rgb);
     try std.testing.expect(app.theme_preview_original == null);
 }
 

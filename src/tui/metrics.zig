@@ -20,26 +20,15 @@ const CountingAllocator = @import("counting_allocator").CountingAllocator;
 /// size for a single active message.
 pub const render_cache_max_bytes: usize = 256 * 1024;
 
-/// Readable-measure cap for transcript content (issue #489): 0 fills the
-/// terminal width (historical behavior); any positive value caps prose and
-/// markdown at that many columns. Set ONCE at startup from
-/// `config.tui.max_content_width` (mirroring `tui_style.active`'s
-/// set-once-at-startup pattern) so every consumer of
-/// `ConversationLayout.contentWidth` — draw, row counting, and scroll
-/// navigation — applies the same cap by construction and the row cache never
-/// desyncs from the render.
-pub var readable_measure_max: u16 = 0;
+pub const PresentationConfig = struct {
+    max_content_width: u16 = 0,
+    density: @import("../config/config.zig").TranscriptDensity = .comfortable,
+    show_turn_timestamps: bool = false,
+    no_color: bool = false,
+};
 
-/// Transcript vertical spacing density (`comfortable` = 1 blank row between
-/// messages; `compact` = 0). Set at startup and on settings preview/save.
-pub var transcript_density: @import("../config/config.zig").TranscriptDensity = .comfortable;
-
-/// Whether user messages render a dim turn separator/timestamp row above the
-/// prompt body. Set at startup and on settings preview/save.
-pub var show_turn_timestamps: bool = false;
-
-pub fn topSpacingRows() u16 {
-    return switch (transcript_density) {
+pub fn topSpacingRows(pres: PresentationConfig) u16 {
+    return switch (pres.density) {
         .comfortable => 1,
         .compact => 0,
     };
@@ -58,19 +47,19 @@ pub fn effectiveContentWidth(width: u16, max_content_width: u16) u16 {
 const content_margin_left: u16 = 2;
 const content_margin_right: u16 = 2;
 
-pub fn messageRowsCached(message: *transcript_mod.Message, width: u16) u16 {
+pub fn messageRowsCached(message: *transcript_mod.Message, width: u16, pres: PresentationConfig) u16 {
     const cache = message.rowCachePtr();
     if (cache.valid and cache.width == width) {
         return cache.rows;
     }
-    const rows = messageContentRows(message, width) + topSpacingRows();
+    const rows = messageContentRows(message, width, pres) + topSpacingRows(pres);
     cache.* = .{ .valid = true, .width = width, .rows = rows };
     return rows;
 }
 
-pub fn messageContentRows(message: *transcript_mod.Message, width: u16) u16 {
+pub fn messageContentRows(message: *transcript_mod.Message, width: u16, pres: PresentationConfig) u16 {
     return switch (message.*) {
-        .user => |m| textRows(m.body, width -| 2) + @as(u16, @intFromBool(show_turn_timestamps)),
+        .user => |m| textRows(m.body, width -| 2) + @as(u16, @intFromBool(pres.show_turn_timestamps)),
         .info => |m| textRows(m.body, width -| 2),
         .notice => |m| blk: {
             const has_marker = std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ");

@@ -168,6 +168,7 @@ pub const Content = struct {
     bash_classifier_input: []const u8 = "",
     max_content_width_input: []const u8 = "",
     version_string: []const u8 = @import("build").version,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -184,9 +185,9 @@ pub const Content = struct {
             &.{},
         );
 
-        try drawTabBar(&surface, ctx, self.state.tab);
+        try drawTabBar(&surface, ctx, self.state.tab, self.palette);
         // Separator after tab bar.
-        drawHorizontalRule(&surface, ctx, 1);
+        drawHorizontalRule(&surface, ctx, 1, self.palette);
 
         // Section content starts at row 2.
         const section_height: u16 = height -| 2;
@@ -199,7 +200,7 @@ pub const Content = struct {
         }
 
         // Bottom hint row.
-        try drawBottomHint(&surface, ctx, self.state);
+        try drawBottomHint(&surface, ctx, self.state, self.palette);
         return surface;
     }
 
@@ -207,8 +208,7 @@ pub const Content = struct {
     // Tab bar (row 0)
     // -----------------------------------------------------------------------
 
-    fn drawTabBar(surface: *vxfw.Surface, ctx: vxfw.DrawContext, active: Tab) !void {
-        const p = tui_style.activePalette();
+    fn drawTabBar(surface: *vxfw.Surface, ctx: vxfw.DrawContext, active: Tab, p: *const tui_style.Palette) !void {
         const start_col: u16 = 2;
         var col: u16 = start_col;
         inline for (@typeInfo(Tab).@"enum".fields) |field| {
@@ -229,7 +229,7 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawGeneral(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const sel = self.state.selection[@intFromEnum(Tab.general)];
 
         // Row 2: section header.
@@ -327,7 +327,7 @@ pub const Content = struct {
             }
         }
         if (general_item_count > visible_items) {
-            panel.drawViewportScrollbarAt(surface, list_start_row, avail_rows, viewport, general_item_count);
+            panel.drawViewportScrollbarAt(surface, list_start_row, avail_rows, viewport, general_item_count, p);
         }
     }
 
@@ -336,7 +336,7 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawPrompt(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const sel = self.state.selection[@intFromEnum(Tab.prompt)];
         const is_editing = self.state.edit_target == .system_prompt;
 
@@ -398,7 +398,7 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawAdvanced(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const sel = self.state.selection[@intFromEnum(Tab.advanced)];
 
         // Row 2: section header.
@@ -438,7 +438,7 @@ pub const Content = struct {
     // -----------------------------------------------------------------------
 
     fn drawAbout(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         _ = self.state;
         try panel.lineStyledAt(surface, 2, "ABOUT ZAY", ctx, left_col, p.panel_header);
         try panel.lineStyledAt(surface, 4, self.version_string, ctx, left_col, p.info);
@@ -484,8 +484,7 @@ pub const Content = struct {
         text: []const u8,
         selected: bool,
     ) !void {
-        _ = self;
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const style = if (selected) p.thinking_body else p.thinking_body;
         try panel.lineStyledAt(surface, row, text, ctx, left_col + 2, style);
     }
@@ -495,8 +494,7 @@ pub const Content = struct {
 // Bottom hint strip
 // ---------------------------------------------------------------------------
 
-fn drawBottomHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *const State) !void {
-    const p = tui_style.activePalette();
+fn drawBottomHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *const State, p: *const tui_style.Palette) !void {
     const row = surface.size.height -| 1;
     const dirty_marker: []const u8 = if (state.dirty) " ● unsaved" else "";
     const hint = try std.fmt.allocPrint(ctx.arena, "Tab next section · Up/Down navigate · Enter toggle/edit · Ctrl+S save{s}", .{dirty_marker});
@@ -510,10 +508,9 @@ fn drawBottomHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, state: *const S
 
 const left_col: u16 = 1;
 
-fn drawHorizontalRule(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16) void {
+fn drawHorizontalRule(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, p: *const tui_style.Palette) void {
     _ = ctx;
     if (row >= surface.size.height) return;
-    const p = tui_style.activePalette();
     var col: u16 = 0;
     while (col < surface.size.width) : (col += 1) {
         surface.writeCell(col, row, .{

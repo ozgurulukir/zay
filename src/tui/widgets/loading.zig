@@ -11,6 +11,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui_message = @import("message.zig");
+const tui_style = @import("../style.zig");
 pub const LoadingWidget = struct {
     /// True while the lane's turn is streaming — the spinner only draws then.
     awaiting_output: bool,
@@ -20,6 +21,7 @@ pub const LoadingWidget = struct {
     label: []const u8,
     /// Animation frame counter (`metrics.loading_frame`).
     loading_frame: u8,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *LoadingWidget) vxfw.Widget {
         return .{
@@ -38,7 +40,7 @@ pub const LoadingWidget = struct {
         });
         if (height > 0 and self.awaiting_output) {
             var row: u16 = if (height > 1) 1 else 0;
-            tui_message.MessageWidget.drawLoading(&surface, self.label, self.loading_frame, &row, ctx);
+            tui_message.MessageWidget.drawLoading(&surface, self.label, self.loading_frame, &row, ctx, self.palette);
         }
         return surface;
     }

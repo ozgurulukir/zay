@@ -38,6 +38,7 @@ pub const Content = struct {
     /// Current text of the "add server by URL" form (borrowed from the App's
     /// `mcp_url_input` buffer). Only rendered while `state.adding`.
     url_input: []const u8 = "",
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -45,7 +46,7 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(
@@ -114,7 +115,7 @@ pub const Content = struct {
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
         }
         if (total_items > visible_items) {
-            panel.drawViewportScrollbarAt(&surface, list_start_row, avail_rows, viewport, total_items);
+            panel.drawViewportScrollbarAt(&surface, list_start_row, avail_rows, viewport, total_items, p);
         }
 
         try panel.lineStyledAt(&surface, height -| 2, "[Space] Toggle  |  [a] Add Server  |  [Ctrl+R] Reconnect  |  [Esc] Close", ctx, 2, p.muted);

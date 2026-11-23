@@ -29,6 +29,7 @@ pub const Content = struct {
     filter: []const u8,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -46,7 +47,7 @@ pub const Content = struct {
     }
 
     fn drawEntries(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const height = surface.size.height;
         if (height == 0) return;
 
@@ -90,9 +91,10 @@ pub const Content = struct {
                 .trailing_mark = mark,
                 .highlight_enabled = self.highlight_enabled,
                 .highlight_style = self.highlight_style,
+                .palette = p,
             });
         }
-        panel.drawViewportScrollbar(surface, viewport, total_matches);
+        panel.drawViewportScrollbar(surface, viewport, total_matches, p);
     }
 };
 

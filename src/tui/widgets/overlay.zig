@@ -106,6 +106,7 @@ pub const SearchableOverlayChrome = struct {
     full_panel: bool = false,
     palette_input: ?*vxfw.TextField = null,
     fill_background: bool = true,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
     content: vxfw.Widget,
 
     pub fn widget(self: *SearchableOverlayChrome) vxfw.Widget {
@@ -114,7 +115,7 @@ pub const SearchableOverlayChrome = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *SearchableOverlayChrome = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const max_w: u16 = ctx.max.width orelse 80;
         const max_h: u16 = ctx.max.height orelse 24;
         const total_w: u16 = @min(self.width, max_w);
@@ -124,6 +125,7 @@ pub const SearchableOverlayChrome = struct {
             .full_panel = self.full_panel or self.palette_input == null,
             .palette_input = self.palette_input,
             .fill_background = self.fill_background,
+            .palette = p,
             .content = self.content,
         };
         const border_labels: []const vxfw.Border.BorderLabel = if (self.label.len > 0)
@@ -146,6 +148,7 @@ const ChromeInner = struct {
     full_panel: bool,
     palette_input: ?*vxfw.TextField,
     fill_background: bool,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
     content: vxfw.Widget,
 
     fn widget(self: *ChromeInner) vxfw.Widget {
@@ -154,12 +157,12 @@ const ChromeInner = struct {
 
     fn drawInner(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *ChromeInner = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const iw: u16 = ctx.max.width orelse 0;
         const ih: u16 = ctx.max.height orelse 0;
 
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = iw, .height = ih });
-        if (self.fill_background) panel.fillBackground(&surface);
+        if (self.fill_background) panel.fillBackground(&surface, p);
 
         if (self.full_panel or self.palette_input == null) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
@@ -249,6 +252,7 @@ pub const OverlayWidget = struct {
     height: u16,
     full_panel: bool,
     palette_input: ?*vxfw.TextField,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
     content: OverlayContent,
 
     pub fn widget(self: *OverlayWidget) vxfw.Widget {
@@ -264,6 +268,7 @@ pub const OverlayWidget = struct {
             .full_panel = self.full_panel,
             .palette_input = self.palette_input,
             .fill_background = true,
+            .palette = self.palette,
             .content = self.content.widget(),
         };
         return chrome.widget().draw(ctx);

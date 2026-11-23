@@ -56,7 +56,7 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
     }
 
     const tui_cfg = app.cached_config.tui;
-    const p = tui_style.activePalette();
+    const p = &app.palette;
     var meter_text: []const u8 = "";
     var meter_style: vaxis.Style = p.model_status;
     if (tui_cfg.show_context_meter) {
@@ -128,6 +128,7 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
         .velocity_text = velocity_text,
         .git_label = app.metrics.git_label,
         .skill_inventory = if (tui_cfg.show_skill_inventory) app.thread.skill_inventory.items else &.{},
+        .palette = p,
     };
 }
 
@@ -178,6 +179,8 @@ pub fn buildTranscriptProps(app: *App, lane: *tui.Thread, now_ms: i64) tx_widget
         .now_ms = now_ms,
         .body_selection = lane.transcript.body_selection,
         .new_output_rect_out = if (lane == app.thread) &app.nav.new_output_rect else null,
+        .palette = &app.palette,
+        .presentation = app.presentation,
     };
 }
 
@@ -209,7 +212,7 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
     // `active` and `focused` are distinct: `active` marks the ●/dim state,
     // `focused` is the single column whose border is highlighted (when the
     // knob is enabled).
-    const p = tui_style.activePalette();
+    const p = &app.palette;
     var border_style: vaxis.Style = if (active) p.body else p.border;
     if (focused and app.cached_config.tui.highlight_focused_border) {
         border_style = p.border_label;
@@ -223,6 +226,8 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
         .state_glyph = state_glyph,
         .ws_marker = ws_marker,
         .border_style = border_style,
+        .palette = &app.palette,
+        .presentation = app.presentation,
     };
 }
 
@@ -434,6 +439,7 @@ fn buildOverlayChildren(
             .label = label,
             .base_screen_row = panel_row,
             .buttons_out = &app.nav.permission_buttons,
+            .palette = &app.palette,
         };
         children[idx] = .{
             .origin = .{ .row = panel_row, .col = 0 },
@@ -464,6 +470,7 @@ fn buildOverlayChildren(
             .log_expanded = app.background_modal_state.log_expanded,
             .log_text = if (cache) |c| c.log_text else "",
             .log_note = if (cache) |c| c.log_note else "",
+            .palette = &app.palette,
         } };
         const rows: usize = @min(@as(usize, 8), views.len);
         const panel_height = background_jobs.panelHeight(
@@ -506,7 +513,7 @@ fn buildOverlayChildren(
     if (flags.toast_visible) {
         // Top-right toast stack, above every other child (z_index 4).
         const toast_w: u16 = @min(max_width, 60);
-        var toast_view: toast.Widget = .{ .bus = &toast.global };
+        var toast_view: toast.Widget = .{ .bus = &toast.global, .palette = &app.palette };
         children[idx] = .{
             .origin = .{ .row = 0, .col = max_width -| toast_w },
             .surface = try toast_view.widget().draw(ctx.withConstraints(
@@ -536,7 +543,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         while (col < write_len) : (col += 1) {
             surface.writeCell(col, 0, .{
                 .char = .{ .grapheme = warning[col .. col + 1], .width = 1 },
-                .style = tui_style.activePalette().notice,
+                .style = app.palette.notice,
             });
         }
         try materializeBlankCells(ctx.arena, &surface);
@@ -607,6 +614,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .awaiting_output = app.thread.turn_view.awaitingOutput(),
         .label = progress_label,
         .loading_frame = app.metrics.loading_frame,
+        .palette = &app.palette,
     };
     var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
     if (modal_layer == .overlay) {

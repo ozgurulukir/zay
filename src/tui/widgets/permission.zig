@@ -24,6 +24,7 @@ pub const PermissionWidget = struct {
     label: []const u8 = "Tool Approval Request",
     base_screen_row: u16 = 0,
     buttons_out: ?*?[4]app_state.PermissionButton = null,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *PermissionWidget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -31,7 +32,7 @@ pub const PermissionWidget = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const snapshot = self.snapshot orelse {
             return vxfw.Surface.init(ctx.arena, self.widget(), .{
                 .width = ctx.max.width orelse 0,
@@ -50,6 +51,7 @@ pub const PermissionWidget = struct {
             .scroll = self.scroll,
             .base_screen_row = self.base_screen_row,
             .buttons_out = self.buttons_out,
+            .palette = p,
         };
         var border: vxfw.Border = .{
             .child = inner.widget(),
@@ -66,6 +68,7 @@ const PermissionInner = struct {
     scroll: u32,
     base_screen_row: u16,
     buttons_out: ?*?[4]app_state.PermissionButton = null,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *PermissionInner) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -73,7 +76,7 @@ const PermissionInner = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionInner = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = width, .height = height });
@@ -89,18 +92,17 @@ const PermissionInner = struct {
         panel.lineStyledAt(&surface, 0, header, ctx, 1, p.panel_header) catch {};
 
         const body_rows = height -| 3;
-        drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows);
+        drawPermissionCommand(&surface, ctx, self.snapshot.command, self.scroll, body_rows, p);
         // TUX03: tell the user when a long command is scrollable and where
         // they are in it (Up/Down scroll, see handlePermissionKey).
-        drawScrollHint(&surface, ctx, self.snapshot.command, self.scroll, body_rows, height);
-        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected, self.base_screen_row + 1, self.buttons_out);
+        drawScrollHint(&surface, ctx, self.snapshot.command, self.scroll, body_rows, height, p);
+        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected, self.base_screen_row + 1, self.buttons_out, p);
         return surface;
     }
 };
 
-fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, rows: u16) void {
+fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, rows: u16, p: *const tui_style.Palette) void {
     if (rows == 0) return;
-    const p = tui_style.activePalette();
     var line_index: u32 = 0;
     var drawn: u16 = 0;
     var iterator = std.mem.splitScalar(u8, command, '\n');
@@ -116,11 +118,10 @@ fn drawPermissionCommand(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command:
     }
 }
 
-fn drawScrollHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, body_rows: u16, height: u16) void {
+fn drawScrollHint(surface: *vxfw.Surface, ctx: vxfw.DrawContext, command: []const u8, scroll: u32, body_rows: u16, height: u16, p: *const tui_style.Palette) void {
     if (body_rows == 0) return;
     const hint_row = height -| 2;
     if (hint_row == 0 or hint_row >= surface.size.height) return;
-    const p = tui_style.activePalette();
     const hint = scrollHintText(ctx.arena, command, scroll, body_rows) orelse return;
     panel.lineStyledAt(surface, hint_row, hint, ctx, 1, p.info) catch {};
 }
@@ -143,9 +144,8 @@ fn scrollHintText(arena: std.mem.Allocator, command: []const u8, scroll: u32, bo
     }) catch null;
 }
 
-fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalChoice, base_screen_row: u16, buttons_out: ?*?[4]app_state.PermissionButton) void {
+fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalChoice, base_screen_row: u16, buttons_out: ?*?[4]app_state.PermissionButton, p: *const tui_style.Palette) void {
     if (row >= surface.size.height) return;
-    const p = tui_style.activePalette();
     const w = surface.size.width;
 
     const items = [_]struct {

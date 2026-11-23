@@ -554,6 +554,7 @@ const containsIgnoreCase = panel.containsIgnoreCase;
 pub const Content = struct {
     state: *TreeState,
     list: *vxfw.ListView,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -561,13 +562,13 @@ pub const Content = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         const height = ctx.max.height orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = height }, &.{});
 
         if (self.state.isEmpty()) {
-            try panel.commandLine(&surface, 0, "No messages yet.", ctx, false);
+            try panel.commandLine(&surface, 0, "No messages yet.", ctx, false, p);
             return surface;
         }
 
@@ -580,7 +581,7 @@ pub const Content = struct {
         try panel.lineStyledAt(&surface, 0, mode_label, ctx, start_col, white);
         const position = if (self.state.visible.len == 0) 0 else self.state.selection + 1;
         const count = try std.fmt.allocPrint(ctx.arena, "{d}/{d}", .{ position, self.state.visible.len });
-        try panel.right(&surface, 0, count, ctx, false);
+        try panel.right(&surface, 0, count, ctx, false, p);
 
         const widgets = try self.rowWidgets(ctx);
         self.list.children = .{ .slice = widgets };
@@ -607,7 +608,7 @@ pub const Content = struct {
         };
         surface.children = children;
         if (detail) |full| {
-            panel.drawDetailFooter(&surface, ctx, height -| 1, full);
+            panel.drawDetailFooter(&surface, ctx, height -| 1, full, p);
         }
         return surface;
     }
@@ -617,7 +618,7 @@ pub const Content = struct {
         const widgets = try ctx.arena.alloc(vxfw.Widget, visible.len);
         const rows = try ctx.arena.alloc(Row, visible.len);
         for (visible, 0..) |*node, i| {
-            rows[i] = .{ .node = node, .selected = i == self.state.selection };
+            rows[i] = .{ .node = node, .selected = i == self.state.selection, .palette = self.palette };
             widgets[i] = rows[i].widget();
         }
         return widgets;
@@ -627,6 +628,7 @@ pub const Content = struct {
 const Row = struct {
     node: *const VisibleNode,
     selected: bool,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -634,18 +636,18 @@ const Row = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Row = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         if (self.selected) panel.fillRow(&surface, 0, p.selected);
 
         // Tree rows anchor at the same left column as the "Filter:" header.
         var col = panel.panel_margin_x;
-        try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(p.thinking_body, self.selected));
+        try panel.lineStyledAt(&surface, 0, self.node.prefix, ctx, col, tui_style.onSelectionBg(p.thinking_body, self.selected, p));
         col += @intCast(ctx.stringWidth(self.node.prefix));
 
         const text = try self.displayText(ctx);
-        try panel.lineStyledAt(&surface, 0, text, ctx, col, rowStyle(self.node.kind, self.node.tool_failed, self.selected));
+        try panel.lineStyledAt(&surface, 0, text, ctx, col, rowStyle(self.node.kind, self.node.tool_failed, self.selected, p));
         return surface;
     }
 
@@ -656,9 +658,8 @@ const Row = struct {
     }
 };
 
-fn rowStyle(kind: session_mod.EntryKind, tool_failed: bool, selected: bool) vaxis.Style {
+fn rowStyle(kind: session_mod.EntryKind, tool_failed: bool, selected: bool, p: *const tui_style.Palette) vaxis.Style {
     _ = tool_failed;
-    const p = tui_style.activePalette();
     const style = switch (kind) {
         .user => p.user,
         .assistant, .assistant_empty => p.thinking_label,
@@ -666,7 +667,7 @@ fn rowStyle(kind: session_mod.EntryKind, tool_failed: bool, selected: bool) vaxi
         .checkpoint => p.checkpoint,
         .branch_summary, .session_info, .other => p.thinking_body,
     };
-    return tui_style.onSelectionBg(style, selected);
+    return tui_style.onSelectionBg(style, selected, p);
 }
 
 test "linear chains stay flush; only branch children get connectors" {

@@ -25,6 +25,7 @@ pub const Content = struct {
     selection: u32,
     /// Shown when `entries` is empty (e.g. "No parked lanes.").
     empty_message: []const u8,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -35,7 +36,7 @@ pub const Content = struct {
         if (self.entries.len == 0) {
             const widgets = try ctx.arena.alloc(vxfw.Widget, 1);
             const empty = try ctx.arena.create(EmptyRow);
-            empty.* = .{ .text = self.empty_message };
+            empty.* = .{ .text = self.empty_message, .palette = self.palette };
             widgets[0] = empty.widget();
             self.list.children = .{ .slice = widgets };
             self.list.item_count = 1;
@@ -47,7 +48,7 @@ pub const Content = struct {
         const widgets = try ctx.arena.alloc(vxfw.Widget, self.entries.len);
         const rows = try ctx.arena.alloc(Row, self.entries.len);
         for (self.entries, 0..) |entry, i| {
-            rows[i] = .{ .entry = entry, .selected = i == self.selection };
+            rows[i] = .{ .entry = entry, .selected = i == self.selection, .palette = self.palette };
             widgets[i] = rows[i].widget();
         }
         self.list.children = .{ .slice = widgets };
@@ -61,6 +62,7 @@ pub const Content = struct {
 const Row = struct {
     entry: Entry,
     selected: bool,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     fn widget(self: *Row) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -70,14 +72,15 @@ const Row = struct {
         const self: *Row = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
-        try panel.commandLine(&surface, 0, self.entry.title, ctx, self.selected);
-        if (self.entry.subtitle.len > 0) try panel.right(&surface, 0, self.entry.subtitle, ctx, self.selected);
+        try panel.commandLine(&surface, 0, self.entry.title, ctx, self.selected, self.palette);
+        if (self.entry.subtitle.len > 0) try panel.right(&surface, 0, self.entry.subtitle, ctx, self.selected, self.palette);
         return surface;
     }
 };
 
 const EmptyRow = struct {
     text: []const u8,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     fn widget(self: *EmptyRow) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -85,7 +88,7 @@ const EmptyRow = struct {
 
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *EmptyRow = @ptrCast(@alignCast(ptr));
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const width = ctx.max.width orelse 0;
         var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), .{ .width = width, .height = 1 }, &.{});
         try panel.lineStyledAt(&surface, 0, self.text, ctx, panel.panel_margin_x, p.notice);

@@ -234,6 +234,7 @@ pub const Content = struct {
     filter: []const u8 = "",
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -253,7 +254,7 @@ pub const Content = struct {
     }
 
     fn drawList(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const total_matches = countMatching(self.state.entries, self.filter);
         if (total_matches == 0) {
             try panel.lineStyledAt(surface, 0, "  No matching providers", ctx, 1, p.thinking_body);
@@ -290,9 +291,9 @@ pub const Content = struct {
         row_selected: bool,
         provider_focused: bool,
     ) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const prefix = "  ";
-        const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
+        const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected, p);
 
         try panel.drawFuzzyListRow(surface, row, ctx, .{
             .prefix = prefix,
@@ -303,6 +304,7 @@ pub const Content = struct {
             .start_col = panel.panel_margin_x,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .palette = p,
         });
 
         // Badge: builtins use the catalogue status array; everything else
@@ -329,8 +331,7 @@ pub const Content = struct {
         status: Status,
         row_selected: bool,
     ) !void {
-        _ = self;
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const text: []const u8 = switch (status) {
             .connected => " [CONNECTED]",
             .failed => " [DISCONNECTED]",
@@ -344,7 +345,7 @@ pub const Content = struct {
         const text_width = ctx.stringWidth(prefix) + ctx.stringWidth(display_name);
         const badge_col: u16 = panel.panel_margin_x +
             @as(u16, @intCast(@min(text_width, @as(usize, std.math.maxInt(u16)))));
-        try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, row_selected));
+        try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, row_selected, p));
     }
 
     fn drawCodex(
@@ -355,9 +356,9 @@ pub const Content = struct {
         row_selected: bool,
         provider_focused: bool,
     ) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const prefix = "  ";
-        const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
+        const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected, p);
 
         try panel.drawFuzzyListRow(surface, row, ctx, .{
             .prefix = prefix,
@@ -368,12 +369,13 @@ pub const Content = struct {
             .start_col = panel.panel_margin_x,
             .highlight_enabled = self.highlight_enabled,
             .highlight_style = self.highlight_style,
+            .palette = p,
         });
 
         if (self.codex_signed_in) {
             const badge_col: u16 = panel.panel_margin_x +
                 @as(u16, @intCast(@min(ctx.stringWidth("  OpenAI Codex"), @as(usize, std.math.maxInt(u16)))));
-            try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(p.success, row_selected));
+            try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(p.success, row_selected, p));
             try self.drawSignOut(surface, ctx, row, row_selected);
         } else {
             const desc_style = if (provider_focused) p.selected_item else p.thinking_body;
@@ -382,16 +384,16 @@ pub const Content = struct {
     }
 
     fn drawSignOut(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, row_selected: bool) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const focused = row_selected and self.state.column == .sign_out;
         const prefix = "  ";
         const text = try std.fmt.allocPrint(ctx.arena, "{s}Sign Out", .{prefix});
-        const style = if (focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
+        const style = if (focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected, p);
         try panel.lineStyledAt(surface, row, text, ctx, panel.secondaryColumn(surface.size.width), style);
     }
 
     fn drawForm(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
-        const p = tui_style.activePalette();
+        const p = self.palette;
         const handle = self.state.form_handle orelse return;
         const display_name = handle.displayName();
         const desc = handle.description();
@@ -501,7 +503,7 @@ test "provider picker keeps codex text visible when sign out is focused" {
 
     try std.testing.expectEqualStrings("O", surface.readCell(panel.panel_margin_x + 2, 0).char.grapheme);
     try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
-    try std.testing.expectEqual(tui_style.activePalette().selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
+    try std.testing.expectEqual(tui_style.default_palette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }
 
 test "provider picker keeps sign out on the selected row background" {
@@ -521,7 +523,7 @@ test "provider picker keeps sign out on the selected row background" {
     const surface = try content.widget().draw(ctx);
 
     try std.testing.expectEqualStrings("S", surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).char.grapheme);
-    try std.testing.expectEqual(tui_style.activePalette().selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
+    try std.testing.expectEqual(tui_style.default_palette.selected.bg, surface.readCell(panel.secondaryColumn(surface.size.width) + 2, 0).style.bg);
 }
 
 test "provider picker selecting a catalogue row opens its form" {

@@ -162,6 +162,7 @@ pub var global: ToastBus = .{};
 /// no key capture. Each toast is a bordered box colored by level.
 pub const Widget = struct {
     bus: *ToastBus,
+    palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Widget) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -203,10 +204,10 @@ pub const Widget = struct {
         );
 
         // Pre-fill surface with opaque themed background so underlying transcript cells don't bleed through.
-        panel.fillBackground(&surface);
+        panel.fillBackground(&surface, self.palette);
 
         var row: u16 = 0;
-        const p = tui_style.activePalette();
+        const p = self.palette;
         for (items[0..visible], 0..) |*item, i| {
             const style = switch (item.level) {
                 .info => p.info,
@@ -515,7 +516,7 @@ test "Widget.draw renders initialized bordered surface" {
     // Verify content row side borders and opaque themed background
     try std.testing.expectEqualStrings("│", surface.buffer[30].char.grapheme);
     try std.testing.expectEqualStrings("│", surface.buffer[59].char.grapheme);
-    try std.testing.expectEqual(tui_style.activePalette().background.bg, surface.buffer[58].style.bg);
+    try std.testing.expectEqual(tui_style.default_palette.background.bg, surface.buffer[58].style.bg);
 
     // Verify bottom border corners and Esc dismiss hint
     try std.testing.expectEqualStrings("╰", surface.buffer[60].char.grapheme);
