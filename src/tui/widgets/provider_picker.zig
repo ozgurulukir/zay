@@ -144,6 +144,7 @@ pub fn getMatchAt(entries: []const ProviderHandle, filter: []const u8, index: u3
 pub const State = struct {
     stage: Stage = .list,
     selection: u32 = 0,
+    scroll: panel.ListScrollState = .{},
     column: Column = .provider,
     form_handle: ?ProviderHandle = null,
     form_error: ?[]const u8 = null,
@@ -227,6 +228,7 @@ pub const State = struct {
 
 pub const Content = struct {
     state: State,
+    scroll: ?*panel.ListScrollState = null,
     codex_signed_in: bool,
     statuses: []const Status,
     key_input: []const u8 = "",
@@ -261,7 +263,10 @@ pub const Content = struct {
             return;
         }
 
-        const viewport = panel.ViewportWindow.compute(self.state.selection, total_matches, surface.size.height);
+        const viewport = if (self.scroll) |s|
+            panel.ViewportWindow.computeStateful(self.state.selection, total_matches, surface.size.height, s)
+        else
+            panel.ViewportWindow.compute(self.state.selection, total_matches, surface.size.height);
         if (viewport.visible_height == 0) return;
 
         var match_idx: u32 = viewport.start_index;

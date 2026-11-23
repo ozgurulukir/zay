@@ -21,6 +21,7 @@ pub const Content = struct {
     entries: []const Entry,
     filter: []const u8,
     selection: u32,
+    scroll: ?*panel.ListScrollState = null,
     highlight_enabled: bool = true,
     highlight_style: config_mod.FuzzyHighlightStyle = .accent,
     palette: *const tui_style.Palette = &tui_style.default_palette,
@@ -57,7 +58,10 @@ pub const Content = struct {
         }
 
         // 2. Viewport window calculation for smooth scrolling.
-        const viewport = panel.ViewportWindow.compute(self.selection, total_matches, height);
+        const viewport = if (self.scroll) |s|
+            panel.ViewportWindow.computeStateful(self.selection, total_matches, height, s)
+        else
+            panel.ViewportWindow.compute(self.selection, total_matches, height);
 
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {

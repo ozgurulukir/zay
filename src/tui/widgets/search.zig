@@ -41,6 +41,7 @@ pub const State = struct {
     hits: std.ArrayList(Hit) = .empty,
     active_hit: usize = 0,
     selection: u32 = 0,
+    scroll: panel.ListScrollState = .{},
     /// True when the palette filter is empty (the overlay shows a usage hint
     /// rather than a "No matching messages" row).
     filter_empty: bool = true,
@@ -55,6 +56,7 @@ pub const State = struct {
         self.freeSnippets(gpa);
         self.matches.clearRetainingCapacity();
         self.selection = 0;
+        self.scroll = .{};
         self.filter_empty = true;
         if (!keep_query) {
             self.hits.clearRetainingCapacity();
@@ -155,7 +157,7 @@ pub const Content = struct {
 
         // Viewport math: only the visible rows are drawn, so a pathological
         // match count can never blow up the overlay.
-        const viewport = panel.ViewportWindow.compute(self.state.selection, @intCast(matches.len), height);
+        const viewport = panel.ViewportWindow.computeStateful(self.state.selection, @intCast(matches.len), height, &self.state.scroll);
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
             const m = matches[match_idx];

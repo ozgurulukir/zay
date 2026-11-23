@@ -16,7 +16,6 @@ const tui_metrics = @import("../metrics.zig");
 const tui_style = @import("../style.zig");
 const panel = @import("panel.zig");
 const app_state = @import("../app_state.zig");
-const Thread = @import("../thread.zig");
 const transcript_mod = @import("../../transcript.zig");
 
 const MessageWidget = tui_message.MessageWidget;
@@ -30,8 +29,11 @@ pub const SearchHit = struct {
 };
 
 pub const TranscriptProps = struct {
-    /// The lane this pane renders — the active lane today; any lane once tiled.
-    thread: *Thread,
+    /// Narrow presentation inputs from the lane (INV-WIDGET-1 — no `*Thread`).
+    messages: []transcript_mod.Message,
+    selected: ?u32 = null,
+    auto_scroll: bool = true,
+    transcript_list: *vxfw.ListView,
     /// `tui_status.modelStatus(live_runtime, cached_config) != null` —
     /// precomputed so this leaf never touches the App or config modules.
     has_model_configured: bool,
@@ -49,8 +51,11 @@ pub const TranscriptProps = struct {
 };
 
 pub const TranscriptWidget = struct {
-    /// The lane this pane renders — the active lane today; any lane once tiled.
-    thread: *Thread,
+    /// Narrow presentation inputs from the lane (INV-WIDGET-1 — no `*Thread`).
+    messages: []transcript_mod.Message,
+    selected: ?u32 = null,
+    auto_scroll: bool = true,
+    transcript_list: *vxfw.ListView,
     /// `tui_status.modelStatus(live_runtime, cached_config) != null` —
     /// precomputed so this leaf never touches the App or config modules.
     has_model_configured: bool,
@@ -68,7 +73,10 @@ pub const TranscriptWidget = struct {
 
     pub fn fromProps(props: TranscriptProps) TranscriptWidget {
         return .{
-            .thread = props.thread,
+            .messages = props.messages,
+            .selected = props.selected,
+            .auto_scroll = props.auto_scroll,
+            .transcript_list = props.transcript_list,
             .has_model_configured = props.has_model_configured,
             .loading_frame = props.loading_frame,
             .blackhole_frame = props.blackhole_frame,
@@ -94,7 +102,7 @@ pub const TranscriptWidget = struct {
         const max_height = ctx.max.height orelse ctx.min.height;
         const splash_viewport_height: u16 = @max(max_height -| ConversationLayout.top -| ConversationLayout.bottom, 1);
 
-        const messages = self.thread.transcript.messages.items;
+        const messages = self.messages;
         // Splash-only state: the logo is the sole message and the user hasn't
         // started typing, so the intro block centers in the viewport.
         const splash_fills = messages.len == 1 and messages[0] == .logo and !self.splash_suppressed;
@@ -102,7 +110,7 @@ pub const TranscriptWidget = struct {
         var builder: MessageListBuilder = .{
             .arena = ctx.arena,
             .messages = messages,
-            .selected = self.thread.transcript.selected,
+            .selected = self.selected,
             .loading_frame = self.loading_frame,
             .blackhole_frame = self.blackhole_frame,
             .has_model_configured = self.has_model_configured,
@@ -112,16 +120,16 @@ pub const TranscriptWidget = struct {
             .search_query = self.search_query,
             .active_search_hit = self.active_search_hit,
             .now_ms = self.now_ms,
-            .body_selection = self.thread.transcript.body_selection,
+            .body_selection = self.body_selection,
             .palette = self.palette,
             .presentation = self.presentation,
         };
-        self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
-        self.thread.transcript_list.item_count = @intCast(messages.len);
+        self.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
+        self.transcript_list.item_count = @intCast(messages.len);
         self.syncCursor(ctx);
 
         var list_padding: vxfw.Padding = .{
-            .child = self.thread.transcript_list.widget(),
+            .child = self.transcript_list.widget(),
             .padding = ConversationLayout.verticalPadding(self.presentation),
         };
         var surface = try list_padding.widget().draw(ctx);
@@ -130,13 +138,13 @@ pub const TranscriptWidget = struct {
         const total_items: u16 = @intCast(messages.len);
         const view_height = surface.size.height;
         const view_width = surface.size.width;
-        const needs_scrollbar = view_height > 0 and view_width > 0 and total_items > 0 and (self.thread.transcript_list.scroll.has_more or self.thread.transcript_list.scroll.top > 0 or self.thread.transcript_list.scroll.offset > 0);
+        const needs_scrollbar = view_height > 0 and view_width > 0 and total_items > 0 and (self.transcript_list.scroll.has_more or self.transcript_list.scroll.top > 0 or self.transcript_list.scroll.offset > 0);
 
         // 2. "↓ new output" pill when auto-scroll is paused and unseen/new messages exist
-        const is_last = if (self.thread.transcript.selected) |sel| sel + 1 >= messages.len else true;
+        const is_last = if (self.selected) |sel| sel + 1 >= messages.len else true;
         const pill_text = " ↓ new output ";
         const pill_len: u16 = @intCast(pill_text.len);
-        const needs_pill = !self.thread.auto_scroll and (self.thread.transcript_list.scroll.has_more or !is_last) and view_width > pill_len + 4 and view_height > 2;
+        const needs_pill = !self.auto_scroll and (self.transcript_list.scroll.has_more or !is_last) and view_width > pill_len + 4 and view_height > 2;
 
         if (!needs_scrollbar and !needs_pill) {
             return surface;
@@ -150,8 +158,8 @@ pub const TranscriptWidget = struct {
         if (needs_scrollbar) {
             const sb_metrics = scrollbarMetrics(
                 messages,
-                self.thread.transcript_list.scroll.top,
-                self.thread.transcript_list.scroll.offset,
+                self.transcript_list.scroll.top,
+                self.transcript_list.scroll.offset,
                 view_height,
                 view_width,
                 self.presentation,
@@ -185,34 +193,34 @@ pub const TranscriptWidget = struct {
     }
 
     fn syncCursor(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
-        const messages = self.thread.transcript.messages.items;
+        const messages = self.messages;
         if (messages.len == 0) return;
-        if (self.thread.auto_scroll) {
+        if (self.auto_scroll) {
             const cursor: u32 = @intCast(messages.len - 1);
-            self.thread.transcript_list.cursor = cursor;
+            self.transcript_list.cursor = cursor;
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
-        const cursor = self.thread.transcript.selected orelse 0;
-        const cursor_changed = self.thread.transcript_list.cursor != cursor;
-        self.thread.transcript_list.cursor = cursor;
-        if (cursor_changed) self.thread.transcript_list.ensureScroll();
+        const cursor = self.selected orelse 0;
+        const cursor_changed = self.transcript_list.cursor != cursor;
+        self.transcript_list.cursor = cursor;
+        if (cursor_changed) self.transcript_list.ensureScroll();
     }
 
     fn scrollCursorToTail(self: *TranscriptWidget, ctx: vxfw.DrawContext, cursor: u32) void {
-        const message_count: u32 = @intCast(self.thread.transcript.messages.items.len);
+        const message_count: u32 = @intCast(self.messages.len);
         if (cursor >= message_count) return;
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message_height = messageRowsCached(&self.thread.transcript.messages.items[cursor], ConversationLayout.contentWidth(max_width, self.presentation.max_content_width), self.presentation);
-        self.thread.transcript_list.scroll.top = cursor;
-        self.thread.transcript_list.scroll.pending_lines = 0;
-        self.thread.transcript_list.scroll.wants_cursor = false;
+        const message_height = messageRowsCached(&self.messages[cursor], ConversationLayout.contentWidth(max_width, self.presentation.max_content_width), self.presentation);
+        self.transcript_list.scroll.top = cursor;
+        self.transcript_list.scroll.pending_lines = 0;
+        self.transcript_list.scroll.wants_cursor = false;
         if (message_height > list_height) {
-            self.thread.transcript_list.scroll.offset = @intCast(message_height - list_height);
+            self.transcript_list.scroll.offset = @intCast(message_height - list_height);
         } else {
-            self.thread.transcript_list.scroll.offset = 0;
+            self.transcript_list.scroll.offset = 0;
         }
     }
 };

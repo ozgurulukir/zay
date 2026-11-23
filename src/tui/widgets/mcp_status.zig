@@ -4,9 +4,17 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const mcp_manager = @import("../../mcp/manager.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
+
+pub const ServerEntry = struct {
+    badge: []const u8,
+    name: []const u8,
+    transport_tag: []const u8,
+    tool_count: usize,
+    latency_ms: u64,
+    error_reason: ?[]const u8 = null,
+};
 
 pub const State = struct {
     selection: usize = 0,
@@ -34,7 +42,9 @@ pub const State = struct {
 
 pub const Content = struct {
     state: *State,
-    manager: *const mcp_manager.McpManager,
+    servers: []const ServerEntry = &.{},
+    active_server_count: usize = 0,
+    total_active_tools: usize = 0,
     /// Current text of the "add server by URL" form (borrowed from the App's
     /// `mcp_url_input` buffer). Only rendered while `state.adding`.
     url_input: []const u8 = "",
@@ -58,8 +68,8 @@ pub const Content = struct {
 
         try panel.lineStyledAt(&surface, 0, "MODEL CONTEXT PROTOCOL (MCP) SERVERS", ctx, 2, p.panel_header);
         const summary = try std.fmt.allocPrint(ctx.arena, "Active Servers: {d} | Active Tools: {d}", .{
-            self.manager.activeServerCount(),
-            self.manager.totalActiveTools(),
+            self.active_server_count,
+            self.total_active_tools,
         });
         try panel.lineStyledAt(&surface, 2, summary, ctx, 2, p.info);
 
@@ -73,7 +83,7 @@ pub const Content = struct {
         }
 
         const list_start_row: u16 = 4;
-        if (self.manager.clients.items.len == 0) {
+        if (self.servers.len == 0) {
             try panel.lineStyledAt(&surface, list_start_row, "No MCP servers configured. Press [a] to add a remote server by URL.", ctx, 2, p.muted);
             try panel.lineStyledAt(&surface, height -| 2, "[a] Add Server  |  [Esc] Close", ctx, 2, p.muted);
             return surface;
@@ -82,34 +92,28 @@ pub const Content = struct {
         const footer_reserved: u16 = 2;
         const avail_rows: u16 = height -| (list_start_row + footer_reserved);
         const visible_items: u16 = @max(@as(u16, 1), avail_rows / 2);
-        const total_items: u32 = @intCast(self.manager.clients.items.len);
+        const total_items: u32 = @intCast(self.servers.len);
         const viewport = panel.ViewportWindow.computeStateful(@intCast(self.state.selection), total_items, visible_items, &self.state.scroll);
 
         var idx = viewport.start_index;
         while (idx < viewport.end_index) : (idx += 1) {
-            const client = self.manager.clients.items[idx];
+            const entry = self.servers[idx];
             const row: u16 = list_start_row + viewport.screenRow(idx) * 2;
             if (row >= height -| footer_reserved) break;
             const is_selected = idx == self.state.selection;
             if (is_selected) panel.fillRow(&surface, row, p.selected);
 
-            const badge = client.status().label();
-            const tool_count = client.discovery.tools.items.len;
-            const transport_tag: []const u8 = switch (client.transport) {
-                .stdio => "stdio",
-                .sse => "remote",
-            };
-            const line = if (client.lifecycle == .failed)
+            const line = if (entry.error_reason) |reason|
                 try std.fmt.allocPrint(
                     ctx.arena,
                     "  [{s}] {s} ({s}) - {d} tools ({d}ms)  ERROR: {s}",
-                    .{ badge, client.name, transport_tag, tool_count, client.latency_ms, client.lifecycle.failed.reason },
+                    .{ entry.badge, entry.name, entry.transport_tag, entry.tool_count, entry.latency_ms, reason },
                 )
             else
                 try std.fmt.allocPrint(
                     ctx.arena,
                     "  [{s}] {s} ({s}) - {d} tools ({d}ms)",
-                    .{ badge, client.name, transport_tag, tool_count, client.latency_ms },
+                    .{ entry.badge, entry.name, entry.transport_tag, entry.tool_count, entry.latency_ms },
                 );
             const style = if (is_selected) p.selected_item else p.muted;
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);

@@ -1743,51 +1743,6 @@ pub fn commandMatchesCountForFilter(app: *const App, filter: []const u8) u32 {
     return mode_lifecycle.commandMatchesCountForFilter(app, filter);
 }
 
-/// Builds the floating `@`-results panel's per-frame view model from app
-/// state (INV-WIDGET-1): every fact the widget renders, computed HERE, so
-/// the widget is a pure function of its props and the draw path never polls
-/// or mutates search state (AD-3 of the draw-purity plan — `drainAtSearch`
-/// owns the polling and the failure-to-notice conversion).
-pub fn buildAtSearchContent(app: *const App) at_search.Content {
-    const kind = app.at_search.kind();
-    const indexing = app.at_search == .indexing;
-    return .{
-        .results = app.at_search.results(),
-        .selection = app.getAtSelection(),
-        .query = switch (app.at_search) {
-            .open => |o| o.query,
-            else => "",
-        },
-        .indexing = indexing,
-        .sigil = if (kind == .file) '@' else '$',
-        .title = if (kind == .file) "Files" else "Skills",
-        .notice = switch (app.at_search) {
-            .open => |o| o.notice orelse "",
-            else => "",
-        },
-        // The @ popup honors the same fuzzy-highlight knob as every other
-        // popup (the old App-aware widget left these at defaults).
-        .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
-        .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
-        .palette = &app.palette,
-    };
-}
-
-/// Floating `@`-results panel. Presentational only: renders the prepared
-/// `Content` built by `buildAtSearchContent`; the main input keeps focus.
-pub const AtSearchWidget = struct {
-    content: at_search.Content,
-
-    pub fn widget(self: *AtSearchWidget) vxfw.Widget {
-        return .{ .userdata = self, .drawFn = drawAtSearch };
-    }
-
-    fn drawAtSearch(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *AtSearchWidget = @ptrCast(@alignCast(ptr));
-        return self.content.widget().draw(ctx);
-    }
-};
-
 const reasoning_options = [_]model_picker.ReasoningOption{
     .{ .label = "default", .effort = .default },
     .{ .label = "medium", .effort = .medium },

@@ -1219,7 +1219,10 @@ test "up enters selected long message at bottom" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var transcript_widget: tx_widget.TranscriptWidget = .{
-        .thread = app.thread,
+        .messages = app.thread.transcript.messages.items,
+        .selected = app.thread.transcript.selected,
+        .auto_scroll = app.thread.auto_scroll,
+        .transcript_list = &app.thread.transcript_list,
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
@@ -4094,7 +4097,10 @@ fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
     defer arena.deinit();
     var counting: CountingAllocator = .{ .child = arena.allocator() };
     var transcript_widget: tx_widget.TranscriptWidget = .{
-        .thread = app.thread,
+        .messages = app.thread.transcript.messages.items,
+        .selected = app.thread.transcript.selected,
+        .auto_scroll = app.thread.auto_scroll,
+        .transcript_list = &app.thread.transcript_list,
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
@@ -4259,7 +4265,10 @@ test "transcript draw width-change re-count stays below a fixed gpa ceiling" {
     defer arena.deinit();
     var counting: CountingAllocator = .{ .child = arena.allocator() };
     var transcript_widget: tx_widget.TranscriptWidget = .{
-        .thread = app.thread,
+        .messages = app.thread.transcript.messages.items,
+        .selected = app.thread.transcript.selected,
+        .auto_scroll = app.thread.auto_scroll,
+        .transcript_list = &app.thread.transcript_list,
         .has_model_configured = false,
         .loading_frame = app.metrics.loading_frame,
         .blackhole_frame = app.metrics.blackhole_frame,
