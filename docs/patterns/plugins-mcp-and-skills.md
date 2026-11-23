@@ -49,6 +49,25 @@ these integration checks: mocked results previously hid path resolution, exact
 file isolation and include-glob failures. Live regex checks require rg; without
 it they verify the failure response and print that the live checks were skipped.
 
+**Regex retry and output bounds (2026-11-23, #590).** The tool is named `grep`,
+so models pass regex syntax without `regex = true`; a literal search that finds
+nothing is retried through ripgrep when the pattern carries regex syntax
+(alternation, escapes, groups, classes, bounds, anchors, `?`, `+`, `.*` — a
+lone `.` or `*` does not count). The retry is a courtesy: when it cannot run
+(rg missing, classifier block, invalid regex) the literal answer is returned
+with the reason. `glob` passes `path` to `find_files` as given — the bridge
+takes an exact file as its root; the parent-walk-plus-basename emulation is
+gone. The plugin shell returns at most 512 KB of a command's stdout
+(`capture_sink.stdout_bytes_limit`), so ripgrep is bounded at its source with
+`-m <max_results>` (matching lines per file); `--max-columns` does nothing
+under `--json`. On `StreamTooLong` the search is retried once with `-m 1` and
+the summary says so; a second overflow is reported with a way to narrow. The
+manifest's `timeout_ms` must cover what the handler requests from the shell:
+the sandbox deadline clamps every `ioTimeout`, so a 60 s request under the 5 s
+default ran for at most 5 s. Searching for `sudo`, `:()` or `rm -rf` is plain
+text to the local shell-safety matcher's lone-search exception — see
+[the classifier doc](../wiki/SAFETY_CLASSIFIER.md).
+
 ### Skill subsystem pattern
 
 `skill` command mode delegates to the host shell's contained foreground pipeline

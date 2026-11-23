@@ -277,19 +277,21 @@ Registers `grep` (content search) and `glob` (filename search via
 `zay.find_files`). `grep` has two backends: literal substring search through
 Zay's built-in `zay.search_files` — self-contained, no external binary —
 and, with `regex = true`, ripgrep via `zay.run_shell` (or `zay.run_bash` fallback), because
-`search_files` is substring-only and Lua patterns are not PCRE.
+`search_files` is substring-only and Lua patterns are not PCRE. A literal
+search that finds nothing is retried as a regular expression when the pattern
+carries regex syntax (`a|b`, `foo.*bar`, `^import`) and `regex` was left unset.
 
 ### init.lua (excerpt — `grep`)
 
 ```lua
 zay.register_tool({
   name = "grep",
-  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). ...",
+  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Regex syntax (alternation `a|b`, `.*`, character classes, anchors) that finds nothing as literal text is retried automatically as a regular expression via ripgrep. Set regex=true to search as a regular expression directly (respects .gitignore, requires `rg`), or regex=false for literal-only. Supports an `include` glob filter (e.g. '*.zig'). ...",
   parameters = {
-    pattern = { type = "string", description = "Text pattern to search for" },
+    pattern = { type = "string", description = "Text to search for. A literal substring by default; regex syntax such as `a|b`, `foo.*bar` or `^import` is retried as a regular expression when the literal search finds nothing" },
     path = { type = "string", description = "File or root directory to search in (default: active workspace)", optional = true },
     include = { type = "string", description = "File glob filter (e.g. '*.zig', '*.lua')", optional = true },
-    regex = { type = "boolean", description = "Treat pattern as a regex via ripgrep (default false = literal substring via built-in search)", optional = true },
+    regex = { type = "boolean", description = "Treat the pattern as a regular expression via ripgrep. Omit for a literal search with an automatic regex retry; false disables the retry", optional = true },
     case_sensitive = { type = "boolean", description = "Case-sensitive search (default false)", optional = true },
     max_results = { type = "integer", description = "Maximum matches to return (default 50, max 200)", optional = true },
   },
@@ -306,9 +308,16 @@ Key points:
   skips dotfiles but scans gitignored dirs (`vendor/`, `zig-cache/`)
 - Both backends accept an exact file path; `include` remains an additional filter.
   Native filters support `*`, `**`, and `?` against basenames or root-relative paths.
+- Both backends print paths relative to the active workspace.
 - Regex output uses ripgrep JSON, preserving Windows drive letters and colons in
   filenames. Lua decoding stops after one overflow match; truncated counts are
   lower bounds. Errors on stderr are surfaced even if PowerShell maps the exit to 1.
+- Ripgrep is asked for at most `max_results` matching lines per file, so a broad
+  pattern cannot flood the plugin shell's output cap. A search that still
+  overflows it is retried with one line per file and reports that it did.
+- `glob` passes `path` to `zay.find_files` as given: the bridge takes an exact
+  file as its root and matches only that file, and walks a directory root
+  recursively.
 - Native directory searches skip unreadable files and files larger than 1 MB;
   explicitly requested files report read errors. Use regex mode for larger files.
 

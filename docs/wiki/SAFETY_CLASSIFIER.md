@@ -46,6 +46,27 @@ parse arbitrary commands into a complete security policy and cannot detect
 every dangerous action. A command not classified as unsafe may run without
 an approval prompt.
 
+The one exception to matching inside quotes is a **lone search command**:
+`rg`, `grep`, `egrep` or `fgrep` on its own, whose arguments are text to
+search for rather than code. `rg -e 'sudo'` searches for a word and cannot
+run it, so its arguments are ignored by the rules — before this, searching
+for `sudo`, `apt` or `:()` was blocked outright. The exception fails closed.
+It applies only when all of the following hold; otherwise the command is
+classified exactly like any other:
+
+- it is a single simple command with no separator, redirect, substitution,
+  environment prefix or path qualifier (`sudo rg`, `rg ...; apt install`
+  and `rg ... > /etc/passwd` are not lone search commands);
+- outside single quotes it contains only inert ASCII — no `$`, backticks,
+  double quotes, braces, backslashes, `@`, or non-ASCII bytes (PowerShell
+  reads several Unicode characters as quotes or newlines);
+- every option before `--` is on a short allowlist of options that only
+  choose what to read or how to print. Options that run programs or load
+  further options are not on it: ripgrep's `--pre`, `--hostname-bin`,
+  `--hyperlink-format` and `--config-path`, and grep variants' `--filter`,
+  `--config` or `-Q`. An unknown option ends the exception for the whole
+  command, whether or not it is quoted.
+
 Parallel lanes use separate Git worktrees for branch and working-file
 isolation. Worktrees do not restrict a process's permissions. The shell tool
 validates its requested working directory against the project root, with
