@@ -126,6 +126,11 @@ fn deinitSharedServices(self: *App) void {
     self.mcp_manager.deinit(self.io);
     log.info("shutdown.mcp.done", .{});
     self.plugin_store.deinit(self.gpa);
+    if (self.cached_approval_command.len > 0) {
+        self.gpa.free(self.cached_approval_command);
+        self.cached_approval_command = &.{};
+    }
+    self.cached_approval = null;
     self.plugin_manager.deinit();
     self.tool_registry.deinit(self.gpa);
     self.gpa.destroy(self.tool_registry);
@@ -218,6 +223,8 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // "vxfw Windows input-thread death".
     tick_heartbeat +%= 1;
     if (tick_heartbeat % 50 == 0) log.debug("heartbeat tick #{d} mode={s}", .{ tick_heartbeat, @tagName(root.app.mode) });
+    root.app.refreshClockSnapshots();
+    root.app.refreshApprovalCache();
 
     // A lane switch changes the active branch, so arm a debounced refresh.
     // `thread` is a pointer, so this is a cheap identity compare — no polling.
@@ -408,7 +415,7 @@ fn drainBackgroundAndLanes(root: *RootWidget) !bool {
 pub fn isLaneVisible(app: *const App, lane: *const Thread) bool {
     if (lane == app.thread) return true;
     const threads = app.threads.slice();
-    for (app.split_rects[0..app.split_rect_count]) |rect| {
+    for (app.frame_geometry.split_rects[0..app.frame_geometry.split_rect_count]) |rect| {
         if (rect.lane_index < threads.len and threads[rect.lane_index] == lane) {
             return true;
         }
@@ -470,7 +477,7 @@ fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
         root.blackhole_tick_accum = 0;
         return;
     }
-    if (root.app.metrics.blackhole_visible) {
+    if (root.app.frame_geometry.blackhole_visible) {
         // Carry the remainder so the average interval tracks ~24 fps even
         // though the host tick (30 ms) is coarser than the frame interval.
         root.blackhole_tick_accum += RootWidget.drain_tick_ms;
@@ -534,7 +541,7 @@ pub fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
     const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
     const any_job_active = anyJobActive(root.app);
-    const blackhole_visible = root.app.metrics.blackhole_visible and (root.app.cached_config.tui.animations == .full);
+    const blackhole_visible = root.app.frame_geometry.blackhole_visible and (root.app.cached_config.tui.animations == .full);
     const diff_refresh_pending = root.diff_refresh_pending;
     const background_active = root.app.backgroundActive();
     const naming_active = root.app.namingActive();
@@ -1042,7 +1049,7 @@ test "idle key event does not arm loading_tick_active (#566)" {
     toast.global.count = 0;
     toast.global.head = 0;
     app.git_label_dirty = false;
-    app.metrics.blackhole_visible = false;
+    app.frame_geometry.blackhole_visible = false;
     app.metrics.loading_tick_active = false;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1074,14 +1081,14 @@ test "streamed delta on visible dual worker lane marks visible_change = true (#5
 
     // .tab mode: worker_lane is off-screen.
     app.split_mode = .tab;
-    app.split_rect_count = 0;
+    app.frame_geometry.split_rect_count = 0;
     try std.testing.expect(!isLaneVisible(&app, worker_lane));
 
     // .dual mode: worker_lane is in split_rects[1].
     app.split_mode = .dual;
-    app.split_rects[0] = .{ .row = 0, .col = 0, .width = 80, .height = 20, .lane_index = 0 };
-    app.split_rects[1] = .{ .row = 0, .col = 80, .width = 80, .height = 20, .lane_index = 1 };
-    app.split_rect_count = 2;
+    app.frame_geometry.split_rects[0] = .{ .row = 0, .col = 0, .width = 80, .height = 20, .lane_index = 0 };
+    app.frame_geometry.split_rects[1] = .{ .row = 0, .col = 80, .width = 80, .height = 20, .lane_index = 1 };
+    app.frame_geometry.split_rect_count = 2;
     try std.testing.expect(isLaneVisible(&app, worker_lane));
 
     // Start an active turn on worker_lane and push a streamed response delta.

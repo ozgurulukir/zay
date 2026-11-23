@@ -137,14 +137,6 @@ pub const InputProps = struct {
     /// Combined buffer halves (arena-owned), plus the cursor's byte offset.
     input_text: []const u8,
     input_cursor: usize,
-    /// Write-back: the wrapped width the multi-line renderer used, consumed
-    /// by vertical cursor navigation (`App.moveInputCursorVertical`).
-    input_wrap_width: *u16,
-    /// Row where the input area starts (the lanes chip adds its base row).
-    input_surface_row: u16 = 0,
-    /// Write-back: hit-test geometry for the lanes chip, read by the mouse
-    /// router. Null = no write-back (tests).
-    chip_rect_out: ?*?app_state.ChipRect = null,
     /// Queued (steer) messages and the selected index.
     queued: []const thread_mod.Thread.QueuedMessage = &.{},
     queued_selection: usize = 0,
@@ -184,9 +176,6 @@ pub const CommandInputText = struct {
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
         const width = ctx.max.width orelse 0;
-        // Write-back: vertical cursor navigation reads this via the App, same
-        // frame timing as before the props conversion.
-        self.props.input_wrap_width.* = width;
         const rows = wrappedTextRows(ctx, self.props.input_text, width);
         if (rows <= 1) return self.props.input_field.draw(ctx);
         return self.drawMultiline(ctx);
@@ -569,13 +558,6 @@ pub const InputWidget = struct {
             };
             child_index += 1;
             left_reserved +|= lanes_width + 1;
-            if (self.props.chip_rect_out) |out| {
-                out.* = .{
-                    .row = self.props.input_surface_row + layout.base_row,
-                    .col = 1,
-                    .width = lanes_width,
-                };
-            }
         }
 
         if (layout.show_badge) {
@@ -896,13 +878,11 @@ test "InputWidget shifts hint past left pills and reserves right diff counts" {
 
     var text_field: vxfw.TextField = .init(gpa);
     defer text_field.deinit();
-    var wrap_width: u16 = 0;
     var widget: InputWidget = .{
         .props = .{
             .input_field = &text_field,
             .input_text = "",
             .input_cursor = 0,
-            .input_wrap_width = &wrap_width,
             .hint_text = "Type prompt · [ESC] Cancel",
             .diff_counts = .{ .additions = 10, .deletions = 2 },
             .background_jobs = 2,
@@ -951,14 +931,12 @@ test "InputWidget draws overflow indicator when multi-line prompt exceeds viewpo
 
     var text_field: vxfw.TextField = .init(gpa);
     defer text_field.deinit();
-    var wrap_width: u16 = 0;
     const text = "line1\nline2\nline3\nline4\nline5";
     var widget: InputWidget = .{
         .props = .{
             .input_field = &text_field,
             .input_text = text,
             .input_cursor = 0,
-            .input_wrap_width = &wrap_width,
         },
     };
 

@@ -22,8 +22,6 @@ pub const PermissionWidget = struct {
     snapshot: ?ApprovalSnapshot = null,
     scroll: u32 = 0,
     label: []const u8 = "Tool Approval Request",
-    base_screen_row: u16 = 0,
-    buttons_out: ?*?[4]app_state.PermissionButton = null,
     palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *PermissionWidget) vxfw.Widget {
@@ -49,8 +47,6 @@ pub const PermissionWidget = struct {
         inner.* = .{
             .snapshot = snapshot,
             .scroll = self.scroll,
-            .base_screen_row = self.base_screen_row,
-            .buttons_out = self.buttons_out,
             .palette = p,
         };
         var border: vxfw.Border = .{
@@ -66,8 +62,6 @@ pub const PermissionWidget = struct {
 const PermissionInner = struct {
     snapshot: ApprovalSnapshot,
     scroll: u32,
-    base_screen_row: u16,
-    buttons_out: ?*?[4]app_state.PermissionButton = null,
     palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *PermissionInner) vxfw.Widget {
@@ -96,7 +90,7 @@ const PermissionInner = struct {
         // TUX03: tell the user when a long command is scrollable and where
         // they are in it (Up/Down scroll, see handlePermissionKey).
         drawScrollHint(&surface, ctx, self.snapshot.command, self.scroll, body_rows, height, p);
-        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected, self.base_screen_row + 1, self.buttons_out, p);
+        drawPermissionActions(&surface, ctx, height -| 1, self.snapshot.selected, p);
         return surface;
     }
 };
@@ -144,7 +138,7 @@ fn scrollHintText(arena: std.mem.Allocator, command: []const u8, scroll: u32, bo
     }) catch null;
 }
 
-fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalChoice, base_screen_row: u16, buttons_out: ?*?[4]app_state.PermissionButton, p: *const tui_style.Palette) void {
+fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16, selected: ApprovalChoice, p: *const tui_style.Palette) void {
     if (row >= surface.size.height) return;
     const w = surface.size.width;
 
@@ -160,25 +154,14 @@ fn drawPermissionActions(surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16
     };
 
     var col: u16 = 1;
-    var recorded: [4]app_state.PermissionButton = undefined;
-    for (items, 0..) |item, i| {
+    for (items) |item| {
         if (col >= w) break;
         const is_sel = selected == item.choice;
         const style: vaxis.Style = if (is_sel) item.style else p.thinking_body;
         const label = actionLabel(ctx, item.text, is_sel);
         const label_width: u16 = @intCast(ctx.stringWidth(label));
         panel.lineStyledAt(surface, row, label, ctx, col, style) catch {};
-        recorded[i] = .{
-            .choice = item.choice,
-            .row = base_screen_row + row,
-            // +1 accounts for the outer vxfw.Border's 1-column left frame.
-            .col = col + 1,
-            .width = label_width,
-        };
         col += label_width + 2;
-    }
-    if (buttons_out) |out| {
-        out.* = recorded;
     }
 }
 

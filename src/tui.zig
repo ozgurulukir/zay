@@ -41,6 +41,7 @@ pub const max_threads: u32 = 4;
 const tui_metrics = @import("tui/metrics.zig");
 const input_undo = @import("tui/input_undo.zig");
 const tui_layout = @import("tui/layout.zig");
+const frame_geometry = @import("tui/frame_geometry.zig");
 const provider_model = @import("tui/provider_model.zig");
 const diff_lifecycle = @import("tui/diff_lifecycle.zig");
 const git_label_job_mod = @import("tui/git_label_job.zig");
@@ -143,21 +144,17 @@ pub const App = struct {
     /// selects the worker shown on the right. Cycled by `Ctrl+L` and set by
     /// `Alt+Left`/`Alt+Right` / mouse click-to-focus.
     focused_worker_index: usize = 1,
-    /// The split column geometry computed this frame by `drawRoot`, reused by
-    /// mouse click-to-focus routing so the render path and the mouse handler
-    /// share one source of truth (`layout.computeSplitLayout`). Populated only
-    /// in split modes; `split_rect_count` is 0 otherwise.
-    split_rects: [4]tui_layout.ColumnRect = undefined,
-    split_rect_count: usize = 0,
-    /// Root-relative row where the input surface is drawn this frame; lets the
-    /// input widget translate its local chip position into absolute coordinates
-    /// for `lanes_chip_rect`.
-    input_surface_row: u16 = 0,
-    /// The actual drawn dimensions of the mode overlay computed during the most
-    /// recent frame. Enables keyboard/mouse scroll clamps to agree with responsive
-    /// or clipped overlay sizes.
-    drawn_overlay_width: u16 = 0,
-    drawn_overlay_height: u16 = 0,
+    /// Pre-draw frame geometry and hit-test map computed at the top of
+    /// `drawRoot` (and on resize) before constructing widgets.
+    frame_geometry: frame_geometry.FrameGeometry = .{},
+    /// Monotonic and wall-clock timestamps snapshotted on tick/event handlers
+    /// so `draw` never queries `std.Io.Clock.now`.
+    frame_now_ms: i64 = 0,
+    wall_now_ms: i64 = 0,
+    /// Cached approval snapshot refreshed outside `draw` so `draw` never
+    /// acquires the worker's approval mutex.
+    cached_approval: ?agent_worker.ApprovalSnapshot = null,
+    cached_approval_command: []u8 = &.{},
     inputs: app_state.InputState,
     /// Cross-pane navigation cursors and the lane-chip hit-test rect.
     nav: app_state.NavState = .{},
@@ -257,7 +254,6 @@ pub const App = struct {
     /// the candidate destination lane indices into `threads`. Owned.
     merge_source_index: usize = 0,
     merge_dest_indices: []usize = &.{},
-    input_wrap_width: u16 = 0,
     at_search: app_state.AtSearchState = .closed,
     /// Shared manager for `run_in_background` bash commands. Heap-allocated (so
     /// its address is stable for the agents that borrow it) and owned here; null
@@ -566,7 +562,7 @@ pub const App = struct {
     }
 
     pub fn drawnOverlayHeight(self: *const App) u16 {
-        if (self.drawn_overlay_height > 0) return self.drawn_overlay_height;
+        if (self.frame_geometry.drawn_overlay_height > 0) return self.frame_geometry.drawn_overlay_height;
         return help_picker.help_overlay_height;
     }
 
@@ -764,7 +760,30 @@ pub const App = struct {
     }
 
     pub fn getLanesChipRect(self: *const App) ?ChipRect {
-        return self.nav.lanes_chip_rect;
+        return self.frame_geometry.lanes_chip_rect;
+    }
+
+    pub fn refreshClockSnapshots(self: *App) void {
+        self.frame_now_ms = std.Io.Clock.now(.awake, self.getIo()).toMilliseconds();
+        self.wall_now_ms = std.Io.Clock.now(.real, self.getIo()).toMilliseconds();
+    }
+
+    pub fn refreshApprovalCache(self: *App) void {
+        const lane = permission_mod.approvalLane(self);
+        const worker = if (lane) |l| if (l.worker_context) |*wc| wc else null else null;
+        if (worker) |w| {
+            if (w.approval.snapshot(w.io, self.gpa, self.thread.permission_selection) catch null) |snap| {
+                if (self.cached_approval_command.len > 0) self.gpa.free(self.cached_approval_command);
+                self.cached_approval_command = @constCast(snap.command);
+                self.cached_approval = snap;
+                return;
+            }
+        }
+        if (self.cached_approval_command.len > 0) {
+            self.gpa.free(self.cached_approval_command);
+            self.cached_approval_command = &.{};
+        }
+        self.cached_approval = null;
     }
 
     pub fn turnStateIsActive(self: *const App) bool {
@@ -1669,6 +1688,7 @@ pub fn openPlugins(app: *App) void {
     app.pickers.plugins.view = .installed;
     app.pickers.plugins.adding = false;
     app.input_buffers.plugin_store_url.clearRetainingCapacity();
+    plugin_store_job_mod.refreshInstalledCache(app);
     app.refreshPluginStore() catch |err| {
         log.warn("plugin_store.refresh.start_failed err={s}", .{@errorName(err)});
     };

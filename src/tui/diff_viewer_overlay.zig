@@ -36,7 +36,6 @@ pub fn drawDiffViewer(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext
     const footer_h: u16 = if (editing) @min(h -| 1, @as(u16, 3)) else @min(h -| 1, @as(u16, 2));
     const body_top: u16 = 0;
     const body_h: u16 = h -| body_top -| footer_h;
-    app.diff.viewport_rows = body_h;
 
     var subs: [3]vxfw.SubSurface = undefined;
     var n: usize = 0;

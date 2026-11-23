@@ -154,7 +154,15 @@ pub const MessageWidget = struct {
     /// Combined byte-offset overlays for a body: search hits (issue #484),
     /// active cycled hit (#502), Shift-arrow/mouse selection (#487/#513), and
     /// `path[:line[:col]]` token underlines (#514).
-    fn overlaySpans(arena: std.mem.Allocator, text: []const u8, query: ?[]const u8, active_range: ?[2]usize, selection: ?[2]usize, p: *const tui_style.Palette) ?[]StyleSpan {
+    fn overlaySpans(
+        arena: std.mem.Allocator,
+        text: []const u8,
+        query: ?[]const u8,
+        active_range: ?[2]usize,
+        selection: ?[2]usize,
+        cached_path_tokens: []const token_scan.PathLineToken,
+        p: *const tui_style.Palette,
+    ) ?[]StyleSpan {
         var spans: std.ArrayList(StyleSpan) = .empty;
         if (active_range) |range| {
             if (range[1] > range[0] and range[1] <= text.len) {
@@ -169,10 +177,10 @@ pub const MessageWidget = struct {
                 spans.append(arena, .{ .start = range[0], .end = range[1], .style = searchMatchStyle(p) }) catch {};
             }
         }
-        if (token_scan.scanPathLineTokens(arena, text, 64) catch null) |tokens| {
+        if (cached_path_tokens.len > 0) {
             var token_style = p.tool;
             token_style.ul_style = .single;
-            for (tokens) |tok| {
+            for (cached_path_tokens) |tok| {
                 spans.append(arena, .{ .start = tok.start, .end = tok.end, .style = token_style }) catch {};
             }
         }
@@ -196,10 +204,11 @@ pub const MessageWidget = struct {
         query: ?[]const u8,
         active_range: ?[2]usize,
         selection: ?[2]usize,
+        cached_path_tokens: []const token_scan.PathLineToken,
         p: *const tui_style.Palette,
         max_content_width: u16,
     ) void {
-        if (overlaySpans(ctx.arena, text, query, active_range, selection, p)) |spans| {
+        if (overlaySpans(ctx.arena, text, query, active_range, selection, cached_path_tokens, p)) |spans| {
             drawWrappedStyled(surface, text, spans, style, "", bar_style, selected, row, ctx, indent, p, max_content_width);
             return;
         }
@@ -227,35 +236,35 @@ pub const MessageWidget = struct {
                     anchor_style.dim = true;
                     drawLine(surface, anchor, anchor_style, styled_as_selected, &row, ctx, 2, null, p);
                 }
-                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
+                drawBodyText(surface, m.body, p.user, styled_as_selected, &row, ctx, 2, p.user, self.search_query, self.active_search_range, self.selection_range, self.message.scanCachePtr().ensurePathTokens(self.gpa, m.body), p, self.presentation.max_content_width);
             },
             .agent => drawMarkdown(self, surface, styled_as_selected, &row, ctx),
             .skill => |m| {
-                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, null, self.selection_range, p, self.presentation.max_content_width);
+                drawBodyText(surface, m.title, p.skill, styled_as_selected, &row, ctx, 2, p.skill, self.search_query, null, self.selection_range, &.{}, p, self.presentation.max_content_width);
                 if (m.expanded and m.body.len > 0) {
-                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
+                    drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 0, null, self.search_query, self.active_search_range, self.selection_range, self.message.scanCachePtr().ensurePathTokens(self.gpa, m.body), p, self.presentation.max_content_width);
                 }
             },
             .notice => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ")) "" else "! ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
+                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.active_search_range, self.selection_range, token_scan.scanPathLineTokens(ctx.arena, marked, 64) catch &.{}, p, self.presentation.max_content_width);
             },
             .success => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "✓ ")) "" else "✓ ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
+                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.active_search_range, self.selection_range, token_scan.scanPathLineTokens(ctx.arena, marked, 64) catch &.{}, p, self.presentation.max_content_width);
             },
-            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width),
+            .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.active_search_range, self.selection_range, self.message.scanCachePtr().ensurePathTokens(self.gpa, m.body), p, self.presentation.max_content_width),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
             .tool => |m| {
                 const title_style = if (m.failed) p.tool_failed else p.tool;
                 try drawToolTitle(surface, m, title_style, styled_as_selected, self.loading_frame, self.now_ms, &row, ctx, p, self.presentation.max_content_width);
-                if (m.expanded) try drawToolBody(surface, m, styled_as_selected, &row, ctx, self.search_query, self.selection_range, p, self.presentation.max_content_width);
+                if (m.expanded) try drawToolBody(surface, m, self.message.scanCachePtr(), self.gpa, styled_as_selected, &row, ctx, self.search_query, self.selection_range, p, self.presentation.max_content_width);
             },
             .thinking => |m| {
                 drawLine(surface, m.title, p.thinking_label, styled_as_selected, &row, ctx, 2, p.thinking_bar, p);
-                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query, self.active_search_range, self.selection_range, p, self.presentation.max_content_width);
+                if (m.expanded) drawBodyText(surface, m.body, p.thinking_body, styled_as_selected, &row, ctx, 2, p.thinking_bar, self.search_query, self.active_search_range, self.selection_range, self.message.scanCachePtr().ensurePathTokens(self.gpa, m.body), p, self.presentation.max_content_width);
             },
             .status => |m| drawLoading(surface, m.title, self.loading_frame, &row, ctx, p),
         }
@@ -739,7 +748,11 @@ fn drawMarkdown(
         };
     };
 
-    const match_spans: ?[]StyleSpan = MessageWidget.overlaySpans(ctx.arena, text, self.search_query, self.active_search_range, self.selection_range, p);
+    // Search-hit ranges over the body (issue #484). Markdown spans borrow the
+    // body bytes, so a span's absolute offset is `span.text.ptr - body.ptr`;
+    // owned-text spans (stacked table keys) fall outside the body bounds and
+    // simply never highlight.
+    const match_spans: ?[]StyleSpan = MessageWidget.overlaySpans(ctx.arena, text, self.search_query, self.active_search_range, self.selection_range, self.message.scanCachePtr().ensurePathTokens(self.gpa, text), p);
     for (rows) |markdown_row| {
         if (row.* >= surface.size.height) return;
         var start_col = markdown_row.indent;
@@ -806,6 +819,8 @@ fn markdownStyle(style: terminal_markdown.Style, p: *const tui_style.Palette) va
 fn drawToolBody(
     surface: *vxfw.Surface,
     message: transcript_mod.ToolView,
+    scan_cache: *transcript_mod.ScanCache,
+    gpa: std.mem.Allocator,
     selected: bool,
     row: *u16,
     ctx: vxfw.DrawContext,
@@ -819,32 +834,34 @@ fn drawToolBody(
         for (message.group_items) |item| {
             const item_text = try ctx.arena.dupe(u8, tui_metrics.formatGroupItemRow(&buf, item));
             const item_style = if (item.failed) p.tool_failed else p.thinking_body;
-            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, null, selection, p, max_content_width);
+            MessageWidget.drawBodyText(surface, item_text, item_style, selected, row, ctx, 0, null, query, null, selection, &.{}, p, max_content_width);
         }
         return;
     }
     if (message.parts.len > 0) {
         for (message.parts) |part| {
             switch (part.kind) {
-                .text => drawToolTextSegment(surface, part.text, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection, p, max_content_width),
+                .text => drawToolTextSegment(surface, part.text, null, gpa, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection, p, max_content_width),
                 .diff => try drawWrappedDiff(surface, part.text, selected, row, ctx, p, max_content_width),
                 .json => drawJson(surface, part, selected, row, ctx, p, max_content_width),
             }
         }
     } else if (message.body.len > 0) {
         switch (message.render) {
-            .plain, .shell => drawToolTextSegment(surface, message.body, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection, p, max_content_width),
+            .plain, .shell => drawToolTextSegment(surface, message.body, scan_cache, gpa, message.render, message.body_expanded_in_place, selected, row, ctx, query, selection, p, max_content_width),
             .diff => try drawWrappedDiff(surface, message.body, selected, row, ctx, p, max_content_width),
         }
     }
     if (message.stderr) |stderr| {
-        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, null, selection, p, max_content_width);
+        MessageWidget.drawBodyText(surface, stderr, p.tool_failed, selected, row, ctx, 0, null, query, null, selection, &.{}, p, max_content_width);
     }
 }
 
 fn drawToolTextSegment(
     surface: *vxfw.Surface,
     text: []const u8,
+    scan_cache: ?*transcript_mod.ScanCache,
+    gpa: std.mem.Allocator,
     render: transcript_mod.Render,
     expanded_in_place: bool,
     selected: bool,
@@ -859,17 +876,19 @@ fn drawToolTextSegment(
         var fbuf: [96]u8 = undefined;
         const formatted_footer = tui_metrics.formatTruncationFooter(&fbuf, ht.omitted_lines);
         const footer = ctx.arena.dupe(u8, formatted_footer) catch "… more lines · Enter to expand in place";
-        drawToolStyledText(surface, ht.head, render, selected, row, ctx, query, selection, p, max_content_width);
+        drawToolStyledText(surface, ht.head, null, gpa, render, selected, row, ctx, query, selection, p, max_content_width);
         MessageWidget.drawWrapped(surface, footer, .{ .fg = p.thinking_body.fg, .dim = true }, selected, row, ctx, 0, null, p, max_content_width);
-        drawToolStyledText(surface, ht.tail, render, selected, row, ctx, query, selection, p, max_content_width);
+        drawToolStyledText(surface, ht.tail, null, gpa, render, selected, row, ctx, query, selection, p, max_content_width);
         return;
     }
-    drawToolStyledText(surface, text, render, selected, row, ctx, query, selection, p, max_content_width);
+    drawToolStyledText(surface, text, scan_cache, gpa, render, selected, row, ctx, query, selection, p, max_content_width);
 }
 
 fn drawToolStyledText(
     surface: *vxfw.Surface,
     text: []const u8,
+    scan_cache: ?*transcript_mod.ScanCache,
+    gpa: std.mem.Allocator,
     render: transcript_mod.Render,
     selected: bool,
     row: *u16,
@@ -879,12 +898,13 @@ fn drawToolStyledText(
     p: *const tui_style.Palette,
     max_content_width: u16,
 ) void {
+    const path_tokens = if (scan_cache) |sc| sc.ensurePathTokens(gpa, text) else (token_scan.scanPathLineTokens(ctx.arena, text, 64) catch &.{});
     if (render != .shell) {
-        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, null, selection, p, max_content_width);
+        MessageWidget.drawBodyText(surface, text, p.thinking_body, selected, row, ctx, 0, null, query, null, selection, path_tokens, p, max_content_width);
         return;
     }
-    const tokens = token_scan.scanShellDiagnostics(ctx.arena, text, 64) catch &.{};
-    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, null, selection, p) orelse &.{};
+    const tokens = if (scan_cache) |sc| sc.ensureShellDiagnostics(gpa, text) else (token_scan.scanShellDiagnostics(ctx.arena, text, 64) catch &.{});
+    const overlays = MessageWidget.overlaySpans(ctx.arena, text, query, null, selection, path_tokens, p) orelse &.{};
     if (tokens.len == 0 and overlays.len == 0) {
         MessageWidget.drawWrapped(surface, text, p.thinking_body, selected, row, ctx, 0, null, p, max_content_width);
         return;

@@ -73,8 +73,6 @@ pub fn buildOverlayWidget(
         overlay.overlaySize(app.mode, max_w, max_h);
     const total_w: u16 = @min(size.width, max_w);
     const total_h: u16 = @min(size.height, max_h);
-    app.drawn_overlay_width = total_w;
-    app.drawn_overlay_height = total_h;
 
     const full_panel = (app.mode == .provider_picker and app.pickers.provider.stage == .form) or
         app.mode == .settings or app.mode == .help or app.mode == .mcp or
@@ -161,8 +159,7 @@ fn buildThemeContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Erro
 }
 
 fn buildPluginsContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Error!plugins_status.Content {
-    const installed_plugins = try plugin_store_job.installedPlugins(app.gpa, app);
-    defer app.gpa.free(installed_plugins);
+    const installed_plugins = app.plugin_store.installed_cache;
     var entries: std.ArrayList(plugins_status.PluginEntry) = .empty;
     for (installed_plugins) |plugin| try entries.append(arena, .{
         .name = plugin.name,
@@ -270,6 +267,7 @@ fn buildSessionContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         .palette = &app.palette,
+        .now_ms = app.wall_now_ms,
     };
 }
 

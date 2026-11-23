@@ -39,9 +39,6 @@ pub const TranscriptProps = struct {
     has_model_configured: bool,
     loading_frame: u8,
     blackhole_frame: u16,
-    /// Write-back into `App.metrics.blackhole_visible` — see
-    /// `updateBlackholeVisibility`.
-    blackhole_visible: *bool,
     /// The active input has text — the splash yields its rows while typing.
     /// Computed at the construction site (INV-WIDGET-1 scalar).
     splash_suppressed: bool = false,
@@ -49,8 +46,6 @@ pub const TranscriptProps = struct {
     active_search_hit: ?SearchHit = null,
     now_ms: i64 = 0,
     body_selection: ?transcript_mod.BodySelection = null,
-    /// Write-back: hit-test geometry for the "↓ new output" pill.
-    new_output_rect_out: ?*?app_state.ChipRect = null,
     palette: *const tui_style.Palette = &tui_style.default_palette,
     presentation: tui_metrics.PresentationConfig = .{},
 };
@@ -65,9 +60,6 @@ pub const TranscriptWidget = struct {
     has_model_configured: bool,
     loading_frame: u8,
     blackhole_frame: u16,
-    /// Write-back into `App.metrics.blackhole_visible` — see
-    /// `updateBlackholeVisibility`.
-    blackhole_visible: *bool,
     /// The active input has text — the splash yields its rows while typing.
     /// Computed at the construction site (INV-WIDGET-1 scalar).
     splash_suppressed: bool = false,
@@ -75,8 +67,6 @@ pub const TranscriptWidget = struct {
     active_search_hit: ?SearchHit = null,
     now_ms: i64 = 0,
     body_selection: ?transcript_mod.BodySelection = null,
-    /// Write-back: hit-test geometry for the "↓ new output" pill.
-    new_output_rect_out: ?*?app_state.ChipRect = null,
     palette: *const tui_style.Palette = &tui_style.default_palette,
     presentation: tui_metrics.PresentationConfig = .{},
 
@@ -87,13 +77,11 @@ pub const TranscriptWidget = struct {
             .has_model_configured = props.has_model_configured,
             .loading_frame = props.loading_frame,
             .blackhole_frame = props.blackhole_frame,
-            .blackhole_visible = props.blackhole_visible,
             .splash_suppressed = props.splash_suppressed,
             .search_query = props.search_query,
             .active_search_hit = props.active_search_hit,
             .now_ms = props.now_ms,
             .body_selection = props.body_selection,
-            .new_output_rect_out = props.new_output_rect_out,
             .palette = props.palette,
             .presentation = props.presentation,
         };
@@ -108,7 +96,8 @@ pub const TranscriptWidget = struct {
 
     fn drawTranscript(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
-        self.syncViewport(ctx);
+        const max_height = ctx.max.height orelse ctx.min.height;
+        const splash_viewport_height: u16 = @max(max_height -| ConversationLayout.top -| ConversationLayout.bottom, 1);
 
         const messages = self.thread.transcript.messages.items;
         // Splash-only state: the logo is the sole message and the user hasn't
@@ -124,7 +113,7 @@ pub const TranscriptWidget = struct {
             .gpa = self.gpa,
             .has_model_configured = self.has_model_configured,
             .splash_fills_viewport = splash_fills,
-            .splash_viewport_height = self.thread.transcript_view_height,
+            .splash_viewport_height = splash_viewport_height,
             .splash_suppressed = self.splash_suppressed,
             .search_query = self.search_query,
             .active_search_hit = self.active_search_hit,
@@ -142,7 +131,6 @@ pub const TranscriptWidget = struct {
             .padding = ConversationLayout.verticalPadding(self.presentation),
         };
         var surface = try list_padding.widget().draw(ctx);
-        self.updateBlackholeVisibility();
 
         // 1. Draw thin scrollbar if transcript overflows viewport
         const total_items: u16 = @intCast(messages.len);
@@ -190,9 +178,6 @@ pub const TranscriptWidget = struct {
             const pill_col = view_width -| pill_len -| 2;
             var pill_surf = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = pill_len, .height = 1 });
             panel.lineStyledAt(&pill_surf, 0, pill_text, ctx, 0, p.permission_approve) catch {};
-            if (self.new_output_rect_out) |out| {
-                out.* = .{ .row = pill_row, .col = pill_col, .width = pill_len };
-            }
             new_children[idx] = .{
                 .origin = .{ .row = @intCast(pill_row), .col = @intCast(pill_col) },
                 .surface = pill_surf,
@@ -203,26 +188,6 @@ pub const TranscriptWidget = struct {
 
         surface.children = new_children[0..idx];
         return surface;
-    }
-
-    // The intro animation only runs while the startup logo (message 0) is the
-    // first item the list view is rendering and the user isn't typing. Once a
-    // turn pushes it off the top, `scroll.top` advances and the animation tick
-    // is allowed to stop.
-    fn updateBlackholeVisibility(self: *TranscriptWidget) void {
-        const messages = self.thread.transcript.messages.items;
-        self.blackhole_visible.* = messages.len > 0 and
-            messages[0] == .logo and
-            self.thread.transcript_list.scroll.top == 0 and
-            !self.splash_suppressed;
-    }
-
-    fn syncViewport(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
-        const max_width = ctx.max.width orelse ctx.min.width;
-        const max_height = ctx.max.height orelse ctx.min.height;
-        self.thread.transcript_view_width = max_width;
-        self.thread.transcript_view_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        if (self.thread.transcript_view_height == 0) self.thread.transcript_view_height = 1;
     }
 
     fn syncCursor(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {

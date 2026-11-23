@@ -465,7 +465,7 @@ pub fn handleDiffBrowseKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vaxi
         ctx.consumeAndRedraw();
         return;
     }
-    const page: i32 = @intCast(@max(@as(u16, 1), app.diff.viewport_rows));
+    const page: i32 = @intCast(@max(@as(u16, 1), app.frame_geometry.diff_viewport_rows));
     if (key.matches(vaxis.Key.page_up, .{})) {
         app.diff.moveCursor(-page);
         ctx.consumeAndRedraw();

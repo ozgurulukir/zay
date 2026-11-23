@@ -52,8 +52,8 @@ pub fn hitTestTranscript(app: *App, row: u16, col: u16) ?HitTarget {
     const list_bottom_pad = ConversationLayout.bottom;
     var list_bottom: u16 = list_top_pad +| view_height;
 
-    if (app.split_rect_count > 0) {
-        const rects = app.split_rects[0..app.split_rect_count];
+    if (app.frame_geometry.split_rect_count > 0) {
+        const rects = app.frame_geometry.split_rects[0..app.frame_geometry.split_rect_count];
         var matched_driver = false;
         for (rects) |rect| {
             if (row >= rect.row and row < rect.row + rect.height and col >= rect.col and col < rect.col + rect.width) {
