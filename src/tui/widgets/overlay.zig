@@ -98,7 +98,7 @@ pub fn overlaySize(mode: Mode, max_cols: u16, max_rows: u16) OverlaySize {
 }
 
 /// Pure searchable overlay chrome: border + label + optional `>` search
-/// `TextField` + `─` separator + child `vxfw.Widget`. Zero `*App` dependency.
+/// `TextField` + `─` separator + child `vxfw.Widget`. Zero App-pointer dependency.
 pub const SearchableOverlayChrome = struct {
     label: []const u8,
     width: u16,
