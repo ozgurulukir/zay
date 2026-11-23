@@ -139,13 +139,51 @@ fn driverWorkspacePath(app: *const App) ?[]const u8 {
     return agent.workspaceBorrow();
 }
 
+/// Modal layer priority shared by rendering (`drawRoot`) and input routing
+/// (`event_router`) so visual z-order and input capture order never diverge.
+pub const ModalLayer = enum {
+    overlay,
+    permission,
+    background,
+    at_search,
+    none,
+};
+
+pub fn activeModalLayer(app: *App) ModalLayer {
+    if (app.mode != .normal and app.mode != .diff_viewer) return .overlay;
+    if (app.permissionPending()) return .permission;
+    if (app.background_modal_state.modal) return .background;
+    if (app.at_search != .closed) return .at_search;
+    return .none;
+}
+
+/// Build `TranscriptProps` for any lane (single-pane or split-pane) so both
+/// `drawRoot` and `buildLaneColumnProps` pass the exact same props.
+pub fn buildTranscriptProps(app: *App, lane: *tui.Thread, now_ms: i64) tx_widget.TranscriptProps {
+    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+    const active_hit = app.pickers.search.activeHit();
+    return .{
+        .thread = lane,
+        .gpa = app.gpa,
+        .has_model_configured = has_model,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+        // Only the pane whose lane owns the shared input yields its splash;
+        // sibling lanes keep theirs until their own first prompt.
+        .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
+        .search_query = app.pickers.search.query,
+        .active_search_hit = if (active_hit) |h| .{ .message_index = h.message_index, .start = h.start, .end = h.end } else null,
+        .now_ms = now_ms,
+        .body_selection = lane.transcript.body_selection,
+        .new_output_rect_out = if (lane == app.thread) &app.nav.new_output_rect else null,
+    };
+}
+
 /// Build a lane column's per-frame view model (INV-WIDGET-1): every fact
 /// `LaneColumnWidget` renders, computed HERE from the App, so the widget
 /// stays a pure function of its props.
-pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u16, active: bool, focused: bool) lane_column.LaneColumnProps {
-    // The model flag mirrors the pre-scalarization behavior: always the
-    // ACTIVE lane's runtime, never the rendered lane's.
-    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u16, active: bool, focused: bool, now_ms: i64) lane_column.LaneColumnProps {
     const title: []const u8 = if (lane.title) |t| t else "untitled";
     // Turn-state marker (S14): a spinner frame while the lane's turn is
     // running, a stop glyph while interrupting, a quiet dot when idle. A
@@ -175,20 +213,10 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
         border_style = tui_style.activePalette().border_label;
     }
     return .{
-        .lane = lane,
+        .transcript = buildTranscriptProps(app, lane, now_ms),
         .width = width,
         .height = height,
         .active = active,
-        .gpa = app.gpa,
-        .has_model_configured = has_model,
-        .loading_frame = app.metrics.loading_frame,
-        .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
-        .blackhole_visible = &app.metrics.blackhole_visible,
-        // Only the pane whose lane owns the shared input yields its splash;
-        // sibling lanes keep theirs until their own first prompt.
-        .splash_suppressed = (lane == app.thread) and app.inputs.input.buf.realLength() > 0,
-        .search_query = app.pickers.search.query,
-        .body_selection = lane.transcript.body_selection,
         .title = title,
         .state_glyph = state_glyph,
         .ws_marker = ws_marker,
@@ -242,6 +270,7 @@ fn buildTopWidget(
     split_cols: []const root_layout.ColumnRect,
     max_width: u16,
     transcript_height: u16,
+    now_ms: i64,
     transcript_view: *tx_widget.TranscriptWidget,
     bufs: *TopWidgetBuffers,
 ) vxfw.Widget {
@@ -253,7 +282,7 @@ fn buildTopWidget(
                 const active = (col.lane_index == 0) or (col.lane_index == worker_focus);
                 const focused = (col.lane_index == worker_focus);
                 bufs.dual_lane_widgets[i] = .{
-                    .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused),
+                    .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused, now_ms),
                 };
                 bufs.dual_lane_boxes[i] = .{
                     .child = bufs.dual_lane_widgets[i].widget(),
@@ -275,7 +304,7 @@ fn buildTopWidget(
                 const active = (col.lane_index == @as(usize, app.activeIndex()));
                 const focused = (col.lane_index == @as(usize, app.activeIndex()));
                 bufs.grid_lane_widgets[i] = .{
-                    .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused),
+                    .props = buildLaneColumnProps(app, lane, col.width, col.height, active, focused, now_ms),
                 };
                 bufs.grid_lane_boxes[i] = .{
                     .child = bufs.grid_lane_widgets[i].widget(),
@@ -491,12 +520,6 @@ fn buildOverlayChildren(
 }
 
 pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-    if (app.mode == .diff_viewer) {
-        app.split_rect_count = 0;
-        var surface = try diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
-        try materializeBlankCells(ctx.arena, &surface);
-        return surface;
-    }
     const max_width = ctx.max.width orelse ctx.min.width;
     const max_height = ctx.max.height orelse ctx.min.height;
     if (max_width < root_layout.min_usable_width or max_height < root_layout.min_usable_height) {
@@ -517,11 +540,45 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         try materializeBlankCells(ctx.arena, &surface);
         return surface;
     }
+
+    const modal_layer = activeModalLayer(app);
+    const toast_visible = toast.global.hasToasts();
+    var overlay_view: overlay.OverlayWidget = .{ .app = app };
+
+    if (app.mode == .diff_viewer) {
+        app.split_rect_count = 0;
+        app.nav.lanes_chip_rect = null;
+        app.nav.new_output_rect = null;
+        const diff_layout: root_layout.RootLayout = .{
+            .input_height = 0,
+            .loading_height = 0,
+            .transcript_height = max_height,
+            .loading_row = max_height,
+            .input_row = max_height,
+        };
+        const main_surface = try diff_viewer_overlay.drawDiffViewer(app, root_widget, ctx);
+        const children = try buildOverlayChildren(app, ctx, diff_layout, max_width, max_height, main_surface, &overlay_view, .{
+            .overlay_visible = false,
+            .permission_visible = modal_layer == .permission,
+            .background_visible = modal_layer == .background,
+            .at_visible = modal_layer == .at_search,
+            .toast_visible = toast_visible,
+        });
+        var surface: vxfw.Surface = .{
+            .size = .{ .width = max_width, .height = max_height },
+            .widget = root_widget,
+            .buffer = &.{},
+            .children = children,
+        };
+        try materializeBlankCells(ctx.arena, &surface);
+        return surface;
+    }
+
     const loading_visible = app.thread.turn_view.awaitingOutput();
     const split = app.split_mode != .tab and app.threads.len() > 1;
 
     const input_combined = try std.mem.concat(ctx.arena, u8, &.{ app.inputs.input.buf.firstHalf(), app.inputs.input.buf.secondHalf() });
-    const layout = root_layout.rootLayout(max_height, false, input_mod.wrappedTextRows(ctx, input_combined, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
+    const layout = root_layout.rootLayout(max_height, input_mod.wrappedTextRows(ctx, input_combined, max_width -| 4), loading_visible or split, app.thread.queued.items.len > 0);
 
     var split_cols: []const root_layout.ColumnRect = &.{};
     var split_rects: [4]root_layout.ColumnRect = undefined;
@@ -535,22 +592,7 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     app.nav.new_output_rect = null;
 
     const now_ms = std.Io.Clock.now(.awake, app.getIo()).toMilliseconds();
-    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
-    const active_hit = app.pickers.search.activeHit();
-    var transcript_view: tx_widget.TranscriptWidget = .{
-        .thread = app.thread,
-        .gpa = app.gpa,
-        .has_model_configured = has_model,
-        .loading_frame = app.metrics.loading_frame,
-        .blackhole_frame = if (app.cached_config.tui.animations == .full) app.metrics.blackhole_frame else 0,
-        .blackhole_visible = &app.metrics.blackhole_visible,
-        .splash_suppressed = app.inputs.input.buf.realLength() > 0,
-        .search_query = app.pickers.search.query,
-        .active_search_hit = if (active_hit) |h| .{ .message_index = h.message_index, .start = h.start, .end = h.end } else null,
-        .now_ms = now_ms,
-        .body_selection = app.thread.transcript.body_selection,
-        .new_output_rect_out = &app.nav.new_output_rect,
-    };
+    var transcript_view = tx_widget.TranscriptWidget.fromProps(buildTranscriptProps(app, app.thread, now_ms));
     const stalled = app.thread.last_activity_ms > 0 and (now_ms - app.thread.last_activity_ms >= 15_000);
     var progress_buf: [128]u8 = undefined;
     const progress_label: []const u8 = try ctx.arena.dupe(u8, turn_view_mod.TurnView.formatProgressLabel(
@@ -565,16 +607,9 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         .loading_frame = app.metrics.loading_frame,
     };
     var input_view: input_mod.InputWidget = .{ .props = buildInputProps(app, ctx.arena, input_combined) };
-    var overlay_view: overlay.OverlayWidget = .{ .app = app };
-
-    const overlay_visible = app.mode != .normal;
-    const permission_visible = app.permissionPending() and !overlay_visible;
-    const background_visible = app.background_modal_state.modal and !overlay_visible and !permission_visible;
-    const at_visible = (app.at_search != .closed) and !overlay_visible and !permission_visible and !background_visible;
-    const toast_visible = toast.global.hasToasts();
 
     var top_bufs: TopWidgetBuffers = .{};
-    const top_widget = buildTopWidget(app, split, split_cols, max_width, layout.transcript_height, &transcript_view, &top_bufs);
+    const top_widget = buildTopWidget(app, split, split_cols, max_width, layout.transcript_height, now_ms, &transcript_view, &top_bufs);
 
     var main_flex_buf: [3]vxfw.FlexItem = undefined;
     var main_flex_count: usize = 0;
@@ -607,10 +642,10 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     ));
 
     const children = try buildOverlayChildren(app, ctx, layout, max_width, max_height, main_surface, &overlay_view, .{
-        .overlay_visible = overlay_visible,
-        .permission_visible = permission_visible,
-        .background_visible = background_visible,
-        .at_visible = at_visible,
+        .overlay_visible = modal_layer == .overlay,
+        .permission_visible = modal_layer == .permission,
+        .background_visible = modal_layer == .background,
+        .at_visible = modal_layer == .at_search,
         .toast_visible = toast_visible,
     });
 

@@ -29,6 +29,30 @@ pub const SearchHit = struct {
     end: usize,
 };
 
+pub const TranscriptProps = struct {
+    /// The lane this pane renders — the active lane today; any lane once tiled.
+    thread: *Thread,
+    /// Per-frame scalars computed by the construction site (INV-WIDGET-1).
+    gpa: std.mem.Allocator,
+    /// `tui_status.modelStatus(live_runtime, cached_config) != null` —
+    /// precomputed so this leaf never touches the App or config modules.
+    has_model_configured: bool,
+    loading_frame: u8,
+    blackhole_frame: u16,
+    /// Write-back into `App.metrics.blackhole_visible` — see
+    /// `updateBlackholeVisibility`.
+    blackhole_visible: *bool,
+    /// The active input has text — the splash yields its rows while typing.
+    /// Computed at the construction site (INV-WIDGET-1 scalar).
+    splash_suppressed: bool = false,
+    search_query: ?[]const u8 = null,
+    active_search_hit: ?SearchHit = null,
+    now_ms: i64 = 0,
+    body_selection: ?transcript_mod.BodySelection = null,
+    /// Write-back: hit-test geometry for the "↓ new output" pill.
+    new_output_rect_out: ?*?app_state.ChipRect = null,
+};
+
 pub const TranscriptWidget = struct {
     /// The lane this pane renders — the active lane today; any lane once tiled.
     thread: *Thread,
@@ -51,6 +75,23 @@ pub const TranscriptWidget = struct {
     body_selection: ?transcript_mod.BodySelection = null,
     /// Write-back: hit-test geometry for the "↓ new output" pill.
     new_output_rect_out: ?*?app_state.ChipRect = null,
+
+    pub fn fromProps(props: TranscriptProps) TranscriptWidget {
+        return .{
+            .thread = props.thread,
+            .gpa = props.gpa,
+            .has_model_configured = props.has_model_configured,
+            .loading_frame = props.loading_frame,
+            .blackhole_frame = props.blackhole_frame,
+            .blackhole_visible = props.blackhole_visible,
+            .splash_suppressed = props.splash_suppressed,
+            .search_query = props.search_query,
+            .active_search_hit = props.active_search_hit,
+            .now_ms = props.now_ms,
+            .body_selection = props.body_selection,
+            .new_output_rect_out = props.new_output_rect_out,
+        };
+    }
 
     pub fn widget(self: *TranscriptWidget) vxfw.Widget {
         return .{

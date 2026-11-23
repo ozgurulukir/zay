@@ -139,37 +139,17 @@ test "diff count labels keep signs next to numbers" {
     try std.testing.expectEqualStrings("-99999", large_deletions);
 }
 
-test "root layout keeps input fixed when panel opens" {
-    const normal = root_layout.rootLayout(30, false, 1, false, false);
-    const picker = root_layout.rootLayout(30, true, 1, false, false);
-
-    try std.testing.expectEqual(normal.input_row, picker.input_row);
-    try std.testing.expectEqual(normal.transcript_height, picker.transcript_height);
-    try std.testing.expectEqual(@as(u16, 19), picker.panel_row);
-    try std.testing.expectEqual(@as(u16, 7), picker.panel_height);
-}
-
-test "root layout clamps panel above input on short screens" {
-    const layout = root_layout.rootLayout(8, true, 1, false, false);
-
-    try std.testing.expectEqual(@as(u16, 4), layout.input_height);
-    try std.testing.expectEqual(@as(u16, 4), layout.transcript_height);
-    try std.testing.expectEqual(@as(u16, 4), layout.panel_height);
-    try std.testing.expectEqual(@as(u16, 0), layout.panel_row);
-    try std.testing.expectEqual(@as(u16, 4), layout.input_row);
-}
-
 test "root layout grows the input as text rows increase" {
-    const one = root_layout.rootLayout(30, false, 1, false, false);
+    const one = root_layout.rootLayout(30, 1, false, false);
     try std.testing.expectEqual(@as(u16, 4), one.input_height);
     try std.testing.expectEqual(@as(u16, 26), one.transcript_height);
 
-    const three = root_layout.rootLayout(30, false, 3, false, false);
+    const three = root_layout.rootLayout(30, 3, false, false);
     try std.testing.expectEqual(@as(u16, 6), three.input_height);
     try std.testing.expectEqual(@as(u16, 24), three.transcript_height);
 
     // A short screen still leaves the transcript some room.
-    const tight = root_layout.rootLayout(10, false, 6, false, false);
+    const tight = root_layout.rootLayout(10, 6, false, false);
     try std.testing.expectEqual(@as(u16, 7), tight.input_height);
     try std.testing.expectEqual(@as(u16, 3), tight.transcript_height);
 }
@@ -178,8 +158,8 @@ test "root layout reserves a row for the queued-message line" {
     // A queued (steered) message draws an extra line above the input border, so
     // the input region must grow by one row — otherwise the hint + diff counts
     // get squeezed out (regression: they vanished after sending mid-generation).
-    const plain = root_layout.rootLayout(30, false, 1, false, false);
-    const queued = root_layout.rootLayout(30, false, 1, false, true);
+    const plain = root_layout.rootLayout(30, 1, false, false);
+    const queued = root_layout.rootLayout(30, 1, false, true);
     try std.testing.expectEqual(plain.input_height + 1, queued.input_height);
 }
 
@@ -390,22 +370,22 @@ test "lane column props preserve active/focused border and splash suppression" {
     const accent = @import("style.zig").activePalette().border_label;
 
     // Focused + knob on: high-contrast accent border, splash suppressed.
-    const focused_active = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true);
+    const focused_active = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true, 0);
     try std.testing.expect(focused_active.border_style.eql(accent));
-    try std.testing.expect(focused_active.splash_suppressed);
+    try std.testing.expect(focused_active.transcript.splash_suppressed);
     try std.testing.expectEqualStrings("untitled", focused_active.title);
     try std.testing.expectEqualStrings("·", focused_active.state_glyph);
-    try std.testing.expect(focused_active.blackhole_visible == &app.metrics.blackhole_visible);
+    try std.testing.expect(focused_active.transcript.blackhole_visible == &app.metrics.blackhole_visible);
 
     // Unfocused sibling: dim border, no splash suppression, own title.
-    const unfocused = draw_root_layout.buildLaneColumnProps(&app, sibling, 40, 10, false, false);
+    const unfocused = draw_root_layout.buildLaneColumnProps(&app, sibling, 40, 10, false, false, 0);
     try std.testing.expect(unfocused.border_style.dim);
-    try std.testing.expect(!unfocused.splash_suppressed);
+    try std.testing.expect(!unfocused.transcript.splash_suppressed);
     try std.testing.expectEqualStrings("side", unfocused.title);
 
     // Knob off: focus falls back to the plain active (non-dim) style.
     app.cached_config.tui.highlight_focused_border = false;
-    const knob_off = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true);
+    const knob_off = draw_root_layout.buildLaneColumnProps(&app, app.thread, 40, 10, true, true, 0);
     try std.testing.expect(!knob_off.border_style.dim);
 }
 
@@ -1577,7 +1557,7 @@ test "awaiting turn draws loading outside the transcript list" {
     try std.testing.expectEqual(@as(usize, 3), main_surface.children.len);
     try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript_list.item_count);
     try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
-    try std.testing.expectEqual(root_layout.rootLayout(10, false, 1, true, false).loading_row, main_surface.children[1].origin.row);
+    try std.testing.expectEqual(root_layout.rootLayout(10, 1, true, false).loading_row, main_surface.children[1].origin.row);
 }
 
 test "awaiting turn preserves selected long message inner scroll" {
@@ -4508,4 +4488,138 @@ test "mouse click outside modal overlay dismisses overlay" {
 
     try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = outside_click });
     try std.testing.expectEqual(app_state_mod.Mode.normal, app.getMode());
+}
+
+test "activeModalLayer and Escape routing prioritize permission over background modal (#562)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    // Wire a worker context with a pending approval while the background modal is open.
+    app.thread.worker_context = .{ .gpa = gpa, .io = io };
+    app.thread.worker_context.?.approval.command = try gpa.dupe(u8, "echo test");
+    app.thread.worker_context.?.approval.tool_name = "bash";
+    app.background_modal_state.modal = true;
+
+    try std.testing.expectEqual(draw_root_layout.ModalLayer.permission, draw_root_layout.activeModalLayer(&app));
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // Escape must reject the pending permission rather than closing the hidden background modal.
+    try event_router.captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+    try std.testing.expect(app.background_modal_state.modal);
+    try std.testing.expect(app.thread.worker_context.?.approval.decision != null);
+    try std.testing.expectEqual(@import("agent_worker.zig").ApprovalDecision.reject, app.thread.worker_context.?.approval.decision.?);
+    gpa.free(app.thread.worker_context.?.approval.command.?);
+    app.thread.worker_context.?.approval.command = null;
+    app.thread.worker_context = null;
+}
+
+test "LaneColumnWidget forwards now_ms and active_search_hit identically to TranscriptWidget (#563)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const msg_idx = try app.thread.transcript.append(gpa, .agent, "agent", "echo needle");
+    app.pickers.search.query = try gpa.dupe(u8, "needle");
+    try app.pickers.search.hits.append(gpa, .{
+        .message_index = msg_idx,
+        .start = 5,
+        .end = 11,
+    });
+    app.pickers.search.active_hit = 0;
+
+    const props = draw_root_layout.buildLaneColumnProps(&app, app.thread, 60, 12, true, false, 6000);
+    try std.testing.expectEqual(@as(i64, 6000), props.transcript.now_ms);
+    try std.testing.expect(props.transcript.active_search_hit != null);
+    try std.testing.expectEqual(msg_idx, props.transcript.active_search_hit.?.message_index);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 60, .height = 12 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    var col_widget: @import("lane_column.zig").LaneColumnWidget = .{ .props = props };
+    const col_surface = try col_widget.widget().draw(ctx);
+    try std.testing.expect(col_surface.children.len > 0);
+}
+
+test "overlay mouse click selects clicked row before submitting (#564)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.setMode(.command);
+    app.nav.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
+    app.nav.command_selection = 0;
+
+    // `overlay_panel_rect` is the Border surface: row 5 is top border, row 6 is `>`,
+    // row 7 is `─`, row 8 is item 0, row 9 is item 1, row 10 is item 2, row 19 is bottom border.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // Clicking the bottom border (row 19) or separator (row 7) must not submit.
+    const bottom_border_click: vaxis.Mouse = .{ .row = 19, .col = 15, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = bottom_border_click });
+    try std.testing.expectEqual(app_state_mod.Mode.command, app.getMode());
+    const separator_click: vaxis.Mouse = .{ .row = 7, .col = 15, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = separator_click });
+    try std.testing.expectEqual(app_state_mod.Mode.command, app.getMode());
+
+    app.setMode(.theme_picker);
+    app.pickers.theme.selection = 0;
+    const click_row_2: vaxis.Mouse = .{ .row = 10, .col = 15, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = click_row_2 });
+    try std.testing.expectEqual(@as(u32, 2), app.pickers.theme.selection);
+}
+
+test "drawRoot composites toast over diff_viewer (#570)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.setMode(.diff_viewer);
+    const toast_mod = @import("toast.zig");
+    toast_mod.global.init(io);
+    toast_mod.global.count = 0;
+    toast_mod.global.head = 0;
+    defer {
+        toast_mod.global.count = 0;
+        toast_mod.global.head = 0;
+    }
+    toast_mod.global.push(.info, "Diff toast visible");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root_widget: RootWidget = .{ .app = &app };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try root_widget.widget().draw(ctx);
+    // Child 0 is main_surface (diff viewer), child 1 is toast.Widget at z_index 4.
+    try std.testing.expectEqual(@as(usize, 2), surface.children.len);
+    try std.testing.expectEqual(@as(u8, 4), surface.children[1].z_index);
 }
