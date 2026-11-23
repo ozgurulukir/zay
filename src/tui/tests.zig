@@ -4568,21 +4568,24 @@ test "overlay mouse click selects clicked row before submitting (#564)" {
     app.nav.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 40, .height = 15 };
     app.nav.command_selection = 0;
 
-    // Row 5 is `>`, row 6 is `─`, row 7 is item 0, row 8 is item 1 (`help` or second command).
-    // Click on row 8 (item index 1) and verify selection updates to 1 before submit.
+    // `overlay_panel_rect` is the Border surface: row 5 is top border, row 6 is `>`,
+    // row 7 is `─`, row 8 is item 0, row 9 is item 1, row 10 is item 2, row 19 is bottom border.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var root: RootWidget = .{ .app = &app };
     var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
 
-    // Use theme_picker with a known non-closing or predictable selection, or check command_selection
-    // on an out-of-bounds row first (should not submit).
-    const oob_click: vaxis.Mouse = .{ .row = 19, .col = 15, .type = .press, .button = .left, .mods = .{} };
-    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = oob_click });
-    // Even if total commands >= 12, let's test theme_picker with 2+ themes where we can check selection:
+    // Clicking the bottom border (row 19) or separator (row 7) must not submit.
+    const bottom_border_click: vaxis.Mouse = .{ .row = 19, .col = 15, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = bottom_border_click });
+    try std.testing.expectEqual(app_state_mod.Mode.command, app.getMode());
+    const separator_click: vaxis.Mouse = .{ .row = 7, .col = 15, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = separator_click });
+    try std.testing.expectEqual(app_state_mod.Mode.command, app.getMode());
+
     app.setMode(.theme_picker);
     app.pickers.theme.selection = 0;
-    const click_row_2: vaxis.Mouse = .{ .row = 9, .col = 15, .type = .press, .button = .left, .mods = .{} };
+    const click_row_2: vaxis.Mouse = .{ .row = 10, .col = 15, .type = .press, .button = .left, .mods = .{} };
     try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = click_row_2 });
     try std.testing.expectEqual(@as(u32, 2), app.pickers.theme.selection);
 }

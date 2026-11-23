@@ -43,10 +43,12 @@ const toast = @import("toast.zig");
 fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) bool {
     if (mouse_row < 0) return false;
     const m_row: u16 = @intCast(mouse_row);
-    // Row 0 is the `>` search prompt and row 1 is the `─` separator.
-    if (m_row < rect.row + 2) return false;
-    const clicked_row: u32 = m_row - (rect.row + 2);
-    const content_h: u16 = rect.height -| 2;
+    // `rect` is the Border surface: row +0 is the top border, +1 is `>`,
+    // +2 is `─`, +3..height-2 are list rows, and height-1 is the bottom border.
+    if (rect.height < 5) return false;
+    if (m_row < rect.row + 3 or m_row >= rect.row + rect.height - 1) return false;
+    const clicked_row: u32 = m_row - (rect.row + 3);
+    const content_h: u16 = rect.height - 4;
 
     switch (app.getMode()) {
         .command => {
