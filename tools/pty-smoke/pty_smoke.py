@@ -81,11 +81,12 @@ class PosixPty:
         import struct
         import termios
 
+        exe = os.path.abspath(exe) if os.sep in exe or (os.altsep and os.altsep in exe) else exe
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             try:
                 os.chdir(cwd)
-                os.execv(exe, [exe])
+                os.execvp(exe, [exe])
             except OSError:
                 pass
             os._exit(127)
@@ -126,6 +127,10 @@ class PosixPty:
         try:
             os.waitpid(self.pid, 0)
         except ChildProcessError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
             pass
 
 
