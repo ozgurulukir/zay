@@ -528,18 +528,21 @@ fn renderLine(gpa: std.mem.Allocator, b: *RowBuilder, line: []const u8, width: u
         },
         .none => {},
     }
-    if (line.len == 0) {
-        if (!state.in_code) state.list_continuation_indent = 0;
-        return appendEmptyRow(gpa, b);
-    }
     if (state.in_code) {
         const prefix = [_]Span{.{ .text = "│ ", .style = .code_border }};
+        if (line.len == 0) {
+            return b.push(gpa, 0, &prefix);
+        }
         const spans = tokenizeCodeLine(gpa, line, state.code_lang, state) catch null;
         if (spans) |s| {
             defer gpa.free(s);
             return appendWrapped(gpa, b, &prefix, 2, s, width);
         }
         return renderPlainLine(gpa, b, line, width, .code, 2, &prefix);
+    }
+    if (line.len == 0) {
+        state.list_continuation_indent = 0;
+        return appendEmptyRow(gpa, b);
     }
     if (headingBody(line)) |heading| {
         state.list_continuation_indent = 0;
@@ -3146,14 +3149,16 @@ test "bare urls exclude trailing sentence punctuation" {
 
 test "fenced code blocks emit header/footer and countRows matches render" {
     const gpa = std.testing.allocator;
-    const with_lang = "```zig\nconst x = 1;\n```";
+    const with_lang = "```zig\nconst x = 1;\n\nconst y = 2;\n```";
     var out1 = try render(gpa, with_lang, 30);
     defer out1.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 3), out1.rows.len);
+    try std.testing.expectEqual(@as(usize, 5), out1.rows.len);
     try std.testing.expectEqual(out1.rows.len, countRows(gpa, with_lang, 30));
     try std.testing.expect(containsStyledText(out1.rows[0].spans, .code_border, "zig"));
     try std.testing.expect(containsStyledText(out1.rows[1].spans, .code_border, "│ "));
-    try std.testing.expect(containsStyledText(out1.rows[2].spans, .code_border, "╰"));
+    try std.testing.expect(containsStyledText(out1.rows[2].spans, .code_border, "│ "));
+    try std.testing.expect(containsStyledText(out1.rows[3].spans, .code_border, "│ "));
+    try std.testing.expect(containsStyledText(out1.rows[4].spans, .code_border, "╰"));
 
     const no_lang = "```\nplain code\n```";
     var out2 = try render(gpa, no_lang, 30);
