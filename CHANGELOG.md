@@ -6,6 +6,22 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-24
+
+### Added
+- TUI: mouse drag selection with double/triple click, path:line token actions, and copy-as-Markdown (#513-514); input edit in $EDITOR (Ctrl+X Ctrl+E), paste-collapse placeholder, overflow indicator, and unified single/multi-row draw path (#509-510, #511, #512); search match cycling (n/N + n/m) with stalled-stream and per-tool elapsed indicators (#502-503); tool truncation (head+tail), consecutive tool grouping, and .shell diagnostic highlighting (#499-500-501); links-in-message picker with full-value detail footer (#504-506); settings density, transcript density, turn timestamps, and maxContentWidth live preview (#507-508); turn progress indicator, tool duration/exit titles, and search hit highlighting (#496); language-aware code highlighting with multi-line state and safer hyperlinks (#494); markdown lists, rules, fences, inline, and content-sized aligned tables (#493); prompt undo/redo, reverse-i-search history, and Shift-arrow body selection (#498).
+- Config: maxContentWidth settings row, transcript density setting, and turn separators/timestamps (#507-508).
+
+### Fixed
+- Security/classifier: split '='-attached option values (e.g. ripgrep --pre=<program>) so option values are no longer invisible to token rules, and flag program-exec options (#595, #598); harden shell containment guard and redirect safety bypasses (#536-537); background log file permissions and output tail truncation (#537).
+- Background/agent: harden cd guard, redirect safety, temp pruning, and log permissions; surface silent failures on deferred stream flush, compaction notices, and snapshot refs (#547, #548, #558).
+- Tools/shell: refuse capped edits and page reads through the bridge line range (#591); harden tools, db_server, classifier, and markdown cache (#553).
+- AI/auth: head-phase timeout gap and streaming wire-format correctness; SSE framing; OAuth dual-stack; atomic model cache writes (#538, #548).
+- Lua/plugins: unify plugin discovery roots, fix repointProjectDir aliased-global reload and loadLuaFile chunkname bug, and deduplicate bridge/test seams (#592); fix grep/glob reliability: regex default & metacharacters, 512 KB rg --json overflow, timeout/classifier mismatches, and walker hardening (#590, #594); close plugin reload and int-coercion hazards (#596).
+- MCP: EOF/SSE handling and identity validation gaps (#549).
+- DB/session: writer quiesce violations and permanent persistence suspension; session config security; writer quiesce/recovery, URL redaction, project trust & migration checks (#541, #542, #550).
+- Build/CI: compile executable in CI, harden vcs.restore/indexPath, fix install.sh (#544, #552).
+- TUI: fix NO_COLOR intro panic, palette wiring, modal bg fills, and /theme preview sync (#585); unify key/focus dispatch and fix /help Enter submission bug (#586); unify FrameGeometry with widget layout and fix stale transcript viewport (#587); enforce draw purity and bound 30ms tick scheduling (#588); complete INV-WIDGET-1 boundaries, unify list scrolling, and fix overlay hit-testing (#589); unify modal layer priority, overlay input routing, split-pane props, and diff surface compositing (#574); sync presentation state on resume, guarantee theme preview revert, and gate tick/split wakeups (#575); fix light-theme badge contrast, add semantic Palette tokens, and add stateful ViewportWindow scrolling (#576); decompose OverlayWidget into SearchableOverlayChrome and frame-boundary builders (#577); move global palette and presentation metrics onto App (#578); pre-draw FrameGeometry and draw-path cache purity (#579); fix overlapping message highlights, fenced code containers, and list lazy continuations (#527); opaque modal/toast backgrounds, toast icons & Esc dismiss, input hint & overflow layout (#526); unify grapheme text fitting/wrapping and compute scrollbar from visual rows (#525).
 ## [0.11.15] - 2026-11-19
 
 ### Fixed
@@ -208,7 +224,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.11.15...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.0
 [0.11.15]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.15
 [0.11.14]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.14
 [0.11.13]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.13
