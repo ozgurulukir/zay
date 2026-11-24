@@ -143,6 +143,7 @@ const RuleId = enum {
     privileged_pm_escalator,
     privileged_pm_manager,
     privileged_pm_phrase,
+    program_exec_option,
 };
 
 const Rule = struct {
@@ -182,6 +183,9 @@ const rules = [_]Rule{
     .{ .id = .privileged_pm_escalator, .matches = isPrivilegedPmEscalator },
     .{ .id = .privileged_pm_manager, .matches = isPrivilegedPmManager },
     .{ .id = .privileged_pm_phrase, .matches = isPrivilegedPmPhrase },
+    // Options that execute a program or load additional flags from a file
+    // (`rg --pre=rm`, `find -exec`, `tar --use-compress-program=...`).
+    .{ .id = .program_exec_option, .matches = isProgramExecOption },
 };
 
 // ── Lone search commands: arguments are data, never code ─────────────
@@ -415,20 +419,36 @@ fn isPrivilegedPmPhrase(command: []const u8) bool {
     return false;
 }
 
+/// True when `command` uses a flag that executes an arbitrary program or
+/// loads further options (`rg --pre=...`, `find -exec`, `tar
+/// --use-compress-program=...`). Matched as a whole normalized token so
+/// `--pre` flags `--pre=rm` without false-positiving on `--pre-glob`.
+fn isProgramExecOption(command: []const u8) bool {
+    const options = [_][]const u8{
+        "--pre",
+        "--hostname-bin",
+        "--config-path",
+        "--filter",
+        "--use-compress-program",
+        "--compress-program",
+        "-exec",
+        "-execdir",
+    };
+    for (options) |opt| {
+        if (tokenContains(command, opt)) return true;
+    }
+    return false;
+}
+
 /// Case-insensitive check that `needle` appears as a whole token anywhere in
-/// `command`, where tokens are split on whitespace AND shell metacharacters
-/// (`; | & ( ) < > / . \'"\\``). This catches `apt;install`, `/usr/bin/apt`,
-/// `./apt`, and `apt\ninstall` — all of which a space-only split would miss.
-/// Copy `command` into `buf`, mapping shell metacharacters that act as token
-/// separators but are not spaces (newline, tab, `; | & ( ) < > / . ' " \``) to a
-/// single space, and collapsing runs of whitespace to one space, so a space-only
-/// split sees `apt;install` / `/usr/bin/apt` / `apt\ninstall` / `pip  install`
-/// (double space) as the same tokens as `apt install`. Returns a slice of `buf`
-/// (caller owns buf).
+/// `command`, where tokens are split on whitespace, `=`, AND shell
+/// metacharacters (`; | & ( ) < > / . \'"\\``). This catches `apt;install`,
+/// `/usr/bin/apt`, `./apt`, `apt\ninstall`, and `--opt=sudo` — all of which
+/// a space-only split would miss.
 fn isNormalizedSep(ch: u8) bool {
     return ch == ' ' or ch == '\n' or ch == '\t' or ch == ';' or ch == '|' or ch == '&' or
         ch == '(' or ch == ')' or ch == '<' or ch == '>' or ch == '/' or
-        ch == '.' or ch == '\'' or ch == '"' or ch == '`';
+        ch == '.' or ch == '\'' or ch == '"' or ch == '`' or ch == '=';
 }
 
 /// Stream-scan normalized tokens without a fixed 4096-byte buffer (#419).
@@ -627,12 +647,12 @@ test "containsIgnoreCase: empty needle matches, case folded" {
 /// Characters that may sit directly before an `rm`/`dd` command word while it
 /// still reads as command position: shell separators (`;`, `|`, `&` —
 /// including unspaced `&&rm`), substitution openings (`(`, backtick), quotes
-/// (`sh -c "rm -rf /"`), and the backslash escape (`\rm` bypasses a rm alias
-/// but still runs rm). Anything else (a letter in `alarm`, a digit, `=`)
-/// means the match is inside a larger word, not a command.
+/// (`sh -c "rm -rf /"`), `=` (`--pre=rm`, `CMD=rm`), and the backslash escape
+/// (`\rm` bypasses a rm alias but still runs rm). Anything else (a letter in
+/// `alarm`, a digit) means the match is inside a larger word, not a command.
 fn isCommandWordBoundary(c: u8) bool {
     return std.ascii.isWhitespace(c) or c == ';' or c == '|' or c == '&' or
-        c == '(' or c == '`' or c == '"' or c == '\'' or c == '\\';
+        c == '(' or c == '`' or c == '"' or c == '\'' or c == '\\' or c == '=';
 }
 
 /// True when `rest` (the text after an `rm` command word) names the
@@ -1614,8 +1634,12 @@ test "lone search exemption fails closed and leaves flagged searches flagged" {
         "rg -e 'it'\\''; sudo apt install y'",
         // Options that run programs or load further options, quoted or not.
         "rg --pre 'sudo' .",
+        "rg '--pre=sudo' .",
+        "rg --pre=sudo -e 'x' .",
+        "rg --pre=rm --pre-glob '*' x .",
         "rg --hostname-bin 'sudo' .",
         "rg --config-path 'sudo' .",
+        "rg --config-path ./rgrc .",
         "grep --filter 'sudo' .",
         "grep -Q 'sudo'",
         // Any option outside the allowlist, wherever it appears.
@@ -1644,13 +1668,7 @@ test "lone search exemption fails closed and leaves flagged searches flagged" {
     // Denied as well, and raw-safe: the verdict must simply not move.
     const unchanged = [_][]const u8{
         "rg --hyperlink-format '{h}' .",
-        "rg --config-path ./rgrc .",
         "rg -e 'x' | cat",
-        // The raw tokenizer does not split on `=`, so an option's attached
-        // value was never a token of its own; the exemption must still
-        // refuse the option itself, quoted or not.
-        "rg '--pre=sudo' .",
-        "rg --pre=sudo -e 'x' .",
     };
     for (unchanged) |command| {
         try expectNoExemption(command, &buf);
@@ -1721,9 +1739,47 @@ test "rule table: every rule attributes its first-fire input" {
         .{ .input = "sudo apt install nginx", .expected = .privileged_pm_escalator },
         .{ .input = "apt-get update", .expected = .privileged_pm_manager },
         .{ .input = "pip install requests", .expected = .privileged_pm_phrase },
+        .{ .input = "rg --pre=rm --pre-glob '*' x .", .expected = .program_exec_option },
     };
     for (cases) |case| {
         try std.testing.expectEqual(case.expected, localClassifyRule(case.input).?);
+    }
+}
+
+test "equals-attached option values and program-exec options (#595)" {
+    // Every rule that can be reached through an `=`-attached value or a
+    // program-executing option must classify `.unsafe`, while ordinary
+    // `KEY=value` arguments stay `.safe`.
+    const unsafe_cases = [_][]const u8{
+        "rg --pre=sudo .",
+        "rg '--pre=sudo' .",
+        "rg --pre=rm --pre-glob '*' x .",
+        "rg --hostname-bin=sh .",
+        "rg --config-path=./rgrc .",
+        "grep --filter=sh x .",
+        "tar --use-compress-program=sh -xf a.tar",
+        "sort --compress-program=sh file.txt",
+        "find . -exec rm {} +",
+        "find . -execdir sh -c 'echo x' {} +",
+        "CMD=rm -rf /",
+        "OPT='--flag=apt'",
+        "RUN='pip install x'",
+    };
+    for (unsafe_cases) |cmd| {
+        try expectVerdict(cmd, .unsafe);
+    }
+
+    const safe_cases = [_][]const u8{
+        "git commit -m x",
+        "cargo build --features=a,b",
+        "echo PATH=/usr/bin",
+        "rg --pre-glob '*.zig' x .",
+        "git diff --message=hello",
+        "curl https://example.com?page=1",
+        "dd if=/dev/zero of=/dev/null",
+    };
+    for (safe_cases) |cmd| {
+        try expectVerdict(cmd, .safe);
     }
 }
 
