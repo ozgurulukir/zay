@@ -8,10 +8,10 @@
 //! before the full `PluginManager` exists.
 
 const std = @import("std");
-const os = @import("os.zig");
 
 const assert = std.debug.assert;
 
+const paths = @import("paths.zig");
 const skill_mod = @import("skill.zig");
 const package = @import("plugin_package.zig");
 const plugin_config = @import("config/plugin.zig");
@@ -46,14 +46,14 @@ pub const PluginPrompt = struct {
     }
 };
 
-/// Discover and load every plugin's `prompt.md` across both plugin roots.
+/// Discover and load every plugin's `prompt.md` across the plugin roots.
 ///
-/// Scans `<home_dir>/.config/zay/plugins/<plugin>/prompt.md` first, then
-/// `<cwd>/plugins/<plugin>/prompt.md`. The former `.zay/plugins/` root is also
-/// scanned as a legacy fallback; the visible root wins when both contain the
-/// same plugin. Plugins without a `prompt.md`, or whose body is empty after
-/// frontmatter stripping, are silently skipped — a missing or blank prompt
-/// is not an error.
+/// Scans the global root first — the same directory the plugin manager
+/// loads from, resolved the same way — then `<cwd>/plugins/<plugin>/prompt.md`.
+/// The former `.zay/plugins/` root is also scanned as a legacy fallback; the
+/// visible root wins when both contain the same plugin. Plugins without a
+/// `prompt.md`, or whose body is empty after frontmatter stripping, are
+/// silently skipped — a missing or blank prompt is not an error.
 pub fn loadAll(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -74,14 +74,19 @@ pub fn loadConfigured(
     defer prompts.deinit(gpa);
     errdefer for (prompts.items) |*prompt| prompt.deinit(gpa);
 
-    const global_parts = [_][]const u8{ ".config", "zay", "plugins" };
+    // One global root, chosen exactly as `PluginManager` chooses it. On
+    // Windows that is the AppData directory when it exists and the XDG tree
+    // otherwise. Scanning both, as this used to, let `.config` prompts
+    // override `%APPDATA%` ones and published prompts for plugins that were
+    // never loaded.
+    if (home_dir.len > 0) {
+        const global = try paths.globalPluginsDir(gpa, io, home_dir);
+        defer gpa.free(global);
+        try scanDirectory(gpa, io, global, configs, &prompts);
+    }
+
     const legacy_project_parts = [_][]const u8{ ".zay", "plugins" };
     const project_parts = [_][]const u8{"plugins"};
-    if (os.is_windows and home_dir.len > 0) {
-        const appdata_parts = [_][]const u8{ "AppData", "Roaming", "zay", "plugins" };
-        try scanRoot(gpa, io, home_dir, &appdata_parts, configs, &prompts);
-    }
-    try scanRoot(gpa, io, home_dir, &global_parts, configs, &prompts);
     try scanRoot(gpa, io, cwd, &legacy_project_parts, configs, &prompts);
     try scanRoot(gpa, io, cwd, &project_parts, configs, &prompts);
 
@@ -184,8 +189,18 @@ fn scanRoot(
         try dir_path_buf.append(gpa, std.fs.path.sep);
         try dir_path_buf.appendSlice(gpa, part);
     }
+    try scanDirectory(gpa, io, dir_path_buf.items, configs, out);
+}
 
-    var dir = std.Io.Dir.openDir(.cwd(), io, dir_path_buf.items, .{ .iterate = true }) catch |err| switch (err) {
+/// Scan one plugin root directory. A missing root is not an error.
+fn scanDirectory(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    configs: []const plugin_config.PluginConfig,
+    out: *std.ArrayList(PluginPrompt),
+) !void {
+    var dir = std.Io.Dir.openDir(.cwd(), io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return,
         else => return err,
     };
@@ -196,7 +211,7 @@ fn scanRoot(
         if (entry.kind != .directory) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
 
-        const plugin_dir = try std.fs.path.join(gpa, &.{ dir_path_buf.items, entry.name });
+        const plugin_dir = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
         defer gpa.free(plugin_dir);
         const prompt_path = try std.fs.path.join(gpa, &.{ plugin_dir, "prompt.md" });
         defer gpa.free(prompt_path);
@@ -436,6 +451,50 @@ test "loadAll: project overrides global with same plugin name" {
 
     try std.testing.expectEqual(@as(usize, 1), prompts.len);
     try std.testing.expectEqualStrings("Project instructions override.", prompts[0].body);
+}
+
+test "loadAll reads one global root, the one the plugin manager loads from" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/plugin-prompt-global-root-test";
+    // The same plugin in both global candidate roots, saying different things.
+    const xdg_body = "XDG instructions.";
+    const appdata_body = "AppData instructions.";
+    for ([_][]const u8{ rel_dir ++ "/home/.config/zay/plugins/shared", rel_dir ++ "/home/AppData/Roaming/zay/plugins/shared" }, [_][]const u8{ xdg_body, appdata_body }) |dir, body| {
+        try std.Io.Dir.createDirPath(.cwd(), io, dir);
+        const prompt_path = try std.fmt.allocPrint(gpa, "{s}/prompt.md", .{dir});
+        defer gpa.free(prompt_path);
+        var file = try std.Io.Dir.createFile(.cwd(), io, prompt_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [128]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(body);
+        try writer.interface.flush();
+    }
+
+    const home = try std.fs.path.join(gpa, &.{ root, rel_dir, "home" });
+    defer gpa.free(home);
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir, "project" });
+    defer gpa.free(cwd);
+    try std.Io.Dir.createDirPath(.cwd(), io, cwd);
+
+    // Windows resolves to AppData when that directory exists; everywhere
+    // else the XDG tree is the only global root.
+    const global_root = try paths.globalPluginsDir(gpa, io, home);
+    defer gpa.free(global_root);
+    const expected = if (std.mem.indexOf(u8, global_root, "AppData") != null) appdata_body else xdg_body;
+
+    const prompts = try loadAll(gpa, io, home, cwd);
+    defer deinitAll(gpa, prompts);
+
+    // One prompt, from the root the manager scans. Scanning both roots let
+    // the other copy override it — or publish prompts for plugins that were
+    // never loaded.
+    try std.testing.expectEqual(@as(usize, 1), prompts.len);
+    try std.testing.expectEqualStrings(expected, prompts[0].body);
 }
 
 test "formatForPrompt emits plugin_prompts block" {

@@ -150,9 +150,20 @@ pub const State = struct {
     // ── value extraction ───────────────────────────────────────────
 
     /// Get the value at `index` as an integer. Returns 0 if not an integer.
+    /// Where 0 is a meaningful value for the caller (a limit, a size), use
+    /// `toIntegerExact` so "not an integer" cannot be read as "zero".
     pub fn toInteger(self: *Self, index: c_int) i64 {
         var isnum: c_int = 0;
         return c.lua_tointegerx(self.handle, index, &isnum);
+    }
+
+    /// Get the value at `index` as an integer, or null when the value is
+    /// not a number or is a float with a fraction. A float that is exactly
+    /// an integer (`20.0`) converts; `20.5` does not.
+    pub fn toIntegerExact(self: *Self, index: c_int) ?i64 {
+        var isnum: c_int = 0;
+        const value = c.lua_tointegerx(self.handle, index, &isnum);
+        return if (isnum != 0) value else null;
     }
 
     /// Get the value at `index` as a number (f64). Returns 0.0 if not a number.

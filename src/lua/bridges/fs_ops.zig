@@ -253,11 +253,13 @@ test "getExtension_returnsEmpty_whenNoDotIsPresent" {
 test "getMimeType_returnsMappedType_whenExtensionIsKnown" {
     try std.testing.expectEqualStrings("text/x-lua", getMimeType("script.lua"));
     try std.testing.expectEqualStrings("application/json", getMimeType("config.json"));
+    try std.testing.expectEqualStrings("text/markdown", getMimeType("README.md"));
     try std.testing.expectEqualStrings("image/png", getMimeType("logo.png"));
 }
 
 test "getMimeType_returnsDefault_whenExtensionIsUnknown" {
     try std.testing.expectEqualStrings("application/octet-stream", getMimeType("file.unknown"));
+    try std.testing.expectEqualStrings("application/octet-stream", getMimeType("file.xyz"));
     try std.testing.expectEqualStrings("application/octet-stream", getMimeType("binary"));
 }
 
@@ -265,6 +267,8 @@ test "detectLanguage_returnsLanguage_whenExtensionIsKnown" {
     try std.testing.expectEqualStrings("zig", detectLanguage("main.zig", ""));
     try std.testing.expectEqualStrings("python", detectLanguage("script.py", ""));
     try std.testing.expectEqualStrings("lua", detectLanguage("init.lua", ""));
+    try std.testing.expectEqualStrings("javascript", detectLanguage("app.js", ""));
+    try std.testing.expectEqualStrings("markdown", detectLanguage("README.md", ""));
 }
 
 test "detectLanguage_returnsScript_whenShebangIsPresent" {
@@ -273,9 +277,12 @@ test "detectLanguage_returnsScript_whenShebangIsPresent" {
 
 test "detectLanguage_returnsText_whenExtensionAndShebangAreMissing" {
     try std.testing.expectEqualStrings("text", detectLanguage("notes", "Just some plain text content"));
+    try std.testing.expectEqualStrings("text", detectLanguage("file.xyz", ""));
 }
 
 test "countLines_returnsLineCount_forVariousTextFormats" {
+    // Empty text is one (empty) line, not zero: `read_file` reports `lines`.
+    try std.testing.expectEqual(1, countLines(""));
     try std.testing.expectEqual(1, countLines("single line"));
     try std.testing.expectEqual(3, countLines("line 1\nline 2\nline 3"));
     try std.testing.expectEqual(2, countLines("line 1\n"));

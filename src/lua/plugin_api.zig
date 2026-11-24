@@ -63,32 +63,14 @@ var require_loading_marker: u8 = 0;
 /// Realpath re-check for a resolved module against the plugin directory
 /// (#448). The lexical resolve above follows nothing, but the read below
 /// would follow a symlink planted inside the plugin dir; comparing real
-/// paths catches it. Mirrors `bridges/shell.zig sanitizePath`: on a missing
-/// leaf the walk climbs to the deepest existing ancestor, and allocation
-/// failure fails closed. POSIX only — `std.c.realpath` is unavailable on
-/// Windows, where the lexical confinement check stays authoritative.
+/// paths catches it. One implementation for every confined path
+/// (`bridge.isWithinRealPath`, shared with `bridges/shell.zig
+/// sanitizePath`). POSIX only — Windows keeps the lexical check
+/// authoritative — and allocation failure fails closed.
 fn requirePathWithinRealPluginDir(plugin_dir: []const u8, candidate: []const u8) bool {
-    var plugin_dir_real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const plugin_dir_real = blk: {
-        const plugin_dir_z = std.heap.page_allocator.dupeZ(u8, plugin_dir) catch return false;
-        defer std.heap.page_allocator.free(plugin_dir_z);
-        const ptr = std.c.realpath(plugin_dir_z.ptr, &plugin_dir_real_buf) orelse break :blk plugin_dir;
-        break :blk std.mem.span(ptr);
-    };
-
-    var probe = candidate;
-    while (true) {
-        const probe_z = std.heap.page_allocator.dupeZ(u8, probe) catch return false;
-        defer std.heap.page_allocator.free(probe_z);
-        var probe_real_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.c.realpath(probe_z.ptr, &probe_real_buf)) |rp| {
-            const real = std.mem.span(rp);
-            if (!std.mem.startsWith(u8, real, plugin_dir_real)) return false;
-            if (real.len > plugin_dir_real.len and real[plugin_dir_real.len] != std.fs.path.sep) return false;
-            return true;
-        }
-        probe = std.fs.path.dirname(probe) orelse return false;
-    }
+    if (os.is_windows) return true;
+    var scratch: bridge.RealPathScratch = .{};
+    return bridge.isWithinRealPath(plugin_dir, candidate, &scratch) catch false;
 }
 
 /// ── zay.require(path) ───────────────────────────────────────────────
@@ -183,7 +165,7 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     // Symlink re-check (INV-REQ-1, #448): the module file exists, so its
     // realpath resolves the chain; a symlink pointing outside the plugin
     // directory must fail the require instead of redirecting the read.
-    if (!os.is_windows and !requirePathWithinRealPluginDir(plugin_dir_owned, resolved_path)) {
+    if (!requirePathWithinRealPluginDir(plugin_dir_owned, resolved_path)) {
         state.pushNil();
         state.pushString("access denied: cannot require module outside plugin directory");
         return 2;
@@ -239,7 +221,19 @@ pub fn requireModule(L: ?*c.lua_State) callconv(.c) c_int {
     // Load chunk. Mode "t" accepts text sources only (INV-REQ-2, #448): a
     // precompiled binary chunk planted in the plugin directory must fail the
     // load instead of executing attacker-chosen bytecode.
-    const load_rc = c.luaL_loadbufferx(L_ptr, content.ptr, content.len, resolved_path_z.ptr, "t");
+    //
+    // The chunk is a file source ("@<path>"), so an error raised in the
+    // module names the module's file. The bare path made Lua take the path
+    // itself for the source text and report it as `[string "<path>"]`.
+    const chunk_name = std.fmt.allocPrintSentinel(std.heap.page_allocator, "@{s}", .{resolved_path}, 0) catch {
+        c.lua_pop(L_ptr, 1); // pop reg_tbl
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    defer std.heap.page_allocator.free(chunk_name);
+
+    const load_rc = c.luaL_loadbufferx(L_ptr, content.ptr, content.len, chunk_name.ptr, "t");
     if (load_rc != c.LUA_OK) {
         // Stack here is [ ... | cache table | load error ]. Remove the cache
         // table so the error message ends up on top (the old `lua_pop(1)`
@@ -310,23 +304,6 @@ pub const globMatchSegment = search_bridge.globMatchSegment;
 pub const FindCtx = search_bridge.FindCtx;
 pub const walkAndMatch = search_bridge.walkAndMatch;
 pub const walkAndSearch = search_bridge.walkAndSearch;
-pub const fileNameMatches = search_bridge.fileNameMatches;
-
-/// Best-effort plugin directory for the shell-block audit log; empty when the
-/// Lua state carries no plugin (bridge unit tests). Borrowed from the Lua GC —
-/// consumed synchronously by the log call before returning.
-fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_plugin_dir");
-    if (c.lua_isnil(L, -1)) {
-        c.lua_pop(L, 1);
-        return "";
-    }
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(L, -1, &len);
-    const dir = if (ptr) |p| p[0..len] else "";
-    c.lua_pop(L, 1);
-    return dir;
-}
 
 pub const quoteShellArg = git_bridge.quoteShellArg;
 pub const appendQuotedArg = git_bridge.appendQuotedArg;
@@ -585,27 +562,6 @@ pub fn countTools(L: *c.lua_State) u32 {
     return @intCast(c.lua_rawlen(L, -1));
 }
 
-/// Find the index of a registered tool by name in the Lua registry.
-/// Returns the 1-based index used by `callToolHandler`, or null if not found.
-pub fn findToolIndex(L: *c.lua_State, tool_name: []const u8) ?c_int {
-    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "zay_tools");
-    defer c.lua_pop(L, 1);
-    if (c.lua_isnil(L, -1)) return null;
-
-    const tools_len = c.lua_rawlen(L, -1);
-    var i: c_int = 1;
-    while (i <= @as(c_int, @intCast(tools_len))) : (i += 1) {
-        _ = c.lua_rawgeti(L, -1, i);
-        _ = c.lua_getfield(L, -1, "name");
-        var len: usize = 0;
-        const ptr = c.lua_tolstring(L, -1, &len);
-        const found = if (ptr) |p| std.mem.eql(u8, p[0..len], tool_name) else false;
-        c.lua_pop(L, 2); // pop name string and entry table
-        if (found) return i;
-    }
-    return null;
-}
-
 /// ── plugin.get_config() ──────────────────────────────────────────────
 ///
 /// Returns the plugin's configured settings as a fresh table, or nil when the
@@ -793,98 +749,6 @@ pub fn callToolHandler(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
-
-test "fileNameMatches: empty pattern matches everything (regression for SIGABRT)" {
-    // Used to be `fp[1..]` which panicked (index-out-of-bounds) on `""`,
-    // crashing the agent when a plugin passed an empty file_pattern
-    // (Lua treats "" as truthy, so project-info/search-tool forwarded it).
-    try std.testing.expect(fileNameMatches("anything.lua", ""));
-    try std.testing.expect(fileNameMatches("Makefile", ""));
-}
-
-test "fileNameMatches: star glob strips leading star" {
-    try std.testing.expect(fileNameMatches("main.lua", "*.lua"));
-    try std.testing.expect(fileNameMatches("vendor/init.lua", "*.lua"));
-    try std.testing.expect(!fileNameMatches("main.zig", "*.lua"));
-}
-
-test "fileNameMatches: bare suffix matches verbatim" {
-    try std.testing.expect(fileNameMatches("main.lua", ".lua"));
-    try std.testing.expect(fileNameMatches("config.json", "json"));
-    try std.testing.expect(!fileNameMatches("config.json", ".lua"));
-}
-
-test "fileNameMatches: star-only pattern matches everything" {
-    try std.testing.expect(fileNameMatches("anything.lua", "*"));
-    try std.testing.expect(fileNameMatches("README", "*"));
-}
-
-test "detectLanguage: known extensions" {
-    try std.testing.expectEqualStrings("zig", detectLanguage("main.zig", ""));
-    try std.testing.expectEqualStrings("lua", detectLanguage("init.lua", ""));
-    try std.testing.expectEqualStrings("python", detectLanguage("script.py", ""));
-    try std.testing.expectEqualStrings("javascript", detectLanguage("app.js", ""));
-    try std.testing.expectEqualStrings("markdown", detectLanguage("README.md", ""));
-}
-
-test "detectLanguage: shebang detection" {
-    try std.testing.expectEqualStrings("script", detectLanguage("script", "#!/usr/bin/env bash"));
-}
-
-test "detectLanguage: unknown extension" {
-    try std.testing.expectEqualStrings("text", detectLanguage("file.xyz", ""));
-}
-
-test "getMimeType: known types" {
-    try std.testing.expectEqualStrings("text/x-lua", getMimeType("test.lua"));
-    try std.testing.expectEqualStrings("application/json", getMimeType("config.json"));
-    try std.testing.expectEqualStrings("text/markdown", getMimeType("README.md"));
-}
-
-test "getMimeType: unknown extension" {
-    try std.testing.expectEqualStrings("application/octet-stream", getMimeType("file.xyz"));
-}
-
-test "getExtension: extracts extension" {
-    try std.testing.expectEqualStrings("zig", getExtension("main.zig"));
-    try std.testing.expectEqualStrings("lua", getExtension("init.lua"));
-}
-
-test "getExtension: no extension" {
-    try std.testing.expectEqualStrings("", getExtension("Makefile"));
-}
-
-test "countLines: empty text" {
-    try std.testing.expectEqual(@as(u32, 1), countLines(""));
-}
-
-test "countLines: single line" {
-    try std.testing.expectEqual(@as(u32, 1), countLines("hello world"));
-}
-
-test "countLines: multiple lines" {
-    try std.testing.expectEqual(@as(u32, 3), countLines("line1\nline2\nline3"));
-}
-
-test "applyLineRange: no range returns full content" {
-    const content = "line1\nline2\nline3";
-    try std.testing.expectEqualStrings(content, applyLineRange(content, null, null));
-}
-
-test "applyLineRange: start_line only" {
-    const content = "line1\nline2\nline3\nline4";
-    try std.testing.expectEqualStrings("line2\nline3\nline4", applyLineRange(content, 2, null));
-}
-
-test "applyLineRange: start and end" {
-    const content = "line1\nline2\nline3\nline4";
-    try std.testing.expectEqualStrings("line2\nline3", applyLineRange(content, 2, 3));
-}
-
-test "applyLineRange: past end returns empty" {
-    const content = "line1\nline2";
-    try std.testing.expectEqualStrings("", applyLineRange(content, 10, null));
-}
 
 test "registerTool + countTools: sandboxed state" {
     const sandbox = @import("sandbox.zig");
@@ -1444,54 +1308,6 @@ test "json round-trip: decode then encode preserves structure" {
     );
 }
 
-// ── glob matcher unit tests ──────────────────────────────────────────
-
-test "matchGlob: empty pattern matches everything" {
-    try std.testing.expect(matchGlob("a.zig", ""));
-    try std.testing.expect(matchGlob("src/foo.ts", ""));
-}
-
-test "matchGlob: literal pattern matches verbatim" {
-    try std.testing.expect(matchGlob("main.zig", "main.zig"));
-    try std.testing.expect(!matchGlob("main.zig", "main.lua"));
-}
-
-test "matchGlob: star within segment" {
-    try std.testing.expect(matchGlob("main.zig", "*.zig"));
-    try std.testing.expect(matchGlob("a.ts", "*.ts"));
-    try std.testing.expect(!matchGlob("a.js", "*.ts"));
-}
-
-test "matchGlob: star does not cross separator" {
-    try std.testing.expect(!matchGlob("src/a.ts", "*.ts"));
-    try std.testing.expect(matchGlob("a.ts", "*"));
-}
-
-test "matchGlob: double-star spans directories" {
-    try std.testing.expect(matchGlob("src/a.zig", "**/*.zig"));
-    try std.testing.expect(matchGlob("src/nested/b.zig", "**/*.zig"));
-    try std.testing.expect(matchGlob("a.zig", "**/*.zig"));
-    try std.testing.expect(!matchGlob("a.lua", "**/*.zig"));
-}
-
-test "matchGlob: double-star under prefix" {
-    try std.testing.expect(matchGlob("src/nested/a.ts", "src/**/*.ts"));
-    try std.testing.expect(matchGlob("src/a.ts", "src/**/*.ts"));
-    try std.testing.expect(!matchGlob("lib/a.ts", "src/**/*.ts"));
-}
-
-test "matchGlob: single-char question mark" {
-    try std.testing.expect(matchGlob("a.ts", "?.ts"));
-    try std.testing.expect(matchGlob("ab.ts", "a?.ts"));
-    try std.testing.expect(!matchGlob("abc.ts", "a?.ts"));
-}
-
-test "matchGlob: trailing double-star matches remainder" {
-    try std.testing.expect(matchGlob("src/a/b/c", "src/**"));
-    try std.testing.expect(matchGlob("src", "src/**"));
-    try std.testing.expect(!matchGlob("lib/a", "src/**"));
-}
-
 // ── P0: shell-injection regression tests ──────────────────────────────
 //
 // The git bridges (`gitDiff`/`gitLog`/`gitCommit`) previously embedded
@@ -1977,13 +1793,15 @@ test "gitStatus returns nil + error outside a repo" {
     defer result.deinit(gpa);
     try std.testing.expect(result.code != 0);
     try std.testing.expect(result.stdout.len == 0);
-    const err = gitErrorString(result.stderr, result.code);
+    var err_buf: [64]u8 = undefined;
+    const err = gitErrorString(&err_buf, result.stderr, result.code);
     try std.testing.expect(err.len > 0);
 }
 
 test "gitErrorString prefers stderr over generic exit code" {
-    try std.testing.expectEqualStrings("fatal: not a git repository", gitErrorString("fatal: not a git repository\n", 128));
-    try std.testing.expect(std.mem.indexOf(u8, gitErrorString("", 128), "code 128") != null);
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("fatal: not a git repository", gitErrorString(&err_buf, "fatal: not a git repository\n", 128));
+    try std.testing.expect(std.mem.indexOf(u8, gitErrorString(&err_buf, "", 128), "code 128") != null);
 }
 
 test "git bridges return strings inside a repo (S4 success path)" {
@@ -2207,26 +2025,6 @@ test "plugin_api: git read bridges run in the dispatch context cwd" {
     );
 }
 
-test "plugin_api: globMatchSegment handles Windows backslashes and forward slashes interchangeably" {
-    // 1. Windows path with forward-slash glob pattern
-    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src/**/*.zig"));
-    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src/*/*.zig"));
-    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "**/*.zig"));
-    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src/tools/bash.zig"));
-
-    // 2. Windows path with backslash glob pattern
-    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src\\**\\*.zig"));
-    try std.testing.expect(globMatchSegment("src\\tools\\bash.zig", "src\\*\\*.zig"));
-
-    // 3. POSIX path with forward-slash pattern
-    try std.testing.expect(globMatchSegment("src/tools/bash.zig", "src/**/*.zig"));
-    try std.testing.expect(globMatchSegment("src/tools/bash.zig", "**/*.zig"));
-
-    // 4. Non-matching paths
-    try std.testing.expect(!globMatchSegment("src\\tools\\bash.zig", "src/*.zig"));
-    try std.testing.expect(!globMatchSegment("src\\tools\\bash.zig", "lib/**/*.zig"));
-}
-
 test "plugin_api: run_shell executes native shell on current OS" {
     const io = std.testing.io;
     const sandbox = @import("sandbox.zig");
@@ -2381,6 +2179,27 @@ test "plugin_api: zay.git_add and selective zay.git_commit validate arguments" {
         \\local ok2, err2 = zay.git_commit()
         \\assert(ok2 == nil, "git_commit without message should fail")
         \\assert(string.find(err2, "commit message argument is required") ~= nil, "unexpected error: " .. tostring(err2))
+        \\
+        \\return "OK"
+    );
+
+    // A file list that names nothing is refused, not run as a bare
+    // `git add --` (git_add would stage nothing and report success;
+    // git_commit would commit whatever was already in the index).
+    try expectLuaOk(&L,
+        \\local add_cases = { "", ",,,", {}, { 42 } }
+        \\for _, files in ipairs(add_cases) do
+        \\  local ok, err = zay.git_add(files)
+        \\  assert(ok == nil, "git_add(" .. tostring(files) .. ") should fail, got success")
+        \\  assert(string.find(err, "name at least one file") ~= nil, "unexpected error: " .. tostring(err))
+        \\end
+        \\
+        \\local commit_cases = { "", ",,,", {}, { 42 }, 42 }
+        \\for _, files in ipairs(commit_cases) do
+        \\  local ok, err = zay.git_commit("m", { files = files })
+        \\  assert(ok == nil, "git_commit(files=" .. tostring(files) .. ") should fail, got success")
+        \\  assert(string.find(err, "files option") ~= nil, "unexpected error: " .. tostring(err))
+        \\end
         \\
         \\return "OK"
     );

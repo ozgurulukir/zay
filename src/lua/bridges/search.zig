@@ -1,6 +1,6 @@
 //! Lua Search bridge module — extracted from `plugin_api.zig`.
 //!
-//! Provides `zay.search_files`, `zay.find_files`, `matchGlob`, `fileNameMatches`.
+//! Provides `zay.search_files`, `zay.find_files`, `matchGlob`.
 
 const std = @import("std");
 const c = @import("c");
@@ -332,13 +332,6 @@ fn segMatch(seg: []const u8, pat: []const u8) bool {
     return pi == pat.len;
 }
 
-/// Test whether `name` matches the user-supplied `file_pattern`.
-pub fn fileNameMatches(name: []const u8, file_pattern: []const u8) bool {
-    if (file_pattern.len == 0) return true;
-    const suffix = if (file_pattern[0] == '*') file_pattern[1..] else file_pattern;
-    return std.mem.endsWith(u8, name, suffix);
-}
-
 /// One search request, shared by the walk and exact-file path.
 const SearchCtx = struct {
     root: []const u8,
@@ -531,11 +524,28 @@ test "matchGlob_returnsTrue_whenTrailingDoubleStarMatchesRemainder" {
     try std.testing.expect(!matchGlob("lib/a", "src/**"));
 }
 
+test "matchGlob_returnsTrue_whenStarOnlyPatternMatchesAnyName" {
+    // Arrange & Act & Assert
+    try std.testing.expect(matchGlob("a.ts", "*"));
+    // `*` is segment-aware: it matches any single segment, not a whole path.
+    try std.testing.expect(!matchGlob("src/a.ts", "*"));
+    try std.testing.expect(!matchGlob("", "*.ts"));
+}
+
 test "matchGlob_handlesMixedPathSeparators" {
     // Arrange & Act & Assert
     try std.testing.expect(matchGlob("src\\tools\\bash.zig", "src/**/*.zig"));
     try std.testing.expect(matchGlob("src/tools/bash.zig", "src\\**\\*.zig"));
     try std.testing.expect(matchGlob("a\\b\\c.txt", "a/b/*.txt"));
+    // Either separator on either side means the same segments.
+    try std.testing.expect(matchGlob("src\\tools\\bash.zig", "src/*/*.zig"));
+    try std.testing.expect(matchGlob("src\\tools\\bash.zig", "**/*.zig"));
+    try std.testing.expect(matchGlob("src\\tools\\bash.zig", "src/tools/bash.zig"));
+    try std.testing.expect(matchGlob("src\\tools\\bash.zig", "src\\*\\*.zig"));
+    try std.testing.expect(matchGlob("src/tools/bash.zig", "**/*.zig"));
+    // Negative space: segment counts still have to line up.
+    try std.testing.expect(!matchGlob("src\\tools\\bash.zig", "src/*.zig"));
+    try std.testing.expect(!matchGlob("src\\tools\\bash.zig", "lib/**/*.zig"));
 }
 
 test "matchGlob_handlesMultipleWildcardsInSingleSegment" {

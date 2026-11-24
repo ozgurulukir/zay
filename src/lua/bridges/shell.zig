@@ -69,28 +69,12 @@ pub fn sanitizePath(io: std.Io, path: []const u8, ctx_cwd: ?[]const u8) ![]u8 {
     if (!std.mem.startsWith(u8, resolved, cwd)) return error.PathTraversal;
     if (resolved.len > cwd.len and resolved[cwd.len] != std.fs.path.sep) return error.PathTraversal;
 
+    // The realpath leg, up to the deepest existing ancestor so a symlink
+    // escaping the workspace cannot hide behind a nonexistent leaf (#415).
+    // POSIX only; Windows keeps the lexical check above authoritative.
     if (!os.is_windows) {
-        const cwd_z = try std.heap.page_allocator.dupeZ(u8, cwd);
-        defer std.heap.page_allocator.free(cwd_z);
-        var real_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const rcwd_ptr = std.c.realpath(cwd_z.ptr, &real_cwd_buf);
-        const real_cwd = if (rcwd_ptr) |rcp| std.mem.span(rcp) else cwd;
-
-        // Walk up to the deepest existing ancestor so a symlink escaping the
-        // workspace cannot be bypassed by targeting a nonexistent leaf (#415).
-        var probe: []const u8 = resolved;
-        while (true) {
-            const probe_z = try std.heap.page_allocator.dupeZ(u8, probe);
-            defer std.heap.page_allocator.free(probe_z);
-            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.c.realpath(probe_z.ptr, &real_buf)) |rp| {
-                const real = std.mem.span(rp);
-                if (!std.mem.startsWith(u8, real, real_cwd)) return error.PathTraversal;
-                if (real.len > real_cwd.len and real[real_cwd.len] != std.fs.path.sep) return error.PathTraversal;
-                break;
-            }
-            probe = std.fs.path.dirname(probe) orelse return error.PathTraversal;
-        }
+        var scratch: bridge.RealPathScratch = .{};
+        if (!try bridge.isWithinRealPath(cwd, resolved, &scratch)) return error.PathTraversal;
     }
 
     return resolved;

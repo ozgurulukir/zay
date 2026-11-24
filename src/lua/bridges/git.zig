@@ -61,15 +61,74 @@ pub fn quoteShellArg(gpa: std.mem.Allocator, s: []const u8, pwsh_rules: bool) st
 
 /// Build a plugin-facing error string for a failed git command. Prefers the
 /// trimmed stderr (git's own message, e.g. "fatal: not a git repository"),
-/// falling back to a generic exit-code message. Returns a slice valid for the
-/// duration of the caller's `result` (no allocation).
-pub fn gitErrorString(stderr: []const u8, code: u32) []const u8 {
+/// falling back to a generic exit-code message written into `buf`. Returns a
+/// slice valid while `buf` does — callers push it into Lua immediately.
+pub fn gitErrorString(buf: *[64]u8, stderr: []const u8, code: u32) []const u8 {
     const trimmed = std.mem.trim(u8, stderr, " \n\r\t");
     if (trimmed.len > 0) return trimmed;
-    return std.fmt.bufPrint(&git_err_buf, "git exited with code {d}", .{code}) catch "git failed";
+    return std.fmt.bufPrint(buf, "git exited with code {d}", .{code}) catch "git failed";
 }
 
-pub threadlocal var git_err_buf: [64]u8 = undefined;
+/// How a Lua file-list value parsed.
+const FileList = union(enum) {
+    /// The string was "." or "-A" and the caller asked for the alias:
+    /// stage everything instead of quoting a path.
+    stage_all,
+    /// Number of quoted paths appended to the command.
+    appended: usize,
+    /// The value is neither a string nor a table of strings.
+    not_a_list,
+};
+
+/// Append the quoted paths of a file list at `index` to `cmd`,
+/// space-separated. A list is a comma-separated string or an array table of
+/// strings; empty items are skipped and the appended count lets the caller
+/// reject a list that named nothing (`git add --` alone would stage nothing,
+/// and `git add -- && git commit -F -` would commit whatever was already in
+/// the index). Table entries that are not strings are skipped — a number is
+/// not coerced into a quoted pathspec. One parser for `zay.git_add` and
+/// `zay.git_commit` — they used to be two copies that had already drifted.
+fn appendGitFileArgs(state: *State, index: c_int, cmd: *std.ArrayList(u8), stage_all_aliases: bool) !FileList {
+    const gpa = std.heap.page_allocator;
+    const L = state.handle;
+
+    // lua_isstring reports true for numbers, so the branches test the type:
+    // a number is not silently quoted into a pathspec.
+    if (c.lua_type(L, index) == c.LUA_TSTRING) {
+        const file_str = state.toString(index) orelse return .{ .appended = 0 };
+        if (stage_all_aliases and (std.mem.eql(u8, file_str, ".") or std.mem.eql(u8, file_str, "-A"))) {
+            return .stage_all;
+        }
+        var appended: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, file_str, ',');
+        while (it.next()) |item| {
+            const trimmed = std.mem.trim(u8, item, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try cmd.append(gpa, ' ');
+            try appendQuotedArg(cmd, gpa, trimmed);
+            appended += 1;
+        }
+        return .{ .appended = appended };
+    }
+    if (state.isTable(index)) {
+        const len = c.lua_rawlen(L, index);
+        var appended: usize = 0;
+        var i: usize = 1;
+        while (i <= len) : (i += 1) {
+            _ = c.lua_rawgeti(L, index, @intCast(i));
+            if (c.lua_type(L, -1) == c.LUA_TSTRING) {
+                if (state.toString(-1)) |s| {
+                    try cmd.append(gpa, ' ');
+                    try appendQuotedArg(cmd, gpa, s);
+                    appended += 1;
+                }
+            }
+            c.lua_pop(L, 1);
+        }
+        return .{ .appended = appended };
+    }
+    return .not_a_list;
+}
 
 /// Find git repository root by walking up from `cwd`. When `cwd` is relative
 /// it resolves against `ctx_cwd` (the dispatch context's cwd; null falls back
@@ -142,8 +201,9 @@ pub fn gitStatus(L: ?*c.lua_State) callconv(.c) c_int {
     defer result.deinit(std.heap.page_allocator);
 
     if (result.code != 0) {
+        var err_buf: [64]u8 = undefined;
         state.pushNil();
-        state.pushString(gitErrorString(result.stderr, result.code));
+        state.pushString(gitErrorString(&err_buf, result.stderr, result.code));
         return 2;
     }
 
@@ -197,8 +257,9 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     defer result.deinit(std.heap.page_allocator);
 
     if (result.code != 0) {
+        var err_buf: [64]u8 = undefined;
         state.pushNil();
-        state.pushString(gitErrorString(result.stderr, result.code));
+        state.pushString(gitErrorString(&err_buf, result.stderr, result.code));
         return 2;
     }
 
@@ -239,8 +300,9 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     defer result.deinit(std.heap.page_allocator);
 
     if (result.code != 0) {
+        var err_buf: [64]u8 = undefined;
         state.pushNil();
-        state.pushString(gitErrorString(result.stderr, result.code));
+        state.pushString(gitErrorString(&err_buf, result.stderr, result.code));
         return 2;
     }
 
@@ -271,8 +333,9 @@ pub fn gitBranch(L: ?*c.lua_State) callconv(.c) c_int {
     defer result.deinit(std.heap.page_allocator);
 
     if (result.code != 0) {
+        var err_buf: [64]u8 = undefined;
         state.pushNil();
-        state.pushString(gitErrorString(result.stderr, result.code));
+        state.pushString(gitErrorString(&err_buf, result.stderr, result.code));
         return 2;
     }
 
@@ -313,45 +376,30 @@ pub fn gitAdd(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    if (state.isString(1)) {
-        const file_str = state.toString(1) orelse {
-            state.pushNil();
-            state.pushString("invalid files string");
-            return 2;
-        };
-        if (std.mem.eql(u8, file_str, ".") or std.mem.eql(u8, file_str, "-A")) {
+    const file_list = appendGitFileArgs(&state, 1, &cmd_buf, true) catch {
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    switch (file_list) {
+        .stage_all => {
             cmd_buf.clearRetainingCapacity();
             cmd_buf.appendSlice(std.heap.page_allocator, "git add -A") catch {
                 state.pushNil();
                 state.pushString("out of memory");
                 return 2;
             };
-        } else {
-            var it = std.mem.tokenizeScalar(u8, file_str, ',');
-            while (it.next()) |item| {
-                const trimmed = std.mem.trim(u8, item, " \t\r\n");
-                if (trimmed.len == 0) continue;
-                cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
-                appendQuotedArg(&cmd_buf, std.heap.page_allocator, trimmed) catch continue;
-            }
-        }
-    } else if (state.isTable(1)) {
-        const len = c.lua_rawlen(L_ptr, 1);
-        var i: usize = 1;
-        while (i <= len) : (i += 1) {
-            _ = c.lua_rawgeti(L_ptr, 1, @intCast(i));
-            if (state.isString(-1)) {
-                if (state.toString(-1)) |s| {
-                    cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
-                    appendQuotedArg(&cmd_buf, std.heap.page_allocator, s) catch continue;
-                }
-            }
-            c.lua_pop(L_ptr, 1);
-        }
-    } else {
-        state.pushNil();
-        state.pushString("files argument must be a string or table of strings");
-        return 2;
+        },
+        .appended => |count| if (count == 0) {
+            state.pushNil();
+            state.pushString("files argument must name at least one file");
+            return 2;
+        },
+        .not_a_list => {
+            state.pushNil();
+            state.pushString("files argument must be a string or table of strings");
+            return 2;
+        },
     }
 
     const cmd = cmd_buf.toOwnedSlice(std.heap.page_allocator) catch {
@@ -407,7 +455,11 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
     if (state.getTop() >= 2 and state.isTable(2)) {
         if (bridge.getTableBoolean(&state, 2, "staged_only")) |staged_only| {
             if (staged_only) {
-                cmd_buf.appendSlice(std.heap.page_allocator, "git commit -F -") catch {};
+                cmd_buf.appendSlice(std.heap.page_allocator, "git commit -F -") catch {
+                    state.pushNil();
+                    state.pushString("out of memory");
+                    return 2;
+                };
                 has_custom_command = true;
             }
         }
@@ -415,35 +467,35 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
         if (!has_custom_command) {
             _ = c.lua_getfield(L_ptr, 2, "files");
             if (!state.isNil(-1)) {
-                if (state.isString(-1)) {
-                    if (state.toString(-1)) |f_str| {
-                        cmd_buf.appendSlice(std.heap.page_allocator, "git add --") catch {};
-                        var it = std.mem.tokenizeScalar(u8, f_str, ',');
-                        while (it.next()) |item| {
-                            const trimmed = std.mem.trim(u8, item, " \t\r\n");
-                            if (trimmed.len == 0) continue;
-                            cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
-                            appendQuotedArg(&cmd_buf, std.heap.page_allocator, trimmed) catch continue;
-                        }
-                        cmd_buf.appendSlice(std.heap.page_allocator, " && git commit -F -") catch {};
+                const file_list = appendGitFileArgs(&state, -1, &cmd_buf, false) catch {
+                    c.lua_pop(L_ptr, 1); // pop "files"
+                    state.pushNil();
+                    state.pushString("out of memory");
+                    return 2;
+                };
+                switch (file_list) {
+                    // stage_all_aliases is false, so the helper cannot return it.
+                    .stage_all => unreachable,
+                    .not_a_list => {
+                        c.lua_pop(L_ptr, 1); // pop "files"
+                        state.pushNil();
+                        state.pushString("files option must be a string or table of strings");
+                        return 2;
+                    },
+                    .appended => |count| if (count == 0) {
+                        c.lua_pop(L_ptr, 1); // pop "files"
+                        state.pushNil();
+                        state.pushString("files option must name at least one file; stage everything with stage_all = true");
+                        return 2;
+                    } else {
+                        cmd_buf.appendSlice(std.heap.page_allocator, " && git commit -F -") catch {
+                            c.lua_pop(L_ptr, 1); // pop "files"
+                            state.pushNil();
+                            state.pushString("out of memory");
+                            return 2;
+                        };
                         has_custom_command = true;
-                    }
-                } else if (state.isTable(-1)) {
-                    cmd_buf.appendSlice(std.heap.page_allocator, "git add --") catch {};
-                    const len = c.lua_rawlen(L_ptr, -1);
-                    var i: usize = 1;
-                    while (i <= len) : (i += 1) {
-                        _ = c.lua_rawgeti(L_ptr, -1, @intCast(i));
-                        if (state.isString(-1)) {
-                            if (state.toString(-1)) |s| {
-                                cmd_buf.append(std.heap.page_allocator, ' ') catch continue;
-                                appendQuotedArg(&cmd_buf, std.heap.page_allocator, s) catch continue;
-                            }
-                        }
-                        c.lua_pop(L_ptr, 1);
-                    }
-                    cmd_buf.appendSlice(std.heap.page_allocator, " && git commit -F -") catch {};
-                    has_custom_command = true;
+                    },
                 }
             }
             c.lua_pop(L_ptr, 1); // pop "files"
@@ -481,6 +533,84 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+test "appendGitFileArgs parses string and table lists and counts what it appends" {
+    var L = try State.init();
+    defer L.deinit();
+
+    // A comma list skips empty items and quotes each path.
+    {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        try std.testing.expect(L.doString("files = 'a.zig, , b lua.lua ,,, c.txt'"));
+        _ = c.lua_getglobal(L.handle, "files");
+        const parsed = try appendGitFileArgs(&L, -1, &cmd, true);
+        try std.testing.expectEqual(FileList{ .appended = 3 }, parsed);
+        try std.testing.expectEqualStrings(" 'a.zig' 'b lua.lua' 'c.txt'", cmd.items);
+        c.lua_pop(L.handle, 1);
+    }
+    // A list that names nothing appends nothing — the caller rejects that.
+    for ([_][]const u8{ "''", "','", "',,, '" }) |literal| {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        const chunk = try std.fmt.allocPrintSentinel(std.testing.allocator, "files = {s}", .{literal}, 0);
+        defer std.testing.allocator.free(chunk);
+        try std.testing.expect(L.doString(chunk));
+        _ = c.lua_getglobal(L.handle, "files");
+        const parsed = try appendGitFileArgs(&L, -1, &cmd, true);
+        try std.testing.expectEqual(FileList{ .appended = 0 }, parsed);
+        try std.testing.expectEqualStrings("", cmd.items);
+        c.lua_pop(L.handle, 1);
+    }
+    // The stage-all alias is recognized only when asked for; otherwise the
+    // path is quoted like any other.
+    {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        try std.testing.expect(L.doString("files = '-A'"));
+        _ = c.lua_getglobal(L.handle, "files");
+        try std.testing.expectEqual(FileList.stage_all, try appendGitFileArgs(&L, -1, &cmd, true));
+        c.lua_pop(L.handle, 1);
+    }
+    {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        try std.testing.expect(L.doString("files = '.'"));
+        _ = c.lua_getglobal(L.handle, "files");
+        const parsed = try appendGitFileArgs(&L, -1, &cmd, false);
+        try std.testing.expectEqual(FileList{ .appended = 1 }, parsed);
+        try std.testing.expectEqualStrings(" '.'", cmd.items);
+        c.lua_pop(L.handle, 1);
+    }
+    // A table appends its string entries and skips the rest.
+    {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        try std.testing.expect(L.doString("files = {'x.zig', 42, 'y z.lua'}"));
+        _ = c.lua_getglobal(L.handle, "files");
+        const parsed = try appendGitFileArgs(&L, -1, &cmd, false);
+        try std.testing.expectEqual(FileList{ .appended = 2 }, parsed);
+        try std.testing.expectEqualStrings(" 'x.zig' 'y z.lua'", cmd.items);
+        c.lua_pop(L.handle, 1);
+    }
+    // An empty table names nothing, and anything else is not a list.
+    {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        try std.testing.expect(L.doString("files = {}"));
+        _ = c.lua_getglobal(L.handle, "files");
+        try std.testing.expectEqual(FileList{ .appended = 0 }, try appendGitFileArgs(&L, -1, &cmd, false));
+        c.lua_pop(L.handle, 1);
+    }
+    {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(std.heap.page_allocator);
+        try std.testing.expect(L.doString("files = 42"));
+        _ = c.lua_getglobal(L.handle, "files");
+        try std.testing.expectEqual(FileList.not_a_list, try appendGitFileArgs(&L, -1, &cmd, false));
+        c.lua_pop(L.handle, 1);
+    }
+}
 
 test "quoteShellArg: POSIX rules (pwsh_rules = false)" {
     const gpa = std.testing.allocator;
