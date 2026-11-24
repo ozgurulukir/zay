@@ -75,6 +75,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
 
       # Reject raw control bytes in tracked text files (everything except
       # newline and tab). Control bytes survive review invisibly and once
@@ -100,3 +102,15 @@ jobs:
       - name: Doc links resolve
         shell: bash
         run: python3 scripts/check_doc_links.py
+
+      # Every store.json entry must match the bytes and version at its pinned
+      # commit; on main, also require the catalog to match HEAD so package
+      # updates cannot silently drift behind the remote store.
+      - name: Plugin catalog hashes and versions
+        shell: bash
+        run: python3 scripts/sync-plugin-catalog.py
+
+      - name: Plugin catalog matches main HEAD
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: python3 scripts/sync-plugin-catalog.py --check-head
