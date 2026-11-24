@@ -18,9 +18,12 @@ application.
   `App` struct.
 - `src/tui/*_lifecycle.zig` modules own domain transitions and keep `App`
   methods as thin delegates where compatibility requires them.
-- `src/tui/widgets/` contains rendering widgets. Leaf widgets must not hold an
-  `App` pointer (`INV-WIDGET-1`); pass scalar props or a view model built at the
-  frame boundary. The picker `overlay` is the documented composite exception.
+- `src/tui/widgets/` contains rendering widgets. Leaf widgets must not import
+  `src/tui.zig` or hold an `App` pointer (`INV-WIDGET-1`); pass scalar props,
+  view models, and `*const Palette` built at the frame boundary. Allowed
+  mutable pointer exceptions: `InputProps.input_field: *vxfw.TextField` (focus
+  identity) and `diff.zig` (`*diff_viewer.State`, accepted debt). `drawRoot`
+  may write only `app.frame_geometry`.
 - `src/tui/command_router.zig` owns per-mode key handling. Do not add another
   private `App` key-routing path.
 

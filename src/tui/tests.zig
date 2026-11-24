@@ -4776,3 +4776,18 @@ test "drawRoot performs 0 app.gpa allocations once caches are warm" {
     _ = try renderRootFrame(&app, &arena, 80, 24);
     try std.testing.expectEqual(@as(usize, 0), counting_gpa.count);
 }
+
+// Guard: every command in tui.commands (except Quit alias) must have a help entry.
+test "help documents every slash command in tui.commands" {
+    for (tui.commands) |cmd| {
+        if (std.mem.eql(u8, cmd.name, "Quit")) continue; // alias of Exit
+        var key_buf: [32]u8 = undefined;
+        key_buf[0] = '/';
+        const raw_name = if (std.mem.eql(u8, cmd.name, "Models")) "model" else cmd.name;
+        for (raw_name, 0..) |ch, ci| {
+            key_buf[1 + ci] = std.ascii.toLower(ch);
+        }
+        const slash_cmd = key_buf[0 .. 1 + raw_name.len];
+        try std.testing.expect(@import("widgets/help_picker.zig").indexOfKey(slash_cmd, .global) != null);
+    }
+}

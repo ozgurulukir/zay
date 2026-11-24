@@ -6,6 +6,7 @@
 //! one-line delegate so existing inline tests resolve via the struct.
 
 const std = @import("std");
+const frame_geometry = @import("frame_geometry.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -260,6 +261,10 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
             root.app.metrics.context_tokens_used = agent_mod.currentContextTokens(&rt.agent);
             root.app.metrics.context_tokens_max = rt.agent.context_window_tokens;
         }
+        root.app.metrics.driver_workspace_path = if (root.app.threads.len() > 0)
+            if (root.app.threads.at(0).agent) |a| a.workspaceBorrow() else null
+        else
+            null;
     }
     visible_change = try drainToasts() or visible_change;
     visible_change = try drainModelsAndMcp(root) or visible_change;
@@ -472,7 +477,7 @@ fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
         root.blackhole_tick_accum = 0;
         return;
     }
-    if (root.app.frame_geometry.blackhole_visible) {
+    if (frame_geometry.isBlackholeVisible(root.app)) {
         // Carry the remainder so the average interval tracks ~24 fps even
         // though the host tick (30 ms) is coarser than the frame interval.
         root.blackhole_tick_accum += RootWidget.drain_tick_ms;
@@ -536,7 +541,7 @@ pub fn decideShouldTick(root: *RootWidget) bool {
     const turn_active = root.app.anyTurnActive();
     const turn_cancel_pending = turn_lifecycle.turnCancelActive(root.app);
     const any_job_active = anyJobActive(root.app);
-    const blackhole_visible = root.app.frame_geometry.blackhole_visible and (root.app.cached_config.tui.animations == .full);
+    const blackhole_visible = frame_geometry.isBlackholeVisible(root.app) and (root.app.cached_config.tui.animations == .full);
     const diff_refresh_pending = root.diff_refresh_pending;
     const background_active = root.app.backgroundActive();
     const naming_active = root.app.namingActive();
@@ -789,7 +794,7 @@ pub fn decideTickIntervalMs(root: *RootWidget) u32 {
     const fast_reason = root.app.anyTurnActive() or
         turn_lifecycle.turnCancelActive(root.app) or
         anyJobActive(root.app) or
-        (root.app.frame_geometry.blackhole_visible and root.app.cached_config.tui.animations == .full) or
+        (frame_geometry.isBlackholeVisible(root.app) and root.app.cached_config.tui.animations == .full) or
         root.diff_refresh_pending or
         root.app.namingActive() or
         root.app.mcp_manager.hasPendingConnects() or
@@ -1112,7 +1117,6 @@ test "streamed delta on visible dual worker lane marks visible_change = true (#5
 }
 
 test "blackhole_visible is false when an overlay mode is active" {
-    const frame_geometry = @import("frame_geometry.zig");
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var agent = agent_mod.Agent.init(gpa, io, ".", .none);

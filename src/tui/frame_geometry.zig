@@ -178,14 +178,21 @@ pub fn computeFrameGeometry(
         };
     }
 
+    geom.blackhole_visible = isBlackholeVisible(app);
+
+    return geom;
+}
+
+/// True when the startup blackhole logo is visible in the transcript.
+/// Pure function of App state so tick scheduling does not depend on last frame's draw.
+pub fn isBlackholeVisible(app: *const App) bool {
+    const messages = app.thread.transcript.messages.items;
     const splash_suppressed = app.inputs.input.buf.realLength() > 0;
-    geom.blackhole_visible = app.mode == .normal and
+    return app.mode == .normal and
         messages.len > 0 and
         messages[0] == .logo and
         app.thread.transcript_list.scroll.top == 0 and
         !splash_suppressed;
-
-    return geom;
 }
 
 fn computePermissionButtons(

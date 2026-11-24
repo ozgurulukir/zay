@@ -394,6 +394,7 @@ pub const MetricsState = struct {
     loading_tick_active: bool = false,
     blackhole_frame: u16 = 0,
     git_label: []const u8 = "",
+    driver_workspace_path: ?[]const u8 = null,
     context_tokens_used: u32 = 0,
     context_tokens_max: u32 = 128000,
     /// Accumulator for the active lane's `response_delta` and `thinking_delta` text bytes, fed as

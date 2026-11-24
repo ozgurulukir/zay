@@ -444,7 +444,7 @@ pub const App = struct {
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
         // Load custom themes and re-apply the theme registry-aware (M1). The
-        // earlier `setActive(resolveTheme(...))` at tui.zig:~1160 is
+        // earlier `setActiveTheme(resolveTheme(...))` during init is
         // builtin-only and runs before initRuntime; this second pass resolves
         // custom slugs so a config with `"theme": "<custom>"` is applied at
         // startup instead of silently falling back to `default`.
@@ -464,13 +464,17 @@ pub const App = struct {
             self.cached_config.tui.density,
             self.cached_config.tui.show_turn_timestamps,
         );
-        const active_theme = self.theme_registry.resolveWithScheme(
-            self.cached_config.theme,
+        const active_theme = self.resolveTheme(self.cached_config.theme);
+        self.setActiveTheme(active_theme);
+    }
+
+    pub fn resolveTheme(self: *const App, name: ?[]const u8) tui_style.Theme {
+        return self.theme_registry.resolveWithScheme(
+            name,
             self.terminal_color_scheme,
             self.cached_config.tui.effectiveLightTheme(),
             self.cached_config.tui.effectiveDarkTheme(),
         );
-        self.setActiveTheme(active_theme);
     }
 
     pub fn activePalette(self: *const App) *const tui_style.Palette {
