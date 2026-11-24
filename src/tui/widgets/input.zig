@@ -2,8 +2,9 @@
 //!
 //! Pulled out of `tui.zig` (R6.1 of `_pm/Projects/tui-split`) — the
 //! `InputWidget` (bordered input field, queued-message preview, hint line,
-//! lanes/background badges, diff counts), `CommandInputText` (the multi-line
-//! renderer inside the input border), the `WrappedInputDraw` /
+//! lanes/background badges, diff counts), `CommandInputText` (the prompt
+//! renderer inside the input border — the single owned draw path for
+//! one-row and multi-row text, #512), the `WrappedInputDraw` /
 //! `WrappedTextPosition` / `VerticalMove` types, and the 13 free functions
 //! that compute word-wrapped cursor positions and draw wrapped text.
 //!
@@ -132,7 +133,9 @@ fn writeAscii(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, col_
 /// arena-owned by the frame; the two pointer fields are write-backs whose
 /// targets (App fields) outlive the draw.
 pub const InputProps = struct {
-    /// The live text field — drawn directly in single-line mode.
+    /// The live text field — the prompt's gap buffer. Its widget is the
+    /// drawn surface's owner (the focus handoff target); its own draw is
+    /// not called anymore (#512).
     input_field: *vxfw.TextField,
     /// Combined buffer halves (arena-owned), plus the cursor's byte offset.
     input_text: []const u8,
@@ -175,9 +178,11 @@ pub const CommandInputText = struct {
 
     fn drawInputText(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *CommandInputText = @ptrCast(@alignCast(ptr));
-        const width = ctx.max.width orelse 0;
-        const rows = wrappedTextRows(ctx, self.props.input_text, width);
-        if (rows <= 1) return self.props.input_field.draw(ctx);
+        // One owned draw path for one-row and multi-row prompts alike
+        // (#512): the wrapped renderer handles a single row identically, so
+        // the two wrap/cursor models can no longer drift. The vendored
+        // TextField stays the gap buffer; its draw is no longer called, and
+        // its surface identity (the focus handoff target) is kept.
         return self.drawMultiline(ctx);
     }
 
@@ -960,4 +965,112 @@ test "InputWidget draws overflow indicator when multi-line prompt exceeds viewpo
         }
     }
     try std.testing.expect(found_overflow);
+}
+
+// ── #512: one owned draw path for one-row and multi-row prompts ──────
+
+fn expectGraphemesEqual(want: []const []const u8, surface: vxfw.Surface) !void {
+    for (want, 0..) |grapheme, col| {
+        const cell = surface.buffer[col];
+        try std.testing.expectEqualStrings(grapheme, cell.char.grapheme);
+        try std.testing.expectEqual(@as(u8, 1), cell.char.width);
+    }
+}
+
+test "unified draw path renders a one-row prompt like the TextField did" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var text_field: vxfw.TextField = .init(gpa);
+    defer text_field.deinit();
+    try text_field.insertSliceAtCursor("hello");
+
+    var props: InputProps = .{ .input_field = &text_field, .input_text = "hello", .input_cursor = 5 };
+    var command_input: CommandInputText = .{ .props = &props };
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 10, .height = 1 },
+        .max = .{ .width = 10, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    // The vendored draw, kept as the reference for the single-row contract
+    // it used to own. The unified path must render the same cells and put
+    // the cursor in the same column.
+    const reference = try text_field.draw(ctx);
+    const unified = try command_input.widget().draw(ctx);
+
+    try std.testing.expectEqual(reference.size, unified.size);
+    try std.testing.expectEqual(@as(vxfw.CursorState, .{ .row = 0, .col = 5 }), unified.cursor);
+    try std.testing.expectEqual(@as(vxfw.CursorState, .{ .row = 0, .col = 5 }), reference.cursor);
+    for (0..reference.size.width) |col| {
+        const index: usize = @intCast(col);
+        try std.testing.expectEqualStrings(reference.buffer[index].char.grapheme, unified.buffer[index].char.grapheme);
+        try std.testing.expectEqual(reference.buffer[index].char.width, unified.buffer[index].char.width);
+        try std.testing.expectEqual(reference.buffer[index].style, unified.buffer[index].style);
+    }
+    try expectGraphemesEqual(&.{ "h", "e", "l", "l", "o" }, unified);
+}
+
+test "unified draw path places a mid-text cursor by grapheme column" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var text_field: vxfw.TextField = .init(gpa);
+    defer text_field.deinit();
+    // "héllo" with the gap parked after 'é' (byte 3, display column 2):
+    // insert the whole text — the gap lands at the end — then move it back.
+    try text_field.insertSliceAtCursor("héllo");
+    text_field.buf.moveGapLeft(3);
+
+    var props: InputProps = .{
+        .input_field = &text_field,
+        .input_text = "héllo",
+        .input_cursor = text_field.buf.firstHalf().len,
+    };
+    var command_input: CommandInputText = .{ .props = &props };
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 10, .height = 1 },
+        .max = .{ .width = 10, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const reference = try text_field.draw(ctx);
+    const unified = try command_input.widget().draw(ctx);
+
+    try std.testing.expectEqual(reference.cursor, unified.cursor);
+    try std.testing.expectEqual(@as(vxfw.CursorState, .{ .row = 0, .col = 2 }), unified.cursor);
+    try expectGraphemesEqual(&.{ "h", "é", "l", "l", "o" }, unified);
+}
+
+test "a one-row prompt that exactly fills its row keeps its text and cursor" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var text_field: vxfw.TextField = .init(gpa);
+    defer text_field.deinit();
+    try text_field.insertSliceAtCursor("0123456789");
+
+    var props: InputProps = .{ .input_field = &text_field, .input_text = "0123456789", .input_cursor = 10 };
+    var command_input: CommandInputText = .{ .props = &props };
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 10, .height = 1 },
+        .max = .{ .width = 10, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const unified = try command_input.widget().draw(ctx);
+
+    // The vendored draw used to replace the last cell with an ellipsis and
+    // park the cursor at column 0 the moment the text reached full width.
+    // The owned path shows the text and rides the cursor to its end.
+    try expectGraphemesEqual(&.{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" }, unified);
+    try std.testing.expectEqual(@as(vxfw.CursorState, .{ .row = 0, .col = 10 }), unified.cursor);
 }

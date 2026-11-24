@@ -1,20 +1,25 @@
 """Scripted PTY smoke test for zay's real terminal build (draw-purity plan, Phase D;
 focus-transition scenarios added by the #292 part 2 work).
 
-Drives the freshly built zay.exe through a Windows ConPTY and asserts on the
-rendered byte stream for the states that need a live terminal: at-search with
+Drives the freshly built zay binary through a real pseudoterminal and asserts on
+the rendered byte stream for the states that need a live terminal: at-search with
 results / empty / no-matches, Esc close, a mid-session resize, and — the
 #292/#313 crash class — mode transitions that must leave typed input alive:
 open the command menu / transcript search / help, close each, then require a
 unique token to echo in the main prompt.
 
+Runs on Windows (ConPTY via pywinpty) and on POSIX (a pty via the standard
+library) with the same scenario list: the #512 draw-path unification needs this
+gate on a platform CI can run it on, and CI has no Windows runner.
+
 Not covered here (needs an agent/LLM to spawn background jobs): the Ctrl+O
 modal states — those are covered deterministically by the scripted in-process
 smoke tests in src/tui/tests.zig ("scripted smoke: ...") which run the real
-drawRoot + event router against real pwsh child processes.
+drawRoot + event router against real shell child processes.
 
 Usage:
-    uv run --with pywinpty python tools/pty-smoke/pty_smoke.py [exe] [cwd]
+    uv run --with pywinpty python tools/pty-smoke/pty_smoke.py [exe] [cwd]   (Windows)
+    python3 tools/pty-smoke/pty_smoke.py [exe] [cwd]                          (POSIX)
 
 Exit code: 0 iff every check passed.
 """
@@ -27,16 +32,110 @@ import tempfile
 import threading
 import time
 
-from winpty import PtyProcess
+IS_WINDOWS = os.name == "nt"
 
-EXE = sys.argv[1] if len(sys.argv) > 1 else os.path.join("zig-out", "bin", "zay.exe")
+if IS_WINDOWS:
+    from winpty import PtyProcess
+
+DEFAULT_EXE = os.path.join("zig-out", "bin", "zay.exe" if IS_WINDOWS else "zay")
+EXE = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_EXE
 CWD = sys.argv[2] if len(sys.argv) > 2 else "."
 
 results = []
 
 
+class WinptyProc:
+    """The pywinpty process behind the same interface the POSIX backend offers."""
+
+    def __init__(self, exe, cwd, dimensions):
+        self.proc = PtyProcess.spawn(exe, dimensions=dimensions, cwd=cwd)
+
+    def write(self, data):
+        self.proc.write(data)
+
+    def read(self, n):
+        return self.proc.read(n)
+
+    def setwinsize(self, rows, cols):
+        self.proc.setwinsize(rows, cols)
+
+    def isalive(self):
+        return self.proc.isalive()
+
+    def terminate(self, force=False):
+        try:
+            self.proc.terminate(force=force)
+        except OSError as exc:
+            # Benign if the child died between the isalive check and here;
+            # anything else leaks a live zay.exe holding the ConPTY.
+            print(f"[WARN] terminate failed: {exc!r}", file=sys.stderr, flush=True)
+
+
+class PosixPty:
+    """A child on a standard-library pty. read() blocks while no data flows —
+    the pump thread below already expects that from the Windows backend."""
+
+    def __init__(self, exe, cwd, dimensions):
+        import fcntl
+        import pty
+        import struct
+        import termios
+
+        exe = os.path.abspath(exe) if os.sep in exe or (os.altsep and os.altsep in exe) else exe
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            try:
+                os.chdir(cwd)
+                os.execvp(exe, [exe])
+            except OSError:
+                pass
+            os._exit(127)
+        rows, cols = dimensions
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+
+    def write(self, data):
+        os.write(self.fd, data.encode())
+
+    def read(self, n):
+        # Raises OSError (EIO) once the child side is gone — the pump thread
+        # treats that as the EOF sentinel.
+        return os.read(self.fd, n).decode(errors="replace")
+
+    def setwinsize(self, rows, cols):
+        import fcntl
+        import struct
+        import termios
+
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+
+    def isalive(self):
+        try:
+            pid, _ = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return False
+        return pid == 0
+
+    def terminate(self, force=False):
+        import signal
+
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(self.pid, 0)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
 def start_reader(p, q):
-    """pywinpty's read() blocks forever when no data flows, so pump it from
+    """The backend's read() blocks forever when no data flows, so pump it from
     a thread and let consumers wait on a queue with a timeout. The None EOF
     sentinel is queued exactly once, on every exit path — a dead child must
     surface as an aborted run, not as quiet output."""
@@ -108,10 +207,11 @@ PROC = None
 
 def main():
     global PROC
-    print(f"spawning {EXE} (cwd={CWD}) under ConPTY 120x34 ...", flush=True)
+    print(f"spawning {EXE} (cwd={CWD}) under "
+          f"{'ConPTY' if IS_WINDOWS else 'a pty'} 120x34 ...", flush=True)
     # Isolate the child from the developer's real zay home (roaming session
     # store, MCP servers, plugins): boot the smoke against default config in
-    # a throwaway APPDATA so the first frame is fast and side-effect free.
+    # a throwaway home so the first frame is fast and side-effect free.
     # The env is copied into the child at spawn, so it is restored afterwards;
     # the temp dir is removed in the finally block.
     isolated = tempfile.mkdtemp(prefix="zay-pty-smoke-")
@@ -121,12 +221,13 @@ def main():
     os.environ["HOME"] = isolated
     p = None
     try:
-        p = PtyProcess.spawn(EXE, dimensions=(34, 120), cwd=CWD)
+        p = (WinptyProc(EXE, CWD, (34, 120)) if IS_WINDOWS
+             else PosixPty(EXE, CWD, (34, 120)))
         PROC = p
         q = queue.Queue()
         start_reader(p, q)
         # Startup (models.dev registry, session-store resume lookups) can
-        # legitimately take ~25s under ConPTY before the first frame.
+        # legitimately take ~25s under a pty before the first frame.
         boot = read_for(q, 45.0)
         if "\x1b[?1049h" not in boot:
             results.append(False)
@@ -258,12 +359,7 @@ def main():
         clear_input()
     finally:
         if p is not None and p.isalive():
-            try:
-                p.terminate(force=True)
-            except OSError as exc:
-                # Benign if the child died between the isalive check and here;
-                # anything else leaks a live zay.exe holding the ConPTY.
-                print(f"[WARN] terminate failed: {exc!r}", file=sys.stderr, flush=True)
+            p.terminate(force=True)
         # Restore the harness's own environment (the child took its copy at
         # spawn) and clean the throwaway config dir.
         if old_appdata is not None:
