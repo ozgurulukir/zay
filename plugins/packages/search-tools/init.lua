@@ -1,23 +1,121 @@
 -- init.lua — Search Tools
 -- Registers `grep` (content search) and `glob` (filename search). Both return
--- grouped, bounded output with truncation markers. `grep` has two backends:
--- substring search (the default) uses Zay's built-in search_files — self-
--- contained, no external binary; regex search (regex=true) shells out to
--- ripgrep, because search_files is substring-only and Lua patterns are not
--- PCRE (no alternation). Quoting for the rg line goes through
--- `zay.shell_quote` with a dialect matched to the runner (see the grep
--- handler). Scope differs by backend: ripgrep honors .gitignore; the native
--- walker skips dotfiles but scans gitignored dirs (vendor/, zig-cache/).
+-- grouped, bounded output with truncation markers.
+--
+-- `grep` has two backends. Literal search runs through Zay's built-in
+-- search_files: self-contained, no external binary, and the default. Regex
+-- search shells out to ripgrep, because search_files is substring-only and
+-- Lua patterns are not PCRE (no alternation). The tool is named `grep`, so
+-- models pass regex syntax without asking for it: when `regex` is left unset
+-- and the pattern carries unambiguous regex syntax, a literal search that
+-- finds nothing is retried as a regular expression. Quoting for the rg line
+-- goes through `zay.shell_quote` with a dialect matched to the runner.
+-- Scope differs by backend: ripgrep honors .gitignore; the native walker
+-- skips dotfiles but scans gitignored dirs (vendor/, zig-cache/).
 
--- Build the rg invocation as a single shell command string with every dynamic
--- value quoted via the supplied `quote` function (regex mode only). rg exit
--- codes the handler relies on: 0 = matches, 1 = no matches, 2 = error (e.g.
--- bad regex); shell returns 127 when rg itself is missing.
 local function fail(message)
   return nil, "Error: " .. message
 end
 
-local function build_rg_command(pattern, root, include, case_sensitive, quote)
+-- Regex syntax that is not ordinary text: alternation, escapes, groups,
+-- classes, bounds, anchors, `?`, `+` and `.*`. A lone `.` or `*` is left
+-- out on purpose: both are common in literal strings, and a regex retry
+-- would then answer a question nobody asked.
+local function looks_like_regex(pattern)
+  -- `]` leads the class because a Lua pattern escapes with `%`, not `\`.
+  return pattern:find("[][\\|(){}^$?+]") ~= nil or pattern:find(".*", 1, true) ~= nil
+end
+
+-- Paths are printed relative to the active workspace whenever they sit
+-- inside it, so both backends report the same shape: ripgrep already prints
+-- workspace-relative paths, the native walker returns absolute ones.
+local function display_path(path)
+  local shown = (path:gsub("\\", "/")):gsub("^%./", "")
+  local cwd = zay.get_cwd()
+  if not cwd or cwd == "" then return shown end
+  local root = (cwd:gsub("\\", "/")):gsub("[/]+$", "")
+  if root == "" then return shown end
+  -- Windows paths are case-insensitive; POSIX ones are not, and folding
+  -- there could hand back a sibling directory's file.
+  local fold = function(p) return p end
+  if zay.get_env("OS") == "Windows_NT" then
+    fold = function(p) return p:lower() end
+  end
+  local prefix = fold(root) .. "/"
+  if fold(shown):sub(1, #prefix) == prefix then
+    return shown:sub(#root + 2)
+  end
+  return shown
+end
+
+-- Grouped listing shared by both backends: a summary line, then each file
+-- as a `path:` header with indented `Line N: <content>` entries.
+local function render(summary, by_file, file_order)
+  if #file_order == 0 then return summary end
+  local out = { summary, "" }
+  for _, file in ipairs(file_order) do
+    table.insert(out, file .. ":")
+    for _, m in ipairs(by_file[file]) do
+      table.insert(out, string.format("  Line %d: %s", m.line, m.content))
+    end
+    table.insert(out, "")
+  end
+  return (table.concat(out, "\n"):gsub("\n$", ""))
+end
+
+-- ── native (literal) backend ────────────────────────────────────────
+
+-- Substring search via Zay's native walker — the primary substring path.
+-- Self-contained (no external binary). Scope: skips dotfiles but NOT
+-- gitignored dirs, so vendor/ and zig-cache/ are searched; for a
+-- gitignore-aware search use regex=true (ripgrep) or bash with rg. File
+-- roots are searched directly by the bridge, without a recursive walk.
+-- Returns the bridge's result table, or nil + message.
+local function native_search(params, root, case_sensitive, max_results)
+  local result, err = zay.search_files(root, params.pattern, {
+    file_pattern = params.include,
+    case_sensitive = case_sensitive,
+    max_results = max_results,
+  })
+  if result == nil then
+    return fail("could not search " .. root .. ": " .. tostring(err or "unknown error"))
+  end
+  if result.error then
+    return fail("could not search " .. root .. ": " .. tostring(result.error))
+  end
+  return result
+end
+
+local function render_native(result, pattern)
+  if result.total_matches == 0 then return "No matches found for: " .. pattern end
+
+  local by_file, file_order = {}, {}
+  for _, m in ipairs(result.results or {}) do
+    local file = display_path(m.file)
+    if not by_file[file] then
+      by_file[file] = {}
+      table.insert(file_order, file)
+    end
+    table.insert(by_file[file], m)
+  end
+
+  local shown = #(result.results or {})
+  local summary
+  if result.truncated then
+    summary = string.format("Found %d matches (showing first %d, more available):", result.total_matches, shown)
+  else
+    summary = string.format("Found %d matches:", result.total_matches)
+  end
+  return render(summary, by_file, file_order)
+end
+
+-- ── regex backend (ripgrep) ─────────────────────────────────────────
+
+-- Build the rg invocation as a single shell command string with every dynamic
+-- value quoted via the supplied `quote` function. rg exit codes the handler
+-- relies on: 0 = matches, 1 = no matches, 2 = error (e.g. bad regex); shell
+-- returns 127 when rg itself is missing.
+local function build_rg_command(pattern, root, include, case_sensitive, max_count, quote)
   local argv = { "rg", "--json", "--color", "never" }
   if not case_sensitive then
     table.insert(argv, "-i")
@@ -28,6 +126,12 @@ local function build_rg_command(pattern, root, include, case_sensitive, quote)
     if quoted == nil then return nil, err end
     table.insert(argv, quoted)
   end
+  -- Bound the stream at its source: at most `max_count` matching lines per
+  -- file. `--max-columns` cannot do this — it has no effect under --json.
+  table.insert(argv, "-m")
+  local quoted_count, count_err = quote(tostring(max_count))
+  if quoted_count == nil then return nil, count_err end
+  table.insert(argv, quoted_count)
   table.insert(argv, "-e")
   local quoted_pattern, pattern_err = quote(pattern)
   if quoted_pattern == nil then return nil, pattern_err end
@@ -39,9 +143,34 @@ local function build_rg_command(pattern, root, include, case_sensitive, quote)
   return table.concat(argv, " ")
 end
 
+-- Regex mode runs through a shell, so the target is validated through the
+-- filesystem boundary first. The shell cwd remains the active workspace and
+-- the target is passed as an argument: relative paths resolve once and
+-- explicit files keep their identity.
+-- Returns true to proceed, a finished result string, or nil + message.
+local function regex_target_check(params, root)
+  local info, path_err = zay.file_info(root)
+  if not info then
+    return fail("regex search failed (unreadable path): " .. tostring(path_err or root))
+  end
+  -- Ripgrep bypasses --glob for explicit files. Check the exact root with
+  -- the bridge's glob matcher so include still intersects the file target.
+  if info.type == "file" and params.include then
+    local included, include_err = zay.find_files(root, params.include, {max_results=1})
+    if not included or included.error then
+      return fail("could not filter regex search path: " .. tostring(include_err or (included and included.error)))
+    end
+    if included.total_matches == 0 then
+      return "No matches found for: " .. params.pattern
+    end
+  end
+  return true
+end
+
 -- JSON keeps drive letters, colons and escaped newlines in paths unambiguous
 -- on every shell. Stop decoding after one overflow match to bound Lua work.
-local function group_rg_output(raw, pattern, max_results)
+-- `note` is appended to the summary line when the caller narrowed the search.
+local function group_rg_output(raw, pattern, max_results, note)
   local by_file, file_order = {}, {}
   local shown, truncated = 0, false
   for line in raw:gmatch("[^\n]+") do
@@ -59,6 +188,7 @@ local function group_rg_output(raw, pattern, max_results)
         return fail("ripgrep returned non-UTF-8 paths or content; use literal search")
       end
       shown = shown + 1
+      file = display_path(file)
       if not by_file[file] then
         by_file[file] = {}
         table.insert(file_order, file)
@@ -76,126 +206,87 @@ local function group_rg_output(raw, pattern, max_results)
     end
   end
   if shown == 0 then return "No matches found for: " .. pattern end
-  local out = {}
+  local summary
   if truncated then
-    table.insert(out, string.format("Found at least %d matches (showing first %d, more available):", shown + 1, shown))
+    summary = string.format("Found at least %d matches (showing first %d, more available):", shown + 1, shown)
   else
-    table.insert(out, string.format("Found %d matches:", shown))
+    summary = string.format("Found %d matches:", shown)
   end
-  table.insert(out, "")
-  for _, file in ipairs(file_order) do
-    table.insert(out, file .. ":")
-    for _, m in ipairs(by_file[file]) do
-      table.insert(out, string.format("  Line %d: %s", m.line, m.content))
-    end
-    table.insert(out, "")
-  end
-  local text = table.concat(out, "\n")
-  return (text:gsub("\n$", ""))
+  return render(summary .. (note or ""), by_file, file_order)
 end
 
--- Local, separator-agnostic path splitters. The plugin sandbox does not
--- expose `std`, and these only ever run AFTER `zay.file_info` has confirmed
--- the path is a file — so the file/dir decision stays on the Zig side
--- (cross-platform). Splitting on either '/' or '\' mirrors Zay's own
--- separator-agnostic path handling and is safe on Windows and POSIX alike.
-local function dirname_of(p)
-  local last = 0
-  for i = 1, #p do
-    local c = p:sub(i, i)
-    if c == "/" or c == "\\" then last = i end
-  end
-  if last == 0 then return "." end
-  return p:sub(1, last - 1)
-end
+-- Run one ripgrep search with at most `max_count` matching lines per file.
+-- Returns the grouped output, or nil + message with a third value of true
+-- when the failure is the plugin shell's output cap: ripgrep matched more
+-- than one stream can carry, which a narrower `max_count` may still fit.
+local function run_rg(params, root, case_sensitive, max_results, max_count, note)
+  local target, target_err = regex_target_check(params, root)
+  if target ~= true then return target, target_err end
 
-local function basename_of(p)
-  local last = 0
-  for i = 1, #p do
-    local c = p:sub(i, i)
-    if c == "/" or c == "\\" then last = i end
+  -- The quoting dialect must match the runner that interprets the line:
+  -- "native" for run_shell (PowerShell '' rule on Windows), "posix" for a
+  -- run_bash fallback (git-bash is POSIX even on Windows). On POSIX both
+  -- dialects are identical.
+  local shell_runner = zay.run_shell or zay.run_bash
+  local dialect = (shell_runner == zay.run_shell) and "native" or "posix"
+  local quote = function(s) return zay.shell_quote(s, dialect) end
+  local cmd, quote_err = build_rg_command(params.pattern, root, params.include, case_sensitive, max_count, quote)
+  if cmd == nil then
+    return fail("could not quote regex search arguments: " .. tostring(quote_err or "unknown error"))
   end
-  return p:sub(last + 1)
-end
+  -- rg over large repos can exceed the 30 s default; the manifest gives the
+  -- dispatch the 60 s this ask needs.
+  local result, shell_err = shell_runner(cmd, { timeout = 60 })
 
--- Resolve a user-supplied `path` into a (root_dir, restriction) pair.
--- Cross-platform file/dir discrimination is delegated to `zay.file_info`
--- (Zig: sanitizePath + stat.kind — identical on Windows and Linux). We never
--- guess file-vs-directory from the path string, which would diverge across
--- platforms (no realpath on Windows, different separators).
--- Returns:
---   dir, nil            when path is a directory (or discrimination failed)
---   dir, basename       when path is a single file: search its parent dir and
---                       restrict results to that one file by name.
-local function resolve_search_root(path)
-  local root = path or "."
-  local ok, info = pcall(function() return zay.file_info(root) end)
-  if ok and info and info.type == "file" then
-    return dirname_of(root), basename_of(root)
-  end
-  return root, nil
-end
-
--- Substring search via Zay's native walker — the primary substring path.
--- Self-contained (no external binary). Scope: skips dotfiles but NOT
--- gitignored dirs, so vendor/ and zig-cache/ are searched; for a
--- gitignore-aware search use regex=true (ripgrep) or bash with rg.
--- File roots are searched directly by the bridge, without a recursive walk.
-local function native_substring_search(params, root, case_sensitive, max_results)
-  local file_pattern = params.include
-  local result, err = zay.search_files(root, params.pattern, {
-    file_pattern = file_pattern,
-    case_sensitive = case_sensitive,
-    max_results = max_results,
-  })
   if result == nil then
-    return fail("could not search " .. root .. ": " .. tostring(err or "unknown error"))
+    return nil, "Error: regex search failed: " .. tostring(shell_err or "unknown error"), shell_err == "StreamTooLong"
   end
-  if result.error then
-    return fail("could not search " .. root .. ": " .. tostring(result.error))
+  if result.code == 127 then
+    return fail("regex search needs ripgrep (rg), which is not installed")
   end
-  if result.total_matches == 0 then
+  if result.code == 2 then
+    return fail("regex search failed (invalid regex or unreadable path): " .. (result.stderr or ""))
+  end
+  if result.code == 1 then
+    -- The PowerShell bridge maps unsuccessful native exits to 1. ripgrep
+    -- emits diagnostics for errors, and leaves stderr empty for no matches.
+    if result.stderr and result.stderr ~= "" then
+      return fail("regex search failed (invalid regex or unreadable path): " .. result.stderr)
+    end
     return "No matches found for: " .. params.pattern
   end
+  if result.code ~= 0 then
+    return fail("regex search failed (exit " .. tostring(result.code) .. "): " .. (result.stderr or "unknown error"))
+  end
+  return group_rg_output(result.stdout, params.pattern, max_results, note)
+end
 
-  local by_file = {}
-  local file_order = {}
-  for _, m in ipairs(result.results or {}) do
-    if not by_file[m.file] then
-      by_file[m.file] = {}
-      table.insert(file_order, m.file)
-    end
-    table.insert(by_file[m.file], m)
-  end
+-- The plugin shell caps one command's output, and a broad pattern can
+-- exceed it even with `max_results` matching lines per file. The retry keeps
+-- one line per file; past that the search is too broad for a single call.
+local function regex_search(params, root, case_sensitive, max_results)
+  local text, err, overflowed = run_rg(params, root, case_sensitive, max_results, max_results)
+  if text ~= nil then return text end
+  if not overflowed then return nil, err end
 
-  local out = {}
-  local shown = #(result.results or {})
-  if result.truncated then
-    table.insert(out, string.format("Found %d matches (showing first %d, more available):", result.total_matches, shown))
-  else
-    table.insert(out, string.format("Found %d matches:", result.total_matches))
+  text, err, overflowed = run_rg(params, root, case_sensitive, max_results, 1,
+    " (one line per file — narrow `path` or `include` to list every match)")
+  if text ~= nil then return text end
+  if overflowed then
+    return fail("regex search matched too much for one call even at one line per file; narrow `path` or `include`")
   end
-  table.insert(out, "")
-  for _, file in ipairs(file_order) do
-    table.insert(out, file .. ":")
-    for _, m in ipairs(by_file[file]) do
-      table.insert(out, string.format("  Line %d: %s", m.line, m.content))
-    end
-    table.insert(out, "")
-  end
-  local text = table.concat(out, "\n")
-  return (text:gsub("\n$", ""))
+  return nil, err
 end
 
 -- ── grep ────────────────────────────────────────────────────────────
 
 zay.register_tool({
   name = "grep",
-  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Set regex=true for full regular expressions (alternation `a|b`, `.*`, character classes) via ripgrep, which respects .gitignore and requires `rg` installed. Supports an `include` glob filter (e.g. '*.zig'). To count matches within files, use bash with rg directly instead of this tool.",
+  description = "Search file contents recursively. Returns matches grouped by file as `path:` headers with indented `Line N: <content>` entries. By default does a literal substring search with Zay's built-in search (no external tools; skips dotfiles but scans gitignored dirs like vendor/). Regex syntax (alternation `a|b`, `.*`, character classes, anchors) that finds nothing as literal text is retried automatically as a regular expression via ripgrep. Set regex=true to search as a regular expression directly (respects .gitignore, requires `rg`), or regex=false for literal-only. Supports an `include` glob filter (e.g. '*.zig'). To count matches within files, use bash with rg directly instead of this tool.",
   parameters = {
     pattern = {
       type = "string",
-      description = "Text pattern to search for",
+      description = "Text to search for. A literal substring by default; regex syntax such as `a|b`, `foo.*bar` or `^import` is retried as a regular expression when the literal search finds nothing",
     },
     path = {
       type = "string",
@@ -209,7 +300,7 @@ zay.register_tool({
     },
     regex = {
       type = "boolean",
-      description = "Treat pattern as a regex via ripgrep (default false = literal substring via built-in search)",
+      description = "Treat the pattern as a regular expression via ripgrep. Omit for a literal search with an automatic regex retry; false disables the retry",
       optional = true,
     },
     case_sensitive = {
@@ -231,67 +322,32 @@ zay.register_tool({
     -- (before the Zig clamp) panic on the u32 cast.
     local max_results = math.max(1, math.min(math.floor(params.max_results or 50), 200))
 
-    -- Substring (default): Zay's native search. Self-contained, no external
+    if params.regex == true then
+      local text, err = regex_search(params, root, case_sensitive, max_results)
+      if text == nil then return nil, err end
+      return text
+    end
+
+    -- Substring: Zay's native search. Self-contained, no external
     -- binary, identical behavior in every environment.
-    if not params.regex then
-      return native_substring_search(params, root, case_sensitive, max_results)
+    local literal, literal_err = native_search(params, root, case_sensitive, max_results)
+    if literal == nil then return nil, literal_err end
+    if literal.total_matches > 0 or params.regex == false or not looks_like_regex(params.pattern) then
+      return render_native(literal, params.pattern)
     end
 
-    -- Regex: ripgrep via shell (search_files is substring-only; Lua patterns
-    -- are not PCRE). Quoting in build_rg_command keeps `|`, spaces, etc. from
-    -- being parsed by the shell. The dialect must match the runner that will
-    -- interpret the line: "native" for run_shell (PowerShell '' rule on
-    -- Windows), "posix" for a run_bash fallback (git-bash is POSIX even on
-    -- Windows). On POSIX both dialects are identical.
-    -- Validate the target through the filesystem boundary before passing it to
-    -- a shell. The shell cwd remains the active workspace, so relative paths
-    -- are resolved once and explicit files retain their identity.
-    local info, path_err = zay.file_info(root)
-    if not info then
-      return fail("regex search failed (unreadable path): " .. tostring(path_err or root))
-    end
-    -- Ripgrep bypasses --glob for explicit files. Check the exact root with
-    -- the bridge's glob matcher so include still intersects the file target.
-    if info.type == "file" and params.include then
-      local included, include_err = zay.find_files(root, params.include, {max_results=1})
-      if not included or included.error then
-        return fail("could not filter regex search path: " .. tostring(include_err or (included and included.error)))
-      end
-      if included.total_matches == 0 then
-        return "No matches found for: " .. params.pattern
-      end
-    end
-    local shell_runner = zay.run_shell or zay.run_bash
-    local dialect = (shell_runner == zay.run_shell) and "native" or "posix"
-    local quote = function(s) return zay.shell_quote(s, dialect) end
-    local cmd, quote_err = build_rg_command(params.pattern, root, params.include, case_sensitive, quote)
-    if cmd == nil then
-      return fail("could not quote regex search arguments: " .. tostring(quote_err or "unknown error"))
-    end
-    -- rg over large repos can exceed the 30 s default; give it a 60 s budget.
-    local bash_result, shell_err = shell_runner(cmd, { timeout = 60 })
-
-    if bash_result == nil then
-      return fail("regex search failed: " .. tostring(shell_err or "unknown error"))
-    end
-    if bash_result.code == 127 then
-      return fail("regex search needs ripgrep (rg), which is not installed")
-    end
-    if bash_result.code == 2 then
-      return fail("regex search failed (invalid regex or unreadable path): " .. (bash_result.stderr or ""))
-    end
-    if bash_result.code == 1 then
-      -- The PowerShell bridge maps unsuccessful native exits to 1. ripgrep
-      -- emits diagnostics for errors, and leaves stderr empty for no matches.
-      if bash_result.stderr and bash_result.stderr ~= "" then
-        return fail("regex search failed (invalid regex or unreadable path): " .. bash_result.stderr)
-      end
+    -- Nothing literal, and the pattern reads as a regular expression: the
+    -- caller most likely asked a regex question of a tool named `grep`. The
+    -- retry is a courtesy — when it cannot run, the literal answer stands
+    -- and says so.
+    local retried, retry_err = regex_search(params, root, case_sensitive, max_results)
+    if retried == nil then
       return "No matches found for: " .. params.pattern
+        .. " (searched as a literal substring; regular-expression retry unavailable: "
+        .. tostring(retry_err or "unknown error") .. ")"
     end
-    if bash_result.code ~= 0 then
-      return fail("regex search failed (exit " .. tostring(bash_result.code) .. "): " .. (bash_result.stderr or "unknown error"))
-    end
-    return group_rg_output(bash_result.stdout, params.pattern, max_results)
+    return "No literal substring matched: " .. params.pattern
+      .. " — showing regular-expression matches (ripgrep):\n" .. retried
   end,
 })
 
@@ -307,7 +363,7 @@ zay.register_tool({
     },
     path = {
       type = "string",
-      description = "Root directory to search in (default: active workspace)",
+      description = "Directory to search in, or one exact file (default: active workspace)",
       optional = true,
     },
     max_results = {
@@ -317,27 +373,20 @@ zay.register_tool({
     },
   },
   handler = function(params)
-    local root, file_restriction = resolve_search_root(params.path)
+    local root = params.path or "."
     local max_results = math.max(1, math.min(math.floor(params.max_results or 100), 200))
-    local opts = { max_results = max_results }
 
-    local result, err = zay.find_files(root, params.pattern, opts)
+    -- The path goes to the bridge as given: `zay.find_files` takes an exact
+    -- file as its root and matches only that file, and walks a directory
+    -- root recursively. Emulating a file with a walk of its parent leaks
+    -- same-named files and can stop before reaching the target.
+    local result, err = zay.find_files(root, params.pattern, { max_results = max_results })
     if result == nil then
       return fail("glob failed for " .. params.pattern .. ": " .. tostring(err or "unknown error"))
     end
-
-    -- When `path` pointed at a single file, keep only that file (the walk
-    -- happened in its parent dir). Restriction is by basename, so it works
-    -- regardless of the user's glob pattern.
     local matches = result.results or {}
-    if file_restriction and file_restriction ~= "" then
-      local filtered = {}
-      for _, f in ipairs(matches) do
-        if basename_of(f.path) == file_restriction then
-          table.insert(filtered, f)
-        end
-      end
-      matches = filtered
+    if result.error and #matches == 0 then
+      return fail("glob failed for " .. params.pattern .. ": " .. tostring(result.error))
     end
 
     if #matches == 0 then
@@ -351,7 +400,7 @@ zay.register_tool({
     end
     table.insert(lines, "")
     for _, f in ipairs(matches) do
-      table.insert(lines, f.path)
+      table.insert(lines, display_path(f.path))
     end
     return table.concat(lines, "\n")
   end,

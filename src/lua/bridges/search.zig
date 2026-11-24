@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const os = @import("../../os.zig");
 const State = @import("../state.zig").State;
 const bridge = @import("../bridge.zig");
 const execution = @import("../execution.zig");
@@ -174,8 +175,14 @@ fn checkWalkBudget(L: ?*c.lua_State) !void {
     if (execution.stopped(l)) return error.PluginExecutionStopped;
 }
 
+/// What a walk can fail with: the dispatch stop, allocation, and the
+/// filesystem errors of one entry's open, stat or iteration step. Named
+/// because the walks are recursive and classify their own nested failures.
+const WalkError = error{ PluginExecutionStopped, OutOfMemory } ||
+    std.Io.Dir.OpenError || std.Io.Dir.StatFileError || std.Io.Dir.Iterator.Error;
+
 /// Walk a directory recursively, matching each file's relative path against pattern.
-pub fn walkAndMatch(io: std.Io, dir_path: []const u8, pattern: []const u8, ctx: *FindCtx) !void {
+pub fn walkAndMatch(io: std.Io, dir_path: []const u8, pattern: []const u8, ctx: *FindCtx) WalkError!void {
     try checkWalkBudget(ctx.L);
     // An exact root uses the same basename glob contract as search_files.
     if (dir_path.len == ctx.root_len) {
@@ -207,7 +214,13 @@ pub fn walkAndMatch(io: std.Io, dir_path: []const u8, pattern: []const u8, ctx: 
         defer std.heap.page_allocator.free(full_path);
 
         switch (entry.kind) {
-            .directory => try walkAndMatch(io, full_path, pattern, ctx),
+            // Same skip-unreadable policy as the content walk: a
+            // dispatch-wide stop ends the listing, an unreadable
+            // subdirectory only removes itself from it.
+            .directory => walkAndMatch(io, full_path, pattern, ctx) catch |err| return switch (err) {
+                error.PluginExecutionStopped, error.OutOfMemory => err,
+                else => continue,
+            },
             .file => {
                 const rel_offset = if (full_path.len > ctx.root_len) ctx.root_len + 1 else full_path.len;
                 const rel_path = if (rel_offset <= full_path.len) full_path[rel_offset..] else entry.name;
@@ -369,7 +382,7 @@ pub fn walkAndSearch(
     }
 }
 
-fn walkSearchDirectory(io: std.Io, dir_path: []const u8, ctx: *SearchCtx) !void {
+fn walkSearchDirectory(io: std.Io, dir_path: []const u8, ctx: *SearchCtx) WalkError!void {
     try checkWalkBudget(ctx.L);
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
@@ -379,7 +392,13 @@ fn walkSearchDirectory(io: std.Io, dir_path: []const u8, ctx: *SearchCtx) !void 
         const full_path = try std.fs.path.join(std.heap.page_allocator, &.{ dir_path, entry.name });
         defer std.heap.page_allocator.free(full_path);
         switch (entry.kind) {
-            .directory => try walkSearchDirectory(io, full_path, ctx),
+            // Preserve the walker's skip-unreadable policy for discovered
+            // directories: a dispatch-wide stop still ends the walk, while
+            // one unreadable subdirectory only removes itself.
+            .directory => walkSearchDirectory(io, full_path, ctx) catch |err| return switch (err) {
+                error.PluginExecutionStopped, error.OutOfMemory => err,
+                else => continue,
+            },
             // Preserve the walker's skip-unreadable policy for discovered files.
             // An explicitly requested file instead reports read errors above.
             .file => searchFile(io, full_path, ctx) catch continue,
@@ -396,6 +415,12 @@ fn searchFile(io: std.Io, full_path: []const u8, ctx: *SearchCtx) !void {
         if (relative.len == 0) relative = name;
         if (!matchGlob(relative, fp) and !matchGlob(name, fp)) return;
     }
+    // Stat before reading: a file past the cap is skipped without pulling a
+    // megabyte off disk first, and only a regular file is ever opened.
+    const stat = try std.Io.Dir.cwd().statFile(io, full_path, .{});
+    if (stat.kind != .file) return error.UnsupportedFileType;
+    if (stat.size > max_read_size) return error.FileTooLarge;
+
     const L_ptr = ctx.L;
     var file = try std.Io.Dir.openFileAbsolute(io, full_path, .{});
     defer file.close(io);
@@ -403,6 +428,9 @@ fn searchFile(io: std.Io, full_path: []const u8, ctx: *SearchCtx) !void {
     var reader = file.reader(io, &.{});
     const content = try reader.interface.allocRemaining(std.heap.page_allocator, .limited(max_read_size));
     defer std.heap.page_allocator.free(content);
+    // A NUL byte marks binary content: its "lines" are noise for the model.
+    // Ripgrep stops at the first NUL for the same reason.
+    if (std.mem.indexOfScalar(u8, content, 0) != null) return;
 
     var line_num: u32 = 0;
     var pos: usize = 0;
@@ -427,13 +455,21 @@ fn searchFile(io: std.Io, full_path: []const u8, ctx: *SearchCtx) !void {
                 _ = c.lua_setfield(L_ptr, -2, "file");
                 st.pushInteger(@as(i64, @intCast(line_num)));
                 _ = c.lua_setfield(L_ptr, -2, "line");
-                const truncated = if (line.len > search_line_truncate_bytes) line[0..search_line_truncate_bytes] else line;
-                st.pushString(truncated);
+                st.pushString(truncateLineUtf8(line));
                 _ = c.lua_setfield(L_ptr, -2, "content");
                 _ = c.lua_rawseti(L_ptr, -2, @as(c_int, @intCast(ctx.result_count.*)));
             }
         }
     }
+}
+
+/// Cut `line` to `search_line_truncate_bytes` without splitting a UTF-8
+/// sequence: the cut backs up over continuation bytes (`10xxxxxx`).
+fn truncateLineUtf8(line: []const u8) []const u8 {
+    if (line.len <= search_line_truncate_bytes) return line;
+    var end = search_line_truncate_bytes;
+    while (end > 0 and (line[end] & 0xc0) == 0x80) end -= 1;
+    return line[0..end];
 }
 
 test "matchGlob_returnsTrue_whenPatternIsEmpty" {
@@ -611,4 +647,138 @@ test "search bridge error paths keep the table shape including truncated (#449)"
         \\assert(type(f.truncated) == "boolean", "truncated field present on find error path")
         \\return "OK"
     ));
+}
+
+// ── #590: one bad entry must not take the whole walk down ─────────────
+
+test "search walks skip an unreadable subdirectory and keep searching" {
+    if (os.is_windows) return error.SkipZigTest;
+    // Root reads a mode-000 directory, so the skip could not be observed.
+    if (std.c.getuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "needle here\n" });
+    try tmp.dir.createDir(io, "locked", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "locked/b.txt", .data = "needle hidden\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.txt", .data = "needle again\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // Take the read bit off one subdirectory, and put it back on every
+    // exit: tmp.cleanup needs it. By path, because a directory opened
+    // without iteration is an O_PATH handle, which fchmod rejects.
+    const deny_all: std.Io.File.Permissions = @enumFromInt(0o000);
+    errdefer tmp.dir.setFilePermissions(io, "locked", .default_dir, .{}) catch {};
+    try tmp.dir.setFilePermissions(io, "locked", deny_all, .{});
+
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+    // The walks push match rows with lua_rawseti relative to the results
+    // table the bridges leave on the stack; mirror that layout here.
+    var st = State{ .handle = L.handle };
+    st.newTable();
+    defer st.pop(1);
+
+    var total: u32 = 0;
+    var count: u32 = 0;
+    try walkAndSearch(io, root, null, "needle", false, 50, &total, &count, L.handle);
+    try std.testing.expectEqual(@as(u32, 2), total);
+    try std.testing.expectEqual(@as(u32, 2), count);
+
+    var ctx = FindCtx{ .total = 0, .result_count = 0, .max_results = 50, .root_len = root.len, .L = L.handle };
+    try walkAndMatch(io, root, "*.txt", &ctx);
+    try std.testing.expectEqual(@as(u32, 2), ctx.total);
+    try std.testing.expectEqual(@as(u32, 2), ctx.result_count);
+
+    try tmp.dir.setFilePermissions(io, "locked", .default_dir, .{});
+}
+
+test "search skips oversized and binary files instead of reading them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The oversized file opens with the needle: reading it would find it.
+    const big = try std.heap.page_allocator.alloc(u8, max_read_size + 6);
+    defer std.heap.page_allocator.free(big);
+    @memset(big, 'x');
+    @memcpy(big[0..6], "needle");
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = big });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin.dat", .data = "needle\x00\nneedle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok.txt", .data = "needle ok\n" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const big_path = try std.fs.path.join(std.testing.allocator, &.{ root, "big.txt" });
+    defer std.testing.allocator.free(big_path);
+    const bin_path = try std.fs.path.join(std.testing.allocator, &.{ root, "bin.dat" });
+    defer std.testing.allocator.free(bin_path);
+
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+    var st = State{ .handle = L.handle };
+    st.newTable();
+    defer st.pop(1);
+
+    // Discovered: skipped silently, like any other unreadable file.
+    var total: u32 = 0;
+    var count: u32 = 0;
+    try walkAndSearch(io, root, null, "needle", false, 50, &total, &count, L.handle);
+    try std.testing.expectEqual(@as(u32, 1), total);
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    // A filename walk never reads the file, so both are still listed.
+    var ctx = FindCtx{ .total = 0, .result_count = 0, .max_results = 50, .root_len = root.len, .L = L.handle };
+    try walkAndMatch(io, root, "*", &ctx);
+    try std.testing.expectEqual(@as(u32, 3), ctx.total);
+
+    // Requested by name: too large is an error the caller asked for; binary
+    // simply has no text lines to match.
+    total = 0;
+    count = 0;
+    try std.testing.expectError(error.FileTooLarge, walkAndSearch(io, big_path, null, "needle", false, 50, &total, &count, L.handle));
+    try walkAndSearch(io, bin_path, null, "needle", false, 50, &total, &count, L.handle);
+    try std.testing.expectEqual(@as(u32, 0), total);
+
+    // Through the bridge the explicit request surfaces as the error field.
+    execution.setDispatchCtx(L.handle, .{ .cwd = root });
+    const ok = L.doString(
+        \\local s = zay.search_files("./big.txt", "needle")
+        \\assert(s.error == "FileTooLarge", "oversized explicit file names its error, got " .. tostring(s.error))
+        \\local b = zay.search_files("./bin.dat", "needle")
+        \\assert(b.error == nil and b.total_matches == 0, "binary explicit file has no matches")
+        \\return "OK"
+    );
+    if (!ok) std.debug.print("Lua error: {s}\n", .{L.getErrorMessage() orelse "unknown"});
+    try std.testing.expect(ok);
+}
+
+test "search line truncation does not split a UTF-8 sequence" {
+    const gpa = std.testing.allocator;
+    const limit = search_line_truncate_bytes;
+    const pad: []const u8 = "a" ** limit;
+
+    // é (two bytes) starts on the last byte inside the limit: its second
+    // byte is the first one cut, so the back-up drops the whole character.
+    const straddling = try std.fmt.allocPrint(gpa, "{s}é tail", .{pad[0 .. limit - 1]});
+    defer gpa.free(straddling);
+    try std.testing.expectEqualStrings(pad[0 .. limit - 1], truncateLineUtf8(straddling));
+
+    // The character ends exactly on the limit and survives whole.
+    const inside = try std.fmt.allocPrint(gpa, "{s}é tail", .{pad[0 .. limit - 2]});
+    defer gpa.free(inside);
+    const inside_expected = try std.fmt.allocPrint(gpa, "{s}é", .{pad[0 .. limit - 2]});
+    defer gpa.free(inside_expected);
+    try std.testing.expectEqualStrings(inside_expected, truncateLineUtf8(inside));
+
+    // A lead byte right after the limit needs no back-up, and short lines
+    // are returned untouched.
+    const beyond = try std.fmt.allocPrint(gpa, "{s}é", .{pad});
+    defer gpa.free(beyond);
+    try std.testing.expectEqualStrings(pad, truncateLineUtf8(beyond));
+    try std.testing.expectEqualStrings("short", truncateLineUtf8("short"));
+    try std.testing.expectEqualStrings("", truncateLineUtf8(""));
 }

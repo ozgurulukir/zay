@@ -98,13 +98,25 @@ pub fn classify(
 fn localClassify(command: []const u8) Verdict {
     const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
     if (trimmed.len == 0) return .safe;
-    return if (localClassifyRule(trimmed) == null) .safe else .unsafe;
+    return if (scopedLocalRule(trimmed) == null) .safe else .unsafe;
 }
 
+/// Whether a local destructive rule fires for `command`. Same verdict path
+/// as `localClassify`, so the two never disagree on any command.
 pub fn isDestructiveRule(command: []const u8) bool {
     const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
     if (trimmed.len == 0) return false;
-    return localClassifyRule(trimmed) != null;
+    return scopedLocalRule(trimmed) != null;
+}
+
+/// First rule that fires on `command` once the data arguments of a lone
+/// search command are blanked (`blankSearchData`). The one verdict path for
+/// both callers above: rules evaluate on the command's structure, never on
+/// text that is only being searched for.
+fn scopedLocalRule(command: []const u8) ?RuleId {
+    var blanked_buf: [search_exempt_command_bytes_max]u8 = undefined;
+    const blanked = blankSearchData(command, &blanked_buf) orelse command;
+    return localClassifyRule(blanked);
 }
 
 /// Identifies which local rule fired for `command` — the same disjunction
@@ -171,6 +183,177 @@ const rules = [_]Rule{
     .{ .id = .privileged_pm_manager, .matches = isPrivilegedPmManager },
     .{ .id = .privileged_pm_phrase, .matches = isPrivilegedPmPhrase },
 };
+
+// ── Lone search commands: arguments are data, never code ─────────────
+//
+// `rg -e 'sudo'` searches for a word; it cannot run it. The rules above are
+// quote-insensitive on purpose (`sh -c "rm -rf /"`), which made every search
+// for a flagged token an `unsafe` verdict — a hard block for plugin shells.
+// A lone search command is the one shape where its arguments are provably
+// inert, so they are blanked before the rules run. The proof is narrow and
+// fails closed: anything the lexer cannot vouch for leaves the command
+// classified exactly as before.
+//
+//   - One simple command, spelled `rg`/`grep`/`egrep`/`fgrep` in lowercase:
+//     no separator, redirect, substitution, env prefix or path qualifier.
+//   - Outside single quotes only inert ASCII. Excluded: separators and
+//     redirects, `$`/backtick/double-quote expansions, braces, backslashes
+//     (an escape in bash, a path separator in PowerShell), `@` (splat and
+//     here-string sigil) and every non-ASCII byte — PowerShell reads several
+//     Unicode code points as quotes, dashes and newlines.
+//   - Every option before `--` comes from `search_data_options_*`. An
+//     unknown option denies the exemption for the whole command: ripgrep's
+//     `--pre`, `--hostname-bin`, `--hyperlink-format` and `--config-path`
+//     run programs or load further flags, and grep variants carry their own
+//     (`--filter`, `--config`, `-Q` on ugrep). An option counts with or
+//     without quotes, so `rg '--pre=apt'` is an option, never data.
+
+const search_commands = [_][]const u8{ "rg", "grep", "egrep", "fgrep" };
+
+/// Long options that only select what to read or how to print it, in
+/// ripgrep and the grep family. Exact names; abbreviations are not options.
+const search_data_options_long = [_][]const u8{
+    "after-context",    "before-context", "binary-files",       "case-sensitive",
+    "color",            "column",         "context",            "count",
+    "encoding",         "engine",         "exclude",            "exclude-dir",
+    "file",             "files",          "files-with-matches", "files-without-match",
+    "fixed-strings",    "follow",         "glob",               "heading",
+    "hidden",           "ignore-case",    "iglob",              "include",
+    "include-dir",      "invert-match",   "json",               "line-buffered",
+    "line-number",      "line-regexp",    "max-columns",        "max-columns-preview",
+    "max-count",        "max-depth",      "max-filesize",       "multiline",
+    "multiline-dotall", "no-column",      "no-config",          "no-filename",
+    "no-heading",       "no-ignore",      "no-ignore-dot",      "no-ignore-parent",
+    "no-ignore-vcs",    "no-line-number", "no-messages",        "no-require-git",
+    "only-matching",    "pcre2",          "pretty",             "quiet",
+    "recursive",        "regexp",         "replace",            "silent",
+    "smart-case",       "sort",           "stats",              "text",
+    "threads",          "trim",           "unrestricted",       "with-filename",
+    "word-regexp",
+};
+
+/// Short option letters with the same property. They may cluster (`-in`)
+/// and take a trailing count (`-A3`); each letter is harmless on its own,
+/// so any split of a cluster is harmless too.
+const search_data_options_short = "aAbBcCeFfgHhIilmnopPqrRsSUuvwx";
+
+/// A command past this length is classified raw. The exemption works on a
+/// bounded copy, and failing closed only forfeits the exemption.
+const search_exempt_command_bytes_max: usize = 4096;
+
+const SearchToken = struct {
+    start: usize,
+    end: usize,
+    /// The whole token is one single-quoted string.
+    quoted: bool,
+};
+
+const SearchLexError = error{NotSearchData};
+
+fn isSearchSeparator(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+/// Bytes that cannot change how either shell splits or runs the command.
+fn isSearchArgumentByte(byte: u8) bool {
+    return switch (byte) {
+        '!', '#', '%', '*', '+', ',', '-', '.', '/', ':', '=', '?', '[', ']', '^', '_', '~' => true,
+        '0'...'9', 'A'...'Z', 'a'...'z' => true,
+        else => false,
+    };
+}
+
+/// Next space- or tab-delimited token. Fails on the first byte that is not
+/// inert outside single quotes, on a quote left open, and on a token that
+/// mixes quoted and unquoted parts: bash and PowerShell split those
+/// differently (`\'` and `-e'x'`), so their meaning cannot be vouched for.
+fn nextSearchToken(command: []const u8, pos: *usize) SearchLexError!?SearchToken {
+    while (pos.* < command.len and isSearchSeparator(command[pos.*])) pos.* += 1;
+    if (pos.* == command.len) return null;
+
+    const start = pos.*;
+    var in_quote = false;
+    var quote_count: usize = 0;
+    while (pos.* < command.len) : (pos.* += 1) {
+        const byte = command[pos.*];
+        if (byte == '\'') {
+            in_quote = !in_quote;
+            quote_count += 1;
+        } else if (!in_quote) {
+            // Between single quotes every other byte is literal in both shells.
+            if (isSearchSeparator(byte)) break;
+            if (!isSearchArgumentByte(byte)) return error.NotSearchData;
+        }
+    }
+    if (in_quote) return error.NotSearchData;
+
+    const quoted = quote_count == 2 and command[start] == '\'' and command[pos.* - 1] == '\'';
+    if (quote_count != 0 and !quoted) return error.NotSearchData;
+    return .{ .start = start, .end = pos.*, .quoted = quoted };
+}
+
+fn isSearchCommand(word: []const u8) bool {
+    for (search_commands) |name| {
+        if (std.mem.eql(u8, word, name)) return true;
+    }
+    return false;
+}
+
+/// Whether `option` (without its quotes) only selects what to read or how to
+/// print it. `-` and `--` are not options here: `-` is stdin, `--` ends them.
+fn isSearchDataOption(option: []const u8) bool {
+    if (option.len < 2 or option[0] != '-') return false;
+
+    if (option[1] == '-') {
+        const name_end = std.mem.indexOfScalar(u8, option, '=') orelse option.len;
+        for (search_data_options_long) |name| {
+            if (std.mem.eql(u8, option[2..name_end], name)) return true;
+        }
+        return false;
+    }
+
+    var index: usize = 1;
+    while (index < option.len and std.ascii.isAlphabetic(option[index])) : (index += 1) {
+        if (std.mem.indexOfScalar(u8, search_data_options_short, option[index]) == null) return false;
+    }
+    if (index == 1) return false;
+    while (index < option.len) : (index += 1) {
+        if (!std.ascii.isDigit(option[index])) return false;
+    }
+    return true;
+}
+
+/// Blank the data arguments of a lone search command into `buf` and return
+/// the result, or null when `command` is not one. Options stay, so the rules
+/// still see them.
+fn blankSearchData(command: []const u8, buf: *[search_exempt_command_bytes_max]u8) ?[]const u8 {
+    if (command.len > buf.len) return null;
+
+    var pos: usize = 0;
+    const head = (nextSearchToken(command, &pos) catch return null) orelse return null;
+    const head_word = command[head.start..head.end];
+    if (head.quoted or !isSearchCommand(head_word)) return null;
+
+    @memcpy(buf[0..command.len], command);
+    const blanked = buf[0..command.len];
+    var past_options = false;
+    while (true) {
+        const next = nextSearchToken(command, &pos) catch return null;
+        const token = next orelse break;
+        const text = command[token.start..token.end];
+        const argument = if (token.quoted) text[1 .. text.len - 1] else text;
+
+        const is_option = !past_options and argument.len > 0 and argument[0] == '-';
+        if (!is_option) {
+            @memset(blanked[token.start..token.end], ' ');
+        } else if (std.mem.eql(u8, argument, "--")) {
+            past_options = true;
+        } else if (!isSearchDataOption(argument)) {
+            return null;
+        }
+    }
+    return blanked;
+}
 
 /// Fork-bomb definition construct `:(){` (the classic `:(){ :|:& };:`).
 fn matchesBashForkBombDefinition(command: []const u8) bool {
@@ -1348,6 +1531,174 @@ test "privileged pm: no false positives on safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
     try std.testing.expectEqual(Verdict.safe, localClassify("equip installation kit"));
+}
+
+// ── Lone search commands: data arguments are not code ────────────────
+
+/// Fails with the command in the message: a bare `expectEqual` inside a loop
+/// over commands does not say which one was misjudged. Also checks the
+/// session-approval gate, which asks the same question another way.
+fn expectVerdict(command: []const u8, expected: Verdict) !void {
+    const got = localClassify(command);
+    if (got != expected) {
+        std.debug.print("misjudged command ({s} expected, {s} returned): {s}\n", .{ @tagName(expected), @tagName(got), command });
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(expected == .unsafe, isDestructiveRule(command));
+}
+
+/// Fails unless the exemption refuses `command`, naming it.
+fn expectNoExemption(command: []const u8, buf: *[search_exempt_command_bytes_max]u8) !void {
+    if (blankSearchData(command, buf) != null) {
+        std.debug.print("exemption granted to a command it must refuse: {s}\n", .{command});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "lone search commands may search for text the rules would flag" {
+    const searched = [_][]const u8{
+        // The search-tools plugin's ripgrep line, and its overflow retry.
+        "rg --json --color never --glob '*.zig' -m 50 -e 'sudo|doas' -- .",
+        "rg --json --color never -m 1 -e 'apt' -- src",
+        "rg -e 'sudo' -- .",
+        "rg -e ':(){ :|:& };:' docs",
+        "rg 'rm -rf /' src",
+        "rg -e 'a|b' -e 'pip install' src",
+        "rg sudo",
+        "grep -rn 'apt install' .",
+        "grep -e 'doas' /etc/config",
+        "egrep 'brew' .",
+        "fgrep 'pacman -S' .",
+        "rg --glob '*.zig' --max-columns-preview -n -e 'snap' .",
+        "rg -A3 -B2 -C1 -m5 -e 'apk' .",
+        "rg -in -e 'zypper' --max-count=20 --color=never .",
+        // After `--` everything is a path, whatever it looks like.
+        "rg -- '--pre sudo'",
+        // Two arguments, both inert however they read.
+        "rg -e 'x' 'sudo apt install'",
+    };
+    for (searched) |command| {
+        // Every case really is text the raw rules flag — otherwise the
+        // test would pass without the exemption doing anything.
+        try std.testing.expect(localClassifyRule(command) != null);
+        try expectVerdict(command, .safe);
+    }
+}
+
+test "lone search exemption fails closed and leaves flagged searches flagged" {
+    // Each command names a search tool and reads like a search, yet the raw
+    // rules flag it. The exemption must not apply, so the verdict stays
+    // `unsafe` exactly as before.
+    const still_flagged = [_][]const u8{
+        // Not a lone search command.
+        "sudo rg -e 'x' .",
+        "command rg -e 'sudo' .",
+        "/usr/bin/rg -e 'sudo' .",
+        "RG -e 'sudo' .",
+        "echo 'sudo'",
+        "sh -c \"rg -e 'sudo' .\"",
+        // A second command, however it is spelled.
+        "rg -e 'x'; sudo apt install y",
+        "rg -e 'x' && sudo apt install y",
+        "rg -e 'x' | sudo tee /etc/hosts",
+        "rg -e 'x' & sudo apt install y",
+        "rg -e 'x'\n sudo apt install y",
+        "rg -e 'x' (cd /tmp && sudo apt install y)",
+        "rg -e 'x' { sudo apt install y; }",
+        // Redirects and substitutions.
+        "rg -e 'x' > /etc/passwd",
+        "rg -e 'sudo' >/etc/passwd",
+        "rg -e 'x' 2> /etc/passwd",
+        "rg -e \"$(sudo apt install y)\"",
+        "rg -e 'x' `sudo apt install y`",
+        "rg -e 'it'\\''; sudo apt install y'",
+        // Options that run programs or load further options, quoted or not.
+        "rg --pre 'sudo' .",
+        "rg --hostname-bin 'sudo' .",
+        "rg --config-path 'sudo' .",
+        "grep --filter 'sudo' .",
+        "grep -Q 'sudo'",
+        // Any option outside the allowlist, wherever it appears.
+        "rg -z -e 'sudo' .",
+        "rg --unknown -e 'sudo' .",
+        "rg --max-col -e 'sudo' .",
+        "rg -e 'sudo' --unknown .",
+        // Quote shapes bash and PowerShell split differently.
+        "rg -e'sudo' .",
+        "rg -e 'sudo'src",
+        "rg -e ''sudo'' .",
+        "rg -e 'sudo",
+        "rg -e 'a\\' ; sudo apt install y",
+        // Bytes that are not inert outside single quotes: a PowerShell
+        // here-string header, a Unicode line separator, a backslash path.
+        "rg -e @'\nsudo apt install y\n'@",
+        "rg -e 'x' \u{2028} sudo apt install y",
+        "rg -e 'x' src\\tools; sudo apt install y",
+    };
+    var buf: [search_exempt_command_bytes_max]u8 = undefined;
+    for (still_flagged) |command| {
+        try expectNoExemption(command, &buf);
+        try expectVerdict(command, .unsafe);
+    }
+
+    // Denied as well, and raw-safe: the verdict must simply not move.
+    const unchanged = [_][]const u8{
+        "rg --hyperlink-format '{h}' .",
+        "rg --config-path ./rgrc .",
+        "rg -e 'x' | cat",
+        // The raw tokenizer does not split on `=`, so an option's attached
+        // value was never a token of its own; the exemption must still
+        // refuse the option itself, quoted or not.
+        "rg '--pre=sudo' .",
+        "rg --pre=sudo -e 'x' .",
+    };
+    for (unchanged) |command| {
+        try expectNoExemption(command, &buf);
+        try expectVerdict(command, .safe);
+    }
+}
+
+test "lone search exemption is bounded and yields to the raw verdict past its bound" {
+    const gpa = std.testing.allocator;
+    // A pattern past the bound, with the flagged word as a token of its own
+    // so the raw rules see it: the command is classified raw — still
+    // flagged, never waved through.
+    const padding = try gpa.alloc(u8, search_exempt_command_bytes_max);
+    defer gpa.free(padding);
+    @memset(padding, 'x');
+    const too_long = try std.fmt.allocPrint(gpa, "rg -e '{s} sudo' .", .{padding});
+    defer gpa.free(too_long);
+
+    var buf: [search_exempt_command_bytes_max]u8 = undefined;
+    try expectNoExemption(too_long, &buf);
+    try expectVerdict(too_long, .unsafe);
+}
+
+test "lone search exemption keeps the options and blanks only the data" {
+    var buf: [search_exempt_command_bytes_max]u8 = undefined;
+    const blanked = blankSearchData("rg -n -e 'sudo' --glob '*.zig' -- --pre=apt", &buf).?;
+    // Option tokens stay; every data argument keeps its width and loses its
+    // bytes ('sudo' and '*.zig' six and seven wide with their quotes,
+    // --pre=apt nine).
+    try std.testing.expectEqualStrings("rg -n -e " ++ "      " ++ " --glob " ++ "       " ++ " -- " ++ "         ", blanked);
+    // The search word itself has to be bare: a quoted one is a different command.
+    try std.testing.expect(blankSearchData("'rg' -e 'sudo' .", &buf) == null);
+}
+
+test "isSearchDataOption accepts only allowlisted options in their exact spelling" {
+    const allowed = [_][]const u8{
+        "--json", "--color=never", "--max-columns-preview", "--no-ignore-vcs",
+        "-i",     "-in",           "-A3",                   "-m50",
+        "-uuu",   "-e5",           "-P",                    "-rS",
+        "-g",
+    };
+    const denied = [_][]const u8{
+        "-",        "--",      "--pre", "--pre=sh", "--pr", "--jsonx",
+        "--json-x", "-z",      "-Q",    "-0",       "-i.",  "-i=x",
+        "--=x",     "---json", "",      "x",        "-pQ",
+    };
+    for (allowed) |option| try std.testing.expect(isSearchDataOption(option));
+    for (denied) |option| try std.testing.expect(!isSearchDataOption(option));
 }
 
 test "rule table: every rule attributes its first-fire input" {

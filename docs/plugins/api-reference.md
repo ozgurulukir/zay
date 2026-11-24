@@ -214,8 +214,11 @@ e.g. `zay.run_bash("cat", { stdin = "hello" })` returns
 `{ stdout = "hello", code = 0 }`.
 
 **`opts.timeout`** is in seconds: default 30, maximum 3600. Execution is also
-capped by the remaining Lua dispatch deadline. Cancellation and deadline
-errors abort the dispatch even inside Lua protected calls.
+capped by the remaining Lua dispatch deadline, which is the manifest's
+`timeout_ms` (5 s unless the plugin raises it) — a larger `timeout` request is
+silently clamped to it, so a plugin that shells out for longer must raise
+`timeout_ms`. Cancellation and deadline errors abort the dispatch even inside
+Lua protected calls.
 
 **Shell safety gate.** Every `run_bash`/`run_shell` command is classified by
 the same shell-safety checker as the built-in `bash` tool *before* it runs.
@@ -227,7 +230,10 @@ When no remote classifier is reachable (or none is configured), an always-armed
 local pattern matcher still blocks obviously destructive forms (`rm -rf /`-
 class, fork bombs, and their PowerShell spellings); plugin shell calls made
 outside tool dispatch (e.g. during `init.lua` load, where no executor context
-exists) are classified by that local backstop only. An empty command string
+exists) are classified by that local backstop only. A lone `rg`/`grep` search
+whose arguments are only search text is not flagged for that text — the
+conditions are listed in [the classifier doc](../wiki/SAFETY_CLASSIFIER.md).
+An empty command string
 returns `nil, "command argument must not be empty"` before anything spawns.
 If the shell binary itself is missing, the call returns `nil, err` where `err` is
 the Zig error name for the failing backend — `"FileNotFound"` for `run_bash`, and
