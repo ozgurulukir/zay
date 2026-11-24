@@ -6,6 +6,10 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-24
+
+### Fixed
+- TUI: align INV-WIDGET-1 docs, remove the draw-path lock, and decouple tick scheduling (#599); keep the left border on empty lines in fenced code blocks.
 ## [0.12.0] - 2026-11-24
 
 ### Added
@@ -224,7 +228,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.1
 [0.12.0]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.0
 [0.11.15]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.15
 [0.11.14]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.14
