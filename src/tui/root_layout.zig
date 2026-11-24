@@ -130,15 +130,6 @@ fn buildInputProps(app: *App, arena: std.mem.Allocator, combined_text: []const u
     };
 }
 
-/// The driver's workspace borrow, if any — the lane whose worktree path the
-/// driver (threads[0]) entered. Only the driver enters lanes, so its agent is
-/// the only one that can hold a workspace.
-fn driverWorkspacePath(app: *const App) ?[]const u8 {
-    if (app.threads.len() == 0) return null;
-    const agent = app.threads.at(0).agent orelse return null;
-    return agent.workspaceBorrow();
-}
-
 /// Modal layer priority shared by rendering (`drawRoot`) and input routing
 /// (`event_router`) so visual z-order and input capture order never diverge.
 pub const ModalLayer = enum {
@@ -201,7 +192,7 @@ pub fn buildLaneColumnProps(app: *App, lane: *tui.Thread, width: u16, height: u1
     };
     // Distinct marker on the lane the driver's workspace currently points at —
     // the "active lane tracking" the model needs to see at a glance.
-    const ws_marker: []const u8 = if (driverWorkspacePath(app)) |ws| blk: {
+    const ws_marker: []const u8 = if (app.metrics.driver_workspace_path) |ws| blk: {
         if (lanes_util.workingLaneOf(lane)) |w| {
             if (lanes_util.pathsEqual(ws, w.path)) break :blk " ⇄";
         }

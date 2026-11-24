@@ -10,7 +10,6 @@ const vxfw = vaxis.vxfw;
 
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
-const tui = @import("../../tui.zig");
 
 /// Which mode's keybindings a help line documents. Rendered as a dim `[tag]`
 /// prefix rather than used to filter — discoverability beats hiding — and
@@ -118,7 +117,7 @@ fn scopeTag(scope: Scope) []const u8 {
 
 /// Index of the first help line whose key contains `key` within `scope`, or
 /// null. Used by the guard test below.
-fn indexOfKey(key: []const u8, scope: Scope) ?usize {
+pub fn indexOfKey(key: []const u8, scope: Scope) ?usize {
     for (help_lines, 0..) |line, i| {
         if (line.scope == scope and std.mem.indexOf(u8, line.key, key) != null) return i;
     }
@@ -138,21 +137,6 @@ test "help documents every diff-viewer, jobs-modal, and lane binding" {
     }
     for ([_][]const u8{"Ctrl+L"}) |k| {
         try std.testing.expect(indexOfKey(k, .lanes) != null);
-    }
-}
-
-// Guard: every command in tui.commands (except Quit alias) must have a help entry.
-test "help documents every slash command in tui.commands" {
-    for (tui.commands) |cmd| {
-        if (std.mem.eql(u8, cmd.name, "Quit")) continue; // alias of Exit
-        var key_buf: [32]u8 = undefined;
-        key_buf[0] = '/';
-        const raw_name = if (std.mem.eql(u8, cmd.name, "Models")) "model" else cmd.name;
-        for (raw_name, 0..) |ch, ci| {
-            key_buf[1 + ci] = std.ascii.toLower(ch);
-        }
-        const slash_cmd = key_buf[0 .. 1 + raw_name.len];
-        try std.testing.expect(indexOfKey(slash_cmd, .global) != null);
     }
 }
 
