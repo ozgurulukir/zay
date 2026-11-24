@@ -186,7 +186,7 @@ Run all registered test suites. Returns `true` if all tests pass.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `zay.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, truncated, full_size, language, mime_type}` | Read file with metadata (`truncated`/`full_size` are set when the read cap clipped the body) |
+| `zay.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, total_lines, truncated, full_size, language, mime_type}` | Read file with metadata. `size`/`lines` describe `content`; `total_lines` counts the lines of the whole read body before a line range slices it (a trailing newline closes its line). `truncated` is `true` only when the read cap clipped the file — a line range alone never sets it |
 | `zay.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write (temp + rename) |
 | `zay.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence); refuses files over the 1 MB read cap (`nil, "…FileTooLarge…"`-class error) |
 | `zay.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Literal content search of an exact file or recursive directory; include globs (`*`, `**`, `?`) match basenames or root-relative paths; `max_results` default 50, hard cap 200 |
@@ -268,6 +268,11 @@ invocations without prompting; see [Permissions and runtime](permissions-and-run
 for why that boundary is safe and the rules future git bridges must follow.
 
 **Result row shapes:** `search_files` rows are `{file, line, content}` (content truncated to 200 bytes per line); `find_files` rows are `{path, name}`; `list_dir`'s `files`/`directories` are **arrays of plain name strings**, not tables. On a mid-walk failure, `search_files`/`find_files` return partial data with an `error` string field plus the usual `total_matches`/`truncated` fields — check `result.error` before trusting `results`.
+
+**Paged reads.** `read_file` never returns more than 1 MB. To page a large file, ask the bridge for the window (`{ start_line = first, end_line = last }`) instead of splitting the whole body in Lua. Two details make paging exact:
+
+- A window that reaches the end of the file comes back without the newline after its last line, so a blank final line has no bytes left to return. Compare against `total_lines`: when the returned lines stop exactly one short of it, that line is the blank one.
+- Never rewrite a file from a read whose `truncated` is `true` — the content is only the first 1 MB. Check the flag before `write_file`, or use `edit_file`, which refuses oversized files itself.
 
 ### Lane & session awareness
 

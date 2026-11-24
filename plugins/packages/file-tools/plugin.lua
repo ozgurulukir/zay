@@ -3,7 +3,7 @@
 -- already know from Claude Code / OpenCode / Zed agents.
 return {
   name = "file-tools",
-  version = "1.0.0",
+  version = "1.0.1",
   author = "Zay",
   description = "Read, write, edit, and list files safely",
   license = "MIT",

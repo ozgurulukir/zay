@@ -62,7 +62,7 @@ changes take effect at restart or the guarded project-switch boundary.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `zay.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, truncated, full_size, language, mime_type}` | Read file with metadata (`truncated`/`full_size` are set when the read cap clipped the body) |
+| `zay.read_file(path, opts?)` | `path`, `opts.start_line`, `opts.end_line`, `opts.max_size` | `{path, content, size, lines, total_lines, truncated, full_size, language, mime_type}` | Read file with metadata (`truncated` is `true` only when the read cap clipped the file; `total_lines` counts the whole read body) |
 | `zay.write_file(path, content)` | `path`, `content` | `true` or `nil` | Atomic file write |
 | `zay.edit_file(path, old, new)` | `path`, `old_string`, `new_string` | `true` or `nil` | Find-and-replace (first occurrence) |
 | `zay.search_files(root, pattern, opts?)` | `root`, `pattern`, `opts.file_pattern`, `opts.case_sensitive`, `opts.max_results` | `{query, total_matches, results, truncated}` | Recursive content grep (substring) |
