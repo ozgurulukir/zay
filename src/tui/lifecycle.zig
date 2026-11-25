@@ -142,11 +142,6 @@ fn deinitSharedServices(self: *App) void {
     // completed. No config deinit here: every borrow above has already been
     // released, and freeing arena slices with `gpa` would be a foreign free.
 
-    if (self.async_worktree_job) |job| {
-        job.deinit();
-        self.async_worktree_job = null;
-    }
-
     // No worker is blocked on the bridge or holds a permit now.
     if (self.lane_bridge) |bridge| {
         self.gpa.destroy(bridge);
@@ -495,7 +490,7 @@ fn advanceBlackholeIfVisible(root: *RootWidget, visible_change: *bool) void {
 /// (src/tui/job.zig). Adding a family arm without wiring its checks into the
 /// switches below fails to compile — tick exhaustiveness is enforced, not
 /// remembered.
-pub const JobFamily = enum { diff_refresh, registry_refresh, model_load, codex_login, git_label, plugin_store };
+pub const JobFamily = enum { diff_refresh, registry_refresh, model_load, codex_login, git_label, plugin_store, worktree_add };
 
 /// Any of the Job(T) families needs a tick to start or drain.
 pub fn anyJobActive(app: *const App) bool {
@@ -514,6 +509,7 @@ fn jobFamilyActive(app: *const App, comptime family: JobFamily) bool {
         .codex_login => provider_model.codexLoginActive(app),
         .git_label => gitLabelRefreshActive(app),
         .plugin_store => plugin_store_job.active(app),
+        .worktree_add => app.async_worktree_job != null,
     };
 }
 
@@ -530,6 +526,7 @@ pub fn cancelAllJobs(app: *App) void {
             .codex_login => provider_model.cancelCodexLogin(app),
             .git_label => cancelGitLabelJob(app),
             .plugin_store => plugin_store_job.cancel(app),
+            .worktree_add => lane_lifecycle.cancelAsyncWorktreeJob(app),
         }
         log.info("shutdown.job.done family={s}", .{field.name});
     }
@@ -549,7 +546,6 @@ pub fn decideShouldTick(root: *RootWidget) bool {
     const mcp_refresh_pending = root.app.mcp_manager.hasPendingRefreshes();
     const manual_compact_active = compaction_lifecycle.manualCompactActive(root.app);
     const toasts_visible = toast.global.hasToasts();
-    const worktree_async_active = lane_lifecycle.anyAsyncWorktreeActive(root.app);
 
     const at_search_active = atSearchActive(root.app);
 
@@ -565,7 +561,6 @@ pub fn decideShouldTick(root: *RootWidget) bool {
         root.app.mcp_manager.hasPendingDestroys() or
         manual_compact_active or
         toasts_visible or
-        worktree_async_active or
         at_search_active;
 }
 
@@ -802,7 +797,6 @@ pub fn decideTickIntervalMs(root: *RootWidget) u32 {
         root.app.mcp_manager.hasPendingDestroys() or
         compaction_lifecycle.manualCompactActive(root.app) or
         toast.global.hasToasts() or
-        lane_lifecycle.anyAsyncWorktreeActive(root.app) or
         atSearchActive(root.app);
     if (!fast_reason and root.app.backgroundActive()) {
         return @max(base_interval, 250);

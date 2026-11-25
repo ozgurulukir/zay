@@ -486,8 +486,78 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
     const dest = try std.fs.path.join(app.gpa, &.{ parent, id[0..] });
     errdefer app.gpa.free(dest);
     try vcs.worktreeAdd(app.gpa, app.io, repo, dest, branch);
-    errdefer vcs.worktreeRemove(app.gpa, app.io, repo, dest) catch {};
     return .{ .branch = branch, .dest = dest };
+}
+
+pub fn cancelAsyncWorktreeJob(app: *App) void {
+    if (app.async_worktree_job) |job| {
+        job.join();
+        if (job.err == null) {
+            rollbackLaneWorktree(app, job.repo, job.dest, job.branch);
+        }
+        job.deinit();
+        app.async_worktree_job = null;
+    }
+}
+
+const WorktreePollResult = union(enum) {
+    pending,
+    ready: struct { dest: []u8, branch: []u8 },
+    failed: Resp,
+};
+
+fn pollOrStartWorktree(app: *App, repo: []const u8, req: *const lane_bridge.Request) WorktreePollResult {
+    if (app.async_worktree_job) |job| {
+        if (job.owner_req != @as(*const anyopaque, req)) return .pending;
+        if (!job.done.load(.acquire)) return .pending;
+        defer {
+            job.deinit();
+            app.async_worktree_job = null;
+        }
+        if (job.err) |err| {
+            return .{ .failed = failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)}) };
+        }
+        const wt_dest = app.gpa.dupe(u8, job.dest) catch {
+            return .{ .failed = failResp(app.gpa, "lane: out of memory\n", .{}) };
+        };
+        const wt_branch = app.gpa.dupe(u8, job.branch) catch {
+            rollbackLaneWorktree(app, repo, wt_dest, job.branch);
+            app.gpa.free(wt_dest);
+            return .{ .failed = failResp(app.gpa, "lane: out of memory\n", .{}) };
+        };
+        return .{ .ready = .{ .dest = wt_dest, .branch = wt_branch } };
+    }
+
+    const home = (app.templateRuntime() orelse {
+        return .{ .failed = failResp(app.gpa, "lane: no active runtime\n", .{}) };
+    }).home_dir;
+
+    var raw: [6]u8 = undefined;
+    app.io.random(&raw);
+    const id = std.fmt.bytesToHex(raw, .lower);
+
+    const branch = app.gpa.alloc(u8, "zay/".len + id.len) catch {
+        return .{ .failed = failResp(app.gpa, "lane: out of memory\n", .{}) };
+    };
+    defer app.gpa.free(branch);
+    @memcpy(branch[0.."zay/".len], "zay/");
+    @memcpy(branch["zay/".len..], &id);
+
+    const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
+        return .{ .failed = failResp(app.gpa, "lane: out of memory\n", .{}) };
+    };
+    defer app.gpa.free(parent);
+    std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
+    const dest = std.fs.path.join(app.gpa, &.{ parent, id[0..] }) catch {
+        return .{ .failed = failResp(app.gpa, "lane: out of memory\n", .{}) };
+    };
+    defer app.gpa.free(dest);
+
+    const job = WorktreeJob.start(app.gpa, app.io, repo, dest, branch, req) catch |err| {
+        return .{ .failed = failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)}) };
+    };
+    app.async_worktree_job = job;
+    return .pending;
 }
 
 /// Roll back a worktree whose lane was never registered with `app.threads`
@@ -646,14 +716,17 @@ pub fn createParallelLane(self: *App) !void {
 /// unlike the user `/parallel` flow, which switches.
 fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
     const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no active runtime\n", .{});
-    const home = (app.templateRuntime() orelse return failResp(app.gpa, "lane: no active runtime\n", .{})).home_dir;
     if (!vcs.isRepo(app.gpa, app.io, repo)) return failResp(app.gpa, "lane: not a git repo — lanes need one\n", .{});
     // The cap counts the DRIVER's main lane too: threads.len starts at 1
     // (the primary), so >= max_threads means "driver + 3 lanes" — a 4th lane
     // would need a 5th pane in the 2×2 grid.
     if (app.threads.len() >= max_threads) return failResp(app.gpa, "lane: too many lanes open (max 4 total: driver + 3)\n", .{});
 
-    const wt = createLaneWorktree(app, repo, home) catch |err| return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
+    const wt = switch (pollOrStartWorktree(app, repo, req)) {
+        .pending => return null,
+        .failed => |r| return r,
+        .ready => |wt| wt,
+    };
     // Every failure path below returns a `Resp` (never an error), so cleanup
     // is explicit at each site — an `errdefer` would never fire here.
     const lane = app.gpa.create(Thread) catch {
@@ -867,60 +940,13 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
     defer if (wt_dest_owned) |d| app.gpa.free(d);
     defer if (wt_branch_owned) |b| app.gpa.free(b);
 
-    if (app.async_worktree_job) |job| {
-        if (!job.done.load(.acquire)) {
-            return null; // Keep request in pending, UI thread continues ticking smoothly
-        }
-        defer {
-            job.deinit();
-            app.async_worktree_job = null;
-        }
-        if (job.err) |err| {
-            return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
-        }
-        wt_dest_owned = app.gpa.dupe(u8, job.dest) catch {
-            return failResp(app.gpa, "lane: out of memory\n", .{});
-        };
-        wt_branch_owned = app.gpa.dupe(u8, job.branch) catch {
-            return failResp(app.gpa, "lane: out of memory\n", .{});
-        };
-    } else {
-        // `home` is only needed for creating a new worktree; compute it here.
-        const home = (app.templateRuntime() orelse {
-            return failResp(app.gpa, "lane: no active runtime\n", .{});
-        }).home_dir;
-
-        var raw: [6]u8 = undefined;
-        app.io.random(&raw);
-        const id = std.fmt.bytesToHex(raw, .lower);
-
-        const branch = app.gpa.alloc(u8, "zay/".len + id.len) catch {
-            return failResp(app.gpa, "lane: out of memory\n", .{});
-        };
-        errdefer app.gpa.free(branch);
-        @memcpy(branch[0.."zay/".len], "zay/");
-        @memcpy(branch["zay/".len..], &id);
-        const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
-            app.gpa.free(branch);
-            return failResp(app.gpa, "lane: out of memory\n", .{});
-        };
-        defer app.gpa.free(parent);
-        std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
-        const dest = std.fs.path.join(app.gpa, &.{ parent, id[0..] }) catch {
-            app.gpa.free(branch);
-            return failResp(app.gpa, "lane: out of memory\n", .{});
-        };
-        errdefer app.gpa.free(dest);
-
-        const job = WorktreeJob.start(app.gpa, app.io, repo, dest, branch) catch |err| {
-            app.gpa.free(branch);
-            app.gpa.free(dest);
-            return failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)});
-        };
-        app.gpa.free(branch);
-        app.gpa.free(dest);
-        app.async_worktree_job = job;
-        return null; // Return null so request stays in pending list and UI tick runs without blocking!
+    switch (pollOrStartWorktree(app, repo, req)) {
+        .pending => return null,
+        .failed => |r| return r,
+        .ready => |wt| {
+            wt_dest_owned = wt.dest;
+            wt_branch_owned = wt.branch;
+        },
     }
 
     const wt_dest = wt_dest_owned.?;
@@ -1731,14 +1757,20 @@ fn gitOk(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, args: []const []co
     if (result.term != .exited or result.term.exited != 0) return error.GitCommandFailed;
 }
 
-/// Post a request to the app's bridge and service it inline (the UI tick).
+/// Post a request to the app's bridge and service it until resolved (simulating UI ticks).
 fn postAndService(io: std.Io, app: *App, req: *lane_bridge.Request) lane_bridge.Response {
     const bridge = app.lane_bridge.?;
     bridge.mutex.lock(io) catch unreachable;
     bridge.pending = req;
     bridge.mutex.unlock(io);
-    serviceLaneBridge(app);
-    std.debug.assert(bridge.pending == null);
+    while (true) {
+        serviceLaneBridge(app);
+        bridge.mutex.lock(io) catch unreachable;
+        const done = bridge.pending == null;
+        bridge.mutex.unlock(io);
+        if (done) break;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
     const out = req.response.?;
     return out;
 }
@@ -3627,7 +3659,7 @@ test "WorktreeJob start and completion lifecycle" {
     defer cleanupLaneWorktreeAndBranch(&app, ".", dest, branch);
 
     // Start an async job
-    const job = try WorktreeJob.start(gpa, io, ".", dest, branch);
+    const job = try WorktreeJob.start(gpa, io, ".", dest, branch, null);
     app.async_worktree_job = job;
 
     // Wait for worker completion
