@@ -13,12 +13,9 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../tui.zig");
 const tui_metrics = @import("metrics.zig");
 const tui_style = @import("style.zig");
 const tx_widget = @import("widgets/transcript.zig");
-
-const Thread = tui.Thread;
 
 /// Everything a lane column renders, computed once per frame by
 /// `root_layout.buildLaneColumnProps` so the widget never reaches into

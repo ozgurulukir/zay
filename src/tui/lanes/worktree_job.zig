@@ -48,25 +48,36 @@ pub const WorktreeJob = struct {
     repo: []u8,
     dest: []u8,
     branch: []u8,
+    owner_req: ?*const anyopaque = null,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     err: ?anyerror = null,
 
-    pub fn start(gpa: std.mem.Allocator, io: std.Io, repo: []const u8, dest: []const u8, branch: []const u8) !*WorktreeJob {
+    pub fn start(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        repo: []const u8,
+        dest: []const u8,
+        branch: []const u8,
+        owner_req: ?*const anyopaque,
+    ) !*WorktreeJob {
         const job = try gpa.create(WorktreeJob);
         errdefer gpa.destroy(job);
+        const owned_repo = try gpa.dupe(u8, repo);
+        errdefer gpa.free(owned_repo);
+        const owned_dest = try gpa.dupe(u8, dest);
+        errdefer gpa.free(owned_dest);
+        const owned_branch = try gpa.dupe(u8, branch);
+        errdefer gpa.free(owned_branch);
+
         job.* = .{
             .gpa = gpa,
             .io = io,
-            .repo = try gpa.dupe(u8, repo),
-            .dest = try gpa.dupe(u8, dest),
-            .branch = try gpa.dupe(u8, branch),
+            .repo = owned_repo,
+            .dest = owned_dest,
+            .branch = owned_branch,
+            .owner_req = owner_req,
         };
-        errdefer {
-            gpa.free(job.repo);
-            gpa.free(job.dest);
-            gpa.free(job.branch);
-        }
         job.thread = try std.Thread.spawn(.{}, runWorker, .{job});
         return job;
     }
@@ -78,8 +89,15 @@ pub const WorktreeJob = struct {
         job.done.store(true, .release);
     }
 
+    pub fn join(self: *WorktreeJob) void {
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
     pub fn deinit(self: *WorktreeJob) void {
-        if (self.thread) |t| t.join();
+        self.join();
         self.gpa.free(self.repo);
         self.gpa.free(self.dest);
         self.gpa.free(self.branch);
