@@ -518,6 +518,7 @@ fn pollOrStartWorktree(app: *App, repo: []const u8, req: *const lane_bridge.Requ
             return .{ .failed = failResp(app.gpa, "lane: worktree create failed: {s}\n", .{@errorName(err)}) };
         }
         const wt_dest = app.gpa.dupe(u8, job.dest) catch {
+            rollbackLaneWorktree(app, repo, job.dest, job.branch);
             return .{ .failed = failResp(app.gpa, "lane: out of memory\n", .{}) };
         };
         const wt_branch = app.gpa.dupe(u8, job.branch) catch {
