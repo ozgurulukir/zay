@@ -1614,9 +1614,6 @@ pub const RootWidget = struct {
         return root_layout_widget.drawRoot(self.app, self.widget(), ctx);
     }
 
-    /// Draw one lane's transcript as a bordered column for split view. The
-    /// border label marks the lane (● active / ○ background) and the active
-    /// column's border is undimmed.
     // --- Diff viewer ------------------------------------------------------
 
     pub fn handleDiffViewerEvent(self: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !void {

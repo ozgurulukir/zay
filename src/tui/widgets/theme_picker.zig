@@ -26,7 +26,7 @@ pub const State = struct {
 pub const Content = struct {
     themes: []const tui_style.Theme,
     selection: u32,
-    scroll: ?*panel.ListScrollState = null,
+    scroll_top: u32 = 0,
     active_name: []const u8,
     filter: []const u8,
     highlight_enabled: bool = true,
@@ -73,10 +73,7 @@ pub const Content = struct {
 
         std.mem.sort(ScoredTheme, matching_themes.items, {}, ScoredTheme.lessThan);
 
-        const viewport = if (self.scroll) |s|
-            panel.ViewportWindow.computeStateful(self.selection, total_matches, height, s)
-        else
-            panel.ViewportWindow.compute(self.selection, total_matches, height);
+        const viewport = panel.ViewportWindow.computeWithScroll(self.selection, total_matches, height, self.scroll_top);
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
             const theme_idx = matching_themes.items[match_idx].idx;

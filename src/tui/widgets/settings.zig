@@ -160,7 +160,7 @@ const about_item_count: u32 = 0; // read-only info
 /// Live config snapshot passed in per draw. No owned memory; caller
 /// holds the config and the state.
 pub const Content = struct {
-    state: *State,
+    state: *const State,
     config: *const config_mod.Config,
     home_dir: []const u8,
     cwd: []const u8,
@@ -228,6 +228,14 @@ pub const Content = struct {
     // General section
     // -----------------------------------------------------------------------
 
+    fn generalViewport(sel: u32, height: u16, scroll_top: u32) panel.ViewportWindow {
+        const list_start_row: u16 = 4;
+        const footer_reserved: u16 = 2;
+        const avail_rows: u16 = height -| (list_start_row + footer_reserved);
+        const visible_items: u16 = @max(@as(u16, 1), avail_rows / 3);
+        return panel.ViewportWindow.computeWithScroll(sel, general_item_count, visible_items, scroll_top);
+    }
+
     fn drawGeneral(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const p = self.palette;
         const sel = self.state.selection[@intFromEnum(Tab.general)];
@@ -238,8 +246,7 @@ pub const Content = struct {
         const list_start_row: u16 = 4;
         const footer_reserved: u16 = 2;
         const avail_rows: u16 = surface.size.height -| (list_start_row + footer_reserved);
-        const visible_items: u16 = @max(@as(u16, 1), avail_rows / 3);
-        const viewport = panel.ViewportWindow.computeStateful(sel, general_item_count, visible_items, &self.state.general_scroll);
+        const viewport = generalViewport(sel, surface.size.height, self.state.general_scroll.scroll_top);
 
         var idx = viewport.start_index;
         while (idx < viewport.end_index) : (idx += 1) {
@@ -326,7 +333,7 @@ pub const Content = struct {
                 else => {},
             }
         }
-        if (general_item_count > visible_items) {
+        if (general_item_count > viewport.visible_height) {
             panel.drawViewportScrollbarAt(surface, list_start_row, avail_rows, viewport, general_item_count, p);
         }
     }
@@ -665,6 +672,7 @@ test "settings General tab scrolls on short terminals so later items stay visibl
     };
     const surface = try content.widget().draw(ctx);
     try std.testing.expectEqual(@as(u16, 10), surface.size.height);
-    // Selection 5 must have scrolled the viewport past item 0.
-    try std.testing.expect(state.general_scroll.scroll_top > 0);
+    // Selection 5 must have scrolled the viewport past item 0 without mutating state.
+    try std.testing.expect(Content.generalViewport(5, 10, 0).start_index > 0);
+    try std.testing.expectEqual(@as(u32, 0), state.general_scroll.scroll_top);
 }

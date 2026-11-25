@@ -53,26 +53,25 @@ pub const ViewportWindow = struct {
     visible_height: u32,
 
     pub fn compute(selection: u32, total_count: u32, height: u16) ViewportWindow {
-        var scratch: ListScrollState = .{};
-        return computeStateful(selection, total_count, height, &scratch);
+        return computeWithScroll(selection, total_count, height, 0);
     }
 
-    pub fn computeStateful(selection: u32, total_count: u32, height: u16, scroll_state: *ListScrollState) ViewportWindow {
+    /// Pure viewport computation starting from `initial_scroll_top` without
+    /// mutating any caller-owned state (safe for `draw` and hit-testing).
+    pub fn computeWithScroll(selection: u32, total_count: u32, height: u16, initial_scroll_top: u32) ViewportWindow {
         const visible_height: u32 = height;
         if (visible_height == 0 or total_count == 0) {
-            scroll_state.scroll_top = 0;
             return .{ .scroll_top = 0, .start_index = 0, .end_index = 0, .visible_height = 0 };
         }
 
         const clamped_sel = @min(selection, total_count - 1);
         const max_scroll = total_count -| visible_height;
-        var scroll_top = @min(scroll_state.scroll_top, max_scroll);
+        var scroll_top = @min(initial_scroll_top, max_scroll);
         if (clamped_sel < scroll_top) {
             scroll_top = clamped_sel;
         } else if (clamped_sel >= scroll_top + visible_height) {
             scroll_top = clamped_sel - visible_height + 1;
         }
-        scroll_state.scroll_top = scroll_top;
 
         const end_index = @min(total_count, scroll_top + visible_height);
         return .{
@@ -81,6 +80,12 @@ pub const ViewportWindow = struct {
             .end_index = end_index,
             .visible_height = visible_height,
         };
+    }
+
+    pub fn computeStateful(selection: u32, total_count: u32, height: u16, scroll_state: *ListScrollState) ViewportWindow {
+        const viewport = computeWithScroll(selection, total_count, height, scroll_state.scroll_top);
+        scroll_state.scroll_top = viewport.scroll_top;
+        return viewport;
     }
 
     pub fn screenRow(self: ViewportWindow, index: u32) u16 {
