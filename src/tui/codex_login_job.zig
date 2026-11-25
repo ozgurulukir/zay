@@ -25,7 +25,7 @@ pub const Outcome = union(enum) {
 
 /// The armed login job as an App field. `generation`/`session_id` let the UI
 /// discard a result whose lane or session was switched while the browser was
-/// open; `cancel_requested` is polled by the OAuth worker so teardown can
+/// open; `job.cancel_requested` is polled by the OAuth worker so teardown can
 /// unwind it.
 pub const CodexLoginJob = struct {
     job: job_mod.Job(Outcome),
@@ -35,7 +35,6 @@ pub const CodexLoginJob = struct {
     generation: u64,
     /// Empty when the active runtime has not persisted a session yet.
     session_id: []u8 = &.{},
-    cancel_requested: std.atomic.Value(bool) = .init(false),
 };
 
 /// Free the arm's allocations (the Job itself is disarmed by then).
@@ -45,14 +44,14 @@ pub fn deinitArm(arm: *CodexLoginJob) void {
     arm.* = undefined;
 }
 
-/// Worker entry point for `Job(Outcome).spawn`. The cooperative cancel flag
-/// is polled inside `loginCancellable`'s callback wait.
-pub fn runLogin(arm: *CodexLoginJob) Outcome {
+/// Worker entry point for `Job(Outcome).spawnCancelable`. The cooperative
+/// cancel flag is polled inside `loginCancellable`'s callback wait.
+pub fn runLogin(arm: *CodexLoginJob, cancel_requested: *const std.atomic.Value(bool)) Outcome {
     const credentials = codex.loginCancellable(
         arm.gpa,
         arm.io,
         arm.home_dir,
-        &arm.cancel_requested,
+        cancel_requested,
     ) catch |err| return .{ .failed = err };
     return .{ .ready = credentials };
 }

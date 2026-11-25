@@ -107,6 +107,12 @@ pub const ModelCatalogue = struct {
         try self.entries.append(gpa, .{ .model = model, .source = source });
     }
 
+    /// Append a model into pre-reserved capacity so ownership transfer cannot
+    /// fail partway through a batch and leave `model`/`source` double-freed.
+    pub fn appendAssumeCapacity(self: *ModelCatalogue, model: codex.Model, source: model_loader.ModelSource) void {
+        self.entries.appendAssumeCapacity(.{ .model = model, .source = source });
+    }
+
     /// Free every entry's model and drop all rows.
     pub fn clearEntries(self: *ModelCatalogue, gpa: std.mem.Allocator) void {
         for (self.entries.items) |*entry| {

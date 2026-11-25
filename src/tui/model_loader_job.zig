@@ -53,12 +53,13 @@ pub fn drainModelLoad(self: *App) !bool {
     if (self.pickers.models.load != .loading) return false;
     if (!self.pickers.models.load.loading.job.isDone()) return false;
 
+    const merge = self.pickers.models.load.loading.merge;
     var outcome = self.pickers.models.load.loading.job.adopt(self.io);
     self.pickers.models.load = .idle;
     defer outcome.deinit(self.gpa);
 
     switch (outcome) {
-        .ready => |*result| try installModelLoadResult(self, result),
+        .ready => |*result| try installModelLoadResult(self, result, merge),
         .failed => |message| {
             self.pickers.models.load = .{ .failed = .{ .message = try self.gpa.dupe(u8, message) } };
         },
@@ -66,8 +67,8 @@ pub fn drainModelLoad(self: *App) !bool {
     return true;
 }
 
-pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
-    if (self.pickers.models.load == .loading and self.pickers.models.load.loading.merge) {
+pub fn installModelLoadResult(self: *App, result: *model_loader.Result, merge: bool) !void {
+    if (merge) {
         // Incremental load: replace only the freshly-fetched providers'
         // models, leaving previously-cached providers untouched. Conn-based
         // dedup: multiple `.openai_compatible` providers share the same enum
@@ -86,12 +87,14 @@ pub fn installModelLoadResult(self: *App, result: *model_loader.Result) !void {
     } else {
         provider_model.codexModelsClear(self);
     }
-    // Move models in (the struct copies own their id/label); clearing the
-    // result without freeing avoids a double-free. `models` and `sources`
-    // are built in lockstep, so they zip into one entry each.
+    // Reserve capacity before moving ownership so a mid-loop OOM cannot leave
+    // moved entries owned by both `pickers.models` and `result` (which
+    // `outcome.deinit` would double-free). `models` and `sources` are built in
+    // lockstep, so they zip into one entry each.
     std.debug.assert(result.models.items.len == result.sources.items.len);
+    try self.pickers.models.entries.ensureUnusedCapacity(self.gpa, result.models.items.len);
     for (result.models.items, result.sources.items) |*model, source| {
-        try self.pickers.models.append(self.gpa, model.*, source);
+        self.pickers.models.appendAssumeCapacity(model.*, source);
     }
     // Merge models.dev registry models for the freshly-fetched providers so
     // subscription models the /models endpoint omits (e.g. cline-pass/*) still
@@ -287,4 +290,58 @@ test "markLoadSpawnFailed moves an armed loading state to failed and keeps cance
     cancelModelLoad(&app);
     try std.testing.expect(app.pickers.models.load == .failed);
     try std.testing.expect(!try drainModelLoad(&app));
+}
+
+test "drainModelLoad with merge=true replaces refreshed conn models and keeps others" {
+    const agent_mod = @import("../agent.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Seed catalogue with one model for conn-a (stale) and one for conn-b (must stay).
+    try app.pickers.models.append(gpa, .{
+        .id = try gpa.dupe(u8, "old-a"),
+        .label = try gpa.dupe(u8, "Old A"),
+    }, .{ .openai_compatible = .{
+        .provider = .openai_compatible,
+        .base_url = try gpa.dupe(u8, "https://a.example"),
+        .auth_key_id = try gpa.dupe(u8, "conn-a"),
+    } });
+    try app.pickers.models.append(gpa, .{
+        .id = try gpa.dupe(u8, "keep-b"),
+        .label = try gpa.dupe(u8, "Keep B"),
+    }, .{ .openai_compatible = .{
+        .provider = .openai_compatible,
+        .base_url = try gpa.dupe(u8, "https://b.example"),
+        .auth_key_id = try gpa.dupe(u8, "conn-b"),
+    } });
+
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator) model_loader.Outcome {
+            var res: model_loader.Result = .{ .gpa = alloc };
+            res.models.append(alloc, .{
+                .id = alloc.dupe(u8, "new-a") catch unreachable,
+                .label = alloc.dupe(u8, "New A") catch unreachable,
+            }) catch unreachable;
+            res.sources.append(alloc, .{ .openai_compatible = .{
+                .provider = .openai_compatible,
+                .base_url = alloc.dupe(u8, "https://a.example") catch unreachable,
+                .auth_key_id = alloc.dupe(u8, "conn-a") catch unreachable,
+            } }) catch unreachable;
+            return .{ .ready = res };
+        }
+    };
+
+    app.pickers.models.load = .{ .loading = .{ .job = .{}, .merge = true } };
+    try app.pickers.models.load.loading.job.spawn(std.testing.io, gpa, Worker.run);
+    while (!app.pickers.models.load.loading.job.isDone()) {
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try std.testing.expect(try drainModelLoad(&app));
+    try std.testing.expectEqual(@as(usize, 2), app.pickers.models.entries.items.len);
+    try std.testing.expectEqualStrings("keep-b", app.pickers.models.entries.items[0].model.id);
+    try std.testing.expectEqualStrings("new-a", app.pickers.models.entries.items[1].model.id);
 }
