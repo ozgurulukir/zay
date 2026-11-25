@@ -25,41 +25,9 @@ const commands = tui.commands;
 const command_prefix: u8 = '/';
 
 pub fn syncModeWithInput(app: *App, value: []const u8) !void {
-    // While typing an API key in the provider form, the input is the key —
-    // never reinterpret a leading '/' as a command.
-    if (app.mode == .provider_picker and app.pickers.provider.stage == .form) return;
-    // While renaming a session, the palette input is not the rename target —
-    // don't reinterpret a leading '/' as a command.
-    if (app.mode == .session_picker and app.nav.session_action != .browsing) return;
-    if (app.mode == .session_picker or app.mode == .provider_picker or app.mode == .model_picker or app.mode == .tree_picker or app.mode == .theme_picker) {
-        if (value.len > 0 and value[0] == command_prefix) {
-            // Leaving `.theme_picker` via a leading '/' is a non-commit exit —
-            // revert the live preview before entering the command menu (M2).
-            if (app.mode == .theme_picker) theme_lifecycle.closeThemePicker(app);
-            // The palette text IS the command being typed — flip without the
-            // input pairing (`setModeKeepInput`), or every keystroke would
-            // wipe the buffer it mirrors.
-            app.setModeKeepInput(.command);
-            app.nav.command_selection = 0;
-            return;
-        }
-        if (app.mode == .theme_picker) {
-            // Keep the selection valid while filtering: a filter that removes
-            // the selected row resets to the top instead of pointing past the
-            // list. Stays in sync with the `.command` clamp in event_callbacks.
-            const count = theme_picker.countMatching(app.theme_registry.slice(), value);
-            if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
-            theme_lifecycle.previewSelected(app);
-        }
-        if (app.mode == .provider_picker and app.pickers.provider.stage == .list) {
-            const count = provider_picker.countMatching(app.pickers.provider.entries, value);
-            if (app.pickers.provider.selection >= count) app.pickers.provider.selection = 0;
-        }
-        if (app.mode == .session_picker) {
-            if (app.nav.resume_selection >= try app.visibleResumeCount()) app.nav.resume_selection = 0;
-        }
-        return;
-    }
+    // Only `.normal` and `.command` bind `inputChanged` to the main input;
+    // picker modes focus `app.inputs.palette` (`paletteInputChanged`).
+    if (app.mode != .normal and app.mode != .command) return;
     if (value.len > 0 and value[0] == command_prefix) {
         app.setModeKeepInput(.command);
         app.nav.command_selection = 0;
@@ -912,38 +880,32 @@ test "submitMode /theme tokyo_night applies inline and closes to normal mode" {
     try std.testing.expectEqual(App.Mode.normal, app.mode);
 }
 
-test "syncModeWithInput keeps theme_picker on a non-slash filter and clamps OOB" {
+test "paletteInputChanged keeps theme_picker on a non-slash filter and clamps OOB" {
+    const event_callbacks = @import("event_callbacks.zig");
+    const vxfw = @import("vaxis").vxfw;
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
     // Start at a selection past the end and type a filter that keeps the mode.
     app.mode = .theme_picker;
     app.pickers.theme.selection = 5;
-    try app.syncModeWithInput("gru");
+    try event_callbacks.paletteInputChanged(&app, &ctx, "gru");
     try std.testing.expectEqual(App.Mode.theme_picker, app.mode);
     // "gru" matches only gruvbox_dark → 1 match → the OOB selection clamps to 0.
     try std.testing.expectEqual(@as(u32, 0), app.pickers.theme.selection);
 
     // A filter with no matches clamps selection to 0 as well.
     app.pickers.theme.selection = 3;
-    try app.syncModeWithInput("zzz");
+    try event_callbacks.paletteInputChanged(&app, &ctx, "zzz");
     try std.testing.expectEqual(App.Mode.theme_picker, app.mode);
     try std.testing.expectEqual(@as(u32, 0), app.pickers.theme.selection);
-}
-
-test "syncModeWithInput drops theme_picker to command on a leading slash" {
-    const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-    var app = try App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
-
-    app.mode = .theme_picker;
-    try app.syncModeWithInput("/");
-    try std.testing.expectEqual(App.Mode.command, app.mode);
 }
 
 test "cancelMode on theme_picker reverts the preview and resets mode" {
@@ -986,23 +948,6 @@ test "cancelMode frees a pending project-root bind" {
     try std.testing.expect(app.nav.session_action == .browsing);
     try std.testing.expect(app.pending_resume == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_buffers.project_root_text.items.len);
-}
-
-test "syncModeWithInput leading slash from theme_picker reverts before entering command" {
-    const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
-    defer agent.deinit();
-    var app = try App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
-
-    app.mode = .theme_picker;
-    app.theme_preview_original = tui_style.default_theme;
-    theme_lifecycle.previewTheme(&app, tui_style.dracula);
-
-    try app.syncModeWithInput("/");
-    try std.testing.expectEqual(App.Mode.command, app.mode);
-    try std.testing.expectEqual(tui_style.default_theme.body, app.activePalette().body.fg.rgb);
-    try std.testing.expect(app.theme_preview_original == null);
 }
 
 test "submitMode on theme_picker with no matching filter reverts the preview" {

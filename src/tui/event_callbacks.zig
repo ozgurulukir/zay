@@ -15,12 +15,14 @@ const App = tui.App;
 pub fn inputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(userdata.?));
     app.clearBlockNav();
-    const was_command = app.mode == .command;
-    try app.syncModeWithInput(value);
-    if (!was_command and app.mode == .command) {
-        app.clearInput();
-        app.clearPaletteInput();
-        try ctx.requestFocus(app.inputs.palette.widget());
+    if (!app.isPasting()) {
+        const was_command = app.mode == .command;
+        try app.syncModeWithInput(value);
+        if (!was_command and app.mode == .command) {
+            app.clearInput();
+            app.clearPaletteInput();
+            try ctx.requestFocus(app.inputs.palette.widget());
+        }
     }
     if (app.mode == .normal) {
         try app.updateAtSearch();

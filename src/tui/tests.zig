@@ -3199,21 +3199,6 @@ test "canceling a picker returns to command menu" {
     try std.testing.expectEqualStrings("", palette_filter);
 }
 
-test "typing slash inside picker opens command menu" {
-    const gpa = std.testing.allocator;
-    var openai_compatible_client: openai_compatible_mod.Client = undefined;
-    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
-    defer openai_compatible_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
-    defer agent.deinit();
-    var app = try App.init(std.testing.io, gpa, &agent);
-    defer app.deinit();
-
-    app.mode = .session_picker;
-    try app.syncModeWithInput("/");
-    try std.testing.expectEqual(App.Mode.command, app.mode);
-}
-
 test "menu navigation wraps and model reasoning tab cycles" {
     const gpa = std.testing.allocator;
     var openai_compatible_client: openai_compatible_mod.Client = undefined;

@@ -692,12 +692,6 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
     const state = &app.pickers.settings;
     if (state.edit_target == .none) return false;
 
-    if (key.matches(vaxis.Key.escape, .{})) {
-        // Cancel — discard changes.
-        state.edit_target = .none;
-        app.input_buffers.settings_text.clearRetainingCapacity();
-        return true;
-    }
     if (key.matches('s', .{ .ctrl = true })) {
         // Ctrl+S while editing: commit, and only save when the commit
         // landed — a failed validation keeps the editor open and must not
@@ -705,10 +699,6 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
         // a second time).
         try commitTextEdit(app);
         if (state.edit_target == .none) _ = try saveSettings(app);
-        return true;
-    }
-    if (key.matches(vaxis.Key.enter, .{})) {
-        try submitTextEdit(app);
         return true;
     }
     if (key.matches(vaxis.Key.backspace, .{})) {
@@ -742,7 +732,9 @@ fn popSettingsTextInput(app: *App) void {
 
 const agent_mod = @import("../agent.zig");
 
-test "handleTextEditKey Enter inserts newline for system_prompt" {
+test "captureEvent Enter inserts newline for system_prompt" {
+    const event_router = @import("event_router.zig");
+    const vxfw = @import("vaxis").vxfw;
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -753,16 +745,21 @@ test "handleTextEditKey Enter inserts newline for system_prompt" {
     app.mode = .settings;
     app.pickers.settings.edit_target = .system_prompt;
 
-    // Simulate Enter key
-    const handled = try handleTextEditKey(&app, .{ .codepoint = vaxis.Key.enter, .mods = .{} });
+    var root: tui.RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
-    // It should have handled the key, the mode should still be system_prompt, and the buffer should have a newline
-    try std.testing.expect(handled);
+    try event_router.captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter, .mods = .{} } });
+
+    // Mode stays in system_prompt edit and the buffer has a newline
     try std.testing.expect(app.pickers.settings.edit_target == .system_prompt);
     try std.testing.expectEqualStrings("\n", app.input_buffers.settings_text.items);
 }
 
-test "handleTextEditKey Enter commits for bash_classifier_url" {
+test "captureEvent Enter commits for bash_classifier_url" {
+    const event_router = @import("event_router.zig");
+    const vxfw = @import("vaxis").vxfw;
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -774,11 +771,14 @@ test "handleTextEditKey Enter commits for bash_classifier_url" {
     app.pickers.settings.edit_target = .bash_classifier_url;
     try app.input_buffers.settings_text.appendSlice(gpa, "https://example.com");
 
-    // Simulate Enter key
-    const handled = try handleTextEditKey(&app, .{ .codepoint = vaxis.Key.enter, .mods = .{} });
+    var root: tui.RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
-    // It should have handled the key, committed the text, and cleared the edit target
-    try std.testing.expect(handled);
+    try event_router.captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter, .mods = .{} } });
+
+    // Committed the text and cleared the edit target
     try std.testing.expect(app.pickers.settings.edit_target == .none);
     try std.testing.expectEqualStrings("https://example.com", app.pickers.settings.pending_bash_classifier_url.?);
 
