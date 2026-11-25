@@ -305,6 +305,7 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         .codex_signed_in = self.isCodexSignedIn(),
         .session_id = try ownedSessionId(self),
     };
+    errdefer if (job.session_id.len > 0) self.gpa.free(job.session_id);
     // Arm LAST — after the last fallible step — so a failure never wedges a
     // `.loading` state with a disarmed job (drainModelLoad would spin the
     // tick and teardown would join an undefined future). Job.spawn captures
@@ -561,7 +562,7 @@ pub fn connectCodex(self: *App) !void {
         .generation = self.thread.generation,
         .session_id = session_id,
     };
-    self.codex_login_job.?.job.spawn(self.io, &self.codex_login_job.?, codex_login_job.runLogin) catch |err| {
+    self.codex_login_job.?.job.spawnCancelable(self.io, &self.codex_login_job.?, codex_login_job.runLogin) catch |err| {
         self.codex_login_job = null;
         return err;
     };
@@ -582,7 +583,6 @@ pub fn cancelCodexLogin(self: *App) void {
     if (self.codex_login_job) |*login| {
         // Ask the OAuth worker to unwind, then join it; the outcome (if any)
         // is discarded — a cancelled login never connects.
-        login.cancel_requested.store(true, .release);
         var outcome = login.job.cancel(self.io);
         outcome.deinit(self.gpa);
         codex_login_job.deinitArm(login);
@@ -903,6 +903,7 @@ pub fn startOpenAiCompatibleModelLoad(
         .codex_signed_in = false,
         .session_id = try ownedSessionId(self),
     };
+    errdefer if (job.session_id.len > 0) self.gpa.free(job.session_id);
     // Arm LAST — see the connected-provider path above.
     self.pickers.models.load = .{
         .loading = .{
@@ -958,6 +959,7 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
         .codex_signed_in = self.isCodexSignedIn(),
         .session_id = try ownedSessionId(self),
     };
+    errdefer if (job.session_id.len > 0) self.gpa.free(job.session_id);
     // Arm LAST — see the connected-provider path above.
     self.pickers.models.load = .{ .loading = .{
         .job = .{},
