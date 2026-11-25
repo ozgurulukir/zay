@@ -1437,11 +1437,15 @@ test "bracketed paste: paste_start with a leading slash does not open the comman
     try std.testing.expect(app.isPasting());
 
     // Outside a paste this exact key (input empty) switches to the command
-    // menu; during a paste it must stay in normal mode.
-    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '/' } });
+    // menu; during a paste it must stay in normal mode even when forwarded
+    // to the TextField (which fires `event_callbacks.inputChanged`).
+    const slash_key: vaxis.Key = .{ .codepoint = '/', .text = "/" };
+    try captureEvent(&app, &root, &ctx, .{ .key_press = slash_key });
+    try app.inputs.input.handleEvent(&ctx, .{ .key_press = slash_key });
 
     try std.testing.expect(app.getMode() == .normal);
     try std.testing.expect(app.isPasting());
+    try std.testing.expectEqualStrings("/", app.inputs.input.buf.firstHalf());
 
     try captureEvent(&app, &root, &ctx, .paste_end);
     try std.testing.expect(!app.isPasting());

@@ -534,17 +534,23 @@ test "openThemePicker snapshots the active theme for revert" {
 }
 
 test "filtering in theme_picker updates live preview to newly selected top match" {
+    const event_callbacks = @import("event_callbacks.zig");
+    const vxfw = @import("vaxis").vxfw;
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
     app.cached_config.tui.theme_live_preview = true;
     openThemePicker(&app);
     app.pickers.theme.selection = 3; // dracula
     try app.inputs.palette.buf.insertSliceAtCursor("gru");
-    try app.syncModeWithInput("gru");
+    try event_callbacks.paletteInputChanged(&app, &ctx, "gru");
 
     try std.testing.expectEqual(@as(u32, 0), app.pickers.theme.selection);
     try std.testing.expectEqual(tui_style.gruvbox_dark.body, app.activePalette().body.fg.rgb);
