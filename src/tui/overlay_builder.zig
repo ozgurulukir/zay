@@ -153,7 +153,7 @@ fn buildThemeContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Erro
     return .{
         .themes = app.theme_registry.slice(),
         .selection = app.pickers.theme.selection,
-        .scroll = &app.pickers.theme.scroll,
+        .scroll_top = app.pickers.theme.scroll.scroll_top,
         .active_name = active_name,
         .filter = filter,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
@@ -300,7 +300,7 @@ fn buildCommandContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.Er
         .entries = try arena.dupe(command_panel.Entry, buf[0..n]),
         .filter = filter,
         .selection = app.nav.command_selection,
-        .scroll = &app.nav.command_scroll,
+        .scroll_top = app.nav.command_scroll.scroll_top,
         .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
         .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         .palette = &app.palette,
@@ -332,7 +332,7 @@ fn buildProviderContent(app: *App, arena: std.mem.Allocator) std.mem.Allocator.E
     const filter = try app.peekPaletteInputArena(arena);
     return .{
         .state = app.pickers.provider,
-        .scroll = &app.pickers.provider.scroll,
+        .scroll_top = app.pickers.provider.scroll.scroll_top,
         .codex_signed_in = app.isCodexSignedIn(),
         .statuses = &app.provider_state.conn_status,
         .key_input = app.input_buffers.provider_key.items,

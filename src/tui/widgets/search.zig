@@ -127,7 +127,7 @@ pub fn searchable(message: transcript_mod.Message) ?Searchable {
 }
 
 pub const Content = struct {
-    state: *State,
+    state: *const State,
     palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
@@ -157,7 +157,7 @@ pub const Content = struct {
 
         // Viewport math: only the visible rows are drawn, so a pathological
         // match count can never blow up the overlay.
-        const viewport = panel.ViewportWindow.computeStateful(self.state.selection, @intCast(matches.len), height, &self.state.scroll);
+        const viewport = panel.ViewportWindow.computeWithScroll(self.state.selection, @intCast(matches.len), height, self.state.scroll.scroll_top);
         var match_idx = viewport.start_index;
         while (match_idx < viewport.end_index) : (match_idx += 1) {
             const m = matches[match_idx];

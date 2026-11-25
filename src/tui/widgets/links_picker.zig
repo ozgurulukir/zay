@@ -114,7 +114,7 @@ pub fn openUrlInPlatform(io: std.Io, url: []const u8) !void {
 }
 
 pub const Content = struct {
-    state: *State,
+    state: *const State,
     palette: *const tui_style.Palette = &tui_style.default_palette,
 
     pub fn widget(self: *Content) vxfw.Widget {
@@ -137,7 +137,7 @@ pub const Content = struct {
         }
 
         const list_height = if (height > 1) height - 1 else height;
-        const viewport = panel.ViewportWindow.computeStateful(self.state.selection, @intCast(items.len), list_height, &self.state.scroll);
+        const viewport = panel.ViewportWindow.computeWithScroll(self.state.selection, @intCast(items.len), list_height, self.state.scroll.scroll_top);
         var idx = viewport.start_index;
         while (idx < viewport.end_index) : (idx += 1) {
             const item = items[idx];

@@ -41,7 +41,7 @@ pub const State = struct {
 };
 
 pub const Content = struct {
-    state: *State,
+    state: *const State,
     servers: []const ServerEntry = &.{},
     active_server_count: usize = 0,
     total_active_tools: usize = 0,
@@ -93,7 +93,7 @@ pub const Content = struct {
         const avail_rows: u16 = height -| (list_start_row + footer_reserved);
         const visible_items: u16 = @max(@as(u16, 1), avail_rows / 2);
         const total_items: u32 = @intCast(self.servers.len);
-        const viewport = panel.ViewportWindow.computeStateful(@intCast(self.state.selection), total_items, visible_items, &self.state.scroll);
+        const viewport = panel.ViewportWindow.computeWithScroll(@intCast(self.state.selection), total_items, visible_items, self.state.scroll.scroll_top);
 
         var idx = viewport.start_index;
         while (idx < viewport.end_index) : (idx += 1) {

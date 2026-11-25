@@ -228,7 +228,7 @@ pub const State = struct {
 
 pub const Content = struct {
     state: State,
-    scroll: ?*panel.ListScrollState = null,
+    scroll_top: u32 = 0,
     codex_signed_in: bool,
     statuses: []const Status,
     key_input: []const u8 = "",
@@ -263,10 +263,7 @@ pub const Content = struct {
             return;
         }
 
-        const viewport = if (self.scroll) |s|
-            panel.ViewportWindow.computeStateful(self.state.selection, total_matches, surface.size.height, s)
-        else
-            panel.ViewportWindow.compute(self.state.selection, total_matches, surface.size.height);
+        const viewport = panel.ViewportWindow.computeWithScroll(self.state.selection, total_matches, surface.size.height, self.scroll_top);
         if (viewport.visible_height == 0) return;
 
         var match_idx: u32 = viewport.start_index;

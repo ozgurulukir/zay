@@ -61,7 +61,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
     switch (mode) {
         .command => {
             const total = tui.commandMatchesCount(app);
-            const vp = panel.ViewportWindow.computeStateful(app.nav.command_selection, total, content_h, &app.nav.command_scroll);
+            const vp = panel.ViewportWindow.computeWithScroll(app.nav.command_selection, total, content_h, app.nav.command_scroll.scroll_top);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.nav.command_selection = target;
@@ -71,7 +71,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
             const filter = app.peekPaletteInput() catch return false;
             defer app.gpa.free(filter);
             const total = theme_picker.countMatching(app.theme_registry.slice(), filter);
-            const vp = panel.ViewportWindow.computeStateful(app.pickers.theme.selection, total, content_h, &app.pickers.theme.scroll);
+            const vp = panel.ViewportWindow.computeWithScroll(app.pickers.theme.selection, total, content_h, app.pickers.theme.scroll.scroll_top);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.theme.selection = target;
@@ -79,7 +79,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
         },
         .search => {
             const total: u32 = @intCast(app.pickers.search.matches.items.len);
-            const vp = panel.ViewportWindow.computeStateful(app.pickers.search.selection, total, content_h, &app.pickers.search.scroll);
+            const vp = panel.ViewportWindow.computeWithScroll(app.pickers.search.selection, total, content_h, app.pickers.search.scroll.scroll_top);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.search.selection = target;
@@ -89,7 +89,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
             const list_h: u16 = if (content_h > 1) content_h - 1 else content_h;
             if (clicked_row >= list_h) return false;
             const total: u32 = @intCast(app.pickers.links.items.items.len);
-            const vp = panel.ViewportWindow.computeStateful(app.pickers.links.selection, total, list_h, &app.pickers.links.scroll);
+            const vp = panel.ViewportWindow.computeWithScroll(app.pickers.links.selection, total, list_h, app.pickers.links.scroll.scroll_top);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.links.selection = target;
@@ -98,7 +98,7 @@ fn selectOverlayRowAt(app: *App, rect: app_state_mod.ChipRect, mouse_row: i16) b
         .provider_picker => {
             if (app.pickers.provider.stage != .list) return false;
             const total: u32 = @intCast(app.pickers.provider.entries.len);
-            const vp = panel.ViewportWindow.computeStateful(app.pickers.provider.selection, total, content_h, &app.pickers.provider.scroll);
+            const vp = panel.ViewportWindow.computeWithScroll(app.pickers.provider.selection, total, content_h, app.pickers.provider.scroll.scroll_top);
             const target = vp.start_index + clicked_row;
             if (target >= total) return false;
             app.pickers.provider.selection = target;
