@@ -617,7 +617,7 @@ pub const BackgroundManager = struct {
             for (self.jobs.items) |job| {
                 const s = job.state.load(.acquire);
                 if (s != .running and s != .termination_requested) continue;
-                if (!isSubpathOrEqual(job.cwd, target_cwd)) continue;
+                if (!paths.isSubpathOrEqual(job.cwd, target_cwd)) continue;
                 // A pinned job already has a killer outside the mutex operating
                 // on this raw pointer (e.g. `cancel` claimed it first); a second
                 // killer would let the first clear the pin mid-kill. The
@@ -892,24 +892,6 @@ const windows = if (os.is_windows) struct {
         unreachable;
     }
 };
-
-pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
-    if (paths.pathsEqual(child, parent)) return true;
-    if (child.len <= parent.len) return false;
-    const prefix = child[0..parent.len];
-    if (paths.pathsEqual(prefix, parent)) {
-        const sep = child[parent.len];
-        return sep == '/' or sep == '\\';
-    }
-    return false;
-}
-
-test "isSubpathOrEqual handles exact match, subpaths, and rejects prefix collisions" {
-    try std.testing.expect(isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1", "C:/Users/zay/worktrees/1"));
-    try std.testing.expect(isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1\\sub", "C:/Users/zay/worktrees/1"));
-    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1-other", "C:/Users/zay/worktrees/1"));
-    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees", "C:/Users/zay/worktrees/1"));
-}
 
 test "BackgroundManager init/deinit cycle is clean" {
     // A manager with no jobs must deinit without leaks or hangs.

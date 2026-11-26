@@ -569,7 +569,7 @@ fn installPlugin(
             defer gpa.free(physical_source);
             const physical_project = try std.Io.Dir.realPathFileAlloc(.cwd(), io, project_root, gpa);
             defer gpa.free(physical_project);
-            if (!pathWithin(physical_source, physical_project)) return error.LocalSourceEscapesProject;
+            if (!paths.isSubpathOrEqual(physical_source, physical_project)) return error.LocalSourceEscapesProject;
             const source_relative = try relativeSourcePath(source_dir, project_root);
             var project = try std.Io.Dir.openDir(.cwd(), io, physical_project, .{ .iterate = true, .follow_symlinks = false });
             defer project.close(io);
@@ -678,12 +678,6 @@ fn copyTree(
             else => return error.InvalidPluginPackage,
         }
     }
-}
-
-fn pathWithin(child: []const u8, parent: []const u8) bool {
-    if (paths.pathsEqual(child, parent)) return true;
-    return child.len > parent.len and paths.pathsEqual(child[0..parent.len], parent) and
-        (child[parent.len] == '/' or child[parent.len] == '\\');
 }
 
 fn relativeSourcePath(source_dir: []const u8, project_root: []const u8) ![]const u8 {
