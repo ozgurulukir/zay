@@ -67,6 +67,26 @@ pub fn pathsEqualInternal(a: []const u8, b: []const u8, is_windows: bool) bool {
     return i == a.len and j == b.len;
 }
 
+/// True when `child` is `parent` itself or a path below it. Comparison is
+/// separator-agnostic (and case-insensitive on Windows) via `pathsEqual`, and
+/// the boundary requires a separator so `/repo-other` is not inside `/repo`.
+pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
+    if (pathsEqual(child, parent)) return true;
+    if (child.len <= parent.len) return false;
+    if (!pathsEqual(child[0..parent.len], parent)) return false;
+    const separator = child[parent.len];
+    return separator == '/' or separator == '\\';
+}
+
+test "isSubpathOrEqual handles exact match, subpaths, and rejects prefix collisions" {
+    try std.testing.expect(isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1\\sub", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees\\1-other", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees", "C:/Users/zay/worktrees/1"));
+    try std.testing.expect(isSubpathOrEqual("/repo/a/b", "/repo/a"));
+    try std.testing.expect(!isSubpathOrEqual("/repo/ab", "/repo/a"));
+}
+
 test "lastPathSegment: empty, trailing slashes, mixed separators, root" {
     try std.testing.expectEqualStrings("", lastPathSegment(""));
     try std.testing.expectEqualStrings("bar", lastPathSegment("/foo/bar"));
