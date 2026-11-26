@@ -106,16 +106,6 @@ fn opFromString(s: []const u8) ?Op {
     return null;
 }
 
-fn formatElapsed(buf: []u8, total_seconds: u64) []const u8 {
-    if (total_seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{total_seconds}) catch "?";
-    const minutes = total_seconds / 60;
-    const seconds = total_seconds % 60;
-    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m {d:0>2}s", .{ minutes, seconds }) catch "?";
-    const hours = minutes / 60;
-    const rem_minutes = minutes % 60;
-    return std.fmt.bufPrint(buf, "{d}h {d:0>2}m", .{ hours, rem_minutes }) catch "?";
-}
-
 pub fn readLogTailBounded(
     io: std.Io,
     gpa: std.mem.Allocator,
