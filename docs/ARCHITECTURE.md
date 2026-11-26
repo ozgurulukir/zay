@@ -133,7 +133,7 @@ and limits.
 
 ### Temp file safety
 
-Temporary log files use hex-only filenames (`zay-bash-<hex>.log` via `bytesToHex`), making path traversal impossible. The `namedTempPath` public API asserts that the provided name contains no path separators.
+Temporary log files use unpredictable names (`zay-bg_<id>-<hex>.log` via `bytesToHex`, plus an exclusive `O_EXCL` create at the call site) rather than predictable sequential ids, so a local user cannot pre-plant a symlink at the next log path. The `namedTempPath` public API asserts that the provided name contains no path separators.
 
 ## Lua Plugin System
 
