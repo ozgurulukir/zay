@@ -799,6 +799,16 @@ fn leaveLane(app: *App) ?Resp {
     return resp(app.gpa, "Left the lane: working root is back to {s} (repo root).\n", .{root}, null, null);
 }
 
+/// Cleanliness of a working tree as a merge precondition. `unverifiable` is
+/// deliberately distinct from `clean`: a failed `git status` must never
+/// authorize a destructive merge.
+const DirtyState = enum { clean, dirty, unverifiable };
+
+fn workingTreeState(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) DirtyState {
+    const dirty = vcs.workingTreeDirty(gpa, io, dir) catch return .unverifiable;
+    return if (dirty) .dirty else .clean;
+}
+
 /// `lane merge {lane}`: fold a finished lane's branch into the primary tree
 /// and remove the lane. Distinct from the user-driven `mergeLane` (which must
 /// never bypass `InFlightTurn`): the driver's own turn is active here by
@@ -821,15 +831,21 @@ fn mergeLaneOp(app: *App, req: *const lane_bridge.Request) ?Resp {
     const working = lanes_util.workingLaneOf(target) orelse return failResp(app.gpa, "lane: [0] is the primary driver lane — cannot merge the primary tree into itself.\n", .{});
     const repo = app.repoRoot() orelse return failResp(app.gpa, "lane: no repo\n", .{});
     // M3: a dirty destination would be misread by vcs.merge as a content
-    // conflict. Refuse with a distinct message instead.
-    if (vcs.workingTreeDirty(app.gpa, app.io, repo) catch false) {
-        return failResp(app.gpa, "lane: the primary tree has uncommitted changes — commit or stash first with 'git commit' or 'git stash'; this is not a merge conflict.\n", .{});
+    // conflict. Refuse with a distinct message instead. An unverifiable tree
+    // refuses too: the merge force-removes the lane worktree afterwards, so a
+    // failed `git status` must not be treated as "clean".
+    switch (workingTreeState(app.gpa, app.io, repo)) {
+        .clean => {},
+        .dirty => return failResp(app.gpa, "lane: the primary tree has uncommitted changes — commit or stash first with 'git commit' or 'git stash'; this is not a merge conflict.\n", .{}),
+        .unverifiable => return failResp(app.gpa, "lane: cannot verify the primary tree is clean — `git status` failed. To fix, commit or stash your changes and confirm git works in this repository, then retry.\n", .{}),
     }
     // M3b: a dirty SOURCE lane would be folded into the primary tree as a
     // fabricated placeholder commit. Refuse and let the model commit its own
     // lane work with a real message (git_commit / bash git commit) first.
-    if (vcs.workingTreeDirty(app.gpa, app.io, working.path) catch false) {
-        return failResp(app.gpa, "lane: lane {s} has uncommitted changes — commit them (e.g. via git_commit or 'bash git commit') before merging; the merge will not fabricate a placeholder commit.\n", .{id});
+    switch (workingTreeState(app.gpa, app.io, working.path)) {
+        .clean => {},
+        .dirty => return failResp(app.gpa, "lane: lane {s} has uncommitted changes — commit them (e.g. via git_commit or 'bash git commit') before merging; the merge will not fabricate a placeholder commit.\n", .{id}),
+        .unverifiable => return failResp(app.gpa, "lane: cannot verify lane {s} is clean — `git status` failed. To fix, commit your lane work and confirm git works in that worktree, then retry.\n", .{id}),
     }
     switch (vcs.merge(app.gpa, app.io, repo, working.branch) catch |err| return failResp(app.gpa, "lane: merge failed: {s}\n", .{@errorName(err)})) {
         .conflict => return failResp(app.gpa, "lane: merge conflict — rolled back, nothing lost. Lane {s} is still open; resolve and retry.\n", .{id}),
@@ -2932,6 +2948,15 @@ test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
     try std.testing.expect(spawner.transcript.containsText("FAILED"));
     try std.testing.expect(spawner.transcript.containsText("Interrupted."));
     try std.testing.expect(!spawner.transcript.containsText("final state: done"));
+}
+
+test "workingTreeState treats an unreadable working tree as unverifiable, not clean" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+    // `git status` fails when its cwd does not exist, which is the shape of a
+    // transient git failure. It must not collapse into `.clean`.
+    try std.testing.expectEqual(DirtyState.unverifiable, workingTreeState(gpa, io, "zay-definitely-not-a-working-tree"));
 }
 
 test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source refused (M3b) until committed" {
