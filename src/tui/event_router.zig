@@ -153,16 +153,7 @@ pub fn captureEvent(
         .key_press => |key| try routeKey(app, root, ctx, key),
         .key_release => |raw| {
             const key = normalizeControlKey(raw);
-            // Releasing either the chord key ('c'/'d', with or without ctrl
-            // if the user lifted Ctrl first) or the Control modifier itself
-            // proves the physical chord was released.
-            if (key.codepoint == 'c' or
-                key.codepoint == 'd' or
-                key.codepoint == vaxis.Key.left_control or
-                key.codepoint == vaxis.Key.right_control)
-            {
-                app.markPendingQuitKeyReleased();
-            }
+            if (isPendingQuitKeyRelease(key)) app.markPendingQuitKeyReleased();
         },
         .paste => |text| {
             app.clearPendingQuitAt();
@@ -434,6 +425,16 @@ fn normalizeControlKey(raw: vaxis.Key) vaxis.Key {
         }
     }
     return key;
+}
+
+/// True when a key release proves the physical Ctrl+C/Ctrl+D chord ended.
+/// The chord key may arrive without Ctrl when the user lifts Ctrl first, and
+/// some terminals report either Control modifier as a separate release.
+fn isPendingQuitKeyRelease(key: vaxis.Key) bool {
+    return key.codepoint == 'c' or
+        key.codepoint == 'd' or
+        key.codepoint == vaxis.Key.left_control or
+        key.codepoint == vaxis.Key.right_control;
 }
 
 /// True when the key is one of the global clipboard-paste chords. Pure —
@@ -866,7 +867,6 @@ fn handleEscapeSequence(
         app.clearInput();
         app.inputs.paste_stash.clear(app.gpa);
         app.closeAtSearch();
-        app.clearPendingQuitAt();
         try root.syncFocus(ctx);
         ctx.consumeAndRedraw();
         return;
@@ -878,7 +878,6 @@ fn handleEscapeSequence(
     }
     // No in-flight turn and no overlay to close — swallow the key so
     // the user doesn't accidentally exit the TUI.
-    app.clearPendingQuitAt();
     ctx.consume_event = true;
 }
 
@@ -1471,7 +1470,11 @@ test "double Ctrl+C confirms quit while background modal is open" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     app.bindInputCallbacks();
-    app.toggleBackgroundModal();
+    // toggleBackgroundModal() refuses to open without a live BackgroundManager,
+    // but routing only reads this flag. Set it directly so the test exercises
+    // the background-modal branch instead of the ordinary key path.
+    app.background_modal_state.modal = true;
+    try std.testing.expect(root_layout.activeModalLayer(&app) == .background);
 
     var root: RootWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1536,6 +1539,32 @@ test "releasing Ctrl before C still marks pending quit released" {
     try captureEvent(&app, &root, &ctx, ctrl_c);
     try std.testing.expect(app.nav.quit == .confirmed);
     try std.testing.expect(ctx.quit);
+}
+
+test "releasing either Control modifier marks pending quit released" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    for ([_]u21{ vaxis.Key.left_control, vaxis.Key.right_control }) |control| {
+        try captureEvent(&app, &root, &ctx, ctrl_c);
+        try std.testing.expect(app.nav.quit == .pending);
+        try std.testing.expect(!app.pendingQuitKeyReleased());
+
+        // Windows can report the modifier release before the character's.
+        try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = control, .mods = .{} } });
+        try std.testing.expect(app.pendingQuitKeyReleased());
+        app.clearPendingQuitAt();
+    }
 }
 
 test "decideShouldTick stays active for confirmed quit on an idle screen" {

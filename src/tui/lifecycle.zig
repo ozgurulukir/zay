@@ -827,7 +827,17 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects() or root.app.mcp_manager.hasPendingRefreshes() or compaction_lifecycle.manualCompactActive(root.app) or gitLabelRefreshActive(root.app) or root.app.nav.quit == .confirmed) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or
+            root.app.pickers.models.load == .loading or
+            root.app.metrics.diff_loading() or
+            root.app.mcp_manager.hasPendingConnects() or
+            root.app.mcp_manager.hasPendingRefreshes() or
+            compaction_lifecycle.manualCompactActive(root.app) or
+            gitLabelRefreshActive(root.app) or
+            root.app.nav.quit == .confirmed)
+        {
+            try ensureTick(root, ctx);
+        }
         ctx.consumeAndRedraw();
         return;
     }
