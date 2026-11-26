@@ -166,6 +166,9 @@ pub fn computeFrameGeometry(
     const is_last = if (app.thread.transcript.selected) |sel| sel + 1 >= messages.len else true;
     const pill_len: u16 = @intCast(" ↓ new output ".len);
     const needs_pill = !split and
+        !overlay_visible and
+        !permission_visible and
+        !app.background_modal_state.modal and
         !app.thread.auto_scroll and
         (app.thread.transcript_list.scroll.has_more or !is_last) and
         width > pill_len + 4 and
