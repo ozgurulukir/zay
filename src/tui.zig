@@ -1666,10 +1666,12 @@ pub fn openPlugins(app: *App) void {
     app.pickers.plugins.view = .installed;
     app.pickers.plugins.adding = false;
     app.input_buffers.plugin_store_url.clearRetainingCapacity();
-    plugin_store_job_mod.refreshInstalledCache(app);
     app.refreshPluginStore() catch |err| {
         log.warn("plugin_store.refresh.start_failed err={s}", .{@errorName(err)});
     };
+    // Populate after startRefresh so an initial repoint() cannot wipe the
+    // PluginManager fallback rows while the async disk scan is in flight.
+    plugin_store_job_mod.refreshInstalledCache(app);
     if (app.liveRuntime() != null) {
         // Push the current tool set into the live AI client. Deliberately NO
         // `registerPluginTools` here: the loaded-plugin set is now known to

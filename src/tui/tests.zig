@@ -181,6 +181,7 @@ test "missing plugin row removal does not start a disk uninstall or confirmation
     app.plugin_store.inventory = .{};
     app.mode = .plugins;
     app.pickers.plugins = .{ .view = .installed };
+    @import("plugin_store_job.zig").refreshInstalledCache(&app);
     try std.testing.expect(try app.handleCommandKey(.{ .codepoint = 'x' }));
     try std.testing.expect(!app.pickers.plugins.confirming_uninstall);
     try std.testing.expect(app.plugin_store.operation == .idle);
