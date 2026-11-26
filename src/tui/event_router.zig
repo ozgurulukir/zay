@@ -425,6 +425,11 @@ fn routeMouse(
             return;
         }
         if (app.thread.transcript.body_selection) |*sel| {
+            if (sel.message_index >= app.thread.transcript.messages.items.len) {
+                app.thread.transcript.body_selection = null;
+                app.nav.mouse_drag_active = false;
+                return;
+            }
             const mouse_sel = @import("mouse_selection.zig");
             if (mouse.row >= 0 and mouse.col >= 0) {
                 if (mouse_sel.hitTestTranscript(app, @intCast(mouse.row), @intCast(mouse.col))) |hit| {

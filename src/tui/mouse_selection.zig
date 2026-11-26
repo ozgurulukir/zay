@@ -300,7 +300,7 @@ fn mapMarkdownRowColToByteOffset(
     for (md_row.spans, 0..) |span, span_idx| {
         const span_w: u16 = @intCast(@min(vaxis.gwidth.gwidth(span.text, .unicode), std.math.maxInt(u16)));
         const borrowed = borrowedSpanOffset(span.text, body);
-        if (local_col < col + span_w) {
+        if (local_col < col +| span_w) {
             if (borrowed) |off| {
                 return colToByteInSegment(span.text, off, local_col -| col);
             }
@@ -382,10 +382,10 @@ fn colToByteInSegment(seg: []const u8, seg_start: usize, target_col: u16) usize 
     while (iter.next()) |g| {
         const grapheme = g.bytes(seg);
         const w: u16 = @intCast(vaxis.gwidth.gwidth(grapheme, .unicode));
-        if (col + w > target_col) {
+        if (col +| w > target_col) {
             return seg_start + g.start;
         }
-        col += w;
+        col +|= w;
     }
     return seg_start + seg.len;
 }
