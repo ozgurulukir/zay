@@ -130,9 +130,12 @@ pub fn schemaFromJsonSchema(gpa: std.mem.Allocator, value: std.json.Value) !tool
     defer required_set.deinit(gpa);
     if (obj.get("required")) |req_val| {
         if (req_val == .array) {
-            required_set.ensureUnusedCapacity(gpa, @intCast(req_val.array.items.len)) catch {};
+            // Capacity is reserved up front, so a failed allocation must abort
+            // the conversion: swallowing it would drop `required` names and
+            // silently weaken validation to "all fields optional".
+            try required_set.ensureUnusedCapacity(gpa, @intCast(req_val.array.items.len));
             for (req_val.array.items) |item| {
-                if (item == .string) required_set.put(gpa, item.string, {}) catch {};
+                if (item == .string) required_set.putAssumeCapacity(item.string, {});
             }
         }
     }
@@ -1077,6 +1080,34 @@ test "schemaFromJsonSchema leaks no per-property fields on a mid-iteration OOM" 
     // Sanity: the function must reach a successful iteration within the bound,
     // otherwise the loop tested nothing but OOMs.
     try std.testing.expect(succeeded);
+}
+
+test "schemaFromJsonSchema propagates OOM instead of dropping required names" {
+    const gpa = std.testing.allocator;
+    const schema_json =
+        \\{"type":"object","properties":{"mode":{"type":"string"}},"required":["mode"]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, schema_json, .{});
+    defer parsed.deinit();
+
+    var saw_oom = false;
+    var index: usize = 0;
+    while (index < 64) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = index });
+        if (schemaFromJsonSchema(failing.allocator(), parsed.value)) |schema| {
+            var owned = schema;
+            defer owned.deinit(failing.allocator());
+            // Success must preserve the required flag; an OOM that was
+            // swallowed during the required-set build would surface here as
+            // `.required == false` with no error.
+            try std.testing.expectEqual(@as(usize, 1), owned.properties.len);
+            try std.testing.expect(owned.properties[0].required);
+        } else |err| {
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            saw_oom = true;
+        }
+    }
+    try std.testing.expect(saw_oom);
 }
 
 test "schemaFromJsonSchema preserves mixed primitive union alternatives" {
