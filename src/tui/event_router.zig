@@ -395,6 +395,9 @@ fn routeMouse(
             if (mouse_sel.hitTestTranscript(app, r, c)) |hit| {
                 const body = app.thread.transcript.messages.items[hit.message_index].mirror().body;
                 app.thread.transcript.selected = hit.message_index;
+                // Sync the ListView cursor so `TranscriptWidget.syncCursor` does not
+                // trigger `ensureScroll()` and jump the viewport mid-click/drag.
+                app.thread.transcript_list.cursor = hit.message_index;
                 if (app.nav.mouse_click_count == 2) {
                     const wr = mouse_sel.wordRange(body, hit.byte_offset);
                     app.thread.transcript.body_selection = .{ .message_index = hit.message_index, .anchor = wr[0], .focus = wr[1] };
@@ -422,8 +425,13 @@ fn routeMouse(
             return;
         }
         if (app.thread.transcript.body_selection) |*sel| {
+            if (sel.message_index >= app.thread.transcript.messages.items.len) {
+                app.thread.transcript.body_selection = null;
+                app.nav.mouse_drag_active = false;
+                return;
+            }
+            const mouse_sel = @import("mouse_selection.zig");
             if (mouse.row >= 0 and mouse.col >= 0) {
-                const mouse_sel = @import("mouse_selection.zig");
                 if (mouse_sel.hitTestTranscript(app, @intCast(mouse.row), @intCast(mouse.col))) |hit| {
                     if (hit.message_index == sel.message_index) {
                         sel.focus = hit.byte_offset;
@@ -432,6 +440,22 @@ fn routeMouse(
                     } else {
                         sel.focus = 0;
                     }
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+            }
+            // Clamp selection to the message start/end when dragging above or below
+            // the transcript viewport so the selection does not freeze at the edge.
+            if (mouse_sel.transcriptViewport(app)) |vp| {
+                const top_screen_row: i32 = @as(i32, vp.view_row) + @as(i32, vp.list_top_pad);
+                const bottom_screen_row: i32 = @as(i32, vp.view_row) + @as(i32, vp.list_bottom);
+                if (mouse.row < top_screen_row) {
+                    sel.focus = 0;
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+                if (mouse.row >= bottom_screen_row) {
+                    sel.focus = app.thread.transcript.messages.items[sel.message_index].mirror().body.len;
                     ctx.consumeAndRedraw();
                     return;
                 }
