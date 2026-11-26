@@ -521,7 +521,7 @@ fn routeKey(
         ctx.consume_event = true;
         return;
     }
-    if (try handleQuitSequence(app, ctx, key)) return;
+    if (try handleQuitSequence(app, root, ctx, key)) return;
     // Any other key cancels the pending-quit prompt.
     app.clearPendingQuitAt();
     if (modal_layer == .permission) {
@@ -875,6 +875,7 @@ fn handleEscapeSequence(
 /// (either cleared input, armed quit, or confirmed quit).
 fn handleQuitSequence(
     app: *App,
+    root: *RootWidget,
     ctx: *vxfw.EventContext,
     key: vaxis.Key,
 ) !bool {
@@ -922,6 +923,9 @@ fn handleQuitSequence(
         }
     }
     app.setPendingQuitAt(now);
+    // Keep the tick alive even on an otherwise idle screen so handleTick
+    // runs to expire the prompt once the double-press window elapses.
+    if (lifecycle.decideShouldTick(root)) try root.ensureTick(ctx);
     ctx.consumeAndRedraw();
     return true;
 }
@@ -1417,7 +1421,16 @@ test "expired pending quit is cleared on the next tick" {
     defer app.deinit();
     app.bindInputCallbacks();
 
-    var root: RootWidget = .{ .app = &app };
+    // Start from a completely idle tick state so we prove arming pending quit
+    // schedules the tick needed to expire it.
+    toast.global.count = 0;
+    toast.global.head = 0;
+    app.git_label_thread = app.thread;
+    app.git_label_dirty = false;
+    app.frame_geometry.blackhole_visible = false;
+    app.metrics.loading_tick_active = false;
+
+    var root: RootWidget = .{ .app = &app, .mcp_connect_pending = false };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
@@ -1425,12 +1438,17 @@ test "expired pending quit is cleared on the next tick" {
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
     try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.metrics.loading_tick_active);
 
     // The 1500ms double-press window has elapsed: the prompt must disappear
-    // instead of lingering with a stale "press again to exit" hint.
+    // instead of lingering with a stale "press again to exit" hint, trigger a
+    // redraw, and stop ticking once idle again.
     app.getIo().sleep(std.Io.Duration.fromMilliseconds(App.ctrl_c_double_press_ms + 100), .awake) catch {};
+    ctx.redraw = false;
     try lifecycle.handleTick(&root, &ctx);
     try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(ctx.redraw);
+    try std.testing.expect(!app.metrics.loading_tick_active);
     try std.testing.expect(!ctx.quit);
 }
 

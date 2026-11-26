@@ -751,12 +751,17 @@ pub const App = struct {
 
     /// Clears an armed quit prompt once its double-press window has elapsed.
     /// Called from the periodic tick so the hint cannot outlive the window.
-    pub fn expirePendingQuit(self: *App) void {
-        const first_press = self.getPendingQuitAt() orelse return;
+    /// Returns true if a stale prompt was cleared so the caller can redraw.
+    pub fn expirePendingQuit(self: *App) bool {
+        const first_press = self.getPendingQuitAt() orelse return false;
         const now = std.Io.Timestamp.now(self.getIo(), .awake);
         const elapsed_ns = first_press.durationTo(now).nanoseconds;
         const window_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
-        if (elapsed_ns > window_ns) self.clearPendingQuitAt();
+        if (elapsed_ns > window_ns) {
+            self.clearPendingQuitAt();
+            return true;
+        }
+        return false;
     }
 
     pub fn markPendingQuitKeyReleased(self: *App) void {
