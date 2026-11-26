@@ -36,12 +36,12 @@ pub fn normalizeMessagesForQwen(
     gpa: std.mem.Allocator,
     messages: []const ai.MessageView,
 ) !NormalizedMessages {
-    // Fast path: zero or one system message already at index 0.
+    // Fast path: zero system messages, or one system message already at index 0.
     var system_count: u32 = 0;
     for (messages) |view| {
         if (view.message().* == .system) system_count += 1;
     }
-    if (system_count <= 1 and (messages.len == 0 or messages[0].message().* == .system)) {
+    if (system_count == 0 or (system_count == 1 and messages[0].message().* == .system)) {
         var passthrough: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
         for (messages) |view| try passthrough.append(gpa, view.message().*);
         return .{ .list = passthrough, .rebuilt = false };
@@ -141,6 +141,25 @@ pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]c
 /// template enforces a single leading system message.
 pub fn isQwenModel(model: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(model, "qwen") or std.ascii.startsWithIgnoreCase(model, "qwq");
+}
+
+/// Models and dialects whose chat templates or gateways reject multiple or
+/// non-leading `system` messages (HTTP 400). Strips any leading org prefix
+/// (`org/model`) before matching the family name so OpenRouter/vLLM/Together
+/// ids (e.g. `alibaba/qwen-2.5-72b`, `anthropic/claude-sonnet-4`,
+/// `google/gemini-2.5-pro`, `deepseek/deepseek-r1`, `mistralai/mistral-large`)
+/// are handled consistently alongside bare ids.
+pub fn requiresSingleLeadingSystem(model: []const u8, dialect: ai.WireDialect) bool {
+    if (dialect == .dashscope or isQwenModel(model)) return true;
+    const base = if (std.mem.lastIndexOfScalar(u8, model, '/')) |slash| model[slash + 1 ..] else model;
+    return std.ascii.startsWithIgnoreCase(base, "qwen") or
+        std.ascii.startsWithIgnoreCase(base, "qwq") or
+        std.ascii.startsWithIgnoreCase(base, "deepseek") or
+        std.ascii.startsWithIgnoreCase(base, "mistral") or
+        std.ascii.startsWithIgnoreCase(base, "mixtral") or
+        std.ascii.startsWithIgnoreCase(base, "gemma") or
+        std.ascii.startsWithIgnoreCase(base, "claude") or
+        std.ascii.startsWithIgnoreCase(base, "gemini");
 }
 
 /// The **model** layer: clip an already-dialect-resolved effort label to what the
@@ -298,4 +317,36 @@ test "normalizeMessagesForQwen passthrough when single leading system" {
     // No rebuild → shares the caller's backing storage.
     try std.testing.expect(!norm.rebuilt);
     try std.testing.expectEqual(@as(usize, 2), norm.list.items.len);
+}
+
+test "normalizeMessagesForQwen passthrough when zero system messages" {
+    const gpa = std.testing.allocator;
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "summarize") } }}) } };
+    const chat_messages = [_]ai.ChatMessage{user};
+    var views: [chat_messages.len]ai.MessageView = undefined;
+    for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
+    defer {
+        gpa.free(user.user.content[0].text.text);
+        gpa.free(user.user.content);
+    }
+
+    const norm = try normalizeMessagesForQwen(gpa, views[0..]);
+    defer deinitNormalizedMessages(gpa, norm.list, norm.rebuilt);
+
+    try std.testing.expect(!norm.rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), norm.list.items.len);
+}
+
+test "requiresSingleLeadingSystem covers strict-template LLM families and org prefixes" {
+    try std.testing.expect(requiresSingleLeadingSystem("any-model", .dashscope));
+    try std.testing.expect(requiresSingleLeadingSystem("qwen3-32b", .minimal));
+    try std.testing.expect(requiresSingleLeadingSystem("alibaba/qwen-2.5-72b", .openrouter));
+    try std.testing.expect(requiresSingleLeadingSystem("anthropic/claude-sonnet-4", .openrouter));
+    try std.testing.expect(requiresSingleLeadingSystem("google/gemini-2.5-pro", .openrouter));
+    try std.testing.expect(requiresSingleLeadingSystem("deepseek-ai/DeepSeek-R1", .minimal));
+    try std.testing.expect(requiresSingleLeadingSystem("mistralai/Mixtral-8x7B", .minimal));
+    try std.testing.expect(requiresSingleLeadingSystem("gemma-3-27b", .minimal));
+    try std.testing.expect(!requiresSingleLeadingSystem("gpt-5", .openai));
+    try std.testing.expect(!requiresSingleLeadingSystem("o3", .openai));
+    try std.testing.expect(!requiresSingleLeadingSystem("llama3", .minimal));
 }
