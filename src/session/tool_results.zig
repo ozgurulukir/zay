@@ -263,14 +263,29 @@ pub fn read(
     const tool_name = try duplicateText(gpa, row[4]);
     errdefer gpa.free(tool_name);
 
+    // Guard the persisted scalar fields before narrowing them: a roaming or
+    // older writer can leave a negative/oversized value that would trap in
+    // safe builds or wrap in ReleaseFast. `search` applies the same bounds.
+    const stored_exit_code = try integer(row[5]);
+    const stored_byte_length = try integer(row[1]);
+    const stored_line_count = try integer(row[2]);
+    const stored_chunk_count = try integer(row[3]);
+    if (stored_exit_code < 0 or stored_exit_code > std.math.maxInt(u8) or
+        stored_byte_length <= 0 or stored_byte_length > @as(i64, @intCast(max_result_bytes)) or
+        stored_line_count < 0 or stored_line_count > @as(i64, @intCast(max_result_bytes)) or
+        stored_chunk_count <= 0 or stored_chunk_count > @as(i64, @intCast(max_result_chunks)))
+    {
+        return error.InvalidStoredResult;
+    }
+
     return .{
         .text = text,
         .tool_name = tool_name,
-        .exit_code = @intCast(try integer(row[5])),
-        .byte_length = @intCast(try integer(row[1])),
-        .line_count = @intCast(try integer(row[2])),
+        .exit_code = @intCast(stored_exit_code),
+        .byte_length = @intCast(stored_byte_length),
+        .line_count = @intCast(stored_line_count),
         .chunk_index = chunk_index,
-        .chunk_count = @intCast(try integer(row[3])),
+        .chunk_count = @intCast(stored_chunk_count),
         .chunk_characters = @intCast(chunk_characters),
         .offset_characters = offset_characters,
     };
@@ -625,6 +640,29 @@ test "tool result chunks round trip and stay scoped to the originating session" 
     try std.testing.expectEqual(@as(u64, 2), slice.chunk_count);
 
     try std.testing.expectError(error.ResultNotFound, read(gpa, io, &backend, "session-b", "call-1", 1, 0, 64, 1000));
+}
+
+test "read rejects stored result fields that cannot be represented" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const connection = try db.Connection.open(":memory:", .{});
+    var backend = try SessionBackend.openLocal(gpa, connection, "test-host", ":memory:");
+    defer backend.deinit();
+    if (backend.local) |*local| try migration.migrate(local, io);
+    try backend.exec(io, "insert into sessions(id, cwd, project_key, created_at_ms, updated_at_ms) values (?, ?, ?, 1, 1)", &.{ .{ .text = "session-a" }, .{ .text = "/project/a" }, .{ .text = "project-a" } });
+
+    const content = try gpa.alloc(u8, inline_limit_bytes + 1);
+    defer gpa.free(content);
+    @memset(content, 'x');
+    _ = try storeAt(gpa, io, &backend, "session-a", "call-bad", "bash", 0, content, 1000);
+
+    // A negative exit code cannot be represented by ResultSlice.exit_code.
+    try backend.exec(io, "update tool_results set exit_code = -1 where id = ?", &.{.{ .text = "call-bad" }});
+    try std.testing.expectError(error.InvalidStoredResult, read(gpa, io, &backend, "session-a", "call-bad", 0, 0, 8, 1000));
+
+    // An oversized chunk count would overflow the narrowing cast.
+    try backend.exec(io, "update tool_results set exit_code = 0, chunk_count = ? where id = ?", &.{ .{ .int = 1_000_000_000 }, .{ .text = "call-bad" } });
+    try std.testing.expectError(error.InvalidStoredResult, read(gpa, io, &backend, "session-a", "call-bad", 0, 0, 8, 1000));
 }
 
 test "saved tool result search crosses chunks and reports character offsets" {
