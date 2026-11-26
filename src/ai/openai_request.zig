@@ -17,7 +17,6 @@ const wire_json = @import("json.zig");
 const model_compat = @import("model_compat.zig");
 const tool_call_args = @import("tool_call_args.zig");
 
-const isQwenModel = model_compat.isQwenModel;
 const normalizeMessagesForQwen = model_compat.normalizeMessagesForQwen;
 const deinitNormalizedMessages = model_compat.deinitNormalizedMessages;
 
@@ -192,17 +191,14 @@ pub fn writePayload(
     // than erroring; never reintroduce an assert or an early return for the
     // empty-tools case.
 
-    // Qwen / DashScope requires a single leading system message; merge + hoist.
-    // Gate this narrowly on the model id (see `isQwenModel`) or the explicit
-    // `.dashscope` dialect so other models on the same provider (ollama,
-    // openrouter, etc.) are never affected — most tolerate multiple / late
-    // system messages and we must not silently rewrite their history.
-    const is_qwen_model = isQwenModel(model);
-    const needs_qwen_normalize = dialect == .dashscope or is_qwen_model;
+    // Strict-template models (Qwen/DashScope, DeepSeek, Mistral, Gemma, Claude,
+    // Gemini) require a single leading system message; merge + hoist for them
+    // while leaving generic/OpenAI models untouched.
+    const needs_system_normalize = model_compat.requiresSingleLeadingSystem(model, dialect);
     var normalized: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
     var wrapped: std.ArrayListUnmanaged(ai.MessageView) = .empty;
     var rebuilt = false;
-    const effective_messages: []const ai.MessageView = if (needs_qwen_normalize) blk: {
+    const effective_messages: []const ai.MessageView = if (needs_system_normalize) blk: {
         const res = try normalizeMessagesForQwen(gpa, messages);
         rebuilt = res.rebuilt;
         normalized = res.list;
@@ -211,7 +207,7 @@ pub fn writePayload(
         }
         break :blk wrapped.items;
     } else messages;
-    defer if (needs_qwen_normalize) {
+    defer if (needs_system_normalize) {
         wrapped.deinit(gpa);
         deinitNormalizedMessages(gpa, normalized, rebuilt);
     };
