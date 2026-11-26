@@ -241,12 +241,18 @@ pub fn evictHistoryImagesViews(gpa: std.mem.Allocator, views: []ai.MessageView) 
     const newest = newest_user orelse return;
 
     for (views[0..newest]) |*view| {
-        // Only user messages can carry image blocks; tool prunes above may
-        // have left `.owned` copies — stub those the same way.
+        // Only user messages can carry image blocks; earlier passes may
+        // have left `.owned` copies — build the stub first so OOM leaves the
+        // original intact, then release any replaced `.owned` message.
         const msg = view.message();
         if (msg.* != .user) continue;
         if (!userMessageHasImage(msg.*)) continue;
-        view.* = .{ .owned = try stubImagesInUserMessage(gpa, msg.*) };
+        const stubbed = try stubImagesInUserMessage(gpa, msg.*);
+        switch (view.*) {
+            .owned => |*old| old.deinit(gpa),
+            .borrowed => {},
+        }
+        view.* = .{ .owned = stubbed };
     }
 }
 
@@ -393,7 +399,7 @@ pub fn estimatePrunedTokensRangeWithSkills(
         const message = messages[index];
         const retained = if (skills) |context| skill_history.retainedTool(context, messages, index) else false;
         if (pruning_active and index < cutoff_index and message == .tool and !retained) {
-            total +|= if (skills != null) estimateRenderedToolTokens(message, historical_tool_cap_bytes) else compaction.estimateMessageTokensCapped(message, historical_tool_cap_bytes);
+            total +|= estimateRenderedToolTokens(message, historical_tool_cap_bytes);
         } else if (evict_history_images and message == .user and
             newest_user != null and index < newest_user.? and userMessageHasImage(message))
         {
@@ -903,6 +909,38 @@ test "evictHistoryImagesViews leaves non-image and single-user histories untouch
     try evictHistoryImagesViews(gpa, views);
     try std.testing.expect(views[0] == .borrowed);
     try std.testing.expect(views[1] == .borrowed);
+}
+
+test "evictHistoryImagesViews frees replaced owned user views without leaking" {
+    const gpa = std.testing.allocator;
+    var newest = try makeTextMessage(gpa, .user, "latest");
+    defer newest.deinit(gpa);
+
+    const views = try gpa.alloc(ai.MessageView, 2);
+    views[0] = .{ .owned = try makeMarkerImageUserMessage(gpa, "shot.png", "QUJD") };
+    views[1] = .{ .borrowed = &newest };
+    defer freePrunedViews(gpa, views);
+
+    try evictHistoryImagesViews(gpa, views);
+    try std.testing.expect(views[0] == .owned);
+    try std.testing.expect(views[0].owned.user.content[1] == .text);
+    try std.testing.expect(std.mem.indexOf(u8, views[0].owned.user.content[1].text.text, "shot.png") != null);
+}
+
+test "estimatePrunedTokensRange agrees with empty SkillContext" {
+    const gpa = std.testing.allocator;
+    var messages: [3]ai.ChatMessage = undefined;
+    messages[0] = try makeToolMessage(gpa, "c1", "x" ** 4000);
+    messages[1] = try makeTextMessage(gpa, .assistant, "done");
+    messages[2] = try makeToolMessage(gpa, "c2", "y" ** 4000);
+    defer for (&messages) |*m| m.deinit(gpa);
+
+    var empty_skills: SkillContext = .{};
+    defer empty_skills.deinit(gpa);
+
+    const without_skills = estimatePrunedTokensRange(&messages, 0, 1, 100, false);
+    const with_empty_skills = estimatePrunedTokensRangeWithSkills(&messages, 0, 1, 100, false, &empty_skills);
+    try std.testing.expectEqual(without_skills, with_empty_skills);
 }
 
 test "estimatePrunedTokensRange counts evicted images as stub tokens" {
