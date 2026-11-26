@@ -222,7 +222,7 @@ pub const Client = struct {
             infer_types[i] = decl_val == null or decl_val.? == .null or
                 (decl_val.? == .string and decl_val.?.string.len == 0);
             if (!infer_types[i] and decl_val.? != .string) return error.InvalidResponse;
-            types[i] = if (infer_types[i]) .text else parseTypeString(decl_val.?.string);
+            types[i] = if (infer_types[i]) .text else db.parseTypeString(decl_val.?.string);
         }
 
         var rows = try aa.alloc([]db.Value, rows_val.array.items.len);
@@ -576,14 +576,6 @@ fn validateBatchResult(batch_response: std.json.Value, statement_count: usize) !
         log.warn("turso.batch rollback executed after commit step", .{});
         return error.QueryFailed;
     }
-}
-
-fn parseTypeString(s: []const u8) db.ColumnType {
-    if (std.ascii.eqlIgnoreCase(s, "int") or std.ascii.eqlIgnoreCase(s, "integer")) return .int;
-    if (std.ascii.eqlIgnoreCase(s, "float") or std.ascii.eqlIgnoreCase(s, "real") or std.ascii.eqlIgnoreCase(s, "double")) return .float;
-    if (std.ascii.eqlIgnoreCase(s, "blob")) return .blob;
-    if (std.ascii.eqlIgnoreCase(s, "null")) return .null;
-    return .text;
 }
 
 pub fn parseHranaValue(aa: std.mem.Allocator, cell_val: std.json.Value) !db.Value {

@@ -283,6 +283,27 @@ pub const ColumnType = enum {
     }
 };
 
+/// Map a SQLite declared type string to the local column type. Case-insensitive;
+/// affinity prefixes and unknown types fall back to `.text`.
+pub fn parseTypeString(s: []const u8) ColumnType {
+    if (std.ascii.eqlIgnoreCase(s, "int") or std.ascii.eqlIgnoreCase(s, "integer")) return .int;
+    if (std.ascii.eqlIgnoreCase(s, "float") or std.ascii.eqlIgnoreCase(s, "real") or std.ascii.eqlIgnoreCase(s, "double")) return .float;
+    if (std.ascii.eqlIgnoreCase(s, "blob")) return .blob;
+    if (std.ascii.eqlIgnoreCase(s, "null")) return .null;
+    return .text;
+}
+
+test "parseTypeString maps standard types" {
+    try std.testing.expectEqual(ColumnType.int, parseTypeString("int"));
+    try std.testing.expectEqual(ColumnType.int, parseTypeString("INTEGER"));
+    try std.testing.expectEqual(ColumnType.float, parseTypeString("real"));
+    try std.testing.expectEqual(ColumnType.float, parseTypeString("double"));
+    try std.testing.expectEqual(ColumnType.blob, parseTypeString("blob"));
+    try std.testing.expectEqual(ColumnType.null, parseTypeString("null"));
+    try std.testing.expectEqual(ColumnType.text, parseTypeString("VARCHAR(255)"));
+    try std.testing.expectEqual(ColumnType.text, parseTypeString("TEXT"));
+}
+
 /// SQLITE_TRANSIENT ((sqlite3_destructor_type)-1): SQLite copies the bound
 /// content immediately. Eliminates the entire class of dangling-pointer bugs
 /// where the caller's buffer is freed or reallocated between bind and step.

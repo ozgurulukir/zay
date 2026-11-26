@@ -243,7 +243,7 @@ pub const Client = struct {
 
         var types = try aa.alloc(db.ColumnType, types_val.array.items.len);
         for (types_val.array.items, 0..) |item, i| {
-            types[i] = if (item == .string) parseTypeString(item.string) else .text;
+            types[i] = if (item == .string) db.parseTypeString(item.string) else .text;
         }
 
         var rows = try aa.alloc([]db.Value, rows_val.array.items.len);
@@ -403,14 +403,6 @@ pub const Client = struct {
     }
 };
 
-fn parseTypeString(s: []const u8) db.ColumnType {
-    if (std.ascii.eqlIgnoreCase(s, "int") or std.ascii.eqlIgnoreCase(s, "integer")) return .int;
-    if (std.ascii.eqlIgnoreCase(s, "float") or std.ascii.eqlIgnoreCase(s, "real") or std.ascii.eqlIgnoreCase(s, "double")) return .float;
-    if (std.ascii.eqlIgnoreCase(s, "blob")) return .blob;
-    if (std.ascii.eqlIgnoreCase(s, "null")) return .null;
-    return .text;
-}
-
 /// Validate the service endpoint BEFORE any network activity (#445). Every
 /// request carries the auth token as a bearer header, so an unparseable
 /// endpoint or embedded credentials fail with InvalidEndpoint, and plain
@@ -543,17 +535,6 @@ test "serializeParams rejects non-finite floats" {
     );
     // A finite float still serializes.
     try serializeParams(&out.writer, &.{.{ .float = 1.5 }});
-}
-
-test "parseTypeString maps standard types" {
-    try std.testing.expectEqual(db.ColumnType.int, parseTypeString("int"));
-    try std.testing.expectEqual(db.ColumnType.int, parseTypeString("INTEGER"));
-    try std.testing.expectEqual(db.ColumnType.float, parseTypeString("real"));
-    try std.testing.expectEqual(db.ColumnType.float, parseTypeString("double"));
-    try std.testing.expectEqual(db.ColumnType.blob, parseTypeString("blob"));
-    try std.testing.expectEqual(db.ColumnType.null, parseTypeString("null"));
-    try std.testing.expectEqual(db.ColumnType.text, parseTypeString("VARCHAR(255)"));
-    try std.testing.expectEqual(db.ColumnType.text, parseTypeString("TEXT"));
 }
 
 test "QueryResult accessors retrieve typed values correctly" {
