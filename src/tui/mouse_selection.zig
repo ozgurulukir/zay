@@ -24,6 +24,13 @@ pub fn wordRange(body: []const u8, offset: usize) [2]usize {
     if (body.len == 0) return .{ 0, 0 };
     const pos = @min(offset, body.len - 1);
     if (!isWordByte(body[pos])) {
+        var iter = vaxis.unicode.graphemeIterator(body);
+        while (iter.next()) |g| {
+            const g_end = g.start + g.len;
+            if (pos >= g.start and pos < g_end) {
+                return .{ g.start, g_end };
+            }
+        }
         return .{ pos, pos + 1 };
     }
     var start = pos;
@@ -202,6 +209,22 @@ test "wordRange and lineRange select expected slices" {
     try std.testing.expectEqualStrings("beta_gamma", body[w[0]..w[1]]);
     const l = lineRange(body, 8);
     try std.testing.expectEqualStrings("alpha beta_gamma", body[l[0]..l[1]]);
+}
+
+test "wordRange selects full UTF-8 grapheme clusters without splitting multi-byte sequences" {
+    const body = "hi 🚀 café";
+    // Emoji starts at byte 3 and is 4 bytes long.
+    const emoji_start = std.mem.indexOf(u8, body, "🚀").?;
+    const w_emoji_start = wordRange(body, emoji_start);
+    try std.testing.expectEqualStrings("🚀", body[w_emoji_start[0]..w_emoji_start[1]]);
+    const w_emoji_mid = wordRange(body, emoji_start + 2);
+    try std.testing.expectEqualStrings("🚀", body[w_emoji_mid[0]..w_emoji_mid[1]]);
+
+    // Multi-byte accented character 'é' at the end.
+    const accented_start = std.mem.indexOf(u8, body, "é").?;
+    const w_accented = wordRange(body, accented_start);
+    try std.testing.expectEqualStrings("é", body[w_accented[0]..w_accented[1]]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body[w_accented[0]..w_accented[1]]));
 }
 
 test "hitTestTranscript accounts for vertical list padding, indent, wrapping, and scroll offset" {
