@@ -739,12 +739,29 @@ pub const App = struct {
         self.nav.quit = if (v) |timestamp| .{
             .pending = .{
                 .at = timestamp,
-                // POSIX terminals generally do not report key releases. Windows
-                // Console does, so require one there to distinguish a second
-                // physical press from the first press's auto-repeat records.
-                .key_released = !os.is_windows,
+                // Start unconditionally unreleased: a release is evidence that
+                // the next press is a new chord, and only a platform that
+                // actually reports one may set this bit. POSIX terminals never
+                // do, so their auto-repeat records are suppressed by the gap
+                // check instead of being mistaken for a genuine second press.
+                .key_released = false,
             },
         } else .none;
+    }
+
+    /// Clears an armed quit prompt once its double-press window has elapsed.
+    /// Called from the periodic tick so the hint cannot outlive the window.
+    /// Returns true if a stale prompt was cleared so the caller can redraw.
+    pub fn expirePendingQuit(self: *App) bool {
+        const first_press = self.getPendingQuitAt() orelse return false;
+        const now = std.Io.Timestamp.now(self.getIo(), .awake);
+        const elapsed_ns = first_press.durationTo(now).nanoseconds;
+        const window_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
+        if (elapsed_ns > window_ns) {
+            self.clearPendingQuitAt();
+            return true;
+        }
+        return false;
     }
 
     pub fn markPendingQuitKeyReleased(self: *App) void {

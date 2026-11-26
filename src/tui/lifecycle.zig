@@ -214,6 +214,9 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         ctx.consume_event = true;
         return;
     }
+    // An armed prompt older than the double-press window is stale: clear it
+    // so the hint stops promising an exit that a late press will not perform.
+    var visible_change = root.app.expirePendingQuit();
 
     // UI-thread heartbeat (~1.5s cadence at the 30ms tick): proves the event
     // loop is alive when reported alongside input breadcrumbs — see AGENTS.md
@@ -237,7 +240,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         provider_model.refreshMcpTools(root.app);
     }
 
-    var visible_change = try serviceGitLabelRefresh(root.app);
+    visible_change = try serviceGitLabelRefresh(root.app) or visible_change;
     visible_change = try drainAgentEvents(root, ctx) or visible_change;
     // Converge interrupted turns whose async teardown finished (after events,
     // so the worker's terminal event drives the machine's own transition when
@@ -548,6 +551,7 @@ pub fn decideShouldTick(root: *RootWidget) bool {
     const toasts_visible = toast.global.hasToasts();
 
     const at_search_active = atSearchActive(root.app);
+    const pending_quit = root.app.nav.quit == .pending;
 
     return turn_active or
         turn_cancel_pending or
@@ -561,7 +565,8 @@ pub fn decideShouldTick(root: *RootWidget) bool {
         root.app.mcp_manager.hasPendingDestroys() or
         manual_compact_active or
         toasts_visible or
-        at_search_active;
+        at_search_active or
+        pending_quit;
 }
 
 fn atSearchActive(app: *App) bool {
