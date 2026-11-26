@@ -16,7 +16,9 @@ pub const bash_spill_prefix = "zay-bash-";
 /// (`zay-pwsh-bg-<hex>.ps1`).
 pub const pwsh_prefix = "zay-pwsh-";
 
-/// Background job logs, composed from the job id: `zay-bg_<id>.log`.
+/// Background job logs, composed from the job id and a random suffix:
+/// `zay-bg_<id>-<hex>.log`. The legacy `zay-bg_<id>.log` shape is still
+/// recognized so files written by older binaries are pruned.
 pub const bg_log_prefix = "zay-bg_";
 
 /// Everything the startup pruner may delete. Bare `zay-` is deliberately
@@ -45,9 +47,29 @@ pub fn isPrunable(name: []const u8) bool {
         return hasStemAndExt(rest, ".log", isLowerHex);
     }
     if (std.mem.startsWith(u8, name, bg_log_prefix)) {
-        return hasStemAndExt(name[bg_log_prefix.len..], ".log", std.ascii.isDigit);
+        return isBgLogStem(name[bg_log_prefix.len..]);
     }
     return false;
+}
+
+/// Background log stems are `<digits>` (legacy) or `<digits>-<lowerhex>`
+/// (current, random suffix).
+fn isBgLogStem(rest: []const u8) bool {
+    const ext = ".log";
+    if (!std.mem.endsWith(u8, rest, ext)) return false;
+    const stem = rest[0 .. rest.len - ext.len];
+    if (stem.len == 0) return false;
+    var index: usize = 0;
+    while (index < stem.len and std.ascii.isDigit(stem[index])) index += 1;
+    if (index == 0) return false;
+    if (index == stem.len) return true;
+    if (stem[index] != '-') return false;
+    index += 1;
+    if (index == stem.len) return false;
+    while (index < stem.len) : (index += 1) {
+        if (!isLowerHex(stem[index])) return false;
+    }
+    return true;
 }
 
 fn hasStemAndExt(rest: []const u8, ext: []const u8, comptime pred: fn (u8) bool) bool {
@@ -80,6 +102,11 @@ test "isPrunable rejects unrelated filenames sharing reserved prefixes" {
     try std.testing.expect(!isPrunable("zay-bash-.log"));
     try std.testing.expect(!isPrunable("zay-bg_.log"));
     try std.testing.expect(isPrunable("zay-bg_42.log"));
+    try std.testing.expect(isPrunable("zay-bg_42-0123abcd0123abcd.log"));
+    try std.testing.expect(!isPrunable("zay-bg_42-.log"));
+    try std.testing.expect(!isPrunable("zay-bg_42-0123ABCD.log"));
+    try std.testing.expect(!isPrunable("zay-bg_42-notes.log"));
+    try std.testing.expect(!isPrunable("zay-bg_-deadbeef.log"));
     try std.testing.expect(isPrunable("zay-pwsh-script-0123abcd.ps1"));
     try std.testing.expect(isPrunable("zay-pwsh-bg-0123abcd.ps1"));
 }

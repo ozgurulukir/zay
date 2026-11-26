@@ -45,6 +45,18 @@ const test_poll_attempts_max: u32 = 100;
 /// Maximum log file size per background job before truncation kicks in (50 MB).
 pub const max_job_log_bytes: u64 = 50 * 1024 * 1024;
 
+/// Log-file name for a background job: the sequential id plus a random suffix.
+/// The id alone is predictable, so a shared temp dir would let another local
+/// user pre-plant a symlink at the expected path; the random suffix (and the
+/// exclusive create at the call site) makes the name unguessable and never
+/// follows a pre-existing link.
+fn bgLogName(gpa: std.mem.Allocator, io: std.Io, id: u64) std.mem.Allocator.Error![]u8 {
+    var suffix_bytes: [8]u8 = undefined;
+    io.random(&suffix_bytes);
+    const suffix = std.fmt.bytesToHex(suffix_bytes, .lower);
+    return std.fmt.allocPrint(gpa, temp_files.bg_log_prefix ++ "{d}-{s}.log", .{ id, &suffix });
+}
+
 pub const BackgroundManager = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -211,7 +223,7 @@ pub const BackgroundManager = struct {
 
         // Composed from `bg_log_prefix` so the log name and the startup pruner
         // share one prefix source; `label` stays the job's display name.
-        const log_name = try std.fmt.allocPrint(gpa, temp_files.bg_log_prefix ++ "{d}.log", .{id});
+        const log_name = try bgLogName(gpa, io, id);
         defer gpa.free(log_name);
 
         var log_path: ?[]u8 = null;
@@ -220,7 +232,11 @@ pub const BackgroundManager = struct {
 
         var log_file: ?std.Io.File = null;
         defer if (log_file) |*f| f.close(io);
+        // Exclusive: never truncate or follow an existing path. The random
+        // suffix makes a collision negligible, and a pre-planted symlink fails
+        // the create instead of redirecting the output.
         log_file = try std.Io.Dir.createFileAbsolute(io, log_path.?, .{
+            .exclusive = true,
             .permissions = if (comptime os.is_windows) .default_file else std.Io.File.Permissions.fromMode(0o600),
         });
 
@@ -1160,6 +1176,19 @@ test "bash subprocess executes and returns captured output" {
         else => 255,
     });
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hello-bg") != null);
+}
+
+test "bgLogName is unpredictable, keeps the job id, and stays prunable" {
+    const gpa = std.testing.allocator;
+    const first = try bgLogName(gpa, std.testing.io, 7);
+    defer gpa.free(first);
+    const second = try bgLogName(gpa, std.testing.io, 7);
+    defer gpa.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.startsWith(u8, first, "zay-bg_7-"));
+    try std.testing.expect(temp_files.isPrunable(first));
+    try std.testing.expect(temp_files.isPrunable(second));
 }
 
 test "formatElapsed renders compact durations" {
