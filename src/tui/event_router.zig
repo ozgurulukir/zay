@@ -192,6 +192,7 @@ pub fn captureEvent(
         },
         .focus_out => {
             app.is_focused = false;
+            app.nav.mouse_drag_active = false;
             ctx.consumeEvent();
         },
         else => {},
@@ -222,6 +223,7 @@ fn routeMouse(
     // Scrolling may bring the logo back into view; the tick stops itself
     // again on the next frame if it didn't.
     if (lifecycle.decideShouldTick(root)) try root.ensureTick(ctx);
+    const layer = root_layout.activeModalLayer(app);
     if (mouse.button == .wheel_up or mouse.button == .wheel_down) {
         if (app.getMode() == .help) {
             if (mouse.button == .wheel_up) {
@@ -235,7 +237,6 @@ fn routeMouse(
                 return;
             }
         }
-        const layer = root_layout.activeModalLayer(app);
         if (layer == .permission) {
             if (mouse.button == .wheel_up) {
                 if (app.thread.permission_scroll > 0) app.thread.permission_scroll -= 1;
@@ -243,6 +244,15 @@ fn routeMouse(
                 app.thread.permission_scroll += 1;
             }
             ctx.consumeAndRedraw();
+            return;
+        }
+        if (app.isDiffViewerMode()) {
+            if (app.diff.sub == .browse) {
+                app.diff.moveCursor(if (mouse.button == .wheel_up) -3 else 3);
+                ctx.consumeAndRedraw();
+            } else {
+                ctx.consumeEvent();
+            }
             return;
         }
         if (layer == .overlay) {
@@ -254,39 +264,43 @@ fn routeMouse(
             ctx.consumeAndRedraw();
             return;
         }
+        if (layer == .background) {
+            const key: vaxis.Key = .{ .codepoint = if (mouse.button == .wheel_up) vaxis.Key.up else vaxis.Key.down };
+            if (app.handleBackgroundModalKey(key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
+            return;
+        }
+        if (layer == .at_search) {
+            const key: vaxis.Key = .{ .codepoint = if (mouse.button == .wheel_up) vaxis.Key.up else vaxis.Key.down };
+            if (try command_router.MentionPopup.handle(app, key)) ctx.consumeAndRedraw() else ctx.consumeEvent();
+            return;
+        }
         if (mouse.button == .wheel_up) app.setThreadAutoScroll(false);
         if (mouse.button == .wheel_down) app.updateMouseAutoScroll();
     }
 
     if (mouse.type == .press and mouse.button == .left) {
-        // 1. "↓ new output" pill click
-        if (app.frame_geometry.new_output_rect) |rect| {
-            if (rect.contains(mouse.row, mouse.col)) {
-                app.jumpTranscriptToBottom();
-                ctx.consumeAndRedraw();
-                return;
-            }
-        }
-
-        const layer = root_layout.activeModalLayer(app);
-
-        // 2. Permission buttons click
-        if (layer == .permission and app.frame_geometry.permission_buttons != null) {
-            for (app.frame_geometry.permission_buttons.?) |btn| {
-                if (btn.contains(mouse.row, mouse.col)) {
-                    switch (btn.choice) {
-                        .approve => try app.resolvePermission(.approve),
-                        .approve_session => try app.resolvePermission(.approve_session),
-                        .reject => try app.resolvePermission(.reject),
-                        .reject_with_reason => try app.resolvePermission(.{ .reject_with_reason = "Rejected by user: command refused" }),
+        // 1. Permission modal owns all clicks while active.
+        if (layer == .permission) {
+            if (app.frame_geometry.permission_buttons) |buttons| {
+                for (buttons) |btn| {
+                    if (btn.contains(mouse.row, mouse.col)) {
+                        switch (btn.choice) {
+                            .approve => try app.resolvePermission(.approve),
+                            .approve_session => try app.resolvePermission(.approve_session),
+                            .reject => try app.resolvePermission(.reject),
+                            .reject_with_reason => try app.resolvePermission(.{ .reject_with_reason = "Rejected by user: command refused" }),
+                        }
+                        ctx.consumeAndRedraw();
+                        return;
                     }
-                    ctx.consumeAndRedraw();
-                    return;
                 }
             }
+            ctx.consumeEvent();
+            return;
         }
 
-        // 3. Modal overlay dismiss (click outside) or row activation
+        // 2. Modal overlay dismiss (click outside) or row activation; clicks
+        // inside non-row chrome are consumed so they never leak to panes behind.
         if (layer == .overlay) {
             if (app.frame_geometry.overlay_panel_rect) |rect| {
                 if (!rect.contains(mouse.row, mouse.col)) {
@@ -307,9 +321,29 @@ fn routeMouse(
                     return;
                 }
             }
+            ctx.consumeEvent();
+            return;
         }
 
-        // 4. Lanes chip click
+        // 3. Background jobs modal and @-search popup block clicks from leaking
+        // into the transcript or split panes beneath them.
+        if (layer == .background or layer == .at_search) {
+            ctx.consumeEvent();
+            return;
+        }
+
+        if (app.isDiffViewerMode()) return;
+
+        // 4. "↓ new output" pill click
+        if (app.frame_geometry.new_output_rect) |rect| {
+            if (rect.contains(mouse.row, mouse.col)) {
+                app.jumpTranscriptToBottom();
+                ctx.consumeAndRedraw();
+                return;
+            }
+        }
+
+        // 5. Lanes chip click
         if (app.getLanesChipRect()) |rect| {
             if (rect.contains(mouse.row, mouse.col)) {
                 // Leave the fullscreen (`tab`) view. `.grid` opens the 2x2
@@ -341,8 +375,8 @@ fn routeMouse(
                 }
             }
         }
-        // 5. Transcript mouse selection (single-click anchor, double-click word, triple-click line).
-        if (app.getMode() == .normal and !app.permissionPending() and mouse.row >= 0 and mouse.col >= 0) {
+        // 6. Transcript mouse selection (single-click anchor, double-click word, triple-click line).
+        if (app.getMode() == .normal and mouse.row >= 0 and mouse.col >= 0) {
             const mouse_sel = @import("mouse_selection.zig");
             const r: u16 = @intCast(mouse.row);
             const c: u16 = @intCast(mouse.col);
@@ -383,6 +417,10 @@ fn routeMouse(
     }
 
     if ((mouse.type == .drag or mouse.type == .motion) and app.nav.mouse_drag_active) {
+        if (app.getMode() != .normal or layer != .none) {
+            app.nav.mouse_drag_active = false;
+            return;
+        }
         if (app.thread.transcript.body_selection) |*sel| {
             if (mouse.row >= 0 and mouse.col >= 0) {
                 const mouse_sel = @import("mouse_selection.zig");

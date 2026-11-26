@@ -4583,6 +4583,141 @@ test "overlay mouse click selects clicked row before submitting (#564)" {
     try std.testing.expectEqual(@as(u32, 2), app.pickers.theme.selection);
 }
 
+test "mouse click on hidden new output pill is blocked while overlay is open" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.thread.auto_scroll = false;
+    app.setMode(.help);
+    app.frame_geometry.overlay_panel_rect = .{ .row = 5, .col = 10, .width = 60, .height = 15 };
+    // Even if a stale new_output_rect sits inside the overlay bounds, modal
+    // layer priority must consume the click instead of jumping the transcript.
+    app.frame_geometry.new_output_rect = .{ .row = 10, .col = 20, .width = 14 };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const click: vaxis.Mouse = .{ .row = 10, .col = 22, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = click });
+    try std.testing.expect(!app.thread.auto_scroll);
+    try std.testing.expect(ctx.consume_event);
+}
+
+test "mouse click inside overlay chrome does not focus split pane behind it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.split_mode = .dual;
+    app.focused_worker_index = 1;
+    app.frame_geometry.split_rects[0] = .{ .row = 0, .col = 40, .width = 40, .height = 20, .lane_index = 2 };
+    app.frame_geometry.split_rect_count = 1;
+
+    app.setMode(.help);
+    app.frame_geometry.overlay_panel_rect = .{ .row = 2, .col = 10, .width = 60, .height = 15 };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const click: vaxis.Mouse = .{ .row = 6, .col = 45, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = click });
+    try std.testing.expectEqual(@as(usize, 1), app.focused_worker_index);
+    try std.testing.expect(ctx.consume_event);
+}
+
+test "mouse wheel in diff viewer scrolls diff cursor without mutating transcript auto_scroll" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.setMode(.diff_viewer);
+    app.thread.auto_scroll = true;
+    for (0..6) |_| {
+        try app.diff.lines.append(gpa, .{ .kind = .context, .text = "line" });
+    }
+    app.diff.cursor = 0;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const wheel_down: vaxis.Mouse = .{ .row = 5, .col = 10, .type = .press, .button = .wheel_down, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = wheel_down });
+    try std.testing.expectEqual(@as(usize, 3), app.diff.cursor);
+    try std.testing.expect(app.thread.auto_scroll);
+    try std.testing.expect(ctx.consume_event);
+
+    const wheel_up: vaxis.Mouse = .{ .row = 5, .col = 10, .type = .press, .button = .wheel_up, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = wheel_up });
+    try std.testing.expectEqual(@as(usize, 0), app.diff.cursor);
+    try std.testing.expect(app.thread.auto_scroll);
+}
+
+test "mouse wheel and click are isolated while background modal is open" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.thread.transcript.append(gpa, .user, "you", "hello world");
+    app.thread.transcript_view_width = 80;
+    app.thread.transcript_view_height = 20;
+    app.thread.auto_scroll = true;
+    app.background_modal_state.modal = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const wheel_up: vaxis.Mouse = .{ .row = 2, .col = 5, .type = .press, .button = .wheel_up, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = wheel_up });
+    try std.testing.expect(app.thread.auto_scroll);
+    try std.testing.expect(ctx.consume_event);
+
+    ctx.consume_event = false;
+    const click: vaxis.Mouse = .{ .row = 2, .col = 5, .type = .press, .button = .left, .mods = .{} };
+    try event_router.captureEvent(&app, &root, &ctx, .{ .mouse = click });
+    try std.testing.expect(app.thread.transcript.body_selection == null);
+    try std.testing.expect(ctx.consume_event);
+}
+
+test "focus_out clears active mouse drag state" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    app.nav.mouse_drag_active = true;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try event_router.captureEvent(&app, &root, &ctx, .focus_out);
+    try std.testing.expect(!app.nav.mouse_drag_active);
+}
+
 test "drawRoot composites toast over diff_viewer (#570)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
