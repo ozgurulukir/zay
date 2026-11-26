@@ -6,6 +6,13 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-26
+
+### Fixed
+- TUI: make double Ctrl+C/Ctrl+D quit reliable across platforms (#604); harden double Ctrl+C/Ctrl+D quit routing and tick lifecycle (#605); preserve confirmed quit state on subsequent presses (#610); unify async WorktreeJob into JobFamily, bind owner request, enforce lane_column boundary (#600); preserve merge flag in drainModelLoad, prevent OOM double-free/leak, unify codex cancel (#601); eliminate draw-time App scroll mutations, enforce const widget props (#603); guard paste against slash command switch, remove dead key-routing branches (#602).
+- Lane: refuse merge when git status cannot verify cleanliness (#606).
+- Background: make job log files unpredictable and exclusive (#607).
+- MCP/session: propagate OOM when building the required set (#608); validate stored tool-result fields before narrowing (#608).
 ## [0.12.1] - 2026-11-24
 
 ### Fixed
@@ -228,7 +235,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.2
 [0.12.1]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.1
 [0.12.0]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.0
 [0.11.15]: https://github.com/ozgurulukir/zay/releases/tag/v0.11.15
