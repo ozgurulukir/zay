@@ -85,8 +85,10 @@ pub const Gate = struct {
 
     /// Classify a quit-chord press. Auto-repeat is swallowed unless a release
     /// proved the previous press ended; a real second press inside the window
-    /// confirms; anything else re-arms at `now`.
+    /// confirms; anything else re-arms at `now`. Once confirmed, stays
+    /// confirmed.
     pub fn onPress(self: *Gate, now: std.Io.Timestamp) PressOutcome {
+        if (self.state == .confirmed) return .confirmed;
         if (self.state == .pending) {
             const gap_ns = self.pending_at.durationTo(now).nanoseconds;
             const auto_repeat_ns: i128 = @as(i128, auto_repeat_gap_ms) * std.time.ns_per_ms;
@@ -169,5 +171,12 @@ test "cancelPending dismisses a prompt but not a confirmed exit" {
 
     gate.confirm();
     gate.cancelPending();
+    try std.testing.expect(gate.isConfirmed());
+}
+
+test "onPress does not downgrade an already-confirmed exit" {
+    var gate: Gate = .{};
+    gate.confirm();
+    try std.testing.expectEqual(PressOutcome.confirmed, gate.onPress(ts(0)));
     try std.testing.expect(gate.isConfirmed());
 }
