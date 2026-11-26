@@ -551,7 +551,7 @@ pub fn decideShouldTick(root: *RootWidget) bool {
     const toasts_visible = toast.global.hasToasts();
 
     const at_search_active = atSearchActive(root.app);
-    const pending_quit = root.app.nav.quit == .pending;
+    const quit_active = root.app.nav.quit != .none;
 
     return turn_active or
         turn_cancel_pending or
@@ -566,7 +566,7 @@ pub fn decideShouldTick(root: *RootWidget) bool {
         manual_compact_active or
         toasts_visible or
         at_search_active or
-        pending_quit;
+        quit_active;
 }
 
 fn atSearchActive(app: *App) bool {
@@ -827,7 +827,17 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
         // or a turn a command started directly (e.g. /sync conflict
         // resolution injects one).
-        if (root.app.thread.turn.isActive() or root.app.pickers.models.load == .loading or root.app.metrics.diff_loading() or root.app.mcp_manager.hasPendingConnects() or root.app.mcp_manager.hasPendingRefreshes() or compaction_lifecycle.manualCompactActive(root.app) or gitLabelRefreshActive(root.app)) try ensureTick(root, ctx);
+        if (root.app.thread.turn.isActive() or
+            root.app.pickers.models.load == .loading or
+            root.app.metrics.diff_loading() or
+            root.app.mcp_manager.hasPendingConnects() or
+            root.app.mcp_manager.hasPendingRefreshes() or
+            compaction_lifecycle.manualCompactActive(root.app) or
+            gitLabelRefreshActive(root.app) or
+            root.app.nav.quit == .confirmed)
+        {
+            try ensureTick(root, ctx);
+        }
         ctx.consumeAndRedraw();
         return;
     }

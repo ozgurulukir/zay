@@ -572,13 +572,13 @@ pub const MentionPopup = struct {
 pub const BlockNav = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         // Copy selected message block or code block to clipboard.
-        // 'c' copies first code block (falling back to message block); 'y' or Ctrl+C copies entire message block.
+        // 'c' copies first code block (falling back to message block); 'y' copies entire message block.
         if (app.getBlockNav()) {
             if (key.matches('c', .{})) {
                 if (try clipboard_helper.copySelectedCodeBlock(app)) return true;
             } else if (key.matches('y', .{ .shift = true }) or key.matches('Y', .{})) {
                 if (try clipboard_helper.copySelectedTranscriptBlockAsMarkdown(app)) return true;
-            } else if (key.matches('y', .{}) or key.matches('c', .{ .ctrl = true })) {
+            } else if (key.matches('y', .{})) {
                 if (try clipboard_helper.copySelectedTranscriptBlock(app)) return true;
             } else if (key.matches('p', .{})) {
                 if (try clipboard_helper.copyFirstPathToken(app)) return true;
