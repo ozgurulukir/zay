@@ -517,7 +517,7 @@ fn executeCommand(app: *App, command: Command) !void {
             _ = try clipboard_helper.pasteFromSystemClipboard(app);
         },
         .exit_cmd => {
-            app.nav.quit = .confirmed;
+            app.quit_gate.confirm();
         },
         .database => try handleDatabaseNotice(app),
     }
@@ -717,7 +717,7 @@ test "submitMode /exit sets quit confirmed" {
     app.nav.command_selection = 0;
     try app.inputs.palette.buf.insertSliceAtCursor("exit");
     try std.testing.expect(try app.submitMode());
-    try std.testing.expect(app.nav.quit == .confirmed);
+    try std.testing.expect(app.quit_gate.isConfirmed());
 }
 
 test "submitMode /help opens help mode" {

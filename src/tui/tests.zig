@@ -954,7 +954,7 @@ test "ctrl-c clears a non-empty input instead of arming quit" {
 
     // The input is cleared and the quit sequence is not armed.
     try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
-    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!app.quit_gate.isActive());
     try std.testing.expect(!ctx.quit);
 }
 

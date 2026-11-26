@@ -153,10 +153,10 @@ pub fn captureEvent(
         .key_press => |key| try routeKey(app, root, ctx, key),
         .key_release => |raw| {
             const key = normalizeControlKey(raw);
-            if (isPendingQuitKeyRelease(key)) app.markPendingQuitKeyReleased();
+            if (isPendingQuitKeyRelease(key)) app.quit_gate.markKeyReleased();
         },
         .paste => |text| {
-            app.clearPendingQuitAt();
+            app.quit_gate.cancelPending();
             try clipboard_helper.pasteToFocusedInput(app, text);
             ctx.consumeAndRedraw();
         },
@@ -437,6 +437,15 @@ fn isPendingQuitKeyRelease(key: vaxis.Key) bool {
         key.codepoint == vaxis.Key.right_control;
 }
 
+/// True when the pressed key is a quit chord for the current state. Ctrl+D
+/// only quits when it would not be typed as EOF into a non-empty prompt.
+fn isQuitPress(app: *const App, key: vaxis.Key) bool {
+    const is_ctrl_c = key.matches('c', .{ .ctrl = true });
+    const is_ctrl_d = key.matches('d', .{ .ctrl = true });
+    const prompt_has_text = app.isNormalMode() and app.inputRealLength() > 0;
+    return is_ctrl_c or (is_ctrl_d and !prompt_has_text);
+}
+
 /// True when the key is one of the global clipboard-paste chords. Pure —
 /// no side effects, no clipboard access — so the chord set is unit-testable
 /// without an OS clipboard (mirrors the `fileNameMatches` extract-pure-helper
@@ -493,10 +502,13 @@ fn routeKey(
         try root.handleDiffViewerEvent(ctx, key);
         return;
     }
+    // Any key that is not a quit chord is activity: it dismisses an armed
+    // quit prompt. This one rule replaces the per-handler clears that used to
+    // drift apart as new key routes were added.
+    if (!isQuitPress(app, key)) app.quit_gate.cancelPending();
     // Global Ctrl+V / Shift+Insert / Alt+V clipboard paste into active input.
     if (isClipboardPasteChord(key)) {
         if (try clipboard_helper.pasteFromSystemClipboard(app)) {
-            app.clearPendingQuitAt();
             ctx.consumeAndRedraw();
             return;
         }
@@ -512,21 +524,18 @@ fn routeKey(
         return;
     }
     if (key.matches('o', .{ .ctrl = true })) {
-        app.clearPendingQuitAt();
         app.toggleBackgroundModal();
         ctx.consumeAndRedraw();
         return;
     }
     if (try routeKeyPromptEditing(app, ctx, key)) return;
     if (try routeKeyViewChords(app, root, ctx, key)) return;
-    if (app.nav.quit == .confirmed) {
+    if (app.quit_gate.isConfirmed()) {
         ctx.quit = true;
         ctx.consume_event = true;
         return;
     }
     if (try handleQuitSequence(app, root, ctx, key)) return;
-    // Any other key cancels the pending-quit prompt.
-    app.clearPendingQuitAt();
     const modal_layer = root_layout.activeModalLayer(app);
     // While the jobs modal is top-most it owns navigation/cancel keys.
     if (modal_layer == .background) {
@@ -573,26 +582,22 @@ fn routeKeyPromptEditing(app: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !bo
     if (app.getMode() == .normal and app.nav.pending_ctrl_x) {
         app.nav.pending_ctrl_x = false;
         if (key.matches('e', .{ .ctrl = true }) or key.matches('e', .{})) {
-            app.clearPendingQuitAt();
             try @import("external_editor.zig").editPromptInExternalEditor(app);
             ctx.consumeAndRedraw();
             return true;
         }
     }
     if (app.getMode() == .normal and !app.nav.block_nav and key.matches('x', .{ .ctrl = true })) {
-        app.clearPendingQuitAt();
         app.nav.pending_ctrl_x = true;
         ctx.consumeEvent();
         return true;
     }
     if (try routeKeyPastePlaceholderBackspace(app, ctx, key)) return true;
     if (app.getMode() == .normal and key.matches('z', .{ .ctrl = true })) {
-        app.clearPendingQuitAt();
         if (app.input_undo.undo(app)) ctx.consumeAndRedraw();
         return true;
     }
     if (app.getMode() == .normal and key.matches('y', .{ .ctrl = true })) {
-        app.clearPendingQuitAt();
         if (app.input_undo.redoStep(app)) ctx.consumeAndRedraw();
         return true;
     }
@@ -617,7 +622,6 @@ fn routeKeyPastePlaceholderBackspace(app: *App, ctx: *vxfw.EventContext, key: va
                     app.inputs.paste_stash.syncWithText(app.gpa, u);
                     const cur = app.inputs.input.buf.cursor;
                     if (span.start < cur) app.inputs.input.buf.moveGapLeft(cur - span.start);
-                    app.clearPendingQuitAt();
                     ctx.consumeAndRedraw();
                     return true;
                 }
@@ -632,7 +636,6 @@ fn routeKeyPastePlaceholderBackspace(app: *App, ctx: *vxfw.EventContext, key: va
 /// cycles the split layout, Ctrl+F opens transcript search.
 fn routeKeyViewChords(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     if (key.matches('l', .{ .ctrl = true }) or key.matches('l', .{ .super = true })) {
-        app.clearPendingQuitAt();
         // Ctrl+L cycles the focused worker lane in `.dual`; in `.grid`/`.tab`
         // it falls back to the mode cycle (the same cycle as Ctrl+W).
         if (app.split_mode == .dual and app.threads.len() > 1) {
@@ -647,7 +650,6 @@ fn routeKeyViewChords(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key
     // normal mode — the diff viewer (which also binds Ctrl+W) short-circuits
     // `routeKey` before reaching here.
     if (key.matches('w', .{ .ctrl = true }) and app.isNormalMode()) {
-        app.clearPendingQuitAt();
         app.cycleSplitMode();
         ctx.consumeAndRedraw();
         return true;
@@ -656,7 +658,6 @@ fn routeKeyViewChords(app: *App, root: *RootWidget, ctx: *vxfw.EventContext, key
     // guaranteed, terminal-agnostic path; Ctrl+F works when the terminal lets
     // it through (verified free across all modes — nothing else binds it).
     if (key.matches('f', .{ .ctrl = true }) and app.isNormalMode()) {
-        app.clearPendingQuitAt();
         _ = try lifecycle.transitionMode(root, ctx, .open_search);
         ctx.consumeAndRedraw();
         return true;
@@ -827,7 +828,6 @@ fn handleEscapeSequence(
     root: *RootWidget,
     ctx: *vxfw.EventContext,
 ) !void {
-    app.clearPendingQuitAt();
     switch (root_layout.activeModalLayer(app)) {
         .background => {
             app.closeBackgroundModal();
@@ -889,51 +889,35 @@ fn handleQuitSequence(
     ctx: *vxfw.EventContext,
     key: vaxis.Key,
 ) !bool {
-    const is_ctrl_c = key.matches('c', .{ .ctrl = true });
     // Ctrl+D is the EOF-style quit chord. The main prompt is only focused in
     // normal mode, so an off-mode draft must not block the exit the pending
     // hint advertises in every mode.
-    const prompt_has_text = app.isNormalMode() and app.inputRealLength() > 0;
-    const is_ctrl_d = key.matches('d', .{ .ctrl = true });
-    const is_ctrl_d_quit = is_ctrl_d and !prompt_has_text;
-    if (!is_ctrl_c and !is_ctrl_d_quit) return false;
+    if (!isQuitPress(app, key)) return false;
 
+    const is_ctrl_c = key.matches('c', .{ .ctrl = true });
     if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
         app.clearInput();
         app.inputs.paste_stash.clear(app.gpa);
         app.closeAtSearch();
         app.clearBlockNav();
-        app.clearPendingQuitAt();
+        app.quit_gate.cancelPending();
         ctx.consumeAndRedraw();
         return true;
     }
     const now = std.Io.Timestamp.now(app.getIo(), .awake);
-    if (app.getPendingQuitAt()) |first_press| {
-        const gap_ns: i128 = first_press.durationTo(now).nanoseconds;
-        const auto_repeat_ns: i128 =
-            @as(i128, App.ctrl_c_auto_repeat_gap_ms) * std.time.ns_per_ms;
-        // A second record faster than the auto-repeat threshold is the same
-        // chord held down — every platform auto-repeats a held key. Suppress
-        // it while no release has been observed; POSIX terminals never report
-        // releases at all, so the gap is their only disambiguator. A real
-        // key_release or a press with a gap past the threshold both confirm
-        // exit without needing that release event.
-        const is_rapid_repeat = gap_ns >= 0 and gap_ns < auto_repeat_ns;
-        if (!app.pendingQuitKeyReleased() and is_rapid_repeat) {
+    switch (app.quit_gate.onPress(now)) {
+        .swallowed => {
             ctx.consumeEvent();
             return true;
-        }
-        const elapsed_ns = gap_ns;
-        const threshold_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
-        if (elapsed_ns >= 0 and elapsed_ns <= threshold_ns) {
+        },
+        .confirmed => {
             log.info("shutdown.request source=keyboard", .{});
-            app.nav.quit = .confirmed;
             ctx.quit = true;
             ctx.consume_event = true;
             return true;
-        }
+        },
+        .armed => {},
     }
-    app.setPendingQuitAt(now);
     // Keep the tick alive even on an otherwise idle screen so handleTick
     // runs to expire the prompt once the double-press window elapses.
     if (lifecycle.decideShouldTick(root)) try root.ensureTick(ctx);
@@ -1162,7 +1146,7 @@ test "single Ctrl-C with empty input arms pending quit" {
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
 
     // First press arms the pending prompt without exiting.
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 }
 
@@ -1208,14 +1192,14 @@ test "bare C0 codepoints (mangled Ctrl+C/Ctrl+D) still drive quit" {
 
     // Bare cp=0x03, no modifiers at all — arms the pending prompt.
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 0x03, .mods = .{} } });
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
-    app.clearPendingQuitAt();
+    app.quit_gate.cancelPending();
 
     // cp=0x04 with a stray alt bit (the exact mangled form from the log) —
     // also arms.
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 0x04, .mods = .{ .alt = true } } });
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 
     // Two bare cp=0x03 presses confirm quit, exactly like real Ctrl+C.
@@ -1246,7 +1230,7 @@ test "Windows Ctrl-D auto-repeat does not confirm quit before key release" {
     try captureEvent(&app, &root, &ctx, bare_ctrl_d);
     try captureEvent(&app, &root, &ctx, bare_ctrl_d);
 
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 
     try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 0x04, .mods = .{} } });
@@ -1274,7 +1258,7 @@ test "held Ctrl+C auto-repeat does not confirm quit without a release" {
     try captureEvent(&app, &root, &ctx, ctrl_c);
     try captureEvent(&app, &root, &ctx, ctrl_c); // auto-repeat, no release in between
 
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 }
 
@@ -1293,7 +1277,7 @@ test "Ctrl-D with empty input arms pending quit like Ctrl-C" {
 
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
 
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 }
 
@@ -1316,9 +1300,9 @@ test "Windows modifier-only Ctrl event preserves the pending quit" {
     // The first Ctrl+D arms the prompt. Windows may put the modifier event
     // between the two character events; it must not clear that pending state.
     try captureEvent(&app, &root, &ctx, ctrl_d);
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try captureEvent(&app, &root, &ctx, ctrl_modifier);
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
     try captureEvent(&app, &root, &ctx, ctrl_d);
 
@@ -1342,7 +1326,7 @@ test "Windows Ctrl-C confirms quit without a key_release event" {
 
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 
     // A deliberate second press with a real time gap (simulating a genuine
@@ -1370,7 +1354,7 @@ test "Ctrl+D confirms an armed quit in an overlay, matching the hint" {
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     const ctrl_d: vxfw.Event = .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
     try captureEvent(&app, &root, &ctx, ctrl_d);
 
@@ -1392,12 +1376,12 @@ test "a non-quit key cancels an armed pending quit" {
     var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
 
     // Any ordinary key falls through handleQuitSequence (returns false) and
     // routeKey cancels the pending prompt.
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'x', .mods = .{} } });
-    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!app.quit_gate.isActive());
 }
 
 test "confirmed quit state exits the TUI on the next tick" {
@@ -1409,7 +1393,7 @@ test "confirmed quit state exits the TUI on the next tick" {
     app.bindInputCallbacks();
 
     // Simulate the `/exit` command having set the confirmed state.
-    app.nav.quit = .confirmed;
+    app.quit_gate.confirm();
 
     var root: RootWidget = .{ .app = &app };
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1448,7 +1432,7 @@ test "expired pending quit is cleared on the next tick" {
 
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(app.metrics.loading_tick_active);
 
     // The 1500ms double-press window has elapsed: the prompt must disappear
@@ -1457,7 +1441,7 @@ test "expired pending quit is cleared on the next tick" {
     app.getIo().sleep(std.Io.Duration.fromMilliseconds(App.ctrl_c_double_press_ms + 100), .awake) catch {};
     ctx.redraw = false;
     try lifecycle.handleTick(&root, &ctx);
-    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!app.quit_gate.isActive());
     try std.testing.expect(ctx.redraw);
     try std.testing.expect(!app.metrics.loading_tick_active);
     try std.testing.expect(!ctx.quit);
@@ -1483,12 +1467,12 @@ test "double Ctrl+C confirms quit while background modal is open" {
 
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
     try std.testing.expect(!ctx.quit);
 
     try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .confirmed);
+    try std.testing.expect(app.quit_gate.isConfirmed());
     try std.testing.expect(ctx.quit);
 }
 
@@ -1507,11 +1491,11 @@ test "Escape closing an overlay cancels an armed pending quit" {
     var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
 
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
     try std.testing.expect(app.getMode() == .normal);
-    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!app.quit_gate.isActive());
 }
 
 test "releasing Ctrl before C still marks pending quit released" {
@@ -1529,15 +1513,15 @@ test "releasing Ctrl before C still marks pending quit released" {
 
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .pending);
-    try std.testing.expect(!app.pendingQuitKeyReleased());
+    try std.testing.expect(app.quit_gate.isPending());
+    try std.testing.expect(!app.quit_gate.pendingKeyReleased());
 
     // User lifts Ctrl first, so C's release arrives without the ctrl modifier.
     try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'c', .mods = .{} } });
-    try std.testing.expect(app.pendingQuitKeyReleased());
+    try std.testing.expect(app.quit_gate.pendingKeyReleased());
 
     try captureEvent(&app, &root, &ctx, ctrl_c);
-    try std.testing.expect(app.nav.quit == .confirmed);
+    try std.testing.expect(app.quit_gate.isConfirmed());
     try std.testing.expect(ctx.quit);
 }
 
@@ -1557,13 +1541,13 @@ test "releasing either Control modifier marks pending quit released" {
     const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
     for ([_]u21{ vaxis.Key.left_control, vaxis.Key.right_control }) |control| {
         try captureEvent(&app, &root, &ctx, ctrl_c);
-        try std.testing.expect(app.nav.quit == .pending);
-        try std.testing.expect(!app.pendingQuitKeyReleased());
+        try std.testing.expect(app.quit_gate.isPending());
+        try std.testing.expect(!app.quit_gate.pendingKeyReleased());
 
         // Windows can report the modifier release before the character's.
         try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = control, .mods = .{} } });
-        try std.testing.expect(app.pendingQuitKeyReleased());
-        app.clearPendingQuitAt();
+        try std.testing.expect(app.quit_gate.pendingKeyReleased());
+        app.quit_gate.cancelPending();
     }
 }
 
@@ -1584,7 +1568,7 @@ test "decideShouldTick stays active for confirmed quit on an idle screen" {
     var root: RootWidget = .{ .app = &app, .mcp_connect_pending = false };
     try std.testing.expect(!lifecycle.decideShouldTick(&root));
 
-    app.nav.quit = .confirmed;
+    app.quit_gate.confirm();
     try std.testing.expect(lifecycle.decideShouldTick(&root));
 }
 
@@ -1602,10 +1586,10 @@ test "paste event cancels an armed pending quit" {
     var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
 
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
-    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(app.quit_gate.isPending());
 
     try captureEvent(&app, &root, &ctx, .{ .paste = "hello" });
-    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!app.quit_gate.isActive());
 }
 
 test "Escape in normal mode with non-empty input clears the input" {
@@ -1627,7 +1611,7 @@ test "Escape in normal mode with non-empty input clears the input" {
     try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
 
     try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
-    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!app.quit_gate.isActive());
 }
 
 test "bracketed paste: multiline paste inserts newlines and does not submit" {
