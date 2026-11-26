@@ -208,7 +208,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     // Windows: some pty backends (including Windows Terminal) do not deliver
     // the trailing event after an exit command, so relying on it would leave
     // the loop running forever. The next loop iteration is always processed.
-    if (root.app.nav.quit == .confirmed) {
+    if (root.app.quit_gate.isConfirmed()) {
         log.info("shutdown.request source=command", .{});
         ctx.quit = true;
         ctx.consume_event = true;
@@ -216,7 +216,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     }
     // An armed prompt older than the double-press window is stale: clear it
     // so the hint stops promising an exit that a late press will not perform.
-    var visible_change = root.app.expirePendingQuit();
+    var visible_change = root.app.quit_gate.expire(std.Io.Timestamp.now(root.app.getIo(), .awake));
 
     // UI-thread heartbeat (~1.5s cadence at the 30ms tick): proves the event
     // loop is alive when reported alongside input breadcrumbs — see AGENTS.md
@@ -551,7 +551,7 @@ pub fn decideShouldTick(root: *RootWidget) bool {
     const toasts_visible = toast.global.hasToasts();
 
     const at_search_active = atSearchActive(root.app);
-    const quit_active = root.app.nav.quit != .none;
+    const quit_active = root.app.quit_gate.isActive();
 
     return turn_active or
         turn_cancel_pending or
@@ -834,7 +834,7 @@ pub fn submit(root: *RootWidget, ctx: *vxfw.EventContext) !void {
             root.app.mcp_manager.hasPendingRefreshes() or
             compaction_lifecycle.manualCompactActive(root.app) or
             gitLabelRefreshActive(root.app) or
-            root.app.nav.quit == .confirmed)
+            root.app.quit_gate.isConfirmed())
         {
             try ensureTick(root, ctx);
         }

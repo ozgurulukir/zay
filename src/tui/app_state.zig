@@ -177,8 +177,7 @@ pub const PickerStates = struct {
 
 /// Navigation cursors and the cross-pane selection state. Owns the
 /// current position in each picker/menu (command, resume, lanes,
-/// transcript) plus the quit-double-tap timestamp and the lane-chip
-/// hit-test rect.
+/// transcript) plus the lane-chip hit-test rect.
 pub const NavState = struct {
     pub const LanesPurpose = enum { manage, merge_dest };
     /// Sub-state of the session resume picker: browsing the list, typing a
@@ -192,15 +191,6 @@ pub const NavState = struct {
     /// project's sessions (no grouping). `project` groups by project
     /// directory. `date` groups by date (Today, Yesterday, This Week, etc.).
     pub const ResumeGroupBy = enum { flat, project, date };
-    pub const PendingQuit = struct {
-        at: std.Io.Timestamp,
-        key_released: bool,
-    };
-    pub const QuitState = union(enum) {
-        none,
-        pending: PendingQuit,
-        confirmed,
-    };
 
     block_nav: bool = false,
     pending_ctrl_x: bool = false,
@@ -220,10 +210,6 @@ pub const NavState = struct {
     lanes_selection: u32 = 0,
     lanes_purpose: LanesPurpose = .manage,
     queued_selection: usize = 0,
-    /// Quit state machine: none -> pending (user pressed Ctrl+C/Ctrl+D once,
-    /// waiting for a released second press within the window) -> confirmed
-    /// (a slash exit command was issued; the next event loop drains it).
-    quit: QuitState = .none,
 };
 
 /// State for the Ctrl+O background-jobs modal: the open flag, the

@@ -27,6 +27,7 @@ const event_router = @import("tui/event_router.zig");
 const command_router = @import("tui/command_router.zig");
 const session_switcher = @import("tui/session_switcher.zig");
 const app_state = @import("tui/app_state.zig");
+const quit_gate = @import("tui/quit_gate.zig");
 const toast = @import("tui/toast.zig");
 const background_delivery = @import("tui/background_delivery.zig");
 const turn_lifecycle = @import("tui/turn_lifecycle.zig");
@@ -160,6 +161,8 @@ pub const App = struct {
     inputs: app_state.InputState,
     /// Cross-pane navigation cursors and the lane-chip hit-test rect.
     nav: app_state.NavState = .{},
+    /// Quit double-press state machine (Ctrl+C/Ctrl+D and `/exit`).
+    quit_gate: quit_gate.Gate = .{},
     /// Back-pointer to the vxfw App that owns the event loop. Set in `tui.run`
     /// after both `App` and `fw_app` are constructed in their final stack
     /// frames. Lets `installRuntime` (called outside an event handler, with no
@@ -298,12 +301,9 @@ pub const App = struct {
     /// busy transcript) so the notice + model message land only when the owning
     /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
     /// `deinit`.
-    pub const ctrl_c_double_press_ms: u32 = 1500;
-    /// Sub-threshold gap (ms) between two Ctrl-C/Ctrl+D presses treated as
-    /// auto-repeat of a single held chord rather than a second physical press.
-    /// Kept below human double-press speed so a deliberately-repeated chord
-    /// still exits while a held key does not.
-    pub const ctrl_c_auto_repeat_gap_ms: u32 = 100;
+    /// Thresholds re-exported for tests; the gate owns their semantics.
+    pub const ctrl_c_double_press_ms: u32 = quit_gate.double_press_window_ms;
+    pub const ctrl_c_auto_repeat_gap_ms: u32 = quit_gate.auto_repeat_gap_ms;
     pub const Mode = app_state.Mode;
     pub const LanesPurpose = app_state.NavState.LanesPurpose;
 
@@ -719,59 +719,6 @@ pub const App = struct {
 
     pub fn setBlockNav(self: *App, v: bool) void {
         self.nav.block_nav = v;
-    }
-
-    pub fn getPendingQuitAt(self: *const App) ?std.Io.Timestamp {
-        return switch (self.nav.quit) {
-            .pending => |pending| pending.at,
-            else => null,
-        };
-    }
-
-    pub fn pendingQuitKeyReleased(self: *const App) bool {
-        return switch (self.nav.quit) {
-            .pending => |pending| pending.key_released,
-            else => false,
-        };
-    }
-
-    pub fn setPendingQuitAt(self: *App, v: ?std.Io.Timestamp) void {
-        self.nav.quit = if (v) |timestamp| .{
-            .pending = .{
-                .at = timestamp,
-                // Start unconditionally unreleased: a release is evidence that
-                // the next press is a new chord, and only a platform that
-                // actually reports one may set this bit. POSIX terminals never
-                // do, so their auto-repeat records are suppressed by the gap
-                // check instead of being mistaken for a genuine second press.
-                .key_released = false,
-            },
-        } else .none;
-    }
-
-    /// Clears an armed quit prompt once its double-press window has elapsed.
-    /// Called from the periodic tick so the hint cannot outlive the window.
-    /// Returns true if a stale prompt was cleared so the caller can redraw.
-    pub fn expirePendingQuit(self: *App) bool {
-        const first_press = self.getPendingQuitAt() orelse return false;
-        const now = std.Io.Timestamp.now(self.getIo(), .awake);
-        const elapsed_ns = first_press.durationTo(now).nanoseconds;
-        const window_ns: i128 = @as(i128, App.ctrl_c_double_press_ms) * std.time.ns_per_ms;
-        if (elapsed_ns > window_ns) {
-            self.clearPendingQuitAt();
-            return true;
-        }
-        return false;
-    }
-
-    pub fn markPendingQuitKeyReleased(self: *App) void {
-        if (self.nav.quit == .pending) {
-            self.nav.quit.pending.key_released = true;
-        }
-    }
-
-    pub fn clearPendingQuitAt(self: *App) void {
-        if (self.nav.quit == .pending) self.nav.quit = .none;
     }
 
     pub fn setSplitMode(self: *App, mode: config_mod.SplitMode) void {
