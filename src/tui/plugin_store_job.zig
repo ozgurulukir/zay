@@ -109,36 +109,66 @@ pub const State = struct {
     }
 };
 
-pub fn refreshInstalledCache(app: *App) void {
-    const next = installedPlugins(app.gpa, app) catch return;
+pub fn clearInstalledCache(app: *App) void {
     if (app.plugin_store.installed_cache.len > 0) {
         app.gpa.free(app.plugin_store.installed_cache);
+        app.plugin_store.installed_cache = &.{};
     }
+}
+
+pub fn refreshInstalledCache(app: *App) void {
+    const next = installedPlugins(app.gpa, app) catch return;
+    clearInstalledCache(app);
     app.plugin_store.installed_cache = next;
 }
 
-/// Build the Installed-tab rows from loaded plugins plus persisted disabled
-/// entries. Disabled plugins are intentionally absent from PluginManager.
+/// Build the Installed-tab rows from on-disk inventory (or loaded plugins as
+/// an immediate fallback before the first disk scan completes) plus persisted
+/// disabled entries. Disabled plugins are intentionally absent from PluginManager.
 pub fn installedPlugins(gpa: std.mem.Allocator, app: *App) ![]InstalledPlugin {
     var rows: std.ArrayList(InstalledPlugin) = .empty;
     errdefer rows.deinit(gpa);
 
-    for (app.plugin_store.inventory.packages) |*disk| {
-        const name = disk.name();
-        const loaded = app.plugin_manager.get(name);
-        const same_copy = if (loaded) |entry| paths.pathsEqual(entry.dir_path, disk.path) else false;
-        try rows.append(gpa, .{
-            .name = name,
-            .active = if (same_copy) loaded.?.active else false,
-            .enabled = configuredEnabled(&app.cached_config, name),
-            .path = disk.path,
-            .version = disk.version(),
-            .origin = @tagName(disk.origin),
-            .diagnostic = disk.diagnostic orelse app.plugin_manager.load_failures.get(disk.path),
-            .managed = disk.origin == .global and disk.receipt != null and disk.ordinary_directory,
-            .shadowed = loaded != null and !same_copy,
-            .permissions = if (disk.manifest) |value| value.permissions else .{},
-        });
+    if (app.plugin_store.inventory.packages.len > 0) {
+        for (app.plugin_store.inventory.packages) |*disk| {
+            const name = disk.name();
+            const loaded = app.plugin_manager.get(name);
+            const same_copy = if (loaded) |entry| paths.pathsEqual(entry.dir_path, disk.path) else false;
+            try rows.append(gpa, .{
+                .name = name,
+                .active = if (same_copy) loaded.?.active else false,
+                .enabled = configuredEnabled(&app.cached_config, name),
+                .path = disk.path,
+                .version = disk.version(),
+                .origin = @tagName(disk.origin),
+                .diagnostic = disk.diagnostic orelse app.plugin_manager.load_failures.get(disk.path),
+                .managed = disk.origin == .global and disk.receipt != null and disk.ordinary_directory,
+                .shadowed = loaded != null and !same_copy,
+                .permissions = if (disk.manifest) |value| value.permissions else .{},
+            });
+        }
+    } else {
+        // Before the async disk scan completes (or if it fails), surface
+        // already-loaded plugins so the Installed tab never flashes empty.
+        var it = app.plugin_manager.iterator();
+        while (it.next()) |entry| {
+            const instance = entry.value_ptr.*;
+            const name = instance.manifest.name;
+            try rows.append(gpa, .{
+                .name = name,
+                .active = instance.active,
+                .enabled = configuredEnabled(&app.cached_config, name),
+                .path = instance.dir_path,
+                .version = instance.manifest.version,
+                .origin = if (isProjectPlugin(app, name)) "project" else "global",
+                .permissions = instance.permissions,
+            });
+        }
+        std.mem.sort(InstalledPlugin, rows.items, {}, struct {
+            fn less(_: void, left: InstalledPlugin, right: InstalledPlugin) bool {
+                return std.mem.order(u8, left.name, right.name) == .lt;
+            }
+        }.less);
     }
     for (app.cached_config.plugins) |configured| {
         var exists = false;
@@ -162,6 +192,8 @@ pub fn repoint(app: *App, project_root: []const u8) !void {
     app.plugin_store.generation += 1;
     if (app.plugin_store.catalogs) |*catalogs| catalogs.deinit(app.gpa);
     app.plugin_store.catalogs = null;
+    // Clear the cache BEFORE freeing inventory so no row can dangle.
+    clearInstalledCache(app);
     app.plugin_store.inventory.deinit(app.gpa);
     app.pickers.plugins.reset();
     app.pickers.plugins.confirming_uninstall = false;
@@ -226,6 +258,7 @@ pub fn toggleEnabled(app: *App, name: []const u8) void {
         setErrorNotice(app, "Could not save plugin setting", err);
         return;
     };
+    refreshInstalledCache(app);
     setNotice(app, if (enabled)
         "Plugin enabled for this project. Restart Zay to load it."
     else
@@ -271,6 +304,7 @@ pub fn forgetMissingPlugin(app: *App, name: []const u8) void {
         }
         return;
     };
+    refreshInstalledCache(app);
     setNotice(app, "Removed saved plugin preference; package was already missing.");
 }
 
@@ -602,8 +636,10 @@ pub fn drain(app: *App) !bool {
                     const selection = refreshedSelection(app, &snapshot.inventory, &snapshot.catalogs);
                     if (app.plugin_store.catalogs) |*old| old.deinit(app.gpa);
                     app.plugin_store.catalogs = snapshot.catalogs;
+                    clearInstalledCache(app);
                     app.plugin_store.inventory.deinit(app.gpa);
                     app.plugin_store.inventory = snapshot.inventory;
+                    refreshInstalledCache(app);
                     app.pickers.plugins.reset();
                     app.pickers.plugins.selection = selection;
                     app.pickers.plugins.confirming_uninstall = false;
@@ -632,6 +668,7 @@ pub fn drain(app: *App) !bool {
             switch (result) {
                 .ready => |inventory| {
                     const selection = refreshedSelection(app, &inventory, if (app.plugin_store.catalogs) |*catalogs| catalogs else null);
+                    clearInstalledCache(app);
                     app.plugin_store.inventory.deinit(app.gpa);
                     app.plugin_store.inventory = inventory;
                     refreshInstalledCache(app);
@@ -731,6 +768,64 @@ test "inventory refresh preserves selected physical copy across row changes" {
     try std.testing.expectEqual(@as(usize, 1), refreshedSelection(&app, &inventory, null));
     const empty: package.Inventory = .{};
     try std.testing.expectEqual(@as(usize, 0), refreshedSelection(&app, &empty, null));
+}
+
+test "refreshInstalledCache populates from inventory and repoint clears cache before freeing inventory" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = @import("../agent.zig").Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    const pkg_dir = try gpa.dupe(u8, "demo");
+    const pkg_path = try gpa.dupe(u8, "/tmp/plugins/demo");
+    const packages = try gpa.alloc(package.Package, 1);
+    packages[0] = .{ .directory = pkg_dir, .path = pkg_path, .origin = .global };
+    app.plugin_store.inventory = .{ .packages = packages };
+
+    refreshInstalledCache(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.plugin_store.installed_cache.len);
+    try std.testing.expectEqualStrings("demo", app.plugin_store.installed_cache[0].name);
+
+    // Repoint must clear installed_cache before freeing inventory so no slices dangle.
+    try repoint(&app, "/tmp/other-project");
+    try std.testing.expectEqual(@as(usize, 0), app.plugin_store.installed_cache.len);
+    try std.testing.expectEqual(@as(usize, 0), app.plugin_store.inventory.packages.len);
+}
+
+test "installedPlugins falls back to loaded PluginManager plugins before disk inventory arrives" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const plugin_dir = try std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "fallback-plugin" });
+    defer gpa.free(plugin_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, plugin_dir);
+
+    const manifest_path = try std.fs.path.join(gpa, &.{ plugin_dir, "plugin.lua" });
+    defer gpa.free(manifest_path);
+    try package.atomicWrite(io, manifest_path, "return { name = \"fallback-demo\", version = \"2.1.0\" }");
+
+    const init_path = try std.fs.path.join(gpa, &.{ plugin_dir, "init.lua" });
+    defer gpa.free(init_path);
+    try package.atomicWrite(io, init_path, "-- no-op init");
+
+    var agent = @import("../agent.zig").Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    _ = try app.plugin_manager.loadOne(plugin_dir, false);
+    try std.testing.expectEqual(@as(usize, 0), app.plugin_store.inventory.packages.len);
+
+    refreshInstalledCache(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.plugin_store.installed_cache.len);
+    try std.testing.expectEqualStrings("fallback-demo", app.plugin_store.installed_cache[0].name);
+    try std.testing.expectEqualStrings("2.1.0", app.plugin_store.installed_cache[0].version);
+    try std.testing.expect(app.plugin_store.installed_cache[0].active);
 }
 
 pub fn cancel(app: *App) void {

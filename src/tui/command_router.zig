@@ -923,11 +923,9 @@ const PluginsMode = struct {
             return true;
         }
         if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            const count = if (app.pickers.plugins.view == .installed) blk: {
-                const rows = try plugin_store_job.installedPlugins(app.gpa, app);
-                defer app.gpa.free(rows);
-                break :blk rows.len;
-            } else if (app.plugin_store.catalogs) |*catalogs| switch (app.pickers.plugins.view) {
+            const count = if (app.pickers.plugins.view == .installed)
+                app.plugin_store.installed_cache.len
+            else if (app.plugin_store.catalogs) |*catalogs| switch (app.pickers.plugins.view) {
                 .store => catalogs.entryCount(),
                 .sources => catalogs.stores.len,
                 .installed => 0,
@@ -1003,11 +1001,11 @@ const PluginsMode = struct {
             return true;
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches(' ', .{})) {
-            if (try selectedInstalledPlugin(app)) |plugin| app.togglePluginEnabled(plugin.name);
+            if (selectedInstalledPlugin(app)) |plugin| app.togglePluginEnabled(plugin.name);
             return true;
         }
         if (app.pickers.plugins.view == .installed and app.plugin_store.operation == .idle and key.matches('x', .{})) {
-            if (try selectedInstalledPlugin(app)) |plugin| {
+            if (selectedInstalledPlugin(app)) |plugin| {
                 if (plugin.path.len == 0) {
                     plugin_store_job.forgetMissingPlugin(app, plugin.name);
                     app.pickers.plugins.reset();
@@ -1027,9 +1025,8 @@ const PluginsMode = struct {
         return false;
     }
 
-    fn selectedInstalledPlugin(app: *App) !?plugin_store_job.InstalledPlugin {
-        const rows = try plugin_store_job.installedPlugins(app.gpa, app);
-        defer app.gpa.free(rows);
+    fn selectedInstalledPlugin(app: *const App) ?plugin_store_job.InstalledPlugin {
+        const rows = app.plugin_store.installed_cache;
         if (app.pickers.plugins.selection >= rows.len) return null;
         return rows[app.pickers.plugins.selection];
     }
