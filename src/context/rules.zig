@@ -233,7 +233,45 @@ fn assembleSystemPromptWithInputs(
     defer gpa.free(base_substituted);
     try out.writer.writeAll(base_substituted);
 
-    // 2. Append Git environment details if in a repo
+    // 2. Rule ingestion: the user-level AGENTS.md from the platform config
+    //    dir first, then the project conventions. Both share the aggregate
+    //    budget and the user file is counted FIRST, so an oversized global
+    //    file narrows what project rules may use (they degrade to omission
+    //    notices rather than failing). Placed before dynamic git state so
+    //    static instructions stay in the stable prompt-cache prefix.
+    var total_rule_bytes: usize = 0;
+    if (home_dir.len > 0) {
+        if (try readRuleFileWithPolicy(gpa, io, config_dir, "AGENTS.md", "user rule file", rule_read_policy)) |content| {
+            defer gpa.free(content);
+            try appendRuleBlock(&out.writer, "user_instructions", "user rule file", "AGENTS.md", content, &total_rule_bytes);
+        }
+    }
+    for (project_rule_filenames) |rule_filename| {
+        if (try readRuleFileWithPolicy(gpa, io, cwd, rule_filename, "project rule file", rule_read_policy)) |content| {
+            defer gpa.free(content);
+            try appendRuleBlock(&out.writer, "project_instructions", "project rule file", rule_filename, content, &total_rule_bytes);
+        }
+    }
+
+    // 3. Append Skills
+    const skill_prompt = try skill_mod.formatForPrompt(gpa, skills);
+    defer gpa.free(skill_prompt);
+    if (skill_prompt.len > 0) {
+        try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(skill_prompt);
+    }
+
+    // 4. Append Plugin prompts (optional per-plugin prompt.md bodies)
+    const plugin_prompt_text = try plugin_prompt.formatForPrompt(gpa, plugin_prompts);
+    defer gpa.free(plugin_prompt_text);
+    if (plugin_prompt_text.len > 0) {
+        try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(plugin_prompt_text);
+    }
+
+    // 5. Append dynamic Git environment details LAST so branch switches and
+    //    clean/dirty flips never invalidate the static prefix (base template,
+    //    rules, skills, plugin prompts) in provider prompt caches.
     const is_repo = if (refresh_snapshot) |snapshot| snapshot.is_repo else vcs.isRepo(gpa, io, cwd);
     if (is_repo) {
         const queried_branch = if (refresh_snapshot == null) vcs.currentBranch(gpa, io, cwd) else null;
@@ -251,41 +289,6 @@ fn assembleSystemPromptWithInputs(
         }
         try out.writer.print("Working Tree Status: {s}\n", .{if (is_dirty) "modified (dirty)" else "clean"});
         try out.writer.print("</git_environment>", .{});
-    }
-
-    // 3. Rule ingestion: the user-level AGENTS.md from the platform config
-    //    dir first, then the project conventions. Both share the aggregate
-    //    budget and the user file is counted FIRST, so an oversized global
-    //    file narrows what project rules may use (they degrade to omission
-    //    notices rather than failing).
-    var total_rule_bytes: usize = 0;
-    if (home_dir.len > 0) {
-        if (try readRuleFileWithPolicy(gpa, io, config_dir, "AGENTS.md", "user rule file", rule_read_policy)) |content| {
-            defer gpa.free(content);
-            try appendRuleBlock(&out.writer, "user_instructions", "user rule file", "AGENTS.md", content, &total_rule_bytes);
-        }
-    }
-    for (project_rule_filenames) |rule_filename| {
-        if (try readRuleFileWithPolicy(gpa, io, cwd, rule_filename, "project rule file", rule_read_policy)) |content| {
-            defer gpa.free(content);
-            try appendRuleBlock(&out.writer, "project_instructions", "project rule file", rule_filename, content, &total_rule_bytes);
-        }
-    }
-
-    // 4. Append Skills
-    const skill_prompt = try skill_mod.formatForPrompt(gpa, skills);
-    defer gpa.free(skill_prompt);
-    if (skill_prompt.len > 0) {
-        try out.writer.writeAll("\n\n");
-        try out.writer.writeAll(skill_prompt);
-    }
-
-    // 5. Append Plugin prompts (optional per-plugin prompt.md bodies)
-    const plugin_prompt_text = try plugin_prompt.formatForPrompt(gpa, plugin_prompts);
-    defer gpa.free(plugin_prompt_text);
-    if (plugin_prompt_text.len > 0) {
-        try out.writer.writeAll("\n\n");
-        try out.writer.writeAll(plugin_prompt_text);
     }
 
     return out.toOwnedSlice();
@@ -1225,4 +1228,26 @@ test "branch name with XML characters is escaped in the git environment block" {
         // No raw `</git_environment>` can appear inside the block itself.
         try std.testing.expect(std.mem.indexOf(u8, block, "</git_environment>") == null);
     }
+}
+
+test "assembleSystemPrompt places static instructions before dynamic git environment" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    var snapshot: RefreshSnapshot = .{
+        .is_repo = true,
+        .branch = try gpa.dupe(u8, "main"),
+        .is_dirty = true,
+        .rules = @splat(.missing),
+    };
+    defer snapshot.deinit(gpa);
+
+    const prompt = try assembleSystemPromptForRefresh(gpa, io, "Base system", "", root, &.{}, &.{}, &snapshot);
+    defer gpa.free(prompt);
+
+    const rules_pos = std.mem.indexOf(u8, prompt, "<project_instructions") orelse return error.ExpectedProjectInstructions;
+    const git_pos = std.mem.indexOf(u8, prompt, "<git_environment>") orelse return error.ExpectedGitEnvironment;
+    try std.testing.expect(rules_pos < git_pos);
 }
