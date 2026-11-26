@@ -214,6 +214,9 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
         ctx.consume_event = true;
         return;
     }
+    // An armed prompt older than the double-press window is stale: clear it
+    // so the hint stops promising an exit that a late press will not perform.
+    root.app.expirePendingQuit();
 
     // UI-thread heartbeat (~1.5s cadence at the 30ms tick): proves the event
     // loop is alive when reported alongside input breadcrumbs — see AGENTS.md

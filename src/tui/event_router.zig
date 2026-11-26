@@ -879,8 +879,13 @@ fn handleQuitSequence(
     key: vaxis.Key,
 ) !bool {
     const is_ctrl_c = key.matches('c', .{ .ctrl = true });
-    const is_ctrl_d_empty = key.matches('d', .{ .ctrl = true }) and app.isNormalMode() and app.inputRealLength() == 0;
-    if (!is_ctrl_c and !is_ctrl_d_empty) return false;
+    // Ctrl+D is the EOF-style quit chord. The main prompt is only focused in
+    // normal mode, so an off-mode draft must not block the exit the pending
+    // hint advertises in every mode.
+    const prompt_has_text = app.isNormalMode() and app.inputRealLength() > 0;
+    const is_ctrl_d = key.matches('d', .{ .ctrl = true });
+    const is_ctrl_d_quit = is_ctrl_d and !prompt_has_text;
+    if (!is_ctrl_c and !is_ctrl_d_quit) return false;
 
     if (is_ctrl_c and app.isNormalMode() and app.inputRealLength() > 0) {
         app.clearInput();
@@ -897,13 +902,13 @@ fn handleQuitSequence(
         const auto_repeat_ns: i128 =
             @as(i128, App.ctrl_c_auto_repeat_gap_ms) * std.time.ns_per_ms;
         // A second record faster than the auto-repeat threshold is the same
-        // chord held down (Windows auto-repeats a key as it is pressed) — a
-        // genuine second press is slower than that. Suppress the rapid repeat
-        // only when no release has been observed: a real key_release (delivered
-        // by some terminals) or a genuine press with a real time gap past the
-        // threshold both confirm exit without needing that release event.
+        // chord held down — every platform auto-repeats a held key. Suppress
+        // it while no release has been observed; POSIX terminals never report
+        // releases at all, so the gap is their only disambiguator. A real
+        // key_release or a press with a gap past the threshold both confirm
+        // exit without needing that release event.
         const is_rapid_repeat = gap_ns >= 0 and gap_ns < auto_repeat_ns;
-        if (os.is_windows and !app.pendingQuitKeyReleased() and is_rapid_repeat) {
+        if (!app.pendingQuitKeyReleased() and is_rapid_repeat) {
             ctx.consumeEvent();
             return true;
         }
@@ -1234,6 +1239,30 @@ test "Windows Ctrl-D auto-repeat does not confirm quit before key release" {
     try std.testing.expect(ctx.quit);
 }
 
+test "held Ctrl+C auto-repeat does not confirm quit without a release" {
+    // A held chord auto-repeats as rapid key_press records on every platform.
+    // POSIX terminals never send key_release, so the release bit cannot be the
+    // disambiguator there — the sub-threshold gap must suppress the repeat.
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+    try captureEvent(&app, &root, &ctx, ctrl_c); // auto-repeat, no release in between
+
+    try std.testing.expect(app.nav.quit == .pending);
+    try std.testing.expect(!ctx.quit);
+}
+
 test "Ctrl-D with empty input arms pending quit like Ctrl-C" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -1309,6 +1338,31 @@ test "Windows Ctrl-C confirms quit without a key_release event" {
     try std.testing.expect(ctx.quit);
 }
 
+test "Ctrl+D confirms an armed quit in an overlay, matching the hint" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+    app.mode = .help;
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    const ctrl_d: vxfw.Event = .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } };
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+    try std.testing.expect(app.nav.quit == .pending);
+    try captureEvent(&app, &root, &ctx, .{ .key_release = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+    try captureEvent(&app, &root, &ctx, ctrl_d);
+
+    // The pending-quit hint says "Ctrl+C or Ctrl+D again" in every mode.
+    try std.testing.expect(ctx.quit);
+}
+
 test "a non-quit key cancels an armed pending quit" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -1353,6 +1407,31 @@ test "confirmed quit state exits the TUI on the next tick" {
     try lifecycle.handleTick(&root, &ctx);
 
     try std.testing.expect(ctx.quit);
+}
+
+test "expired pending quit is cleared on the next tick" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    const ctrl_c: vxfw.Event = .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } };
+    try captureEvent(&app, &root, &ctx, ctrl_c);
+    try std.testing.expect(app.nav.quit == .pending);
+
+    // The 1500ms double-press window has elapsed: the prompt must disappear
+    // instead of lingering with a stale "press again to exit" hint.
+    app.getIo().sleep(std.Io.Duration.fromMilliseconds(App.ctrl_c_double_press_ms + 100), .awake) catch {};
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expect(app.nav.quit == .none);
+    try std.testing.expect(!ctx.quit);
 }
 
 test "Escape in normal mode with non-empty input clears the input" {
