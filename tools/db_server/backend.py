@@ -6,7 +6,9 @@ import abc
 import asyncio
 import os
 import sqlite3
+import ssl
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 class DatabaseBackend(abc.ABC):
@@ -64,36 +66,41 @@ class SqliteBackend(DatabaseBackend):
         self._conn = conn
 
     async def connect(self) -> None:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._sync_connect)
+        await asyncio.to_thread(self._sync_connect)
+
+    def _sync_close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
     async def close(self) -> None:
         async with self._lock:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
+            await asyncio.to_thread(self._sync_close)
+
+    def _sync_health(self) -> dict[str, Any]:
+        if not self._conn:
+            return {"status": "disconnected", "backend": "sqlite"}
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            # Get table list
+            cur = self._conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            tables = [row[0] for row in cur.fetchall()]
+            cur.close()
+            return {
+                "status": "ok",
+                "backend": "sqlite",
+                "db_path": self.db_path,
+                "tables": tables,
+            }
+        except Exception as e:
+            return {"status": "error", "backend": "sqlite", "error": str(e)}
 
     async def health(self) -> dict[str, Any]:
         async with self._lock:
-            if not self._conn:
-                return {"status": "disconnected", "backend": "sqlite"}
-            try:
-                cur = self._conn.cursor()
-                cur.execute("SELECT 1")
-                cur.close()
-                # Get table list
-                cur = self._conn.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-                tables = [row[0] for row in cur.fetchall()]
-                cur.close()
-                return {
-                    "status": "ok",
-                    "backend": "sqlite",
-                    "db_path": self.db_path,
-                    "tables": tables,
-                }
-            except Exception as e:
-                return {"status": "error", "backend": "sqlite", "error": str(e)}
+            return await asyncio.to_thread(self._sync_health)
 
     @staticmethod
     def _infer_type(val: Any) -> str:
@@ -109,122 +116,135 @@ class SqliteBackend(DatabaseBackend):
             return "blob"
         return "text"
 
+    def _sync_exec(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        p = params or []
+        cur = self._conn.cursor()
+        try:
+            cur.execute(sql, p)
+            changes = cur.rowcount if cur.rowcount != -1 else 0
+            last_rowid = cur.lastrowid
+            return {
+                "success": True,
+                "changes": changes,
+                "last_insert_rowid": last_rowid,
+            }
+        finally:
+            cur.close()
+
     async def exec(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
         async with self._lock:
-            if not self._conn:
-                raise RuntimeError("Database not connected")
-            p = params or []
-            cur = self._conn.cursor()
-            try:
-                cur.execute(sql, p)
-                changes = cur.rowcount if cur.rowcount != -1 else 0
-                last_rowid = cur.lastrowid
-                return {
-                    "success": True,
-                    "changes": changes,
-                    "last_insert_rowid": last_rowid,
-                }
-            finally:
-                cur.close()
+            return await asyncio.to_thread(self._sync_exec, sql, params)
+
+    def _sync_query(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        p = params or []
+        cur = self._conn.cursor()
+        try:
+            self._conn.execute("PRAGMA query_only = ON")
+            cur.execute(sql, p)
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            raw_rows = cur.fetchall()
+
+            types: list[str] = ["text"] * len(cols)
+            if raw_rows:
+                # Infer types from first non-null sample per column
+                for col_idx in range(len(cols)):
+                    for row in raw_rows:
+                        val = row[col_idx]
+                        if val is not None:
+                            types[col_idx] = self._infer_type(val)
+                            break
+
+            # Serialize rows: convert bytes to hex or string
+            formatted_rows: list[list[Any]] = []
+            for row in raw_rows:
+                formatted_row: list[Any] = []
+                for val in row:
+                    if isinstance(val, bytes):
+                        formatted_row.append(val.decode("utf-8", errors="replace"))
+                    else:
+                        formatted_row.append(val)
+                formatted_rows.append(formatted_row)
+
+            return {
+                "success": True,
+                "columns": cols,
+                "types": types,
+                "rows": formatted_rows,
+                "count": len(formatted_rows),
+            }
+        finally:
+            self._conn.execute("PRAGMA query_only = OFF")
+            cur.close()
 
     async def query(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
         async with self._lock:
-            if not self._conn:
-                raise RuntimeError("Database not connected")
-            p = params or []
-            cur = self._conn.cursor()
-            try:
-                self._conn.execute("PRAGMA query_only = ON")
-                cur.execute(sql, p)
-                cols = [desc[0] for desc in cur.description] if cur.description else []
-                raw_rows = cur.fetchall()
+            return await asyncio.to_thread(self._sync_query, sql, params)
 
-                types: list[str] = ["text"] * len(cols)
-                if raw_rows:
-                    # Infer types from first non-null sample per column
-                    for col_idx in range(len(cols)):
-                        for row in raw_rows:
-                            val = row[col_idx]
-                            if val is not None:
-                                types[col_idx] = self._infer_type(val)
-                                break
-
-                # Serialize rows: convert bytes to hex or string
-                formatted_rows: list[list[Any]] = []
-                for row in raw_rows:
-                    formatted_row: list[Any] = []
-                    for val in row:
-                        if isinstance(val, bytes):
-                            formatted_row.append(val.decode("utf-8", errors="replace"))
-                        else:
-                            formatted_row.append(val)
-                    formatted_rows.append(formatted_row)
-
-                return {
-                    "success": True,
-                    "columns": cols,
-                    "types": types,
-                    "rows": formatted_rows,
-                    "count": len(formatted_rows),
-                }
-            finally:
-                self._conn.execute("PRAGMA query_only = OFF")
-                cur.close()
+    def _sync_batch(self, statements: list[dict[str, Any]]) -> dict[str, Any]:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cur = self._conn.cursor()
+        results: list[dict[str, Any]] = []
+        try:
+            self._conn.execute("BEGIN TRANSACTION")
+            for s in statements:
+                sql = s.get("sql", "")
+                params = s.get("params", [])
+                cur.execute(sql, params)
+                results.append({
+                    "changes": cur.rowcount if cur.rowcount != -1 else 0,
+                    "last_insert_rowid": cur.lastrowid,
+                })
+            self._conn.execute("COMMIT")
+            return {"success": True, "results": results}
+        except Exception as e:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise RuntimeError(f"Batch transaction failed and rolled back: {e}") from e
+        finally:
+            cur.close()
 
     async def batch(self, statements: list[dict[str, Any]]) -> dict[str, Any]:
         async with self._lock:
-            if not self._conn:
-                raise RuntimeError("Database not connected")
-            cur = self._conn.cursor()
-            results: list[dict[str, Any]] = []
-            try:
-                self._conn.execute("BEGIN TRANSACTION")
-                for s in statements:
-                    sql = s.get("sql", "")
-                    params = s.get("params", [])
-                    cur.execute(sql, params)
-                    results.append({
-                        "changes": cur.rowcount if cur.rowcount != -1 else 0,
-                        "last_insert_rowid": cur.lastrowid,
-                    })
-                self._conn.execute("COMMIT")
-                return {"success": True, "results": results}
-            except Exception as e:
-                self._conn.execute("ROLLBACK")
-                raise RuntimeError(f"Batch transaction failed and rolled back: {e}") from e
-            finally:
-                cur.close()
+            return await asyncio.to_thread(self._sync_batch, statements)
 
-    async def schema(self, table: str | None = None) -> dict[str, Any]:
-        async with self._lock:
-            if not self._conn:
-                raise RuntimeError("Database not connected")
-            cur = self._conn.cursor()
-            try:
-                if table:
-                    if not _is_valid_identifier(table):
-                        raise ValueError("Invalid table identifier")
-                    cur.execute(f'PRAGMA table_info("{table}")')
-                    cols = [
+    def _sync_schema(self, table: str | None = None) -> dict[str, Any]:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cur = self._conn.cursor()
+        try:
+            if table:
+                if not _is_valid_identifier(table):
+                    raise ValueError("Invalid table identifier")
+                cur.execute(f'PRAGMA table_info("{table}")')
+                cols = [
+                    {"cid": row[0], "name": row[1], "type": row[2], "notnull": bool(row[3]), "dflt_value": row[4], "pk": bool(row[5])}
+                    for row in cur.fetchall()
+                ]
+                return {"success": True, "tables": {table: cols}}
+            else:
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                tables = [row[0] for row in cur.fetchall()]
+                result: dict[str, Any] = {}
+                for t in tables:
+                    if not _is_valid_identifier(t):
+                        continue
+                    cur.execute(f'PRAGMA table_info("{t}")')
+                    result[t] = [
                         {"cid": row[0], "name": row[1], "type": row[2], "notnull": bool(row[3]), "dflt_value": row[4], "pk": bool(row[5])}
                         for row in cur.fetchall()
                     ]
-                    return {"success": True, "tables": {table: cols}}
-                else:
-                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-                    tables = [row[0] for row in cur.fetchall()]
-                    result: dict[str, Any] = {}
-                    for t in tables:
-                        if not _is_valid_identifier(t):
-                            continue
-                        cur.execute(f'PRAGMA table_info("{t}")')
-                        result[t] = [
-                            {"cid": row[0], "name": row[1], "type": row[2], "notnull": bool(row[3]), "dflt_value": row[4], "pk": bool(row[5])}
-                            for row in cur.fetchall()
-                        ]
-                    return {"success": True, "tables": result}
-            finally:
-                cur.close()
+                return {"success": True, "tables": result}
+        finally:
+            cur.close()
+
+    async def schema(self, table: str | None = None) -> dict[str, Any]:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_schema, table)
 
 
 def _is_valid_identifier(name: str) -> bool:
@@ -291,8 +311,41 @@ def to_pg_sql(sql: str) -> str:
     return "".join(parts)
 
 
+def _prepare_postgres_connection(connection_url: str) -> tuple[str, Any]:
+    """Strip sslmode from a Postgres DSN safely and map it to an asyncpg ssl option."""
+    parsed = urlsplit(connection_url)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    sslmode: str | None = None
+    remaining: list[tuple[str, str]] = []
+    for k, v in query_pairs:
+        if k.lower() == "sslmode":
+            sslmode = v.lower()
+        else:
+            remaining.append((k, v))
+
+    clean_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(remaining), parsed.fragment))
+
+    if sslmode is None:
+        return clean_url, None
+    if sslmode == "disable":
+        return clean_url, False
+    if sslmode in ("prefer", "require"):
+        return clean_url, sslmode
+    if sslmode == "verify-ca":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return clean_url, ctx
+    if sslmode == "verify-full":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return clean_url, ctx
+    raise ValueError(f"Unsupported PostgreSQL sslmode: {sslmode!r}")
+
+
 class PostgresBackend(DatabaseBackend):
-    """PostgreSQL backend connector (using asyncpg or psycopg when available)."""
+    """PostgreSQL backend connector (using asyncpg)."""
 
     def __init__(self, connection_url: str) -> None:
         self.connection_url = connection_url
@@ -301,26 +354,22 @@ class PostgresBackend(DatabaseBackend):
     async def connect(self) -> None:
         try:
             import asyncpg  # type: ignore
-            url = self.connection_url
-            ssl_val: Any = None
-            if "sslmode=require" in url or "sslmode=verify-full" in url or "sslmode=verify-ca" in url:
-                ssl_val = "require"
-                url = url.replace("?sslmode=require", "").replace("&sslmode=require", "")
-                url = url.replace("?sslmode=verify-full", "").replace("&sslmode=verify-full", "")
-                url = url.replace("?sslmode=verify-ca", "").replace("&sslmode=verify-ca", "")
+        except ImportError as e:
+            raise RuntimeError(
+                "Cannot connect to PostgreSQL because 'asyncpg' is not installed. "
+                "To fix, install asyncpg (e.g. 'pip install asyncpg' or 'uv add asyncpg')."
+            ) from e
 
-            kwargs: dict[str, Any] = {
-                "min_size": 1,
-                "max_size": 10,
-                "statement_cache_size": 0,  # Critical for PgBouncer / Supavisor / Neon poolers
-            }
-            if ssl_val is not None:
-                kwargs["ssl"] = ssl_val
+        url, ssl_val = _prepare_postgres_connection(self.connection_url)
+        kwargs: dict[str, Any] = {
+            "min_size": 1,
+            "max_size": 10,
+            "statement_cache_size": 0,  # Critical for PgBouncer / Supavisor / Neon poolers
+        }
+        if ssl_val is not None:
+            kwargs["ssl"] = ssl_val
 
-            self._pool = await asyncpg.create_pool(url, **kwargs)
-        except ImportError:
-            # Fallback or informative notice
-            pass
+        self._pool = await asyncpg.create_pool(url, **kwargs)
 
     async def close(self) -> None:
         if self._pool:

@@ -8,11 +8,24 @@ import httpx
 from .base import BaseClassifier, ClassifyResponse
 
 
+DEFAULT_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def _normalize_chat_completions_url(url: str) -> str:
+    trimmed = url.strip().rstrip("/")
+    if not trimmed:
+        return DEFAULT_CHAT_COMPLETIONS_URL
+    if trimmed.endswith("/chat/completions"):
+        return trimmed
+    return f"{trimmed}/chat/completions"
+
+
 class LlmProxyClassifier(BaseClassifier):
     """Zero-shot command safety classifier via external LLM endpoint."""
 
     def __init__(self, api_url: str | None = None, api_key: str | None = None, model: str = "gpt-4o-mini") -> None:
-        self.api_url = api_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
+        raw_url = api_url or os.environ.get("OPENAI_BASE_URL") or DEFAULT_CHAT_COMPLETIONS_URL
+        self.api_url = _normalize_chat_completions_url(raw_url)
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.model = model
 

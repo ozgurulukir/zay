@@ -75,7 +75,6 @@ def parse_args() -> argparse.Namespace:
     )
     serve_parser.add_argument("--host", default=DEFAULT_BIND_HOST, help=f"Bind host (default: {DEFAULT_BIND_HOST})")
     serve_parser.add_argument("--port", type=int, default=DEFAULT_BIND_PORT, help=f"Bind port (default: {DEFAULT_BIND_PORT})")
-    serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
 
     # Download subcommand
     download_parser = subparsers.add_parser("download", help="Pre-download model weights from HuggingFace")
