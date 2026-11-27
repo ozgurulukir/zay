@@ -223,11 +223,15 @@ pub const McpClient = struct {
     /// of wedging it in CONNECTING with stale tools. On OOM the client ends
     /// up cleanly `.disabled` (stopped, cache empty) rather than half-failed.
     pub fn setError(self: *McpClient, io: std.Io, comptime fmt: []const u8, args: anytype) void {
-        switch (self.lifecycle) {
-            .stdio, .sse => self.stop(io),
-            else => {},
-        }
+        self.setErrorFromWorker(io, fmt, args);
         self.clearTools();
+    }
+
+    /// Worker-thread variant of `setError`: stops the live transport and
+    /// transitions `lifecycle` to `.failed` under `transport_mutex`, without
+    /// mutating `self.discovery.tools` (which is owned by the main/UI thread).
+    pub fn setErrorFromWorker(self: *McpClient, io: std.Io, comptime fmt: []const u8, args: anytype) void {
+        self.stop(io);
         // Allocate the replacement before freeing the old reason: on OOM the
         // client keeps a coherent (already-stopped) state instead of carrying
         // a freed `.failed` reason.
@@ -238,8 +242,8 @@ pub const McpClient = struct {
         // Serialize the lifecycle overwrite with any worker's capture bracket
         // (#385) — a capture that took the `.stdio` tag branch must never
         // dereference a union mid-overwrite.
-        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
-        defer if (locked) self.transport_mutex.unlock(io);
+        self.transport_mutex.lockUncancelable(io);
+        defer self.transport_mutex.unlock(io);
         if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
         self.lifecycle = .{ .failed = .{ .reason = reason } };
     }

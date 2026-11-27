@@ -155,7 +155,7 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
         const io_storage = @as(*std.Io, @ptrCast(@alignCast(c.lua_newuserdata(L, @sizeOf(std.Io)))));
         io_storage.* = io.?;
         c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_io");
-        registerPluginApi(L);
+        registerPluginApi(L, permissions);
         // Copy the enforced get_env gate into the state's own registry
         // (#448): full-access states are trusted host builds and serve
         // anything; plugin states get exactly what the manifest granted.
@@ -211,7 +211,7 @@ fn registerPluginTable(L: *c.lua_State) void {
 /// Register Zay plugin API functions into the `zay` global table.
 /// These are safe C functions that plugins can call instead of blocked
 /// libraries like `io.*`.
-fn registerPluginApi(L: *c.lua_State) void {
+fn registerPluginApi(L: *c.lua_State, permissions: Permissions) void {
     // Initialize module cache in registry
     c.lua_newtable(L);
     c.lua_setfield(L, c.LUA_REGISTRYINDEX, "zay_loaded_modules");
@@ -231,10 +231,6 @@ fn registerPluginApi(L: *c.lua_State) void {
         .{ .name = "file_info", .func = plugin_api.fileInfo },
         .{ .name = "mkdir", .func = plugin_api.mkdir },
         .{ .name = "copy_path", .func = plugin_api.copyPath },
-        .{ .name = "move_path", .func = plugin_api.movePath },
-        .{ .name = "delete_path", .func = plugin_api.deletePath },
-        .{ .name = "run_bash", .func = plugin_api.runBash },
-        .{ .name = "run_shell", .func = plugin_api.runShell },
         .{ .name = "get_env", .func = plugin_api.getEnv },
         .{ .name = "get_cwd", .func = plugin_api.getCwd },
         .{ .name = "get_project_root", .func = plugin_api.getProjectRoot },
@@ -255,6 +251,20 @@ fn registerPluginApi(L: *c.lua_State) void {
     for (funcs) |f| {
         execution.pushGuardedFunction(L, f.func);
         c.lua_setfield(L, -2, f.name.ptr);
+    }
+
+    if (permissions.allow_os_remove or permissions.full_access) {
+        execution.pushGuardedFunction(L, plugin_api.movePath);
+        c.lua_setfield(L, -2, "move_path");
+        execution.pushGuardedFunction(L, plugin_api.deletePath);
+        c.lua_setfield(L, -2, "delete_path");
+    }
+
+    if (permissions.allow_os_execute or permissions.full_access) {
+        execution.pushGuardedFunction(L, plugin_api.runBash);
+        c.lua_setfield(L, -2, "run_bash");
+        execution.pushGuardedFunction(L, plugin_api.runShell);
+        c.lua_setfield(L, -2, "run_shell");
     }
 
     // Set zay as a global
@@ -780,4 +790,28 @@ test "sandbox: budget API no-ops on a manifest-shaped extraspace" {
     try std.testing.expect(armed != 0);
     try std.testing.expect(capped >= t0);
     try std.testing.expect(capped <= t0 + 2 * std.time.ns_per_s);
+}
+
+test "sandbox gates zay shell and destructive path bridges on manifest permissions (#630)" {
+    const io = std.testing.io;
+    {
+        var L = try createSandboxedStateWithIo(.{}, io);
+        defer destroySandboxedState(&L);
+        try std.testing.expect(L.doString(
+            \\assert(zay.run_bash == nil, "run_bash must be hidden without allow_os_execute")
+            \\assert(zay.run_shell == nil, "run_shell must be hidden without allow_os_execute")
+            \\assert(zay.delete_path == nil, "delete_path must be hidden without allow_os_remove")
+            \\assert(zay.move_path == nil, "move_path must be hidden without allow_os_remove")
+        ));
+    }
+    {
+        var L = try createSandboxedStateWithIo(.{ .allow_os_execute = true, .allow_os_remove = true }, io);
+        defer destroySandboxedState(&L);
+        try std.testing.expect(L.doString(
+            \\assert(type(zay.run_bash) == "function")
+            \\assert(type(zay.run_shell) == "function")
+            \\assert(type(zay.delete_path) == "function")
+            \\assert(type(zay.move_path) == "function")
+        ));
+    }
 }

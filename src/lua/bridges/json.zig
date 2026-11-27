@@ -105,6 +105,13 @@ fn writeLuaValueJson(
         c.LUA_TNIL => try writer.writeAll("null"),
         c.LUA_TBOOLEAN => try writer.writeAll(if (c.lua_toboolean(L, index) != 0) "true" else "false"),
         c.LUA_TNUMBER => {
+            if (c.lua_isinteger(L, index) == 0) {
+                const num = c.lua_tonumberx(L, index, null);
+                if (!std.math.isFinite(num)) {
+                    try writer.writeAll("null");
+                    return;
+                }
+            }
             var len: usize = 0;
             const ptr = c.lua_tolstring(L, index, &len);
             if (ptr) |p| try writer.writeAll(p[0..len]) else try writer.writeAll("0");
@@ -276,6 +283,14 @@ fn writeIndent(writer: *std.Io.Writer, depth: usize) JsonWriteError!void {
 
 /// Recursively push a `std.json.Value` onto the Lua stack.
 pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value) !void {
+    const top = c.lua_gettop(L);
+    errdefer c.lua_settop(L, top);
+    return pushJsonValueDepth(L, gpa, value, 0);
+}
+
+fn pushJsonValueDepth(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value, depth: usize) !void {
+    if (depth >= max_json_depth) return error.JsonTooDeep;
+    if (c.lua_checkstack(L, 4) == 0) return error.LuaStackOverflow;
     switch (value) {
         .null => c.lua_pushnil(L),
         .bool => |b| c.lua_pushboolean(L, if (b) 1 else 0),
@@ -294,7 +309,7 @@ pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Va
         .array => |items| {
             c.lua_createtable(L, @intCast(items.items.len), 0);
             for (items.items, 0..) |item, i| {
-                try pushJsonValue(L, gpa, item);
+                try pushJsonValueDepth(L, gpa, item, depth + 1);
                 c.lua_rawseti(L, -2, @intCast(i + 1));
             }
         },
@@ -303,7 +318,7 @@ pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Va
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 _ = c.lua_pushlstring(L, entry.key_ptr.ptr, entry.key_ptr.len);
-                try pushJsonValue(L, gpa, entry.value_ptr.*);
+                try pushJsonValueDepth(L, gpa, entry.value_ptr.*, depth + 1);
                 _ = c.lua_settable(L, -3);
             }
         },
@@ -389,6 +404,34 @@ test "bridges.json: table with numeric and mixed keys does not corrupt lua_next"
         \\assert(decoded["foo"] == "bar", "string key foo should be encoded")
         \\return "OK"
     );
+}
+
+test "bridges.json: non-finite floats serialize as null (#630)" {
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer sandbox.destroySandboxedState(&L);
+    try expectLuaOk(&L,
+        \\assert(zay.json_encode(math.huge) == "null", "inf must encode as null")
+        \\assert(zay.json_encode(-math.huge) == "null", "-inf must encode as null")
+        \\assert(zay.json_encode(0/0) == "null", "nan must encode as null")
+        \\return "OK"
+    );
+}
+
+test "bridges.json: pushJsonValue rejects deeply nested JSON (#630)" {
+    const gpa = std.testing.allocator;
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer sandbox.destroySandboxedState(&L);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    for (0..max_json_depth + 2) |_| try buf.append(gpa, '[');
+    for (0..max_json_depth + 2) |_| try buf.append(gpa, ']');
+
+    const top_before = c.lua_gettop(L.handle);
+    try std.testing.expectError(error.JsonTooDeep, pushJsonToLua(L.handle, gpa, buf.items));
+    try std.testing.expectEqual(top_before, c.lua_gettop(L.handle));
 }
 
 test "bridges.json: circular table bounds recursion without host crash" {

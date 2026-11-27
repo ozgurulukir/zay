@@ -223,18 +223,18 @@ pub fn listToolsFresh(self: *McpClient, io: std.Io) !std.ArrayList(discovery_mod
 fn sendRequestWithRecovery(self: *McpClient, io: std.Io, method: []const u8, params_json: ?[]const u8) ![]u8 {
     return self.sendRequest(io, method, params_json) catch |err| switch (err) {
         error.McpServerCrashed => {
-            self.setError(io, "MCP server crashed", .{});
+            self.setErrorFromWorker(io, "MCP server crashed", .{});
             return error.McpServerCrashed;
         },
         error.McpSessionExpired => {
             initialize(self, io) catch |init_err| {
-                self.setError(io, "MCP session expired and re-initialize failed: {s}", .{@errorName(init_err)});
+                self.setErrorFromWorker(io, "MCP session expired and re-initialize failed: {s}", .{@errorName(init_err)});
                 return init_err;
             };
             return self.sendRequest(io, method, params_json) catch |retry_err| {
                 switch (retry_err) {
                     error.McpServerCrashed, error.McpSessionExpired => {
-                        self.setError(io, "MCP request failed after session refresh: {s}", .{@errorName(retry_err)});
+                        self.setErrorFromWorker(io, "MCP request failed after session refresh: {s}", .{@errorName(retry_err)});
                     },
                     else => {},
                 }
@@ -250,13 +250,18 @@ fn sendRequestWithRecovery(self: *McpClient, io: std.Io, method: []const u8, par
 /// JSON-RPC errors and `isError: true` both return the server's message
 /// as text (not a Zig error) so the model can read what went wrong.
 pub fn callTool(self: *McpClient, io: std.Io, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
-    // Build params JSON with proper escaping for tool_name
+    // Validate and compact-serialize arguments_json so raw newlines or
+    // malformed JSON can never corrupt or inject NDJSON frames.
+    const parsed_args = std.json.parseFromSlice(std.json.Value, self.gpa, arguments_json, .{}) catch return error.InvalidArgumentsJson;
+    defer parsed_args.deinit();
+
+    // Build params JSON with proper escaping for tool_name and arguments
     var pw: std.Io.Writer.Allocating = .init(self.gpa);
     defer pw.deinit();
     try pw.writer.writeAll("{\"name\":");
     try std.json.Stringify.value(tool_name, .{}, &pw.writer);
     try pw.writer.writeAll(",\"arguments\":");
-    try pw.writer.writeAll(arguments_json);
+    try std.json.Stringify.value(parsed_args.value, .{}, &pw.writer);
     try pw.writer.writeAll("}");
     const params = try pw.toOwnedSlice();
     defer self.gpa.free(params);
@@ -582,4 +587,12 @@ test "McpClient listToolsFresh keeps the cache when a continuation page is malfo
     if (client.listToolsFresh(io)) |_| return error.ExpectedError else |_| {}
     try std.testing.expectEqual(@as(usize, 1), client.discovery.tools.items.len);
     try std.testing.expectEqualStrings("kept", client.discovery.tools.items[0].name);
+}
+
+test "callTool rejects invalid arguments_json before framing (#631)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var client = try McpClient.initStdio(gpa, "test", "echo", &.{});
+    defer client.deinit(io);
+    try std.testing.expectError(error.InvalidArgumentsJson, callTool(&client, io, "greet", "{not valid json\n{\"injected\":true}"));
 }

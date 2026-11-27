@@ -1542,7 +1542,7 @@ test "findFiles clamps a negative max_results without panicking" {
 test "runBash clamps a negative timeout without panicking" {
     if (os.is_windows) return error.SkipZigTest;
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local r = zay.run_bash("true", { timeout = -1 })
@@ -1555,7 +1555,7 @@ test "runBash clamps a negative timeout without panicking" {
 test "runBash pipes opts.stdin to the child (P4)" {
     if (os.is_windows) return error.SkipZigTest;
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local r = zay.run_bash("cat", { stdin = "hello stdin" })
@@ -1576,7 +1576,7 @@ test "runBash blocks unsafe commands via the local matcher (P5)" {
     // No classifier URL configured (null slot): the always-armed local
     // matcher must still block destructive commands.
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
     // A fresh dispatch context carries a null classifier_url, matching the
     // old unset slot: the always-armed local matcher handles the gate.
@@ -1595,7 +1595,7 @@ test "runBash safety gate holds with a configured-but-unreachable classifier (P5
     // matcher covers root-target deletion forms (`rm -rf /`-class), not every
     // destructive spelling — the remote classifier covers the full surface.
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
     execution.setDispatchCtx(L.handle, .{ .classifier_url = "http://127.0.0.1:1/classify" });
     if (os.is_windows) return error.SkipZigTest;
@@ -1614,7 +1614,7 @@ test "runBash and run_shell reject an empty command before any spawn (P5)" {
     // The guard is backend-independent and fires before classify and before
     // either backend's command.len > 0 assert.
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_execute = true }, std.testing.io);
     defer sandbox.destroySandboxedState(&L);
     try expectLuaOk(&L,
         \\local r1, e1 = zay.run_bash("")
@@ -1854,7 +1854,7 @@ test "plugin_api: deletePath removes regular file, empty dir, and recursive tree
     defer std.Io.Dir.cwd().deleteTree(io, test_base) catch {};
 
     const sandbox = @import("sandbox.zig");
-    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    var L = try sandbox.createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
     defer sandbox.destroySandboxedState(&L);
 
     // 1. Create and delete regular file

@@ -467,6 +467,12 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
         if (!has_custom_command) {
             _ = c.lua_getfield(L_ptr, 2, "files");
             if (!state.isNil(-1)) {
+                cmd_buf.appendSlice(std.heap.page_allocator, "git add --") catch {
+                    c.lua_pop(L_ptr, 1); // pop "files"
+                    state.pushNil();
+                    state.pushString("out of memory");
+                    return 2;
+                };
                 const file_list = appendGitFileArgs(&state, -1, &cmd_buf, false) catch {
                     c.lua_pop(L_ptr, 1); // pop "files"
                     state.pushNil();
@@ -693,4 +699,31 @@ fn runGitCommand(L: *c.lua_State, io: std.Io, cwd: []const u8, command: []const 
         execution.noteError(L, err);
         return err;
     };
+}
+
+test "gitCommit with opts.files prefixes git add -- instead of executing file paths (#617)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(dir_path);
+
+    const sandbox = @import("../sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer sandbox.destroySandboxedState(&L);
+    execution.setDispatchCtx(L.handle, .{ .cwd = dir_path });
+
+    // Even in a non-git temp dir, passing { "sh", "-c", "echo PWNED" } must
+    // invoke `git add -- 'sh' '-c' 'echo PWNED'`, NOT execute `sh -c ...`.
+    const ok = L.doString(
+        \\local res, err = zay.git_commit("msg", { files = { "sh", "-c", "echo PWNED" } })
+        \\assert(err == nil, "unexpected bridge error: " .. tostring(err))
+        \\assert(res.success == false, "expected git add to fail outside git repo")
+        \\assert(string.find(res.output, "PWNED", 1, true) == nil, "file arg was executed as shell command: " .. tostring(res.output))
+        \\return "OK"
+    );
+    try std.testing.expect(ok);
 }
