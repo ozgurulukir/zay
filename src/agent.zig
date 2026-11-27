@@ -139,6 +139,7 @@ pub const Agent = struct {
     message_queue: MessageQueue = .{},
     message_queue_storage: [agent_queue.capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.Io.Mutex = .init,
+    message_queue_seq: u64 = 0,
     /// Cache of pruned historical tool messages across run-loop iterations (TD-13).
     /// Prevents repeated allocations and string truncation during multi-step turns.
     tool_view_cache: context_assembly.PrunedToolCache = .{},

@@ -13,11 +13,11 @@
 //! cleanup; `clearQueue` no-ops) and sits outside this seam.
 //!
 //! Invariants carried by this module (do not split across modules): the
-//! lock-failure-tolerant no-op paths (`hasQueuedMessages` → false,
-//! `clearQueue`/`setQueuedSteer` → no-op, `takeQueuedUserMessage` → null;
-//! documented contextually in agent.zig and the concurrency test below), the
-//! FIFO-steer drain contract, the atomic `enqueueSteer` push+mark under one
-//! lock, and the `raw` bypass of `@`-mention expansion / skill prefixing.
+//! uncancelable lock paths (`hasQueuedMessages`, `clearQueue`,
+//! `peekQueuedUserMessage`, `takeQueuedUserMessage`), the lock-failure-tolerant
+//! `setQueuedSteer` no-op path, the FIFO-steer drain contract, the atomic
+//! `enqueueSteer` push+mark under one lock, and the `raw` bypass of `@`-mention
+//! expansion / skill prefixing.
 
 const std = @import("std");
 const agent_mod = @import("../agent.zig");
@@ -33,7 +33,9 @@ pub fn enqueueUser(self: *Agent, content: []const u8) !void {
     errdefer self.gpa.free(owned);
     try self.message_queue_mutex.lock(self.io);
     defer self.message_queue_mutex.unlock(self.io);
-    if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned })) return error.QueueFull;
+    const seq = self.message_queue_seq;
+    if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .seq = seq })) return error.QueueFull;
+    self.message_queue_seq += 1;
 }
 
 /// Queue a machine-generated user message delivered verbatim (no `@`-mention
@@ -46,7 +48,9 @@ pub fn enqueueRaw(self: *Agent, content: []const u8) !void {
     errdefer self.gpa.free(owned);
     try self.message_queue_mutex.lock(self.io);
     defer self.message_queue_mutex.unlock(self.io);
-    if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true })) return error.QueueFull;
+    const seq = self.message_queue_seq;
+    if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true, .seq = seq })) return error.QueueFull;
+    self.message_queue_seq += 1;
 }
 
 /// Queue a user message marked to steer (inject after the next tool batch).
@@ -58,7 +62,9 @@ pub fn enqueueSteer(self: *Agent, content: []const u8) !void {
     errdefer self.gpa.free(owned);
     try self.message_queue_mutex.lock(self.io);
     defer self.message_queue_mutex.unlock(self.io);
-    if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .steer = true })) return error.QueueFull;
+    const seq = self.message_queue_seq;
+    if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .steer = true, .seq = seq })) return error.QueueFull;
+    self.message_queue_seq += 1;
 }
 
 /// Whether any user message is waiting in the queue. The UI uses this to
@@ -78,7 +84,7 @@ pub fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
     // through the full expansion path. Only pop after insertion succeeds so
     // an error never drops the queued prompt (#543).
     if (peeked.raw) try self.addUser(peeked.prompt) else try self.addUserPrompt(peeked.prompt);
-    if (takeQueuedUserMessage(self, steer_only)) |popped| {
+    if (takeQueuedUserMessage(self, peeked.seq)) |popped| {
         self.gpa.free(popped.prompt);
     }
     return 1;
@@ -110,23 +116,20 @@ fn peekQueuedUserMessage(self: *Agent, steer_only: bool) !?QueuedUserMessage {
     const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
     if (steer_only and !front.steer) return null;
     const prompt_copy = try self.gpa.dupe(u8, front.prompt);
-    return .{ .prompt = prompt_copy, .steer = front.steer, .raw = front.raw };
+    return .{ .prompt = prompt_copy, .steer = front.steer, .raw = front.raw, .seq = front.seq };
 }
 
-/// Pop and return the front queued message. When `steer_only` is set, only
-/// pops if the front message is marked to steer (otherwise returns null,
-/// leaving the queue untouched). Caller owns `queued.prompt`.
-fn takeQueuedUserMessage(self: *Agent, steer_only: bool) ?QueuedUserMessage {
-    if (self.message_queue_mutex.lock(self.io)) |_| {
-        defer self.message_queue_mutex.unlock(self.io);
-        if (steer_only) {
-            const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
-            if (!front.steer) return null;
-        }
-        return self.message_queue.pop(&self.message_queue_storage);
-    } else |_| {
-        return null;
-    }
+/// Pop and return the front queued message if and only if its sequence ID
+/// matches `expected_seq`. Uses `lockUncancelable` so cancellation cannot
+/// leave an already-delivered entry stuck at the front of the queue, and
+/// checks `seq` so a concurrent `clearQueue` + `enqueueUser` never loses a
+/// newer undelivered message. Caller owns `queued.prompt`.
+fn takeQueuedUserMessage(self: *Agent, expected_seq: u64) ?QueuedUserMessage {
+    self.message_queue_mutex.lockUncancelable(self.io);
+    defer self.message_queue_mutex.unlock(self.io);
+    const front = self.message_queue.peek(&self.message_queue_storage) orelse return null;
+    if (front.seq != expected_seq) return null;
+    return self.message_queue.pop(&self.message_queue_storage);
 }
 
 /// Mark the queued message at logical `index` to steer (inject after the
@@ -348,4 +351,26 @@ test "clear queue drops messages without delivering them" {
 
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
+}
+
+test "takeQueuedUserMessage refuses to pop a newer entry after clearQueue + enqueue" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    try enqueueUser(&agent, "first");
+    const peeked = (try peekQueuedUserMessage(&agent, false)).?;
+    defer gpa.free(peeked.prompt);
+
+    clearQueue(&agent);
+    try enqueueUser(&agent, "second");
+
+    // Sequence ID mismatch: must not pop the newer "second" message.
+    try std.testing.expect(takeQueuedUserMessage(&agent, peeked.seq) == null);
+    try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
+
+    // Draining now delivers "second".
+    try std.testing.expectEqual(@as(u32, 1), try drainQueuedUserMessage(&agent, false));
+    try std.testing.expectEqualStrings("second", agent.messages()[0].text());
+    try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
 }

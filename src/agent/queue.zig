@@ -31,6 +31,9 @@ pub const QueuedUserMessage = struct {
     /// generated content (e.g. background-job completion notices) whose body
     /// must not be reinterpreted as file references.
     raw: bool = false,
+    /// Monotonic sequence ID assigned on enqueue so `takeQueuedUserMessage`
+    /// only pops the exact entry that `peekQueuedUserMessage` observed.
+    seq: u64 = 0,
 };
 
 /// Bounded queue of queued user messages with fixed capacity.
