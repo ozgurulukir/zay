@@ -34,6 +34,14 @@ def test_auth_unauthorized(client: TestClient):
     response = client.post("/v1/exec", json={"sql": "CREATE TABLE test (id INT);"})
     assert response.status_code == 401
 
+    # Non-ASCII API key header must return 401 rather than TypeError (500) in hmac.compare_digest
+    non_ascii_resp = client.post(
+        "/v1/exec",
+        json={"sql": "CREATE TABLE test (id INT);"},
+        headers=[(b"x-api-key", b"caf\xe9")],
+    )
+    assert non_ascii_resp.status_code == 401
+
 
 def test_exec_and_query(client: TestClient):
     headers = {"Authorization": "Bearer test-secret"}
@@ -142,7 +150,100 @@ def test_schema_invalid_identifier_rejected(client: TestClient):
 
 
 def test_postgres_backend_ssl_parsing():
-    from backend import PostgresBackend
+    import ssl
+    from backend import PostgresBackend, _prepare_postgres_connection
 
     b = PostgresBackend("postgresql://user:pass@ep-xyz.neon.tech/neondb?sslmode=require")
     assert b.connection_url.endswith("?sslmode=require")
+
+    # verify-full produces strict SSLContext with hostname checking and preserves other params
+    url, ssl_opt = _prepare_postgres_connection(
+        "postgresql://user:pass@db.example.com:5432/app?sslmode=verify-full&application_name=zay&connect_timeout=5"
+    )
+    assert url == "postgresql://user:pass@db.example.com:5432/app?application_name=zay&connect_timeout=5"
+    assert isinstance(ssl_opt, ssl.SSLContext)
+    assert ssl_opt.check_hostname is True
+    assert ssl_opt.verify_mode == ssl.CERT_REQUIRED
+
+    # verify-ca produces SSLContext with CA verification and check_hostname=False
+    url_ca, ssl_ca = _prepare_postgres_connection(
+        "postgresql://user:pass@db.example.com/app?connect_timeout=5&sslmode=verify-ca"
+    )
+    assert url_ca == "postgresql://user:pass@db.example.com/app?connect_timeout=5"
+    assert isinstance(ssl_ca, ssl.SSLContext)
+    assert ssl_ca.check_hostname is False
+    assert ssl_ca.verify_mode == ssl.CERT_REQUIRED
+
+    # require and disable
+    url_req, ssl_req = _prepare_postgres_connection("postgresql://u:p@host/db?sslmode=require")
+    assert url_req == "postgresql://u:p@host/db"
+    assert ssl_req == "require"
+
+    url_dis, ssl_dis = _prepare_postgres_connection("postgresql://u:p@host/db?sslmode=disable")
+    assert url_dis == "postgresql://u:p@host/db"
+    assert ssl_dis is False
+
+    # no sslmode
+    url_none, ssl_none = _prepare_postgres_connection("postgresql://u:p@host/db?application_name=zay")
+    assert url_none == "postgresql://u:p@host/db?application_name=zay"
+    assert ssl_none is None
+
+    # unsupported sslmode fails fast
+    with pytest.raises(ValueError, match="Unsupported PostgreSQL sslmode"):
+        _prepare_postgres_connection("postgresql://u:p@host/db?sslmode=invalid")
+
+
+def test_postgres_connect_fails_fast_without_asyncpg(monkeypatch):
+    import asyncio
+    from backend import PostgresBackend
+
+    monkeypatch.setitem(sys.modules, "asyncpg", None)
+    backend = PostgresBackend("postgresql://u:p@host/db")
+    with pytest.raises(RuntimeError, match="asyncpg"):
+        asyncio.run(backend.connect())
+
+
+def test_batch_rollback_preserves_original_error_when_not_in_transaction(client: TestClient):
+    headers = {"Authorization": "Bearer test-secret"}
+    # COMMIT ends the transaction early; the next invalid statement fails outside a transaction.
+    # The error should report the invalid SQL error, not "cannot rollback - no transaction is active".
+    resp = client.post(
+        "/v1/batch",
+        json={
+            "statements": [
+                {"sql": "COMMIT"},
+                {"sql": "SELECT * FROM nonexistent_table_xyz"},
+            ]
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "nonexistent_table_xyz" in resp.json()["detail"]
+    assert "no transaction is active" not in resp.json()["detail"]
+
+
+def test_validate_bind_security():
+    from server import parse_args, validate_bind_security
+
+    # Loopback hosts allowed without API key
+    validate_bind_security("127.0.0.1", None)
+    validate_bind_security("localhost", None)
+    validate_bind_security("::1", None)
+
+    # Non-loopback hosts refused without API key
+    with pytest.raises(ValueError, match="non-loopback"):
+        validate_bind_security("0.0.0.0", None)
+    with pytest.raises(ValueError, match="non-loopback"):
+        validate_bind_security("::", None)
+    with pytest.raises(ValueError, match="non-loopback"):
+        validate_bind_security("192.168.1.50", None)
+
+    # Allowed with API key or explicit override
+    validate_bind_security("0.0.0.0", "secret-key")
+    validate_bind_security("0.0.0.0", None, allow_unauthenticated=True)
+
+    # --reload flag removed; --allow-unauthenticated supported
+    args = parse_args(["--host", "0.0.0.0", "--allow-unauthenticated"])
+    assert args.allow_unauthenticated is True
+    with pytest.raises(SystemExit):
+        parse_args(["--reload"])
