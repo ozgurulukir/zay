@@ -8,5 +8,6 @@ return {
   permissions = {
     -- require_others is advisory pending enforcement (T3).
     require_others = false,
+    allow_os_remove = true,
   },
 }

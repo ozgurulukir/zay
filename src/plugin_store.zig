@@ -880,10 +880,23 @@ fn containsFile(files: []const File, path: []const u8) bool {
     return false;
 }
 
+fn isLoopbackHost(host: std.Uri.Component) bool {
+    const raw = switch (host) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+    return std.ascii.eqlIgnoreCase(raw, "localhost") or
+        std.mem.eql(u8, raw, "127.0.0.1") or
+        std.mem.eql(u8, raw, "::1") or
+        std.mem.eql(u8, raw, "[::1]");
+}
+
 fn validateHttpUrl(url: []const u8) !void {
     const uri = std.Uri.parse(url) catch return error.InvalidStoreUrl;
-    if (!(std.ascii.eqlIgnoreCase(uri.scheme, "http") or std.ascii.eqlIgnoreCase(uri.scheme, "https"))) return error.InvalidStoreUrl;
-    if (uri.host == null) return error.InvalidStoreUrl;
+    const host = uri.host orelse return error.InvalidStoreUrl;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http") and isLoopbackHost(host)) return;
+    return error.InvalidStoreUrl;
 }
 
 fn loadStoreRegistrations(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !std.ArrayList(StoreRegistration) {
@@ -1482,4 +1495,13 @@ test "removeStoreUrl purges all duplicate occurrences of store url" {
     var loaded = try loadStoreRegistrations(gpa, io, home);
     defer deinitStoreRegistrations(gpa, &loaded);
     try std.testing.expectEqual(@as(usize, 0), loaded.items.len);
+}
+
+test "validateHttpUrl requires https except for loopback hosts (#629)" {
+    try validateHttpUrl("https://example.com/store.json");
+    try validateHttpUrl("http://localhost:8080/store.json");
+    try validateHttpUrl("http://127.0.0.1:8080/store.json");
+    try validateHttpUrl("http://[::1]:8080/store.json");
+    try std.testing.expectError(error.InvalidStoreUrl, validateHttpUrl("http://example.com/store.json"));
+    try std.testing.expectError(error.InvalidStoreUrl, validateHttpUrl("ftp://example.com/store.json"));
 }

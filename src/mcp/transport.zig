@@ -51,6 +51,9 @@ pub const Notification = struct {
 
 /// Format a JSON-RPC 2.0 Request frame into an allocated string slice.
 pub fn formatRequest(gpa: std.mem.Allocator, id: i64, method: []const u8, params_json: ?[]const u8) ![]u8 {
+    if (params_json) |p| {
+        if (std.mem.indexOfAny(u8, p, "\r\n") != null) return error.InvalidFrame;
+    }
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
@@ -66,6 +69,9 @@ pub fn formatRequest(gpa: std.mem.Allocator, id: i64, method: []const u8, params
 
 /// Format a JSON-RPC 2.0 Notification frame into an allocated string slice.
 pub fn formatNotification(gpa: std.mem.Allocator, method: []const u8, params_json: ?[]const u8) ![]u8 {
+    if (params_json) |p| {
+        if (std.mem.indexOfAny(u8, p, "\r\n") != null) return error.InvalidFrame;
+    }
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
@@ -715,4 +721,12 @@ test "readSseResponse aborts when notification bytes flood past the aggregate by
         notifications.deinit(gpa);
     }
     try std.testing.expectError(error.McpStreamTooLarge, readSseResponseBounded(gpa, &reader, 1, &notifications, sse_notification_max, bytes_max));
+}
+
+test "formatRequest and formatNotification reject raw newlines in params_json (#631)" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFrame, formatRequest(gpa, 1, "tools/call", "{\"a\":1}\n{\"jsonrpc\":\"2.0\"}"));
+    try std.testing.expectError(error.InvalidFrame, formatRequest(gpa, 1, "tools/call", "{\"a\":1}\r"));
+    try std.testing.expectError(error.InvalidFrame, formatNotification(gpa, "notifications/test", "{\"a\":1}\n"));
+    try std.testing.expectError(error.InvalidFrame, formatNotification(gpa, "notifications/test", "{\"a\":1}\r"));
 }

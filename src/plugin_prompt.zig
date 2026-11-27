@@ -263,16 +263,12 @@ fn scanDirectory(
 /// as "nothing to say" and returns `error.FileNotFound` so the caller's
 /// skip path stays uniform.
 fn loadOne(gpa: std.mem.Allocator, io: std.Io, path: []const u8, plugin_name: []const u8) !PluginPrompt {
-    const file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
-    defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.size > max_body_bytes) return error.FileTooBig;
-    if (stat.size == 0) return error.FileNotFound;
-
-    const raw = try gpa.alloc(u8, @intCast(stat.size));
+    const raw = package.readFile(gpa, io, path, max_body_bytes) catch |err| switch (err) {
+        error.StreamTooLong => return error.FileTooBig,
+        else => return err,
+    };
     defer gpa.free(raw);
-    var reader = file.reader(io, &.{});
-    try reader.interface.readSliceAll(raw);
+    if (raw.len == 0) return error.FileNotFound;
 
     const body = skill_mod.stripFrontmatter(raw);
     if (body.len == 0) return error.FileNotFound;
@@ -669,4 +665,20 @@ test "formatForPrompt omission does not pin the budget for later plugins (#449)"
     const small_block = text[small_start..small_close];
     try std.testing.expect(std.mem.indexOf(u8, small_block, "error=") == null);
     try std.testing.expect(std.mem.indexOf(u8, small_block, "bbbbbbbbbb") != null);
+}
+
+test "loadOne rejects symlinked prompt.md (#629)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "top secret" });
+    try tmp.dir.symLink(io, "secret.txt", "prompt.md", .{});
+
+    const link_path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "prompt.md" });
+    defer gpa.free(link_path);
+
+    try std.testing.expectError(error.SymLinkLoop, loadOne(gpa, io, link_path, "evil"));
 }

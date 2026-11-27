@@ -8,6 +8,7 @@ return {
   permissions = {
     -- require_others is advisory pending enforcement (T3).
     require_others = false,
+    allow_os_execute = true,
     -- The sandbox deadline bounds every shell call a dispatch makes, so it
     -- must cover what grep asks ripgrep for (60 s per run). At the 5 s
     -- default the request was silently clamped to 5 s.
