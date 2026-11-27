@@ -190,12 +190,14 @@ const ChromeInner = struct {
         }
 
         // Horizontal separator under the search row.
-        var sep_col: u16 = 0;
-        while (sep_col < iw) : (sep_col += 1) {
-            surface.writeCell(sep_col, 1, .{
-                .char = .{ .grapheme = "─", .width = 1 },
-                .style = p.border,
-            });
+        if (ih > 1) {
+            var sep_col: u16 = 0;
+            while (sep_col < iw) : (sep_col += 1) {
+                surface.writeCell(sep_col, 1, .{
+                    .char = .{ .grapheme = "─", .width = 1 },
+                    .style = p.border,
+                });
+            }
         }
 
         const children = try ctx.arena.alloc(vxfw.SubSurface, 2);

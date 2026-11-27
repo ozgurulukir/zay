@@ -243,8 +243,8 @@ pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
         // The prompt slot is freed through its own context so the bytes are
         // released by the same allocator that allocated them.
         worker.pending_prompt.freeStale(worker.gpa);
-        worker.approval.deinit(worker.io, gpa);
-        worker.queue.deinit(worker.io, gpa);
+        worker.approval.deinit(worker.io, worker.gpa);
+        worker.queue.deinit(worker.io, worker.gpa);
     }
     switch (self.engine) {
         .idle => |*lane| lane.deinit(gpa),

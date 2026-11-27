@@ -242,12 +242,12 @@ pub fn visualRowStart(text: []const u8, target_row: u16, width: u16) usize {
         const spaces_width = gw(spaces);
         const word_width = gw(word);
         if (col > 0) {
-            if (col + spaces_width + word_width > width) {
-                row += 1;
+            if (col +| spaces_width +| word_width > width) {
+                row +|= 1;
                 col = 0;
                 if (row == target_row) return word_start;
             } else {
-                col = @min(width, col + spaces_width);
+                col = @min(width, col +| spaces_width);
             }
         }
         if (advanceRowStart(word, word_start, &row, &col, width, target_row)) |off| return off;
@@ -267,12 +267,12 @@ fn advanceRowStart(text: []const u8, base: usize, row: *u16, col: *u16, width: u
             local += grapheme.len;
             continue;
         }
-        if (col.* + cell_width > width) {
-            row.* += 1;
+        if (col.* +| cell_width > width) {
+            row.* +|= 1;
             col.* = 0;
             if (row.* == target_row) return base + local;
         }
-        col.* = @min(width, col.* + cell_width);
+        col.* = @min(width, col.* +| cell_width);
         local += grapheme.len;
     }
     return null;
@@ -314,7 +314,7 @@ const WrappedInputDraw = struct {
 /// Cell width of a string under the unicode width method — the same metric the
 /// renderer uses (`DrawContext.stringWidth` is a static wrapper over this).
 fn gw(s: []const u8) u16 {
-    return @intCast(vaxis.gwidth.gwidth(s, .unicode));
+    return @intCast(@min(vaxis.gwidth.gwidth(s, .unicode), std.math.maxInt(u16)));
 }
 
 pub fn wrappedTextRows(ctx: vxfw.DrawContext, text: []const u8, width: u16) u16 {
@@ -338,7 +338,7 @@ pub fn wrappedPosition(text: []const u8, cursor: usize, width: u16) WrappedTextP
     while (index < text.len) {
         if (cursor <= index) return .{ .row = row, .col = col };
         if (text[index] == '\n') {
-            row += 1;
+            row +|= 1;
             col = 0;
             index += 1;
             continue;
@@ -362,11 +362,11 @@ pub fn wrappedPosition(text: []const u8, cursor: usize, width: u16) WrappedTextP
         const spaces_width = gw(spaces);
         const word_width = gw(word);
         if (col > 0) {
-            if (col + spaces_width + word_width > width) {
-                row += 1;
+            if (col +| spaces_width +| word_width > width) {
+                row +|= 1;
                 col = 0;
             } else {
-                col = @min(width, col + spaces_width);
+                col = @min(width, col +| spaces_width);
             }
         }
         if (cursor <= index) return advancePosition(text[word_start..cursor], row, col, width);
@@ -385,11 +385,11 @@ fn advancePosition(text: []const u8, row_start: u16, col_start: u16, width: u16)
     while (iter.next()) |grapheme| {
         const cell_width = gw(grapheme.bytes(text));
         if (cell_width == 0) continue;
-        if (col + cell_width > width) {
-            row += 1;
+        if (col +| cell_width > width) {
+            row +|= 1;
             col = 0;
         }
-        col = @min(width, col + cell_width);
+        col = @min(width, col +| cell_width);
     }
     return .{ .row = row, .col = col };
 }
@@ -402,7 +402,7 @@ fn drawInputWrapped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const
     var index: usize = 0;
     while (index < text.len) {
         if (text[index] == '\n') {
-            row += 1;
+            row +|= 1;
             col = 0;
             index += 1;
             continue;
@@ -420,11 +420,11 @@ fn drawInputWrapped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const
             continue;
         }
 
-        const spaces_width: u16 = @intCast(ctx.stringWidth(spaces));
-        const word_width: u16 = @intCast(ctx.stringWidth(word));
+        const spaces_width: u16 = @intCast(@min(ctx.stringWidth(spaces), std.math.maxInt(u16)));
+        const word_width: u16 = @intCast(@min(ctx.stringWidth(word), std.math.maxInt(u16)));
         if (col > 0) {
-            if (col + spaces_width + word_width > draw.width) {
-                row += 1;
+            if (col +| spaces_width +| word_width > draw.width) {
+                row +|= 1;
                 col = 0;
             } else {
                 drawRunWrapped(surface, ctx, spaces, draw, &row, &col);
@@ -438,10 +438,10 @@ fn drawRunWrapped(surface: *vxfw.Surface, ctx: vxfw.DrawContext, text: []const u
     var iter = ctx.graphemeIterator(text);
     while (iter.next()) |grapheme| {
         const bytes = grapheme.bytes(text);
-        const cell_width: u16 = @intCast(ctx.stringWidth(bytes));
+        const cell_width: u16 = @intCast(@min(ctx.stringWidth(bytes), std.math.maxInt(u16)));
         if (cell_width == 0) continue;
-        if (col.* + cell_width > draw.width) {
-            row.* += 1;
+        if (col.* +| cell_width > draw.width) {
+            row.* +|= 1;
             col.* = 0;
         }
         if (row.* >= draw.first_visible) {
