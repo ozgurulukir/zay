@@ -600,28 +600,6 @@ fn attachClients(self: *AgentRuntime, plan: AttachPlan) !void {
     }
 }
 
-/// Sole caller is `tryAttachOpenAiResponsesFromConfig` — private.
-fn attachOpenAiResponsesClient(
-    self: *AgentRuntime,
-    provider_name: []const u8,
-    base_url: []const u8,
-    api_key: []const u8,
-    model_id: []const u8,
-    reasoning: ai.Reasoning,
-    user_headers: []const config_mod.ProviderHeader,
-) !void {
-    return attachClients(self, .{
-        .adapter = .responses,
-        .provider_name = provider_name,
-        .base_url = base_url,
-        .api_key = api_key,
-        .model_id = model_id,
-        .reasoning = reasoning,
-        .user_headers = user_headers,
-        .main_system_prompt = self.system_prompt,
-    });
-}
-
 fn languageModelMatches(a: ai.LanguageModel, b: ai.LanguageModel) bool {
     return switch (a) {
         .none => b == .none,

@@ -13,11 +13,11 @@
 //! cleanup; `clearQueue` no-ops) and sits outside this seam.
 //!
 //! Invariants carried by this module (do not split across modules): the
-//! lock-failure-tolerant no-op paths (`hasQueuedMessages` → false,
-//! `clearQueue`/`setQueuedSteer` → no-op, `takeQueuedUserMessage` → null;
-//! documented contextually in agent.zig and the concurrency test below), the
-//! FIFO-steer drain contract, the atomic `enqueueSteer` push+mark under one
-//! lock, and the `raw` bypass of `@`-mention expansion / skill prefixing.
+//! uncancelable lock paths (`hasQueuedMessages`, `clearQueue`,
+//! `peekQueuedUserMessage`, `takeQueuedUserMessage`), the lock-failure-tolerant
+//! `setQueuedSteer` no-op path, the FIFO-steer drain contract, the atomic
+//! `enqueueSteer` push+mark under one lock, and the `raw` bypass of `@`-mention
+//! expansion / skill prefixing.
 
 const std = @import("std");
 const agent_mod = @import("../agent.zig");
