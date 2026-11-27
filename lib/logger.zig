@@ -40,7 +40,7 @@ const State = struct {
     condition: std.Io.Condition = .init,
     io: std.Io = undefined,
     enabled_file: bool = false,
-    stderr_ready: bool = false,
+    stderr_ready: std.atomic.Value(bool) = .init(false),
     stderr_level: std.log.Level = .warn,
     /// True when `ZAY_LOG_STDERR_LEVEL` was explicitly set. When false and a
     /// `toast_sink` is installed, warn+ routes to the toast instead of stderr
@@ -83,16 +83,16 @@ pub const Options = struct {
 };
 
 pub fn init(options: Options) error{PathTooLong}!void {
-    if (state.mutex.lock(state.io)) |_| {
-        defer state.mutex.unlock(state.io);
+    if (state.mutex.lock(options.io)) |_| {
+        defer state.mutex.unlock(options.io);
 
         // Captured for every build — the stderr sink needs an `io` to write.
         state.io = options.io;
-        state.stderr_ready = true;
         state.stderr_level = options.stderr_level;
         state.stderr_explicit = options.stderr_explicit;
         state.toast_sink = options.toast_sink;
         state.max_bytes = options.max_bytes;
+        state.stderr_ready.store(true, .release);
 
         if (enabled_file) {
             if (state.enabled_file) return;
@@ -117,7 +117,7 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
     // stderr so early failures (config load before init) are still visible.
     // Uses the libc `write` (the binary links libc anyway; mirrors
     // `src/clipboard.zig`'s `std.c.write`), fd 2 = stderr.
-    if (!state.stderr_ready) {
+    if (!state.stderr_ready.load(.acquire)) {
         var buf: [4096]u8 = undefined;
         if (std.fmt.bufPrint(&buf, fmt, args)) |line| {
             platform.writeToFd(2, line);
@@ -134,6 +134,7 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
         break :blk std.fmt.bufPrint(&msg_buf, "logger format failed: {s}", .{@errorName(err)}) catch "logger format failed";
     };
 
+    var toast_sink_to_call: ?*const fn (level: std.log.Level, msg: []const u8) void = null;
     if (state.mutex.lock(state.io)) |_| {
         defer state.mutex.unlock(state.io);
 
@@ -150,7 +151,7 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
         const to_toast = state.toast_sink != null and is_warn_or_worse;
 
         if (to_stderr) writeStderrLine(formatted);
-        if (to_toast) if (state.toast_sink) |sink| sink(level, formatted);
+        if (to_toast) toast_sink_to_call = state.toast_sink;
 
         // Tee: file sink (Debug only).
         if (enabled_file and state.enabled_file) {
@@ -168,14 +169,18 @@ pub fn dispatch(level: std.log.Level, scope_name: []const u8, comptime fmt: []co
     } else |_| {
         // Lock failed (canceled) — drop the entry silently.
     }
+
+    if (toast_sink_to_call) |sink| sink(level, formatted);
 }
 
 pub fn deinit() void {
+    if (!state.stderr_ready.load(.acquire)) return;
+
     var residual_dropped: u64 = 0;
     var have_dropped = false;
     {
         if (state.mutex.lock(state.io)) |_| {
-            if (!state.stderr_ready and !state.enabled_file) {
+            if (!state.stderr_ready.load(.acquire) and !state.enabled_file) {
                 state.mutex.unlock(state.io);
                 return;
             }
@@ -206,7 +211,7 @@ pub fn deinit() void {
     if (have_dropped) {
         var drop_buf: [128]u8 = undefined;
         const text = std.fmt.bufPrint(&drop_buf, "logger dropped {d} entries (deinit)", .{residual_dropped}) catch "logger dropped entries (deinit)";
-        if (state.stderr_ready) {
+        if (state.stderr_ready.load(.acquire)) {
             if (state.mutex.lock(state.io)) |_| {
                 defer state.mutex.unlock(state.io);
                 writeStderrLine(text);
@@ -378,21 +383,21 @@ test "stderr sink is level-gated and deinit flushes the dropped count" {
     var capture_buf: [4096]u8 = undefined;
 
     const prev_io = state.io;
-    const prev_ready = state.stderr_ready;
+    const prev_ready = state.stderr_ready.load(.acquire);
     const prev_level = state.stderr_level;
     const prev_writer = state.stderr_writer;
     const prev_dropped = state.dropped;
     defer {
         // Restore global state — other tests in this file assume pre-init.
         state.io = prev_io;
-        state.stderr_ready = prev_ready;
+        state.stderr_ready.store(prev_ready, .release);
         state.stderr_level = prev_level;
         state.stderr_writer = prev_writer;
         state.dropped = prev_dropped;
     }
 
     state.io = io;
-    state.stderr_ready = true;
+    state.stderr_ready.store(true, .release);
     state.stderr_level = .warn;
     state.stderr_writer = capture.writer(io, &capture_buf);
     state.dropped = 0;
@@ -422,7 +427,7 @@ test "toast sink receives warn+ when stderr is not explicit" {
     var capture_buf: [4096]u8 = undefined;
 
     const prev_io = state.io;
-    const prev_ready = state.stderr_ready;
+    const prev_ready = state.stderr_ready.load(.acquire);
     const prev_level = state.stderr_level;
     const prev_explicit = state.stderr_explicit;
     const prev_sink = state.toast_sink;
@@ -430,7 +435,7 @@ test "toast sink receives warn+ when stderr is not explicit" {
     const prev_dropped = state.dropped;
     defer {
         state.io = prev_io;
-        state.stderr_ready = prev_ready;
+        state.stderr_ready.store(prev_ready, .release);
         state.stderr_level = prev_level;
         state.stderr_explicit = prev_explicit;
         state.toast_sink = prev_sink;
@@ -439,7 +444,7 @@ test "toast sink receives warn+ when stderr is not explicit" {
     }
 
     state.io = io;
-    state.stderr_ready = true;
+    state.stderr_ready.store(true, .release);
     state.stderr_level = .warn;
     state.stderr_explicit = false; // env var NOT set
     state.stderr_writer = capture.writer(io, &capture_buf);
@@ -479,7 +484,7 @@ test "explicit stderr level restores stderr alongside the toast sink" {
     var capture_buf: [4096]u8 = undefined;
 
     const prev_io = state.io;
-    const prev_ready = state.stderr_ready;
+    const prev_ready = state.stderr_ready.load(.acquire);
     const prev_level = state.stderr_level;
     const prev_explicit = state.stderr_explicit;
     const prev_sink = state.toast_sink;
@@ -487,7 +492,7 @@ test "explicit stderr level restores stderr alongside the toast sink" {
     const prev_dropped = state.dropped;
     defer {
         state.io = prev_io;
-        state.stderr_ready = prev_ready;
+        state.stderr_ready.store(prev_ready, .release);
         state.stderr_level = prev_level;
         state.stderr_explicit = prev_explicit;
         state.toast_sink = prev_sink;
@@ -496,7 +501,7 @@ test "explicit stderr level restores stderr alongside the toast sink" {
     }
 
     state.io = io;
-    state.stderr_ready = true;
+    state.stderr_ready.store(true, .release);
     state.stderr_level = .debug; // explicit: full stderr
     state.stderr_explicit = true;
     state.stderr_writer = capture.writer(io, &capture_buf);
@@ -531,4 +536,45 @@ test "formatTimestamp is pure and fills the caller buffer" {
     const buf_start = @intFromPtr(&buf);
     const buf_end = buf_start + buf.len;
     try std.testing.expect(ts_addr >= buf_start and ts_addr <= buf_end);
+}
+
+var test_reentrant_calls: usize = 0;
+
+fn testReentrantToastSink(level: std.log.Level, msg: []const u8) void {
+    _ = level;
+    _ = msg;
+    test_reentrant_calls += 1;
+    if (test_reentrant_calls == 1) {
+        // Re-entering dispatch from inside toast_sink must not deadlock.
+        dispatch(.warn, "test", "reentrant warn", .{});
+    }
+}
+
+test "toast sink invoked outside mutex does not deadlock on re-entrant dispatch" {
+    const io = std.testing.io;
+    const prev_io = state.io;
+    const prev_ready = state.stderr_ready.load(.acquire);
+    const prev_level = state.stderr_level;
+    const prev_explicit = state.stderr_explicit;
+    const prev_sink = state.toast_sink;
+    const prev_dropped = state.dropped;
+    defer {
+        state.io = prev_io;
+        state.stderr_ready.store(prev_ready, .release);
+        state.stderr_level = prev_level;
+        state.stderr_explicit = prev_explicit;
+        state.toast_sink = prev_sink;
+        state.dropped = prev_dropped;
+    }
+
+    state.io = io;
+    state.stderr_ready.store(true, .release);
+    state.stderr_level = .warn;
+    state.stderr_explicit = false;
+    state.dropped = 0;
+    test_reentrant_calls = 0;
+    state.toast_sink = testReentrantToastSink;
+
+    dispatch(.warn, "test", "outer warn", .{});
+    try std.testing.expectEqual(@as(usize, 2), test_reentrant_calls);
 }
