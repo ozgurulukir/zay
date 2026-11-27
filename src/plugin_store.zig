@@ -894,6 +894,11 @@ fn isLoopbackHost(host: std.Uri.Component) bool {
 fn validateHttpUrl(url: []const u8) !void {
     const uri = std.Uri.parse(url) catch return error.InvalidStoreUrl;
     const host = uri.host orelse return error.InvalidStoreUrl;
+    const raw_host = switch (host) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+    if (raw_host.len == 0) return error.InvalidStoreUrl;
     if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return;
     if (std.ascii.eqlIgnoreCase(uri.scheme, "http") and isLoopbackHost(host)) return;
     return error.InvalidStoreUrl;
@@ -1503,5 +1508,6 @@ test "validateHttpUrl requires https except for loopback hosts (#629)" {
     try validateHttpUrl("http://127.0.0.1:8080/store.json");
     try validateHttpUrl("http://[::1]:8080/store.json");
     try std.testing.expectError(error.InvalidStoreUrl, validateHttpUrl("http://example.com/store.json"));
+    try std.testing.expectError(error.InvalidStoreUrl, validateHttpUrl("https:///store.json"));
     try std.testing.expectError(error.InvalidStoreUrl, validateHttpUrl("ftp://example.com/store.json"));
 }

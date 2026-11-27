@@ -283,6 +283,8 @@ fn writeIndent(writer: *std.Io.Writer, depth: usize) JsonWriteError!void {
 
 /// Recursively push a `std.json.Value` onto the Lua stack.
 pub fn pushJsonValue(L: *c.lua_State, gpa: std.mem.Allocator, value: std.json.Value) !void {
+    const top = c.lua_gettop(L);
+    errdefer c.lua_settop(L, top);
     return pushJsonValueDepth(L, gpa, value, 0);
 }
 
@@ -427,7 +429,9 @@ test "bridges.json: pushJsonValue rejects deeply nested JSON (#630)" {
     for (0..max_json_depth + 2) |_| try buf.append(gpa, '[');
     for (0..max_json_depth + 2) |_| try buf.append(gpa, ']');
 
+    const top_before = c.lua_gettop(L.handle);
     try std.testing.expectError(error.JsonTooDeep, pushJsonToLua(L.handle, gpa, buf.items));
+    try std.testing.expectEqual(top_before, c.lua_gettop(L.handle));
 }
 
 test "bridges.json: circular table bounds recursion without host crash" {

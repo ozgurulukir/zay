@@ -242,8 +242,8 @@ pub const McpClient = struct {
         // Serialize the lifecycle overwrite with any worker's capture bracket
         // (#385) — a capture that took the `.stdio` tag branch must never
         // dereference a union mid-overwrite.
-        const locked = if (self.transport_mutex.lock(io)) true else |_| false;
-        defer if (locked) self.transport_mutex.unlock(io);
+        self.transport_mutex.lockUncancelable(io);
+        defer self.transport_mutex.unlock(io);
         if (self.lifecycle == .failed) self.gpa.free(self.lifecycle.failed.reason);
         self.lifecycle = .{ .failed = .{ .reason = reason } };
     }
