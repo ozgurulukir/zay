@@ -69,8 +69,9 @@ pub const QueryResult = struct {
 
     pub fn get(self: *const QueryResult, row_idx: usize, col_idx: usize) ?db.Value {
         if (row_idx >= self.rows.len) return null;
-        if (col_idx >= self.columns.len) return null;
-        return self.rows[row_idx][col_idx];
+        const row = self.rows[row_idx];
+        if (col_idx >= self.columns.len or col_idx >= row.len) return null;
+        return row[col_idx];
     }
 
     pub fn getInt(self: *const QueryResult, row_idx: usize, col_idx: usize) ?i64 {
@@ -249,6 +250,7 @@ pub const Client = struct {
         var rows = try aa.alloc([]db.Value, rows_val.array.items.len);
         for (rows_val.array.items, 0..) |row_item, r| {
             if (row_item != .array) return error.InvalidResponse;
+            if (row_item.array.items.len != columns.len) return error.InvalidResponse;
             var row_cells = try aa.alloc(db.Value, row_item.array.items.len);
             for (row_item.array.items, 0..) |cell, c| {
                 row_cells[c] = switch (cell) {
@@ -573,4 +575,35 @@ test "QueryResult accessors retrieve typed values correctly" {
     try std.testing.expectEqual(@as(f64, 99.5), res.getFloat(0, 2).?);
     try std.testing.expect(res.getInt(0, 1) == null);
     try std.testing.expect(res.getInt(1, 0) == null);
+}
+
+test "QueryResult.get returns null for ragged rows" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    const aa = arena.allocator();
+
+    var cols = try aa.alloc([]const u8, 2);
+    cols[0] = "a";
+    cols[1] = "b";
+
+    var types = try aa.alloc(db.ColumnType, 2);
+    types[0] = .int;
+    types[1] = .int;
+
+    var rows = try aa.alloc([]db.Value, 1);
+    var cells = try aa.alloc(db.Value, 1);
+    cells[0] = .{ .int = 42 };
+    rows[0] = cells;
+
+    var res = QueryResult{
+        .arena = arena,
+        .columns = cols,
+        .types = types,
+        .rows = rows,
+        .count = 1,
+    };
+    defer res.deinit();
+
+    try std.testing.expectEqual(@as(i64, 42), res.getInt(0, 0).?);
+    try std.testing.expect(res.get(0, 1) == null);
 }

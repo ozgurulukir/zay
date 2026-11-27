@@ -371,14 +371,14 @@ fn remoteAppliedVersion(target: anytype, io: std.Io) !?u32 {
     defer res.deinit();
     if (res.rows.len == 0 or res.rows[0].len == 0) return null;
     return switch (res.rows[0][0]) {
-        .int => |v| if (v > 0) @intCast(v) else null,
+        .int => |v| if (v > 0) std.math.cast(u32, v) orelse return error.InvalidMigrationVersion else null,
         else => null,
     };
 }
 
 fn remoteColumnExists(target: anytype, io: std.Io, table: []const u8, column: []const u8, is_postgres: bool) !bool {
     const sql = if (is_postgres)
-        "select count(*) from information_schema.columns where table_name = ? and column_name = ?"
+        "select count(*) from information_schema.columns where table_schema = current_schema() and table_name = ? and column_name = ?"
     else
         "select count(*) from pragma_table_info(?) where name = ?";
     var res = try target.query(io, sql, &.{ .{ .text = table }, .{ .text = column } });
@@ -392,7 +392,7 @@ fn remoteColumnExists(target: anytype, io: std.Io, table: []const u8, column: []
 
 fn remoteTableExists(target: anytype, io: std.Io, table: []const u8, is_postgres: bool) !bool {
     const sql = if (is_postgres)
-        "select count(*) from information_schema.tables where table_name = ?"
+        "select count(*) from information_schema.tables where table_schema = current_schema() and table_name = ?"
     else
         "select count(*) from sqlite_master where type = 'table' and name = ?";
     var res = try target.query(io, sql, &.{.{ .text = table }});
@@ -406,7 +406,7 @@ fn remoteTableExists(target: anytype, io: std.Io, table: []const u8, is_postgres
 
 fn remoteIndexExists(target: anytype, io: std.Io, index_name: []const u8, is_postgres: bool) !bool {
     const sql = if (is_postgres)
-        "select count(*) from pg_indexes where indexname = ?"
+        "select count(*) from pg_indexes where schemaname = current_schema() and indexname = ?"
     else
         "select count(*) from sqlite_master where type = 'index' and name = ?";
     var res = try target.query(io, sql, &.{.{ .text = index_name }});

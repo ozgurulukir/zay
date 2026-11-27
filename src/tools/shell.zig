@@ -245,7 +245,7 @@ pub fn Impl(comptime B: type) type {
                 }
             }
 
-            return runCapturedWithCancellation(gpa, io, resolved_cwd, command, &env_map, args.timeout_seconds, opts.cancel_requested);
+            return runCapturedWithCancellation(gpa, io, resolved_cwd, command, args.command, &env_map, args.timeout_seconds, opts.cancel_requested);
         }
 
         fn runCapturedWithCancellation(
@@ -253,6 +253,7 @@ pub fn Impl(comptime B: type) type {
             io: std.Io,
             cwd: []const u8,
             command: []const u8,
+            display_command: []const u8,
             env_map: *const std.process.Environ.Map,
             timeout_seconds: u32,
             cancel_requested: ?*const std.atomic.Value(bool),
@@ -272,7 +273,7 @@ pub fn Impl(comptime B: type) type {
             defer captured.deinit(gpa);
 
             const status: FinishStatus = if (captured.timed_out) .{ .timeout_seconds = timeout_seconds } else .{};
-            return finishOutput(gpa, &captured, status, command);
+            return finishOutput(gpa, &captured, status, display_command);
         }
 
         /// Whether the arguments request a background launch. Cheap parse used by

@@ -488,8 +488,12 @@ fn containsProtectedResultTable(gpa: std.mem.Allocator, sql: []const u8) std.mem
         const token = tokens.items[index];
         var scope = &scopes.items[scopes.items.len - 1];
         if (token.isSymbol('(')) {
+            const child_expects_table = scope.expects_table;
             if (scope.expects_table) scope.expects_table = false;
-            try scopes.append(gpa, .{});
+            try scopes.append(gpa, .{
+                .in_from_clause = child_expects_table,
+                .expects_table = child_expects_table,
+            });
             index += 1;
             continue;
         }
@@ -500,6 +504,12 @@ fn containsProtectedResultTable(gpa: std.mem.Allocator, sql: []const u8) std.mem
         }
 
         if (token.kind == .word) {
+            if (token.isWord("select") or token.isWord("with") or token.isWord("values")) {
+                scope.in_from_clause = false;
+                scope.expects_table = false;
+                index += 1;
+                continue;
+            }
             if (token.isWord("where") or token.isWord("group") or token.isWord("order") or
                 token.isWord("having") or token.isWord("limit") or token.isWord("window") or
                 token.isWord("union") or token.isWord("except") or token.isWord("intersect") or
@@ -1286,4 +1296,15 @@ test "database tool schema carries enum_values for action" {
     for (expected, action_prop.enum_values.?) |exp, act| {
         try std.testing.expectEqualStrings(exp, act);
     }
+}
+
+test "containsProtectedResultTable rejects parenthesized table expressions" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect(try containsProtectedResultTable(gpa, "SELECT * FROM (tool_results)"));
+    try std.testing.expect(try containsProtectedResultTable(gpa, "SELECT * FROM (tool_result_chunks)"));
+    try std.testing.expect(try containsProtectedResultTable(gpa, "SELECT * FROM ((tool_results))"));
+    try std.testing.expect(try containsProtectedResultTable(gpa, "SELECT * FROM (sessions, tool_results)"));
+    try std.testing.expect(try containsProtectedResultTable(gpa, "SELECT * FROM (SELECT * FROM tool_results)"));
+    try std.testing.expect(!(try containsProtectedResultTable(gpa, "SELECT * FROM (SELECT 1)")));
+    try std.testing.expect(!(try containsProtectedResultTable(gpa, "SELECT * FROM (sessions)")));
 }

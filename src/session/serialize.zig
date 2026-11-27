@@ -49,11 +49,6 @@ pub fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.
     const role_value = parsed.value.object.get("role") orelse return error.CorruptPayload;
     if (role_value != .string) return error.CorruptPayload;
     const role = ai.Role.fromString(role_value.string) catch return error.CorruptPayload;
-    const call_id = try optionalString(gpa, parsed.value, "call_id");
-    errdefer if (call_id) |id| gpa.free(id);
-    const tool_display_label = try optionalString(gpa, parsed.value, "tool_display_label");
-    errdefer if (tool_display_label) |label| gpa.free(label);
-    const tool_failed = try optionalBool(parsed.value, "tool_failed");
     const content_value = parsed.value.object.get("content") orelse return error.CorruptPayload;
     const content = try parseContentBlocks(gpa, content_value);
     errdefer freeContentBlocks(gpa, content);
@@ -61,13 +56,20 @@ pub fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.
         .system => .{ .system = .{ .content = content } },
         .user => .{ .user = .{ .content = content } },
         .assistant => .{ .assistant = .{ .content = content } },
-        .tool => .{
-            .tool = .{
-                .content = content,
-                .call_id = .{ .value = call_id orelse return error.CorruptPayload },
-                .display_label = tool_display_label,
-                .failed = tool_failed,
-            },
+        .tool => blk: {
+            const call_id = try optionalString(gpa, parsed.value, "call_id");
+            errdefer if (call_id) |id| gpa.free(id);
+            const tool_display_label = try optionalString(gpa, parsed.value, "tool_display_label");
+            errdefer if (tool_display_label) |label| gpa.free(label);
+            const tool_failed = try optionalBool(parsed.value, "tool_failed");
+            break :blk .{
+                .tool = .{
+                    .content = content,
+                    .call_id = .{ .value = call_id orelse return error.CorruptPayload },
+                    .display_label = tool_display_label,
+                    .failed = tool_failed,
+                },
+            };
         },
     };
 }
@@ -75,6 +77,7 @@ pub fn jsonToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.
 pub fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) Error!ai.ChatMessage {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, payload_json, .{}) catch return error.CorruptPayload;
     defer parsed.deinit();
+    if (parsed.value != .object) return error.CorruptPayload;
     const summary = parsed.value.object.get("summary") orelse return error.CorruptPayload;
     if (summary != .string) return error.CorruptPayload;
     const content = try std.fmt.allocPrint(gpa, "Branch summary: {s}", .{summary.string});
@@ -87,13 +90,17 @@ pub fn branchSummaryToMessage(gpa: std.mem.Allocator, payload_json: []const u8) 
 pub fn parseContentBlocks(gpa: std.mem.Allocator, value: std.json.Value) Error![]ai.ContentBlock {
     if (value == .string) {
         const blocks = try gpa.alloc(ai.ContentBlock, 1);
+        errdefer gpa.free(blocks);
         blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, value.string) } };
         return blocks;
     }
     if (value != .array) return error.CorruptPayload;
     const blocks = try gpa.alloc(ai.ContentBlock, value.array.items.len);
     var initialized: usize = 0;
-    errdefer freeContentBlocks(gpa, blocks[0..initialized]);
+    errdefer {
+        for (blocks[0..initialized]) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
     for (value.array.items) |item| {
         blocks[initialized] = try ai.ContentBlock.fromJson(gpa, item);
         initialized += 1;
@@ -123,10 +130,15 @@ pub fn parseToolCalls(gpa: std.mem.Allocator, value: std.json.Value) Error![]con
         if (id != .string) return error.CorruptPayload;
         if (name != .string) return error.CorruptPayload;
         if (arguments != .string) return error.CorruptPayload;
+        const duped_id = try gpa.dupe(u8, id.string);
+        errdefer gpa.free(duped_id);
+        const duped_name = try gpa.dupe(u8, name.string);
+        errdefer gpa.free(duped_name);
+        const duped_arguments = try gpa.dupe(u8, arguments.string);
         calls[initialized] = .{
-            .call_id = .{ .value = try gpa.dupe(u8, id.string) },
-            .name = try gpa.dupe(u8, name.string),
-            .arguments = try gpa.dupe(u8, arguments.string),
+            .call_id = .{ .value = duped_id },
+            .name = duped_name,
+            .arguments = duped_arguments,
         };
         initialized += 1;
     }
@@ -333,4 +345,27 @@ test "titleToJson escapes quotes for embedding in stored payloads" {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, encoded, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("say \"hi\" \\ back", parsed.value.object.get("title").?.string);
+}
+
+test "branchSummaryToMessage rejects non-object JSON without panicking" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.CorruptPayload, branchSummaryToMessage(gpa, "[]"));
+    try std.testing.expectError(error.CorruptPayload, branchSummaryToMessage(gpa, "\"summary\""));
+    try std.testing.expectError(error.CorruptPayload, branchSummaryToMessage(gpa, "123"));
+}
+
+test "jsonToMessage does not leak tool metadata on non-tool roles" {
+    const gpa = std.testing.allocator;
+    var msg = try jsonToMessage(gpa,
+        \\{"role":"user","content":"hello","call_id":"call_1","tool_display_label":"lbl"}
+    );
+    defer msg.deinit(gpa);
+    try std.testing.expect(msg == .user);
+}
+
+test "parseContentBlocks frees full allocation on partial element failure" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.CorruptPayload, jsonToMessage(gpa,
+        \\{"role":"user","content":[{"type":"text","text":"ok"},{"type":"bogus"}]}
+    ));
 }

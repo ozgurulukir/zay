@@ -154,7 +154,8 @@ pub const Statement = struct {
 
     pub fn bindBlob(self: *Statement, index: i32, value: []const u8) Error!void {
         assert(index > 0);
-        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, @intCast(value.len), sqliteTransient()));
+        const len = std.math.cast(c_int, value.len) orelse return error.Misuse;
+        try self.check(c.sqlite3_bind_blob(self.handle, index, value.ptr, len, sqliteTransient()));
     }
 
     pub fn bindValue(self: *Statement, index: i32, value: Value) Error!void {

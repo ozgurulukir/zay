@@ -40,15 +40,15 @@ pub const Backend = struct {
     /// The `cd:` message writes to stderr so it is captured but the guard still
     /// fails the command.
     pub const cd_guard_functions =
-        \\function Set-Location { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Path)
+        \\New-Item -Path Function:\Set-Location -Options Constant -Force -Value { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Path)
         \\    $target = if ($Path.Count -eq 0) { (Get-Location).Path } else { $Path[0] }
         \\    $abs = if ([System.IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Get-Location) $target }
         \\    $abs = [System.IO.Path]::GetFullPath($abs)
         \\    $root = $_zay_root.TrimEnd('\', '/')
-        \\    if ($abs -ne $_zay_root -and $abs -ne $root -and $abs -notlike "$root\*") { throw "cd: $abs escapes the workspace root" }
-        \\    Microsoft.PowerShell.Management\Set-Location @Path }
-        \\function Push-Location { throw "pushd: not allowed in this workspace" }
-        \\function Pop-Location  { throw "popd: not allowed in this workspace" }
+        \\    if ($abs -ne $_zay_root -and $abs -ne $root -and !$abs.StartsWith("$root\", [System.StringComparison]::OrdinalIgnoreCase)) { throw "cd: $abs escapes the workspace root" }
+        \\    Microsoft.PowerShell.Management\Set-Location @Path } | Out-Null
+        \\New-Item -Path Function:\Push-Location -Options Constant -Force -Value { throw "pushd: not allowed in this workspace" } | Out-Null
+        \\New-Item -Path Function:\Pop-Location -Options Constant -Force -Value { throw "popd: not allowed in this workspace" } | Out-Null
         \\
     ;
 
@@ -82,7 +82,7 @@ pub const Backend = struct {
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
-        try out.appendSlice(gpa, "$_zay_root = [System.IO.Path]::GetFullPath('");
+        try out.appendSlice(gpa, "New-Variable -Name _zay_root -Value ([System.IO.Path]::GetFullPath('");
         for (normalized_root) |c| {
             if (c == '\'') {
                 try out.appendSlice(gpa, "''");
@@ -90,7 +90,7 @@ pub const Backend = struct {
                 try out.append(gpa, c);
             }
         }
-        try out.appendSlice(gpa, "');\n");
+        try out.appendSlice(gpa, "')) -Option Constant;\n");
         try out.appendSlice(gpa, cd_guard_functions);
         try out.appendSlice(gpa, command);
         return out.toOwnedSlice(gpa);
@@ -228,9 +228,10 @@ test "prependCdGuard anchors on the project root and defines the guard" {
     const guarded = try Backend.prependCdGuard(gpa, "C:\\Users\\u\\repo", "Write-Output hi");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.startsWith(u8, guarded, "$_zay_root = [System.IO.Path]::GetFullPath('C:\\Users\\u\\repo');\n"));
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "function Set-Location") != null);
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "function Push-Location") != null);
+    try std.testing.expect(std.mem.startsWith(u8, guarded, "New-Variable -Name _zay_root -Value ([System.IO.Path]::GetFullPath('C:\\Users\\u\\repo')) -Option Constant;\n"));
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "Function:\\Set-Location -Options Constant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "Function:\\Push-Location -Options Constant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "StartsWith(\"$root\\\", [System.StringComparison]::OrdinalIgnoreCase)") != null);
     try std.testing.expect(std.mem.endsWith(u8, guarded, "Write-Output hi"));
 }
 
@@ -239,7 +240,7 @@ test "prependCdGuard doubles single quotes in the root path" {
     const guarded = try Backend.prependCdGuard(gpa, "C:\\Repo O'Brien", "true");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_zay_root = [System.IO.Path]::GetFullPath('C:\\Repo O''Brien');") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "New-Variable -Name _zay_root -Value ([System.IO.Path]::GetFullPath('C:\\Repo O''Brien')) -Option Constant;") != null);
 }
 
 test "prependCdGuard canonicalizes forward slashes in project root" {
@@ -247,7 +248,7 @@ test "prependCdGuard canonicalizes forward slashes in project root" {
     const guarded = try Backend.prependCdGuard(gpa, "C:/Users/u/repo", "Write-Output hi");
     defer gpa.free(guarded);
 
-    try std.testing.expect(std.mem.indexOf(u8, guarded, "$_zay_root = [System.IO.Path]::GetFullPath('") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guarded, "New-Variable -Name _zay_root -Value ([System.IO.Path]::GetFullPath('") != null);
 }
 
 test "validateCwd handles case-folding, slash differences, and rejects prefix collisions" {
