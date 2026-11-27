@@ -50,7 +50,7 @@ pub fn clearWorkspaceBorrowForPath(app: *App, path: []const u8) !void {
         const agent = other.agent orelse continue;
         const ws = agent.workspaceBorrow() orelse continue;
         if (!lanes_util.pathsEqual(ws, path)) continue;
-        if (other.turn.isActive()) return error.InFlightTurn;
+        if (other.turn.isActive() or other.cancel_job != null) return error.InFlightTurn;
         agent.setWorkspace(null);
     }
 }
@@ -187,6 +187,7 @@ pub fn abandonLane(app: *App, index: u32) !void {
     std.debug.assert(index < app.threads.len());
     std.debug.assert(app.threads.len() <= max_threads);
     const lane = app.threads.slice()[index];
+    if (lane.cancel_job != null) return error.InFlightTurn;
     var branch: ?[]u8 = null;
     var dir: ?[]u8 = null;
     if (lanes_util.workingLaneOf(lane)) |w| {
@@ -244,9 +245,10 @@ pub fn reportLaneError(app: *App, err: anyerror) !void {
 
 pub fn mergeLane(app: *App, source: lanes_util.MergeSource, dest: *Thread) !void {
     std.debug.assert(app.threads.len() <= max_threads);
-    if (dest.turn.isActive()) return error.InFlightTurn;
+    if (dest.turn.isActive() or dest.cancel_job != null) return error.InFlightTurn;
     if (source.active_index) |si| {
-        if (app.threads.slice()[si].turn.isActive()) return error.InFlightTurn;
+        const src_lane = app.threads.slice()[si];
+        if (src_lane.turn.isActive() or src_lane.cancel_job != null) return error.InFlightTurn;
     }
     try clearWorkspaceBorrowForPath(app, source.path);
     const dest_dir = laneMergeDir(app, dest) orelse return error.NoActiveRuntime;

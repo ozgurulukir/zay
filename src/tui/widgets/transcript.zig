@@ -125,6 +125,7 @@ pub const TranscriptWidget = struct {
             .presentation = self.presentation,
         };
         self.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
+        defer self.transcript_list.children = .{ .slice = &.{} };
         self.transcript_list.item_count = @intCast(messages.len);
         self.syncCursor(ctx);
 
@@ -397,7 +398,7 @@ fn scrollbarMetrics(
     }
     const max_u16 = std.math.maxInt(u16);
     const total: u16 = @intCast(@min(max_u16, @max(total_rows, @as(usize, view_height) + 1)));
-    const scroll_pos: u16 = @intCast(@min(total, scroll_row));
+    const scroll_pos: u16 = @intCast(@min(total -| view_height, scroll_row));
     return .{ .scroll_pos = scroll_pos, .total = total };
 }
 
@@ -415,4 +416,7 @@ test "TranscriptWidget scrollbar reflects visual rows for a single long message"
 
     const m_top = scrollbarMetrics(transcript.messages.items, 0, 0, 6, 40, .{});
     try std.testing.expectEqual(@as(u16, 0), m_top.scroll_pos);
+
+    const m_past_end = scrollbarMetrics(transcript.messages.items, 0, 100, 6, 40, .{});
+    try std.testing.expectEqual(@as(u16, 16), m_past_end.scroll_pos);
 }

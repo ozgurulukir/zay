@@ -90,8 +90,10 @@ pub fn scheduleLaneNaming(app: *App, lane: *Thread, first_message: []const u8) !
     if (runtime.naming_client == .none) return;
 
     const first = try app.gpa.dupe(u8, first_message);
-    errdefer app.gpa.free(first);
-    const job = try app.gpa.create(naming_mod.BranchJob);
+    const job = app.gpa.create(naming_mod.BranchJob) catch |err| {
+        app.gpa.free(first);
+        return err;
+    };
     job.* = .{
         .gpa = app.gpa,
         .io = app.io,

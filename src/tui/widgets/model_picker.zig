@@ -109,6 +109,7 @@ pub const Content = struct {
         const built = try self.modelWidgets(ctx);
         if (built.widgets.len <= 1) return self.drawStatus(ctx, "No matching models", p.notice);
         self.list.children = .{ .slice = built.widgets };
+        defer self.list.children = .{ .slice = &.{} };
         self.list.item_count = @intCast(built.widgets.len);
         self.list.cursor = built.cursor;
         self.syncListScroll();

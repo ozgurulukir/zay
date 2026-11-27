@@ -389,6 +389,7 @@ pub const App = struct {
     ) !App {
         std.debug.assert(host_id.len > 0);
         var app = try init(io, gpa, &runtime.agent);
+        errdefer app.deinit();
         app.cached_config = config;
         app.config_arena = config_arena;
         app.environ_map = environ_map;
@@ -432,14 +433,12 @@ pub const App = struct {
         // One shared background manager for the whole session. Heap-allocated so
         // its address stays put as agents (primary + lanes) borrow it.
         const manager = try gpa.create(background_mod.BackgroundManager);
-        errdefer gpa.destroy(manager);
         manager.* = .init(io, gpa);
         app.background = manager;
         // The primary agent's shared subsystems (this background manager
         // among them) are armed by one attach in `run` after `app` settles
         // in its final stack frame — &app.X here would dangle after
         // return-by-value.
-        app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.thread.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
@@ -449,6 +448,7 @@ pub const App = struct {
         // custom slugs so a config with `"theme": "<custom>"` is applied at
         // startup instead of silently falling back to `default`.
         try app.theme_registry.loadCustom(gpa, io, runtime.home_dir, runtime.cwd, app.cached_config.tui.custom_themes_dir);
+        app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.syncPresentationConfig();
         return app;
     }

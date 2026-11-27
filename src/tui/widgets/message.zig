@@ -244,12 +244,18 @@ pub const MessageWidget = struct {
             .notice => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "! ") or std.mem.startsWith(u8, m.body, "⚠ ")) "" else "! ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, self.active_search_range, self.selection_range, token_scan.scanPathLineTokens(ctx.arena, marked, 64) catch &.{}, p, self.presentation.max_content_width);
+                const delta: usize = if (marked.ptr != m.body.ptr) prefix.len else 0;
+                const search_range: ?[2]usize = if (self.active_search_range) |r| .{ r[0] +| delta, r[1] +| delta } else null;
+                const sel_range: ?[2]usize = if (self.selection_range) |r| .{ r[0] +| delta, r[1] +| delta } else null;
+                drawBodyText(surface, marked, p.notice, styled_as_selected, &row, ctx, 2, p.notice, self.search_query, search_range, sel_range, token_scan.scanPathLineTokens(ctx.arena, marked, 64) catch &.{}, p, self.presentation.max_content_width);
             },
             .success => |m| {
                 const prefix: []const u8 = if (std.mem.startsWith(u8, m.body, "✓ ")) "" else "✓ ";
                 const marked = if (prefix.len > 0) std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, m.body }) catch m.body else m.body;
-                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, self.active_search_range, self.selection_range, token_scan.scanPathLineTokens(ctx.arena, marked, 64) catch &.{}, p, self.presentation.max_content_width);
+                const delta: usize = if (marked.ptr != m.body.ptr) prefix.len else 0;
+                const search_range: ?[2]usize = if (self.active_search_range) |r| .{ r[0] +| delta, r[1] +| delta } else null;
+                const sel_range: ?[2]usize = if (self.selection_range) |r| .{ r[0] +| delta, r[1] +| delta } else null;
+                drawBodyText(surface, marked, p.tool, styled_as_selected, &row, ctx, 2, p.tool, self.search_query, search_range, sel_range, token_scan.scanPathLineTokens(ctx.arena, marked, 64) catch &.{}, p, self.presentation.max_content_width);
             },
             .info => |m| drawBodyText(surface, m.body, p.info, styled_as_selected, &row, ctx, 2, p.info, self.search_query, self.active_search_range, self.selection_range, self.message.scanCachePtr().cachedPathTokens(ctx.arena, m.body), p, self.presentation.max_content_width),
             .logo => self.drawIntro(surface, self.blackhole_frame, &row, ctx),
@@ -633,7 +639,7 @@ pub const MessageWidget = struct {
         hls: []const StyleSpan,
         p: *const tui_style.Palette,
     ) void {
-        var col = ConversationLayout.left + start_col;
+        var col = ConversationLayout.left +| start_col;
         const col_limit = surface.size.width -| ConversationLayout.right;
         var iter = ctx.graphemeIterator(text);
         while (iter.next()) |grapheme| {
@@ -641,7 +647,7 @@ pub const MessageWidget = struct {
             const bytes = grapheme.bytes(text);
             const width: u16 = @intCast(ctx.stringWidth(bytes));
             if (width == 0) continue;
-            if (col + width > col_limit) return;
+            if (col +| width > col_limit) return;
             var cell: vaxis.Cell = .{
                 .char = .{ .grapheme = bytes, .width = @intCast(width) },
                 .style = mergedSelectedStyle(style, selected),
@@ -784,7 +790,7 @@ fn drawMarkdown(
                 }
             }
             MessageWidget.writeTextWithLink(surface, span.text, markdownStyle(span.style, p), selected, row.*, ctx, start_col, span.link_url, rel_buf[0..rel_count], p);
-            start_col += @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
+            start_col +|= @intCast(@min(ctx.stringWidth(span.text), std.math.maxInt(u16)));
         }
         row.* += 1;
     }
@@ -1075,14 +1081,14 @@ fn drawStyledSegment(
     var iter = ctx.graphemeIterator(segment);
     var byte_pos: usize = 0;
     while (iter.next()) |grapheme| {
-        if (col >= col_limit) return;
+        if (col >= col_limit) break;
         const bytes = grapheme.bytes(segment);
         const width: u16 = @intCast(ctx.stringWidth(bytes));
         if (width == 0) {
             byte_pos += bytes.len;
             continue;
         }
-        if (col + width > col_limit) return;
+        if (col +| width > col_limit) break;
         const style = styleAt(text_abs + byte_pos, text_abs + byte_pos + bytes.len, spans, default_style);
         MessageWidget.writeCellOnCard(surface, col, row.*, .{
             .char = .{ .grapheme = bytes, .width = @intCast(width) },

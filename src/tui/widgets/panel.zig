@@ -138,7 +138,8 @@ pub fn drawScrollbarAt(surface: *vxfw.Surface, start_row: u16, height: u16, scro
 
     const bar_height: usize = @max(1, @as(usize, height) * @as(usize, height) / @as(usize, total));
     const max_top = height -| @as(u16, @intCast(bar_height));
-    const top: u16 = @intCast(@as(usize, scroll) * @as(usize, max_top) / @as(usize, max_s));
+    const clamped_scroll = @min(scroll, max_s);
+    const top: u16 = @intCast(@as(usize, clamped_scroll) * @as(usize, max_top) / @as(usize, max_s));
 
     var r: u16 = 0;
     while (r < height and start_row + r < surface.size.height) : (r += 1) {
@@ -875,4 +876,27 @@ test "ViewportWindow.computeStateful preserves scroll_top on upward navigation (
     // Move up to row 5: above scroll_top, so scroll_top shifts to 5.
     const up_above = ViewportWindow.computeStateful(5, 20, 5, &scroll);
     try std.testing.expectEqual(@as(u32, 5), up_above.scroll_top);
+}
+
+test "drawScrollbarAt clamps scroll exceeding max_s onto the track" {
+    const gpa = std.testing.allocator;
+    const dummy_widget: vxfw.Widget = .{
+        .userdata = @ptrCast(@constCast(&gpa)),
+        .drawFn = struct {
+            fn draw(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+                unreachable;
+            }
+        }.draw,
+    };
+    var surface = try vxfw.Surface.init(gpa, dummy_widget, .{ .width = 4, .height = 6 });
+    defer gpa.free(surface.buffer);
+
+    drawScrollbarAt(&surface, 0, 6, 999, 12, &tui_style.default_palette);
+    // Thumb (bar_height = 3, top = 3) must land on rows 3..5 rather than off-track.
+    var saw_thumb = false;
+    for (1..5) |r| {
+        const cell = surface.readCell(3, @intCast(r));
+        if (std.mem.eql(u8, cell.char.grapheme, "█")) saw_thumb = true;
+    }
+    try std.testing.expect(saw_thumb);
 }

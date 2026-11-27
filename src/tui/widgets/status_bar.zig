@@ -69,7 +69,7 @@ pub fn layoutSegments(
             const w: u16 = @intCast(@min(text_fit.measure(cand.text), std.math.maxInt(u16)));
             if (w == 0) continue;
             const gap: u16 = if (active_count > 0) cand.gap_before else 0;
-            needed_width += gap + w;
+            needed_width +|= gap +| w;
             active_count += 1;
         }
 
@@ -153,14 +153,14 @@ pub fn layoutStatusBar(
     const has_meter = meter_text.len > 0 and meter_width > 0;
 
     const full_left_width: u16 = if (has_velocity and has_status)
-        velocity_width + 2 + status_width
+        velocity_width +| 2 +| status_width
     else if (has_velocity)
         velocity_width
     else
         status_width;
 
     const gap_width: u16 = if (has_meter and full_left_width > 0) 1 else 0;
-    const all_three_width = full_left_width + gap_width + (if (has_meter) meter_width else 0);
+    const all_three_width = full_left_width +| gap_width +| (if (has_meter) meter_width else 0);
 
     // 1. Check if all three (or whatever is present including velocity) fit.
     if (has_velocity and all_three_width <= available_width) {
@@ -191,7 +191,7 @@ pub fn layoutStatusBar(
 
     // 2. Velocity dropped (or not present). Try status + meter.
     const status_gap_width: u16 = if (has_meter and has_status) 1 else 0;
-    const status_meter_width = status_width + status_gap_width + (if (has_meter) meter_width else 0);
+    const status_meter_width = status_width +| status_gap_width +| (if (has_meter) meter_width else 0);
 
     if (has_meter and status_meter_width <= available_width) {
         var count: usize = 0;
