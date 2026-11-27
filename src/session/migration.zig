@@ -406,7 +406,7 @@ fn remoteTableExists(target: anytype, io: std.Io, table: []const u8, is_postgres
 
 fn remoteIndexExists(target: anytype, io: std.Io, index_name: []const u8, is_postgres: bool) !bool {
     const sql = if (is_postgres)
-        "select count(*) from pg_indexes where indexname = ?"
+        "select count(*) from pg_indexes where schemaname = current_schema() and indexname = ?"
     else
         "select count(*) from sqlite_master where type = 'index' and name = ?";
     var res = try target.query(io, sql, &.{.{ .text = index_name }});

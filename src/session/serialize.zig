@@ -97,7 +97,10 @@ pub fn parseContentBlocks(gpa: std.mem.Allocator, value: std.json.Value) Error![
     if (value != .array) return error.CorruptPayload;
     const blocks = try gpa.alloc(ai.ContentBlock, value.array.items.len);
     var initialized: usize = 0;
-    errdefer freeContentBlocks(gpa, blocks[0..initialized]);
+    errdefer {
+        for (blocks[0..initialized]) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
     for (value.array.items) |item| {
         blocks[initialized] = try ai.ContentBlock.fromJson(gpa, item);
         initialized += 1;
@@ -358,4 +361,11 @@ test "jsonToMessage does not leak tool metadata on non-tool roles" {
     );
     defer msg.deinit(gpa);
     try std.testing.expect(msg == .user);
+}
+
+test "parseContentBlocks frees full allocation on partial element failure" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.CorruptPayload, jsonToMessage(gpa,
+        \\{"role":"user","content":[{"type":"text","text":"ok"},{"type":"bogus"}]}
+    ));
 }
