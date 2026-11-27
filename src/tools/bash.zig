@@ -34,7 +34,8 @@ pub const Backend = struct {
     /// that `cd`s to the main tree's absolute path stays put. `pushd`/`popd` are
     /// rejected outright (they'd bypass the guard).
     pub const cd_guard_functions =
-        \\cd() { while [ $# -gt 0 ] && { [ "$1" = -P ] || [ "$1" = -L ] || [ "$1" = -- ]; }; do shift; done; local _prev="$PWD"; builtin cd "$@" || return 1; local _phys="$(pwd -P)"; if [ "$_phys" != "$_zay_root" ] && [ "${_phys#$_zay_root}" = "$_phys" ]; then printf 'cd: %s escapes the workspace root\n' "$_phys" >&2; builtin cd "$_prev" 2>/dev/null || builtin cd "$_zay_root"; return 1; fi; return 0; };
+        \\readonly _zay_root;
+        \\cd() { while [ $# -gt 0 ] && { [ "$1" = -P ] || [ "$1" = -L ] || [ "$1" = -- ]; }; do shift; done; local _prev="$PWD"; builtin cd "$@" || return 1; local _phys="$(pwd -P)"; if [ "$_zay_root" != "/" ] && [ "$_phys" != "$_zay_root" ] && [ "${_phys#"$_zay_root"/}" = "$_phys" ]; then printf 'cd: %s escapes the workspace root\n' "$_phys" >&2; builtin cd "$_prev" 2>/dev/null || builtin cd "$_zay_root"; return 1; fi; return 0; };
         \\pushd() { printf 'pushd: not allowed in this workspace\n' >&2; return 1; };
         \\popd() { printf 'popd: not allowed in this workspace\n' >&2; return 1; };
         \\readonly -f cd pushd popd;
@@ -655,4 +656,58 @@ test "hasCdGuardBypass flags quoted and escaped builtin spellings (#439)" {
     for (allowed) |command| {
         try std.testing.expect(!Backend.hasCdGuardBypass(command));
     }
+}
+
+test "contained bash prevents reassigning _zay_root and sibling-prefix escapes" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const fixture_root = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(fixture_root);
+    const root_abs = try std.fs.path.join(gpa, &.{ fixture_root, "repo" });
+    defer gpa.free(root_abs);
+    const sibling_abs = try std.fs.path.join(gpa, &.{ fixture_root, "repo-evil" });
+    defer gpa.free(sibling_abs);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root_abs);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sibling_abs);
+
+    // Reassigning _zay_root must fail because it is readonly.
+    var reassign = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"_zay_root=/; cd /etc && pwd\",\"description\":\"escape\"}", null, bash_safety.mintClassified("containment-fixture"));
+    defer reassign.deinit(gpa);
+    try std.testing.expect(reassign.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, reassign.stdout, "readonly variable") != null or
+        std.mem.indexOf(u8, reassign.stdout, "escapes the workspace root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reassign.stdout, "\n/etc") == null);
+
+    // Sibling-prefix directory (/.../repo-evil from /.../repo) must be refused.
+    const sibling_args = try std.fmt.allocPrint(gpa, "{{\"command\":\"cd '{s}' && pwd\",\"description\":\"escape\"}}", .{sibling_abs});
+    defer gpa.free(sibling_args);
+    var sibling = try runContained(gpa, std.testing.io, root_abs, sibling_args, null, bash_safety.mintClassified("containment-fixture"));
+    defer sibling.deinit(gpa);
+    try std.testing.expect(sibling.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, sibling.stdout, "escapes the workspace root") != null);
+}
+
+test "contained bash observation echoes original command without guard script" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(test_cwd);
+    const root_abs = try std.fs.path.join(gpa, &.{ test_cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(root_abs);
+
+    var output = try runContained(gpa, std.testing.io, root_abs, "{\"command\":\"printf ok\",\"description\":\"read\"}", null, bash_safety.mintClassified("containment-fixture"));
+    defer output.deinit(gpa);
+    const observation = try testObservationText(gpa, output);
+    defer gpa.free(observation);
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("$ printf ok\nok", observation);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "_zay_root") == null);
+    try std.testing.expect(std.mem.indexOf(u8, observation, "cd() {") == null);
 }

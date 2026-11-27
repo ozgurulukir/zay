@@ -156,7 +156,10 @@ fn writeScriptTemp(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8
     // 0600: the script embeds model commands (which may reference secrets);
     // the default mode would leave it group/other-readable after umask (#440).
     // Windows has no mode bits.
-    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .permissions = if (comptime os.is_windows) .default_file else std.Io.File.Permissions.fromMode(0o600) });
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .exclusive = true,
+        .permissions = if (comptime os.is_windows) .default_file else std.Io.File.Permissions.fromMode(0o600),
+    });
     defer file.close(io);
     // Prefix UTF-8 BOM (\xEF\xBB\xBF) so Windows PowerShell 5.1 interprets the
     // script as UTF-8 rather than ANSI/Windows-1252, while PowerShell 7+ handles it seamlessly.
