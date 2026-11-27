@@ -276,6 +276,12 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         };
         break :blk legacy;
     };
+    const diagnostics = load_result.takeDiagnostics();
+    var diagnostics_owned = true;
+    errdefer if (diagnostics_owned) {
+        for (diagnostics) |*d| d.deinit(runtime_gpa);
+        runtime_gpa.free(diagnostics);
+    };
     if (resume_session_id) |id| {
         defer runtime_gpa.free(id);
         agent_runtime.initResume(.{
@@ -287,7 +293,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .base_system_prompt = system_prompt,
             .config = load_result.config,
             .config_arena = load_result.arena_state.allocator(),
-            .diagnostics = load_result.takeDiagnostics(),
+            .diagnostics = diagnostics,
             .host_id = host_id,
             .session_id = id,
         }) catch |err| {
@@ -300,7 +306,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
                 .home_dir = home_dir,
                 .base_system_prompt = system_prompt,
                 .config = load_result.config,
-                .diagnostics = load_result.takeDiagnostics(),
+                .diagnostics = diagnostics,
                 .host_id = host_id,
             });
         };
@@ -313,10 +319,11 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
             .home_dir = home_dir,
             .base_system_prompt = system_prompt,
             .config = load_result.config,
-            .diagnostics = load_result.takeDiagnostics(),
+            .diagnostics = diagnostics,
             .host_id = host_id,
         });
     }
+    diagnostics_owned = false;
     // The TUI borrows the merged config and its backing arena for its whole
     // lifetime (`App.config_arena` is a non-owning pointer): provider/theme/
     // settings/plugin mutations overwrite slices in the arena and a

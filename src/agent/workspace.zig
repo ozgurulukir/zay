@@ -23,19 +23,20 @@ pub const WorkspaceScope = struct {
     mutex: std.Io.Mutex = .init,
 
     /// The directory tools run in: the workspace root when scoped, else
-    /// `fallback` (the caller's session cwd). On lock failure the fallback is
-    /// returned — a torn read must never widen where tools run. The returned
-    /// slice is borrowed (the backing path is Thread-owned and outlives it).
+    /// `fallback` (the caller's session cwd). The returned slice is borrowed
+    /// (the backing path is Thread-owned and outlives it).
     pub fn effectiveCwd(self: *WorkspaceScope, io: std.Io, fallback: []const u8) []const u8 {
-        self.mutex.lock(io) catch return fallback;
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.path orelse fallback;
     }
 
     /// Set the workspace borrow (worker thread, `lane enter`/`leave`). The
     /// path is borrowed from the lane's `Thread`, never copied or freed here.
+    /// Uses `lockUncancelable` so teardown `setWorkspace(io, null)` can never
+    /// be skipped on a canceled `io` and leave a dangling pointer.
     pub fn setWorkspace(self: *WorkspaceScope, io: std.Io, path: ?[]const u8) void {
-        self.mutex.lock(io) catch return;
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.path = path;
     }
@@ -43,7 +44,7 @@ pub const WorkspaceScope = struct {
     /// Read the workspace borrow (UI thread). Returns a borrowed slice; the
     /// backing path is Thread-owned and outlives the borrow.
     pub fn workspaceBorrow(self: *WorkspaceScope, io: std.Io) ?[]const u8 {
-        self.mutex.lock(io) catch return null;
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.path;
     }

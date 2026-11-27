@@ -411,12 +411,18 @@ pub fn reconcileUnresolvedToolCalls(self: *Agent, result_text: []const u8, displ
     for (missing.items) |id| {
         const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
         errdefer self.gpa.free(blocks);
-        blocks[0] = .{ .text = .{ .text = try self.gpa.dupe(u8, result_text) } };
+        const owned_result_text = try self.gpa.dupe(u8, result_text);
+        errdefer self.gpa.free(owned_result_text);
+        blocks[0] = .{ .text = .{ .text = owned_result_text } };
+        const owned_call_id = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(owned_call_id);
+        const owned_display_label = try self.gpa.dupe(u8, display_label);
+        errdefer self.gpa.free(owned_display_label);
         try self.context_manager.appendPersisted(.{
             .tool = .{
                 .content = blocks,
-                .call_id = .{ .value = try self.gpa.dupe(u8, id) },
-                .display_label = try self.gpa.dupe(u8, display_label),
+                .call_id = .{ .value = owned_call_id },
+                .display_label = owned_display_label,
                 .failed = true,
             },
         });

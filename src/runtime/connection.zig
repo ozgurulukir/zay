@@ -131,6 +131,11 @@ const AttachPlan = struct {
     /// The main role's system prompt. Null = keep `ai.Config`'s default
     /// (chat: the agent prompt lives in history, not on the wire).
     main_system_prompt: ?[]const u8 = null,
+    /// Per-model capability fallbacks from `config.model_selection`. Applied
+    /// per attach when the global `self.context_settings` overrides are null,
+    /// without mutating `self.context_settings` across model switches.
+    model_context_window: ?u32 = null,
+    model_max_output_tokens: ?u32 = null,
 };
 
 /// Pick and wire the LanguageModel adapter specified in `config`.
@@ -313,12 +318,6 @@ fn tryAttachOpenAiCompatibleFromConfig(
     provider: config_mod.Provider,
     config: config_mod.Config,
 ) !void {
-    // Resolve wire dialect from provider identity before any attach.
-    self.wire_dialect = ai.WireDialect.resolve(
-        provider,
-        config.provider_name orelse "",
-        config.base_url orelse "",
-    );
     // C1: read the prompt-cache-disable flag once here so all three
     // attached clients (main / compaction / naming) inherit it.
     self.disable_prompt_cache = config.context.disable_prompt_cache orelse false;
@@ -328,6 +327,11 @@ fn tryAttachOpenAiCompatibleFromConfig(
         // the base_url was hydrated from the providers[] map by
         // hydrateActiveModel during config merge.
         const base_url = config.base_url orelse provider.defaultBaseUrl() orelse return;
+        self.wire_dialect = ai.WireDialect.resolve(
+            provider,
+            config.provider_name orelse "",
+            base_url,
+        );
         const model_id = if (config.model) |m| m.id else "default";
         const effort = if (config.model) |m| m.reasoning.resolve() else ai.ReasoningEffort.medium;
         var loaded_key: ?[]u8 = null;
@@ -358,8 +362,15 @@ fn tryAttachOpenAiCompatibleFromConfig(
         }
         break :blk provider.defaultBaseUrl() orelse return;
     };
+    // Resolve wire dialect from the active model selection's provider and
+    // resolved base_url (not top-level config fields, which lag on cross-
+    // provider resume).
+    self.wire_dialect = ai.WireDialect.resolve(
+        provider,
+        ms.providerName(),
+        base_url,
+    );
     const effort = ms.model().reasoning.resolve();
-    resolveModelContextFallbacks(self, ms);
     var loaded_key: ?[]u8 = null;
     defer if (loaded_key) |k| self.gpa.free(k);
     const api_key = resolveApiKeyForAttach(self, provider, ms.providerName(), ms.apiKey(), &loaded_key);
@@ -367,7 +378,18 @@ fn tryAttachOpenAiCompatibleFromConfig(
         .builtin => |b| b.model.id,
         .custom => |c| c.model.id,
     };
-    try attachOpenAiCompatibleClientWithPolicy(self, ms.providerName(), base_url, api_key, model_id_to_attach, effort, config.providerHeadersByName(ms.providerName()), config.responsePolicyForModel(ms.providerName(), model_id_to_attach, base_url));
+    try attachClients(self, .{
+        .response_policy = config.responsePolicyForModel(ms.providerName(), model_id_to_attach, base_url),
+        .adapter = .chat,
+        .provider_name = ms.providerName(),
+        .base_url = base_url,
+        .api_key = api_key,
+        .model_id = model_id_to_attach,
+        .reasoning = .{ .effort = effort, .summary = .auto },
+        .user_headers = config.providerHeadersByName(ms.providerName()),
+        .model_context_window = ms.model().context_window,
+        .model_max_output_tokens = ms.model().max_output_tokens,
+    });
 }
 
 fn tryAttachOpenAiResponsesFromConfig(
@@ -376,17 +398,17 @@ fn tryAttachOpenAiResponsesFromConfig(
     config: config_mod.Config,
 ) !void {
     const ms = config.model_selection orelse return;
-    // Resolve the wire dialect here too: `buildProviderHeaders` consumes
-    // it for the OpenRouter attribution arm, so a stale value from a
-    // previous attach would mis-emit `X-Title` on this one.
-    self.wire_dialect = ai.WireDialect.resolve(
-        provider,
-        config.provider_name orelse "",
-        config.base_url orelse "",
-    );
     self.disable_prompt_cache = config.context.disable_prompt_cache orelse false;
     const base_url = if (ms.baseUrl()) |url| if (url.len > 0) url else provider.defaultBaseUrl() orelse return else provider.defaultBaseUrl() orelse return;
-    resolveModelContextFallbacks(self, ms);
+    // Resolve the wire dialect from the active model selection's provider and
+    // resolved base_url: `buildProviderHeaders` consumes it for the OpenRouter
+    // attribution arm, so a stale value or lagging top-level config must not
+    // mis-emit `X-Title`.
+    self.wire_dialect = ai.WireDialect.resolve(
+        provider,
+        ms.providerName(),
+        base_url,
+    );
     const reasoning: ai.Reasoning = .{
         .effort = ms.model().reasoning.resolve(),
         .summary = .auto,
@@ -394,7 +416,18 @@ fn tryAttachOpenAiResponsesFromConfig(
     var loaded_key: ?[]u8 = null;
     defer if (loaded_key) |k| self.gpa.free(k);
     const api_key = resolveApiKeyForAttach(self, provider, ms.providerName(), ms.apiKey(), &loaded_key);
-    try attachOpenAiResponsesClient(self, ms.providerName(), base_url, api_key, ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
+    try attachClients(self, .{
+        .adapter = .responses,
+        .provider_name = ms.providerName(),
+        .base_url = base_url,
+        .api_key = api_key,
+        .model_id = ms.model().id,
+        .reasoning = reasoning,
+        .user_headers = config.providerHeadersByName(ms.providerName()),
+        .main_system_prompt = self.system_prompt,
+        .model_context_window = ms.model().context_window,
+        .model_max_output_tokens = ms.model().max_output_tokens,
+    });
 }
 
 /// Resolve the API key for an attach path: inline key, then `auth.json`, then
@@ -417,20 +450,6 @@ fn resolveApiKeyForAttach(
         log.warn("auth.missing_key provider={s} — requests will likely fail with 402", .{provider_name});
     }
     return provider.anonymousApiKey() orelse "";
-}
-
-/// Per-model context_window and max_output_tokens from the providers map
-/// act as fallbacks when the global overrides are not set. Capability
-/// fallbacks are adapter-independent, so every attach path resolves them
-/// (the responses path previously skipped them — the chat path's block,
-/// deduplicated here).
-fn resolveModelContextFallbacks(self: *AgentRuntime, ms: config_mod.ModelSelection) void {
-    if (self.context_settings.override_context_window == null) {
-        self.context_settings.override_context_window = ms.model().context_window;
-    }
-    if (self.context_settings.max_output_tokens == null) {
-        self.context_settings.max_output_tokens = ms.model().max_output_tokens;
-    }
 }
 
 /// Look up per-model capability data from the runtime's models.dev registry.
@@ -487,7 +506,7 @@ fn attachBaseConfig(
         .chat => {
             cfg.wire_dialect = self.wire_dialect;
             cfg.is_reasoning_model = compaction.isReasoningModel(model_info);
-            cfg.max_output_tokens = self.context_settings.max_output_tokens;
+            cfg.max_output_tokens = self.context_settings.max_output_tokens orelse plan.model_max_output_tokens;
             cfg.max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse ai.default_max_parallel_tool_calls;
         },
         .codex => cfg.account_id = plan.account_id,
@@ -559,7 +578,8 @@ fn attachClients(self: *AgentRuntime, plan: AttachPlan) !void {
     // Ownership hands off here: nothing after this line may fail before
     // `replaceClient` runs, or `main_client` would leak.
     replaceClient(self, main_client);
-    self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
+    const effective_context_window = self.context_settings.override_context_window orelse plan.model_context_window;
+    self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, effective_context_window);
     agent_mod.resetContextUsage(&self.agent);
 
     attach_compaction: {
@@ -1084,9 +1104,10 @@ test "attach parity: every role inherits plan fields across all adapters" {
         defer runtime.deinit();
 
         // The per-model context fallbacks ride the responses path too —
-        // capability fallbacks are adapter-independent.
-        try std.testing.expectEqual(@as(?u32, 12345), runtime.context_settings.override_context_window);
-        try std.testing.expectEqual(@as(?u32, 999), runtime.context_settings.max_output_tokens);
+        // applied per attach without mutating `runtime.context_settings`.
+        try std.testing.expectEqual(@as(u32, 12345), runtime.agent.context_window_tokens);
+        try std.testing.expectEqual(@as(?u32, null), runtime.context_settings.override_context_window);
+        try std.testing.expectEqual(@as(?u32, null), runtime.context_settings.max_output_tokens);
 
         const main_client = runtime.owned_client.?.responses;
         const comp_client = runtime.owned_compaction_client.?.responses;
@@ -1109,6 +1130,48 @@ test "attach parity: every role inherits plan fields across all adapters" {
         try std.testing.expectEqual(runtime.strict_outputs, main_client.config.strict);
         try std.testing.expect(!comp_client.config.strict);
         try std.testing.expect(!naming_client.config.strict);
+        // Switching models mid-session must apply the new model's limits
+        // without the first model's limits sticking in `context_settings`.
+        try applyFromConfig(&runtime, .{
+            .model_selection = .{
+                .builtin = .{
+                    .provider = .ollama,
+                    .provider_name = @constCast("ollama"),
+                    .model = .{
+                        .id = @constCast("llama3"),
+                        .reasoning = .unset,
+                        .context_window = 64000,
+                        .max_output_tokens = 4096,
+                    },
+                    .use_responses_endpoint = false,
+                    .bash_classifier_url = null,
+                },
+            },
+        });
+        try std.testing.expectEqual(@as(u32, 64000), runtime.agent.context_window_tokens);
+        try std.testing.expectEqual(@as(?u32, 4096), runtime.owned_client.?.openai_compatible.config.max_output_tokens);
+        try std.testing.expectEqual(@as(?u32, null), runtime.context_settings.override_context_window);
+        try std.testing.expectEqual(@as(?u32, null), runtime.context_settings.max_output_tokens);
+
+        // Cross-provider resume: `model_selection` overrides lagging top-level
+        // `provider_name` / `base_url` when resolving `wire_dialect`.
+        try applyFromConfig(&runtime, .{
+            .provider_name = @constCast("ollama"),
+            .base_url = @constCast("http://localhost:11434/v1"),
+            .model_selection = .{
+                .builtin = .{
+                    .provider = .openrouter,
+                    .provider_name = @constCast("openrouter"),
+                    .model = .{
+                        .id = @constCast("anthropic/claude-sonnet-4"),
+                        .reasoning = .unset,
+                    },
+                    .use_responses_endpoint = false,
+                    .bash_classifier_url = null,
+                },
+            },
+        });
+        try std.testing.expectEqual(ai.WireDialect.openrouter, runtime.wire_dialect);
     }
 
     // ── codex: account id and prompt roles on every role ──
