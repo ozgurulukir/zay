@@ -239,14 +239,14 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         // Propagate provider_name so serialize's legacy fallback writes the
         // correct config key (e.g. "stepfun-ai-step-plan") instead of the
         // enum label ("openai_compatible").
-        if (target.provider_name) |old| gpa.free(old);
-        target.provider_name = try gpa.dupe(u8, ms.providerName());
-        if (target.model) |*old| old.deinit(gpa);
+        try replaceOptionalSlice(gpa, &target.provider_name, ms.providerName());
         const model = switch (ms) {
             .builtin => |b| b.model,
             .custom => |c| c.model,
         };
-        target.model = try model.clone(gpa);
+        const next_model = try model.clone(gpa);
+        if (target.model) |*old| old.deinit(gpa);
+        target.model = next_model;
         if (ms.baseUrl()) |base_url| try replaceOptionalSlice(gpa, &target.base_url, base_url);
         if (ms.apiKey()) |api_key| try replaceOptionalSlice(gpa, &target.api_key, api_key);
         target.use_responses_endpoint = ms.useResponsesEndpoint();
@@ -261,8 +261,9 @@ fn applyConfigOverlay(gpa: std.mem.Allocator, target: *Config, updates: Config) 
         try applyTextOverlay(gpa, &target.bash_classifier_url, updates.bash_classifier_url);
         try applyTextOverlay(gpa, &target.system_prompt, updates.system_prompt);
         if (updates.model) |m| {
+            const next_model = try m.clone(gpa);
             if (target.model) |*old| old.deinit(gpa);
-            target.model = try m.clone(gpa);
+            target.model = next_model;
         }
         // Keep model_selection in sync with legacy fields so serialize
         // (which prefers model_selection) picks up the changes.
@@ -321,10 +322,7 @@ fn applyToastOverlay(gpa: std.mem.Allocator, target: *Config, updates: ToastSett
     if (updates.enabled != null) target.toast.enabled = updates.enabled;
     if (updates.duration_ms != null) target.toast.duration_ms = updates.duration_ms;
     if (updates.max_visible != null) target.toast.max_visible = updates.max_visible;
-    if (updates.position) |s| {
-        if (target.toast.position) |old| gpa.free(old);
-        target.toast.position = try gpa.dupe(u8, s);
-    }
+    if (updates.position) |s| try replaceOptionalSlice(gpa, &target.toast.position, s);
 }
 
 /// Merge TUI settings: presence-gated (#447). A parsed layer sets
@@ -342,18 +340,9 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
         target.tui.theme_live_preview = updates.theme_live_preview;
         target.tui.theme_live_preview_is_set = true;
     }
-    if (updates.custom_themes_dir) |s| {
-        if (target.tui.custom_themes_dir) |old| gpa.free(old);
-        target.tui.custom_themes_dir = try gpa.dupe(u8, s);
-    }
-    if (updates.light_theme) |s| {
-        if (target.tui.light_theme) |old| gpa.free(old);
-        target.tui.light_theme = try gpa.dupe(u8, s);
-    }
-    if (updates.dark_theme) |s| {
-        if (target.tui.dark_theme) |old| gpa.free(old);
-        target.tui.dark_theme = try gpa.dupe(u8, s);
-    }
+    if (updates.custom_themes_dir) |s| try replaceOptionalSlice(gpa, &target.tui.custom_themes_dir, s);
+    if (updates.light_theme) |s| try replaceOptionalSlice(gpa, &target.tui.light_theme, s);
+    if (updates.dark_theme) |s| try replaceOptionalSlice(gpa, &target.tui.dark_theme, s);
     if (updates.no_color_is_set) {
         target.tui.no_color = updates.no_color;
         target.tui.no_color_is_set = true;
@@ -373,6 +362,10 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
     if (updates.min_split_width_is_set) {
         target.tui.min_split_width = updates.min_split_width;
         target.tui.min_split_width_is_set = true;
+    }
+    if (updates.max_content_width_is_set) {
+        target.tui.max_content_width = updates.max_content_width;
+        target.tui.max_content_width_is_set = true;
     }
     if (updates.highlight_focused_border_is_set) {
         target.tui.highlight_focused_border = updates.highlight_focused_border;
@@ -683,8 +676,7 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
     if (provider == .openai_compatible) {
         for (config.providers) |entry| {
             if (entry.provider != .openai_compatible) continue;
-            if (config.provider_name) |old| gpa.free(old);
-            config.provider_name = try gpa.dupe(u8, entry.name);
+            try replaceOptionalSlice(gpa, &config.provider_name, entry.name);
             try hydrateFromProviderEntry(gpa, config, entry);
             return;
         }
@@ -707,8 +699,9 @@ fn hydrateFromProviderEntry(gpa: std.mem.Allocator, config: *Config, entry: Prov
         config.model.?.context_window = model.context_window;
         config.model.?.max_output_tokens = model.max_output_tokens;
         if (model.reasoning_options.len > 0) {
+            const next_options = try gpa.dupe(ReasoningEffort, model.reasoning_options);
             if (config.model.?.reasoning_options.len > 0) gpa.free(config.model.?.reasoning_options);
-            config.model.?.reasoning_options = try gpa.dupe(ReasoningEffort, model.reasoning_options);
+            config.model.?.reasoning_options = next_options;
         }
         return;
     }
@@ -6517,4 +6510,68 @@ test "isValidDatabaseUrl accepts https/loopback and rejects lookalike hosts" {
     try std.testing.expect(!isValidDatabaseUrl("http://localhost.evil.com/db"));
     try std.testing.expect(!isValidDatabaseUrl("http://127.0.0.1.evil.com/db"));
     try std.testing.expect(!isValidDatabaseUrl("http://localhost@evil.com/db"));
+}
+
+test "applyTuiOverlay preserves maxContentWidth across layer merges" {
+    const gpa = std.testing.allocator;
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (sink.items) |*d| d.deinit(gpa);
+        sink.deinit(gpa);
+    }
+
+    var base = try parseFile(gpa, "<global>",
+        \\{ "tui": { "maxContentWidth": 100 } }
+    , &sink);
+    defer base.deinit(gpa);
+
+    var project = try parseFile(gpa, "<project>",
+        \\{ "tui": { "density": "compact" } }
+    , &sink);
+    defer project.deinit(gpa);
+
+    var merged: Config = .{};
+    defer merged.deinit(gpa);
+    try applyConfigOverlay(gpa, &merged, base);
+    try applyConfigOverlay(gpa, &merged, project);
+
+    try std.testing.expectEqual(@as(u16, 100), merged.tui.max_content_width);
+    try std.testing.expect(merged.tui.max_content_width_is_set);
+
+    // Explicit reset to 0 in a higher layer overrides the lower layer.
+    var override_layer = try parseFile(gpa, "<override>",
+        \\{ "tui": { "maxContentWidth": 0 } }
+    , &sink);
+    defer override_layer.deinit(gpa);
+    try applyConfigOverlay(gpa, &merged, override_layer);
+    try std.testing.expectEqual(@as(u16, 0), merged.tui.max_content_width);
+    try std.testing.expect(merged.tui.max_content_width_is_set);
+}
+
+test "applyConfigOverlay does not double-free owned fields on OOM" {
+    const gpa = std.testing.allocator;
+
+    var target: Config = .{};
+    defer target.deinit(gpa);
+    target.provider_name = try gpa.dupe(u8, "openai");
+    target.toast.position = try gpa.dupe(u8, "top-right");
+    target.tui.custom_themes_dir = try gpa.dupe(u8, "/themes/old");
+    target.tui.light_theme = try gpa.dupe(u8, "latte");
+    target.tui.dark_theme = try gpa.dupe(u8, "mocha");
+
+    var updates: Config = .{};
+    defer updates.deinit(gpa);
+    updates.toast.position = try gpa.dupe(u8, "bottom-left");
+    updates.tui.custom_themes_dir = try gpa.dupe(u8, "/themes/new");
+    updates.tui.light_theme = try gpa.dupe(u8, "day");
+    updates.tui.dark_theme = try gpa.dupe(u8, "night");
+
+    // Fail on the very first allocation during overlay merge; existing fields
+    // must remain valid and intact so target.deinit(gpa) does not double-free.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, applyConfigOverlay(failing.allocator(), &target, updates));
+    try std.testing.expectEqualStrings("top-right", target.toast.position.?);
+    try std.testing.expectEqualStrings("/themes/old", target.tui.custom_themes_dir.?);
+    try std.testing.expectEqualStrings("latte", target.tui.light_theme.?);
+    try std.testing.expectEqualStrings("mocha", target.tui.dark_theme.?);
 }

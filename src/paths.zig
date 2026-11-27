@@ -68,14 +68,48 @@ pub fn pathsEqualInternal(a: []const u8, b: []const u8, is_windows: bool) bool {
 }
 
 /// True when `child` is `parent` itself or a path below it. Comparison is
-/// separator-agnostic (and case-insensitive on Windows) via `pathsEqual`, and
-/// the boundary requires a separator so `/repo-other` is not inside `/repo`.
+/// separator-agnostic (and case-insensitive on Windows) via a
+/// separator-collapsing walk matching `pathsEqualInternal`, and the boundary
+/// requires a separator (or bare root) so `/repo-other` is not inside `/repo`.
 pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
-    if (pathsEqual(child, parent)) return true;
-    if (child.len <= parent.len) return false;
-    if (!pathsEqual(child[0..parent.len], parent)) return false;
-    const separator = child[parent.len];
-    return separator == '/' or separator == '\\';
+    return isSubpathOrEqualInternal(child, parent, os.is_windows);
+}
+
+pub fn isSubpathOrEqualInternal(child: []const u8, parent: []const u8, is_windows: bool) bool {
+    if (parent.len == 0) return child.len == 0;
+    if (child.len == 0) return false;
+
+    var i: usize = 0;
+    var j: usize = 0;
+    var last_was_sep = false;
+    while (i < child.len and j < parent.len) {
+        const cc = child[i];
+        const cp = parent[j];
+        const is_sep_c = (cc == '/' or cc == '\\');
+        const is_sep_p = (cp == '/' or cp == '\\');
+
+        if (is_sep_c and is_sep_p) {
+            while (i + 1 < child.len and (child[i + 1] == '/' or child[i + 1] == '\\')) i += 1;
+            while (j + 1 < parent.len and (parent[j + 1] == '/' or parent[j + 1] == '\\')) j += 1;
+            last_was_sep = true;
+        } else {
+            const eq = if (is_windows)
+                std.ascii.toLower(cc) == std.ascii.toLower(cp)
+            else
+                cc == cp;
+            if (!eq) return false;
+            last_was_sep = false;
+        }
+        i += 1;
+        j += 1;
+    }
+
+    while (j < parent.len and (parent[j] == '/' or parent[j] == '\\')) j += 1;
+    if (j < parent.len) return false;
+
+    if (i == child.len) return true;
+    if (last_was_sep) return true;
+    return child[i] == '/' or child[i] == '\\';
 }
 
 test "isSubpathOrEqual handles exact match, subpaths, and rejects prefix collisions" {
@@ -85,6 +119,17 @@ test "isSubpathOrEqual handles exact match, subpaths, and rejects prefix collisi
     try std.testing.expect(!isSubpathOrEqual("C:\\Users\\zay\\worktrees", "C:/Users/zay/worktrees/1"));
     try std.testing.expect(isSubpathOrEqual("/repo/a/b", "/repo/a"));
     try std.testing.expect(!isSubpathOrEqual("/repo/ab", "/repo/a"));
+    // Trailing separators on parent, bare root '/', and redundant separators.
+    try std.testing.expect(isSubpathOrEqual("/repo/wt/sub", "/repo/wt/"));
+    try std.testing.expect(isSubpathOrEqual("/repo/wt", "/repo/wt/"));
+    try std.testing.expect(isSubpathOrEqual("/etc/passwd", "/"));
+    try std.testing.expect(isSubpathOrEqual("/", "/"));
+    try std.testing.expect(!isSubpathOrEqual("etc/passwd", "/"));
+    try std.testing.expect(isSubpathOrEqual("/repo//sub/x", "/repo/sub"));
+    try std.testing.expect(isSubpathOrEqual("/repo//sub//x", "/repo/sub/"));
+    try std.testing.expect(!isSubpathOrEqual("/repo//sub-other/x", "/repo/sub"));
+    try std.testing.expect(isSubpathOrEqualInternal("c:\\repo\\sub", "C:/REPO/", true));
+    try std.testing.expect(!isSubpathOrEqualInternal("/Repo/sub", "/repo/", false));
 }
 
 test "lastPathSegment: empty, trailing slashes, mixed separators, root" {
