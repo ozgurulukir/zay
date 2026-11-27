@@ -676,8 +676,7 @@ fn hydrateActiveModel(gpa: std.mem.Allocator, config: *Config) !void {
     if (provider == .openai_compatible) {
         for (config.providers) |entry| {
             if (entry.provider != .openai_compatible) continue;
-            if (config.provider_name) |old| gpa.free(old);
-            config.provider_name = try gpa.dupe(u8, entry.name);
+            try replaceOptionalSlice(gpa, &config.provider_name, entry.name);
             try hydrateFromProviderEntry(gpa, config, entry);
             return;
         }
@@ -700,8 +699,9 @@ fn hydrateFromProviderEntry(gpa: std.mem.Allocator, config: *Config, entry: Prov
         config.model.?.context_window = model.context_window;
         config.model.?.max_output_tokens = model.max_output_tokens;
         if (model.reasoning_options.len > 0) {
+            const next_options = try gpa.dupe(ReasoningEffort, model.reasoning_options);
             if (config.model.?.reasoning_options.len > 0) gpa.free(config.model.?.reasoning_options);
-            config.model.?.reasoning_options = try gpa.dupe(ReasoningEffort, model.reasoning_options);
+            config.model.?.reasoning_options = next_options;
         }
         return;
     }
