@@ -145,7 +145,12 @@ pub const Client = struct {
         }
         try client.writeText(body.written());
 
-        var state: core.StreamState = .{};
+        var state: core.StreamState = .{
+            .limits = .{
+                .max_parallel_calls = self.core_client.config.max_parallel_tool_calls,
+                .model_label = self.core_client.config.model,
+            },
+        };
         defer state.deinit(gpa);
         errdefer state.deinitBlocks(gpa);
         var event_count: u32 = 0;
@@ -369,6 +374,9 @@ fn buildHandshakeHeaders(
     authorization: []const u8,
     config: ai.Config,
 ) ![]u8 {
+    if (!provider_headers.isValidHeaderValue(host_header)) return error.InvalidHeaderValue;
+    if (!provider_headers.isValidHeaderValue(authorization)) return error.InvalidHeaderValue;
+
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const w = &out.writer;
@@ -382,6 +390,7 @@ fn buildHandshakeHeaders(
         if (skip) continue;
         const v = resolveSpecValue(h.value, config) orelse continue;
         if (v.len == 0) continue;
+        if (!provider_headers.isValidHeaderValue(v)) return error.InvalidHeaderValue;
         try w.print("{s}: {s}\r\n", .{ h.name, v });
     }
     // The websocket transport negotiates a different Beta mode than SSE.
@@ -503,6 +512,40 @@ test "codex websocket watchdog shuts down Windows Io sockets without Winsock" {
         .future = null,
     };
     watchdog.shutdown();
+}
+
+test "buildHandshakeHeaders rejects control bytes in header values" {
+    const gpa = std.testing.allocator;
+    const base_config: ai.Config = .{
+        .base_url = default_codex_endpoint,
+        .api_key = "test-key",
+        .model = "gpt-5.4",
+        .session_id = "sess-1",
+        .account_id = "acct-1",
+    };
+
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        buildHandshakeHeaders(gpa, "chatgpt.com\r\nX-Injected: 1", "Bearer ok", base_config),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        buildHandshakeHeaders(gpa, "chatgpt.com", "Bearer bad\r\nX-Injected: 1", base_config),
+    );
+
+    var bad_session = base_config;
+    bad_session.session_id = "sess\r\nX-Injected: 1";
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        buildHandshakeHeaders(gpa, "chatgpt.com", "Bearer ok", bad_session),
+    );
+
+    var bad_account = base_config;
+    bad_account.account_id = "acct\nX-Injected: 1";
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        buildHandshakeHeaders(gpa, "chatgpt.com", "Bearer ok", bad_account),
+    );
 }
 
 test {

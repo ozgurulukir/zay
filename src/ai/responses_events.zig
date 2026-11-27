@@ -693,8 +693,8 @@ fn textBlockAt(blocks: *std.ArrayList(ai.ContentBlock), index: usize) !*ai.TextB
 }
 
 fn updateTextBlockMetadata(gpa: std.mem.Allocator, blocks: *std.ArrayList(ai.ContentBlock), index: usize, item: std.json.Value) !void {
-    const phase = try optionalString(gpa, item, "phase");
     const text_block = try textBlockAt(blocks, index);
+    const phase = try optionalString(gpa, item, "phase");
     if (text_block.responses_phase) |old| gpa.free(old);
     text_block.responses_phase = phase;
 }

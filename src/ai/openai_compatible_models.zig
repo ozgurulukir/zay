@@ -48,6 +48,9 @@ pub fn listModels(
     options: Options,
 ) ![]ModelEntry {
     if (base_url.len == 0) return error.EmptyBaseUrl;
+    if (api_key.len > 0 and !provider_headers.isValidHeaderValue(api_key)) {
+        return error.InvalidHeaderValue;
+    }
 
     const v1_root = try openai_endpoint.v1Root(gpa, base_url);
     defer gpa.free(v1_root);
