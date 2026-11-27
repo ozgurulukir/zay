@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-11-27
+
+### Fixed
+- Security: install.ps1 fails closed when fetching the .sha256 sidecar fails unless ZAY_SKIP_CHECKSUM=1, matching install.sh; pass -Raw to Get-Content so multi-line checksum files do not fail .Split() (#637). CI/release.yml verify official Zig 0.16.0 archive SHA256 digests before extraction.
+- Tools: harden db_server TLS/auth/SQLite and classifier URL normalization; encode API keys as UTF-8 for hmac.compare_digest (#638).
+- Config/logger: fix init/dispatch synchronization races; allocate before freeing during model hydration; scope remoteIndexExists to current_schema() (#639).
+- AI/auth: validate headers, bound tool-call forks, harden Codex OAuth listener (#640).
+- Agent/runtime: harden queue drain, workspace mutex, errdefer cleanup, and model switching (#641).
+- Shell/background/session: harden shell containment guards, database table guard, and session persistence (#642).
+- Lua/plugins/mcp: harden gitCommit, plugin loader/store, Lua sandbox/JSON, and MCP client — restore Lua stack on pushJsonValue error, lock lifecycle uncancelably, reject empty store URL host (#643).
+- TUI: harden lifecycle ownership and widget bounds/overflows (#644); isolate mouse routing across modal layers and diff viewer (#611); select full UTF-8 grapheme clusters in mouse word selection (#612); align mouse selection hit-testing with rendered transcript geometry (#613); refresh installed plugin cache across all lifecycle transitions (#614).
 ## [0.12.2] - 2026-11-26
 
 ### Fixed
@@ -235,7 +246,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.3
 [0.12.2]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.2
 [0.12.1]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.1
 [0.12.0]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.0
