@@ -397,11 +397,17 @@ pub const ContentBlock = union(enum) {
                 try jsonByteArrayToString(gpa, text.array.items)
             else
                 return error.CorruptPayload;
+            errdefer gpa.free(text_str);
+
+            const responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id");
+            errdefer if (responses_item_id) |id| gpa.free(id);
+
+            const responses_phase = try jsonOptionalString(gpa, value, "responses_phase");
 
             const block: TextBlock = .{
                 .text = text_str,
-                .responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id"),
-                .responses_phase = try jsonOptionalString(gpa, value, "responses_phase"),
+                .responses_item_id = responses_item_id,
+                .responses_phase = responses_phase,
             };
             return if (std.mem.eql(u8, kind.string, "refusal")) .{ .refusal = block } else .{ .text = block };
         }
@@ -410,7 +416,10 @@ pub const ContentBlock = union(enum) {
             const data = value.object.get("data_base64") orelse return error.CorruptPayload;
             if (mime != .string) return error.CorruptPayload;
             if (data != .string) return error.CorruptPayload;
-            return .{ .image = .{ .mime_type = try gpa.dupe(u8, mime.string), .data_base64 = try gpa.dupe(u8, data.string) } };
+            const mime_type = try gpa.dupe(u8, mime.string);
+            errdefer gpa.free(mime_type);
+            const data_base64 = try gpa.dupe(u8, data.string);
+            return .{ .image = .{ .mime_type = mime_type, .data_base64 = data_base64 } };
         }
         if (std.mem.eql(u8, kind.string, "reasoning")) {
             const text = value.object.get("text") orelse return error.CorruptPayload;
@@ -420,8 +429,10 @@ pub const ContentBlock = union(enum) {
                 try jsonByteArrayToString(gpa, text.array.items)
             else
                 return error.CorruptPayload;
+            errdefer gpa.free(text_str);
 
-            return .{ .reasoning = .{ .text = text_str, .responses_item_json = try jsonOptionalString(gpa, value, "responses_item_json") } };
+            const responses_item_json = try jsonOptionalString(gpa, value, "responses_item_json");
+            return .{ .reasoning = .{ .text = text_str, .responses_item_json = responses_item_json } };
         }
         if (std.mem.eql(u8, kind.string, "tool_call")) {
             const call_id = value.object.get("call_id") orelse return error.CorruptPayload;
@@ -430,11 +441,18 @@ pub const ContentBlock = union(enum) {
             if (call_id != .string) return error.CorruptPayload;
             if (name != .string) return error.CorruptPayload;
             if (arguments != .string) return error.CorruptPayload;
+            const call_id_str = try gpa.dupe(u8, call_id.string);
+            errdefer gpa.free(call_id_str);
+            const responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id");
+            errdefer if (responses_item_id) |id| gpa.free(id);
+            const name_str = try gpa.dupe(u8, name.string);
+            errdefer gpa.free(name_str);
+            const arguments_str = try gpa.dupe(u8, arguments.string);
             return .{ .tool_call = .{
-                .call_id = .{ .value = try gpa.dupe(u8, call_id.string) },
-                .responses_item_id = try jsonOptionalString(gpa, value, "responses_item_id"),
-                .name = try gpa.dupe(u8, name.string),
-                .arguments = try gpa.dupe(u8, arguments.string),
+                .call_id = .{ .value = call_id_str },
+                .responses_item_id = responses_item_id,
+                .name = name_str,
+                .arguments = arguments_str,
             } };
         }
         return error.CorruptPayload;
@@ -893,4 +911,19 @@ test "noopObserver fills every slot and overrides compose" {
     observer.on_content = Seen.onContent;
     try observer.on_content(observer.ctx, "counted");
     try std.testing.expectEqual(@as(u32, 1), seen.content_count);
+}
+
+test "ContentBlock.fromJson frees partial allocations on corrupt optional fields" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"type\":\"text\",\"text\":\"hello\",\"responses_item_id\":123}",
+        "{\"type\":\"text\",\"text\":\"hello\",\"responses_item_id\":\"item_1\",\"responses_phase\":123}",
+        "{\"type\":\"reasoning\",\"text\":\"think\",\"responses_item_json\":123}",
+        "{\"type\":\"tool_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\",\"responses_item_id\":123}",
+    };
+    for (cases) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.CorruptPayload, ContentBlock.fromJson(gpa, parsed.value));
+    }
 }

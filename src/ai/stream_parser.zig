@@ -69,18 +69,24 @@ const ToolCallBuilder = struct {
             try self.id.toOwnedSlice(gpa)
         else
             try tool_call_args.mintSyntheticCallId(gpa, id_seq);
+        errdefer gpa.free(id);
+
         const raw_args = try self.arguments.toOwnedSlice(gpa);
         const sanitized = tool_call_args.sanitizeToolArguments(raw_args);
         const arguments = if (sanitized.ptr == raw_args.ptr and sanitized.len == raw_args.len)
             raw_args
         else blk: {
+            errdefer gpa.free(raw_args);
             const duped = try gpa.dupe(u8, sanitized);
             gpa.free(raw_args);
             break :blk duped;
         };
+        errdefer gpa.free(arguments);
+
+        const name = try self.name.toOwnedSlice(gpa);
         return .{
             .call_id = .{ .value = id },
-            .name = try self.name.toOwnedSlice(gpa),
+            .name = name,
             .arguments = arguments,
         };
     }
@@ -716,6 +722,7 @@ fn parseToolCallObject(
         const existing = &stream.builders.items[@as(usize, current)];
         if (existing.id.items.len > 0 and !std.mem.eql(u8, existing.id.items, pending.id.items)) {
             const new_slot: u32 = @intCast(stream.builders.items.len);
+            if (new_slot >= tool_call_array_cap) return error.TooManyToolCalls;
             // The fork creates a builder just like the explicit-index and
             // index-less paths above, so it honours the same cap — otherwise a
             // provider reusing `index: 0` for many parallel calls would fork
@@ -1507,4 +1514,34 @@ test "processStreamChunk does not call on_delta_end for empty chunks" {
     try std.testing.expectEqualStrings("", observer_ctx.reasoning.items);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.tool_calls.items.len);
     try std.testing.expectEqual(@as(usize, 0), observer_ctx.delta_ends);
+}
+
+test "parseStreamChunk rejects >64 collided tool-call IDs instead of panicking" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+
+    var stream: ToolCallStream = .{
+        .limits = .{ .max_parallel_calls = 128, .model_label = "test-model" },
+    };
+    defer stream.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < tool_call_array_cap) : (i += 1) {
+        const chunk = try std.fmt.allocPrint(
+            gpa,
+            "{{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_{d}\",\"function\":{{\"name\":\"read\",\"arguments\":\"{{}}\"}}}}]}}}}]}}",
+            .{i},
+        );
+        defer gpa.free(chunk);
+        _ = try parseStreamChunk(gpa, chunk, &content, &reasoning, &stream);
+    }
+
+    const overflow_chunk = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_overflow\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}";
+    try std.testing.expectError(
+        error.TooManyToolCalls,
+        parseStreamChunk(gpa, overflow_chunk, &content, &reasoning, &stream),
+    );
 }

@@ -73,6 +73,9 @@ pub const Client = struct {
     ) !void {
         if (config.base_url.len == 0) return error.EmptyBaseUrl;
         if (config.model.len == 0) return error.EmptyModelId;
+        if (config.api_key.len > 0 and !provider_headers.isValidHeaderValue(config.api_key)) {
+            return error.InvalidHeaderValue;
+        }
 
         const v1_root = try openaiV1Root(gpa, config.base_url);
         defer gpa.free(v1_root);

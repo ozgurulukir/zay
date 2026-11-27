@@ -79,6 +79,9 @@ pub const Client = struct {
     pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config, responses_config: ResponsesConfig) !void {
         if (config.base_url.len == 0) return error.EmptyBaseUrl;
         if (config.model.len == 0) return error.EmptyModelId;
+        if (config.api_key.len > 0 and !provider_headers.isValidHeaderValue(config.api_key)) {
+            return error.InvalidHeaderValue;
+        }
         const url = try responsesUrl(gpa, config.base_url, responses_config);
         errdefer gpa.free(url);
         const authorization = try std.fmt.allocPrint(gpa, "{s}{s}", .{ http.bearer_prefix, config.api_key });

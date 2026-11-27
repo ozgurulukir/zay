@@ -317,6 +317,9 @@ pub const Transport = struct {
         env: stream_part.StreamEnv,
         retry_after_secs: *?u64,
     ) !ai.Turn {
+        if (self.authorization) |a| {
+            if (!provider_headers.isValidHeaderValue(a)) return error.InvalidHeaderValue;
+        }
         var extra_headers_buffer: [provider_headers.max_outbound_headers]std.http.Header = undefined;
         const extra_headers = self.materializeHeaders(&extra_headers_buffer);
         var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{

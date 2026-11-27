@@ -400,30 +400,68 @@ const AcceptSlot = struct {
     done: bool = false,
     active_acceptors: u8 = 0,
 
-    fn offer(self: *AcceptSlot, io: std.Io, stream: std.Io.net.Stream) void {
+    fn offer(self: *AcceptSlot, io: std.Io, stream: std.Io.net.Stream) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.stream == null and !self.done) {
-            self.stream = stream;
-            self.done = true;
-            self.cond.signal(io);
-            return;
+        while (self.stream != null and !self.done) {
+            self.cond.waitUncancelable(io, &self.mutex);
         }
-        var extra = stream;
-        extra.close(io);
+        if (self.done) {
+            var extra = stream;
+            extra.close(io);
+            return false;
+        }
+        self.stream = stream;
+        self.cond.broadcast(io);
+        return true;
     }
 
-    fn acceptOne(server: *std.Io.net.Server, io: std.Io, slot: *AcceptSlot) void {
+    fn acceptLoop(server: *std.Io.net.Server, io: std.Io, slot: *AcceptSlot) void {
         defer {
             slot.mutex.lockUncancelable(io);
             slot.active_acceptors -= 1;
-            if (slot.active_acceptors == 0) slot.cond.signal(io);
+            if (slot.active_acceptors == 0) slot.cond.broadcast(io);
             slot.mutex.unlock(io);
         }
-        const stream = server.accept(io) catch return;
-        slot.offer(io, stream);
+        while (true) {
+            const stream = server.accept(io) catch return;
+            if (!slot.offer(io, stream)) return;
+        }
     }
 };
+
+fn setStreamTimeoutMs(stream: *const std.Io.net.Stream, timeout_ms: u64) void {
+    if (os.is_windows) return;
+    const clamped_ms = @max(@as(u64, 1), timeout_ms);
+    const tv: std.posix.timeval = .{
+        .sec = @intCast(clamped_ms / std.time.ms_per_s),
+        .usec = @intCast((clamped_ms % std.time.ms_per_s) * std.time.us_per_ms),
+    };
+    std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+    std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.SNDTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+}
+
+fn remainingMs(io: std.Io, deadline_ns: i64) u64 {
+    const now_ns: i64 = @intCast(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds);
+    if (now_ns >= deadline_ns) return 0;
+    const diff_ns: u64 = @intCast(deadline_ns - now_ns);
+    return @max(@as(u64, 1), diff_ns / std.time.ns_per_ms);
+}
+
+fn isCallbackPath(target: []const u8) bool {
+    return std.mem.eql(u8, target, "/auth/callback") or
+        std.mem.startsWith(u8, target, "/auth/callback?");
+}
 
 fn waitForAuthorizationCode(
     gpa: std.mem.Allocator,
@@ -433,6 +471,9 @@ fn waitForAuthorizationCode(
     state: []const u8,
     cancel_requested: ?*const std.atomic.Value(bool),
 ) ![]u8 {
+    const start_ns: i64 = @intCast(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds);
+    const deadline_ns = start_ns + @as(i64, @intCast(timeout_ms)) * std.time.ns_per_ms;
+
     var address4 = try std.Io.net.IpAddress.parseIp4(auth_host, port);
     var server4 = try address4.listen(io, .{ .reuse_address = true });
     defer server4.deinit(io);
@@ -454,12 +495,12 @@ fn waitForAuthorizationCode(
     }
 
     var slot: AcceptSlot = .{ .active_acceptors = 1 };
-    var t4 = try std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ &server4, io, &slot });
+    var t4 = try std.Thread.spawn(.{}, AcceptSlot.acceptLoop, .{ &server4, io, &slot });
     const t6_opt: ?std.Thread = if (server6_opt) |*s6| blk: {
         slot.mutex.lockUncancelable(io);
         slot.active_acceptors += 1;
         slot.mutex.unlock(io);
-        if (std.Thread.spawn(.{}, AcceptSlot.acceptOne, .{ s6, io, &slot })) |t6| {
+        if (std.Thread.spawn(.{}, AcceptSlot.acceptLoop, .{ s6, io, &slot })) |t6| {
             break :blk t6;
         } else |_| {
             slot.mutex.lockUncancelable(io);
@@ -471,8 +512,13 @@ fn waitForAuthorizationCode(
     defer {
         slot.mutex.lockUncancelable(io);
         slot.done = true;
+        if (slot.stream) |*pending| {
+            pending.close(io);
+            slot.stream = null;
+        }
+        slot.cond.broadcast(io);
         slot.mutex.unlock(io);
-        // Unblock whichever listener thread did not receive the connection.
+        // Unblock both listener threads so they observe `slot.done`.
         if (std.Io.net.IpAddress.parseIp4(auth_host, port)) |a4| {
             AcceptWatchdog.pokeAddress(io, a4, false);
         } else |_| {}
@@ -485,40 +531,64 @@ fn waitForAuthorizationCode(
         if (t6_opt) |t6| t6.join();
     }
 
-    slot.mutex.lockUncancelable(io);
-    while (slot.stream == null and slot.active_acceptors > 0) {
-        slot.cond.waitUncancelable(io, &slot.mutex);
-    }
-    if (slot.stream == null) {
-        slot.mutex.unlock(io);
-        return error.AcceptFailed;
-    }
-    var stream = slot.stream.?;
-    slot.stream = null;
-    slot.mutex.unlock(io);
-    defer stream.close(io);
+    const per_connection_timeout_max_ms: u64 = 2_000;
+    while (true) {
+        if (isCancelled(cancel_requested)) return error.LoginCancelled;
+        if (remainingMs(io, deadline_ns) == 0) return error.Timeout;
 
-    var read_buffer: [8192]u8 = undefined;
-    var write_buffer: [8192]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var writer = stream.writer(io, &write_buffer);
-    var http_server = std.http.Server.init(&reader.interface, &writer.interface);
-    var request = http_server.receiveHead() catch |err| switch (err) {
-        // Watchdog poke: the loopback client hung up without sending anything.
-        error.HttpConnectionClosing => {
+        slot.mutex.lockUncancelable(io);
+        while (slot.stream == null and slot.active_acceptors > 0) {
+            slot.cond.waitUncancelable(io, &slot.mutex);
+        }
+        if (slot.stream == null) {
+            slot.mutex.unlock(io);
             if (isCancelled(cancel_requested)) return error.LoginCancelled;
-            return error.Timeout;
-        },
-        else => return err,
-    };
-    if (isCancelled(cancel_requested)) return error.LoginCancelled;
-    const code = parseCallbackTarget(gpa, request.head.target, state) catch |err| {
-        try request.respond("OpenAI authentication failed.", .{ .status = .bad_request });
-        return err;
-    };
-    errdefer gpa.free(code);
-    try request.respond("OpenAI authentication completed. You can close this window.", .{});
-    return code;
+            if (remainingMs(io, deadline_ns) == 0) return error.Timeout;
+            return error.AcceptFailed;
+        }
+        var stream = slot.stream.?;
+        slot.stream = null;
+        slot.cond.broadcast(io);
+        slot.mutex.unlock(io);
+        defer stream.close(io);
+
+        if (isCancelled(cancel_requested)) return error.LoginCancelled;
+        const left_ms = remainingMs(io, deadline_ns);
+        if (left_ms == 0) return error.Timeout;
+
+        // Bound reads/writes on the accepted socket so a stalled local
+        // connection cannot hang past `timeout_ms` or ignore cancellation.
+        setStreamTimeoutMs(&stream, @min(left_ms, per_connection_timeout_max_ms));
+        const read_io = http.timeoutAwareIo(io);
+
+        var read_buffer: [8192]u8 = undefined;
+        var write_buffer: [8192]u8 = undefined;
+        var reader = stream.reader(read_io, &read_buffer);
+        var writer = stream.writer(read_io, &write_buffer);
+        var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+        var request = http_server.receiveHead() catch {
+            if (isCancelled(cancel_requested)) return error.LoginCancelled;
+            if (remainingMs(io, deadline_ns) == 0) return error.Timeout;
+            // Ignore speculative preconnects, empty closes, or stalled sockets.
+            continue;
+        };
+        if (isCancelled(cancel_requested)) return error.LoginCancelled;
+
+        // Ignore stray browser requests (e.g. /favicon.ico) instead of
+        // aborting the entire OAuth login.
+        if (!isCallbackPath(request.head.target)) {
+            request.respond("Not found.", .{ .status = .not_found }) catch {};
+            continue;
+        }
+
+        const code = parseCallbackTarget(gpa, request.head.target, state) catch |err| {
+            request.respond("OpenAI authentication failed.", .{ .status = .bad_request }) catch {};
+            return err;
+        };
+        errdefer gpa.free(code);
+        try request.respond("OpenAI authentication completed. You can close this window.", .{});
+        return code;
+    }
 }
 
 fn isCancelled(cancel_requested: ?*const std.atomic.Value(bool)) bool {
@@ -1051,13 +1121,50 @@ test "waitForAuthorizationCode rejects state mismatch and invalid path" {
         try std.testing.expectError(error.StateMismatch, waitForAuthorizationCode(gpa, io, auth_port, 10_000, "expected_state", null));
     }
 
-    // Invalid Path case
+    // Stray browser request (/favicon.ico) followed by valid callback succeeds.
     {
-        const client = MockCallbackClient{ .io = io, .path = "/wrong/path?code=test_code&state=expected_state" };
-        const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
+        const StrayThenValidClient = struct {
+            io: std.Io,
+
+            fn run(self: @This()) void {
+                const stray = MockCallbackClient{ .io = self.io, .path = "/favicon.ico" };
+                stray.run();
+                const valid = MockCallbackClient{ .io = self.io, .path = "/auth/callback?code=after_stray&state=expected_state" };
+                valid.run();
+            }
+        };
+        const thread = try std.Thread.spawn(.{}, StrayThenValidClient.run, .{StrayThenValidClient{ .io = io }});
         defer thread.join();
 
-        try std.testing.expectError(error.InvalidCallback, waitForAuthorizationCode(gpa, io, auth_port, 10_000, "expected_state", null));
+        const code = try waitForAuthorizationCode(gpa, io, auth_port, 10_000, "expected_state", null);
+        defer gpa.free(code);
+        try std.testing.expectEqualStrings("after_stray", code);
+    }
+
+    // Stalled connection (connects without sending bytes) times out instead of hanging.
+    if (!os.is_windows) {
+        const StalledClient = struct {
+            io: std.Io,
+            release: *std.atomic.Value(bool),
+
+            fn run(self: @This()) void {
+                self.io.sleep(.fromMilliseconds(30), .awake) catch {};
+                const addr = std.Io.net.IpAddress.parseIp4(auth_host, auth_port) catch return;
+                var stream = addr.connect(self.io, .{ .mode = .stream }) catch return;
+                defer stream.close(self.io);
+                while (!self.release.load(.acquire)) {
+                    self.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                }
+            }
+        };
+        var release = std.atomic.Value(bool).init(false);
+        const thread = try std.Thread.spawn(.{}, StalledClient.run, .{StalledClient{ .io = io, .release = &release }});
+        defer {
+            release.store(true, .release);
+            thread.join();
+        }
+
+        try std.testing.expectError(error.Timeout, waitForAuthorizationCode(gpa, io, auth_port, 250, "expected_state", null));
     }
 }
 
