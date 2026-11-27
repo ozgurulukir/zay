@@ -34,6 +34,14 @@ def test_auth_unauthorized(client: TestClient):
     response = client.post("/v1/exec", json={"sql": "CREATE TABLE test (id INT);"})
     assert response.status_code == 401
 
+    # Non-ASCII API key header must return 401 rather than TypeError (500) in hmac.compare_digest
+    non_ascii_resp = client.post(
+        "/v1/exec",
+        json={"sql": "CREATE TABLE test (id INT);"},
+        headers=[(b"x-api-key", b"caf\xe9")],
+    )
+    assert non_ascii_resp.status_code == 401
+
 
 def test_exec_and_query(client: TestClient):
     headers = {"Authorization": "Bearer test-secret"}
@@ -225,6 +233,8 @@ def test_validate_bind_security():
     # Non-loopback hosts refused without API key
     with pytest.raises(ValueError, match="non-loopback"):
         validate_bind_security("0.0.0.0", None)
+    with pytest.raises(ValueError, match="non-loopback"):
+        validate_bind_security("::", None)
     with pytest.raises(ValueError, match="non-loopback"):
         validate_bind_security("192.168.1.50", None)
 

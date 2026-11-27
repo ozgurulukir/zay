@@ -109,7 +109,7 @@ def build_app(host: DatabaseHost) -> FastAPI:
         elif x_api_key:
             token = x_api_key.strip()
 
-        if token is None or not hmac.compare_digest(token, host.api_key):
+        if token is None or not hmac.compare_digest(token.encode("utf-8"), host.api_key.encode("utf-8")):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing database service API key",
