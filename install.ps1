@@ -47,25 +47,28 @@ try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempArtifactPath -UseBasicParsing
 
     Write-Host "==> Verifying SHA256 checksum..." -ForegroundColor Cyan
-    # Wrap ONLY the sidecar download in try/catch: a failed fetch (transient
-    # network error) degrades to a warning. Everything below the catch runs
-    # unguarded, because under $ErrorActionPreference = 'Stop' Write-Error is
-    # a terminating error and the previously adjacent catch swallowed it as
-    # "Checksum verification skipped" — a mismatched binary was then installed
-    # by the Copy-Item below (#451). A mismatch or unparseable sidecar must
-    # abort the install instead.
+    # Wrap ONLY the sidecar download in try/catch: a failed fetch fails closed
+    # unless $env:ZAY_SKIP_CHECKSUM is "1" (matching install.sh). Everything
+    # below the catch runs unguarded, because under $ErrorActionPreference = 'Stop'
+    # Write-Error is a terminating error and a mismatch or unparseable sidecar
+    # must always abort the install (#451).
     $SidecarFetched = $true
     try {
         Invoke-WebRequest -Uri $ChecksumUrl -OutFile $TempShaPath -UseBasicParsing
     } catch {
-        $SidecarFetched = $false
-        Write-Host "Warning: Checksum verification skipped ($($_.Exception.Message))" -ForegroundColor Yellow
+        if ($env:ZAY_SKIP_CHECKSUM -eq "1") {
+            $SidecarFetched = $false
+            Write-Host "Warning: ZAY_SKIP_CHECKSUM=1 set and checksum file not available ($($_.Exception.Message)); installing an unverified binary." -ForegroundColor Yellow
+        } else {
+            Write-Host "Set `$env:ZAY_SKIP_CHECKSUM='1' to install an unverified binary at your own risk." -ForegroundColor Yellow
+            Write-Error "Checksum file not available ($($_.Exception.Message)); refusing to install an unverified binary."
+            exit 1
+        }
     }
     if ($SidecarFetched) {
-        # Get-Content returns $null for a zero-byte sidecar, which made the
-        # .Split below throw into the same skip path; guard it so an empty
-        # sidecar fails closed too.
-        $SidecarContent = Get-Content $TempShaPath
+        # Get-Content -Raw returns $null for a zero-byte sidecar and a single
+        # string for multi-line files; guard it so an empty sidecar fails closed.
+        $SidecarContent = Get-Content -Raw $TempShaPath
         if (-not $SidecarContent) {
             Write-Error "Checksum file is empty; refusing to install an unverified binary."
             exit 1
@@ -119,7 +122,7 @@ try {
         $SeedVerified = $false
         try {
             Invoke-WebRequest -Uri "$BaseUrl/api.json.sha256" -OutFile $TempApiShaPath -UseBasicParsing -TimeoutSec 300
-            $SeedExpected = (Get-Content $TempApiShaPath).Split(" ")[0].Trim()
+            $SeedExpected = (Get-Content -Raw $TempApiShaPath).Split(" ")[0].Trim()
             $SeedActual = (Get-FileHash -Path $TempApiPath -Algorithm SHA256).Hash.ToLower()
             if ($SeedExpected -and ($SeedExpected.ToLower() -eq $SeedActual)) {
                 $SeedVerified = $true
