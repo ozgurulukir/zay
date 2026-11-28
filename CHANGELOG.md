@@ -6,6 +6,13 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-11-28
+
+### Changed
+- Docs: align tool, plugin, and repo instructions with source — fix factual drift in database, lane, path-tools, modular-demo, and CODE_INTELLIGENCE prompts, point CLAUDE.md to AGENTS.md, remove stale libvaxis patch-helper note from AGENTS.md, and deduplicate overlapping plugin/tool prompt guidance (#611-#616).
+- Skills: align codebase skills with AGENTS.md and skill standards — fix factual drift (arm-first Job(T), Lua bridge permissions and error returns, Zig naming/builtins, config schema validation), update stale doc pointers to wiki namespaces, remove orphaned how/references prompt templates, and sharpen trigger descriptions (#611-#616).
+- Documentation: sync docs with v0.12.3 hardening — db_server, installers/CI, Lua plugin sandbox & store, MCP framing, safety classifier, and engineering patterns updated to match current behavior (#637-#644); remove stale duplicate sections in providers-tools-and-wire-protocols.md in favor of canonical cross-links.
+- Plugins: sync store.json catalog hashes, byte sizes, and pinned URLs so sync-plugin-catalog --check-head stays green on main.
 ## [0.12.3] - 2026-11-27
 
 ### Fixed
@@ -246,7 +253,8 @@ See the [GitHub releases](https://github.com/ozgurulukir/zay/releases) and git
 history for prior changes. Older entries are not yet backfilled in this file
 (TODO: backfill from release notes).
 
-[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.3...HEAD
+[Unreleased]: https://github.com/ozgurulukir/zay/compare/v0.12.4...HEAD
+[0.12.4]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.4
 [0.12.3]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.3
 [0.12.2]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.2
 [0.12.1]: https://github.com/ozgurulukir/zay/releases/tag/v0.12.1
