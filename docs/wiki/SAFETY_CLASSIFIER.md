@@ -79,9 +79,9 @@ when untrusted code needs a stronger boundary.
 - **Classified:** model-facing `bash`/`pwsh` tool calls and `skill`
   command-mode calls — all go through the executor's approval gate
   (`executor_safety.shouldRejectUnsafeShell`) before dispatch. Lua
-  `zay.run_bash` / `zay.run_shell` (and `os.execute` when the
-  `allow_os_execute` permission is granted, which dispatches through
-  `zay.run_shell`) classify and spawn through one fused bridge helper
+  `zay.run_bash` / `zay.run_shell` (only exposed when `allow_os_execute = true`,
+  along with `os.execute` which dispatches through `zay.run_shell`) classify
+  and spawn through one fused bridge helper
   (`spawnClassifiedShell` in `src/lua/bridges/shell.zig`):
   `bash_safety.classify` → hard-block `unsafe` verdicts → spawn, with the
   raw backend spawn calls private to that helper so a new bridge entry
@@ -206,6 +206,6 @@ if loading failed.
 |---|---|
 | `modernbert` | ONNX preset; weight-download failures fall back to `rules`. Other initialization errors are reported. |
 | `rules` | Local regex and token heuristics; no model weights. |
-| `llm-proxy` | Delegates classification to a configured remote LLM. |
+| `llm-proxy` | Delegates classification to a configured remote LLM (`OPENAI_BASE_URL` normalized to `/chat/completions`, `OPENAI_API_KEY`; fails closed to `unsafe` on request or parse failure). |
 
 For service implementation notes, see [`tools/classifier/README.md`](../../tools/classifier/README.md).

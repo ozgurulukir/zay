@@ -195,15 +195,15 @@ Run all registered test suites. Returns `true` if all tests pass.
 | `zay.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
 | `zay.mkdir(path)` | `path` | `true` or `nil` | Create directory recursively |
 | `zay.copy_path(src, dst)` | `src`, `dst` | `true` or `nil` | Copy a single file |
-| `zay.move_path(src, dst)` | `src`, `dst` | `true` or `nil` | Move/rename file or directory |
-| `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory safely |
+| `zay.move_path(src, dst)` | `src`, `dst` | `true` or `nil` | Move/rename file or directory *(requires `allow_os_remove`; `nil` otherwise)* |
+| `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory safely *(requires `allow_os_remove`; `nil` otherwise)* |
 
 ### Shell & Environment
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `zay.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (`pwsh.exe` on Windows, `bash` on POSIX) |
-| `zay.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution (git-bash on Windows) |
+| `zay.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (`pwsh.exe` on Windows, `bash` on POSIX) *(requires `allow_os_execute`; `nil` otherwise)* |
+| `zay.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution (git-bash on Windows) *(requires `allow_os_execute`; `nil` otherwise)* |
 | `zay.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, or `"native"`) | quoted `string` or `nil, err` | Quote one argument for a shell command line (see below) |
 | `zay.get_env(name)` | `name` | `string` or `nil, err` | Environment variable. Without the `allow_env` permission only a harmless allowlist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`, `TZ`) is readable; other names return `nil` plus a denial message |
 | `zay.get_cwd()` | — | `string` | Effective cwd of the current dispatch/event callback — a lane worktree root, or a resumed session's cwd; outside dispatch (init.lua load) the process cwd |
@@ -312,8 +312,8 @@ future addition.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `zay.json_decode(str)` | JSON `string` | Lua value or `nil, err` | Parse JSON into a native Lua value (objects → tables, arrays → 1-indexed tables). |
-| `zay.json_encode(value, opts?)` | any value, `opts.pretty` | JSON `string` or `nil, err` | Serialize a Lua value to JSON. Contiguous 1..N integer keys → array; otherwise object. `pretty=true` → indent_2. |
+| `zay.json_decode(str)` | JSON `string` | Lua value or `nil, err` | Parse JSON into a native Lua value (objects → tables, arrays → 1-indexed tables). Rejects nesting deeper than 32 levels (`max_json_depth`) or exceeding Lua stack space without corrupting the stack. |
+| `zay.json_encode(value, opts?)` | any value, `opts.pretty` | JSON `string` or `nil, err` | Serialize a Lua value to JSON. Contiguous 1..N integer keys → array; otherwise object. `pretty=true` → indent_2. Non-finite floats (`math.huge`, `-math.huge`, `0/0`) and values nested past 32 levels emit `null`. |
 
 These bridges let plugins parse and emit structured data without hand-rolling a
 parser or shelling out to `jq`. `json_decode` reuses Zay's `std.json` parser;

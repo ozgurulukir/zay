@@ -33,9 +33,9 @@ uv run --project tools/db_server --extra postgres -m tools.db_server.server \
   --api-key "secret-key"
 ```
 
-The service reads its backend, PostgreSQL URL, and API key from these CLI flags;
-it does not read `ZAY_DB_*` environment variables. Omit `--api-key` only when
-an unauthenticated service is intentional.
+The service reads `--backend` and `--postgres-url` from CLI flags; `--api-key` falls back to `ZAY_DB_API_KEY` when omitted. Binding to a non-loopback host without `--api-key` or `ZAY_DB_API_KEY` is refused at startup unless `--allow-unauthenticated` is passed.
+
+When `--backend postgres` is selected, `asyncpg` (installed via the `postgres` extra) is required at startup, and PostgreSQL DSN `sslmode` values (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`) are mapped to `asyncpg` TLS settings.
 
 ### 2. Configure Zay Agent
 
@@ -59,5 +59,7 @@ export ZAY_DATABASE_AUTH_TOKEN="secret-key"
 
 ```bash
 docker build -t zay-db-server -f tools/db_server/Dockerfile tools/db_server
-docker run -d -p 8766:8766 -v zay-data:/data --name zay-db-server zay-db-server
+docker run -d -p 8766:8766 -e ZAY_DB_API_KEY="secret-key" -v zay-data:/data --name zay-db-server zay-db-server
 ```
+
+Because the image binds `--host 0.0.0.0` (non-loopback), pass `-e ZAY_DB_API_KEY=...` (or append `--allow-unauthenticated` explicitly for unauthenticated use).

@@ -107,9 +107,7 @@ uv run -m tools.db_server.server --port 8766
 
 #### Option B: Cloud PostgreSQL (Neon / Supabase / Render)
 
-The service is configured **entirely through CLI flags** — it reads no `ZAY_DB_*`
-environment variables. `asyncpg` ships as the `postgres` extra, so install it or the
-Postgres pool is never created and `/health` reports `standby`.
+The backend and PostgreSQL URL are passed via CLI flags; `--api-key` falls back to the `ZAY_DB_API_KEY` environment variable if set. `asyncpg` ships as the `postgres` extra and is required at startup when `--backend postgres` is selected (missing `asyncpg` raises a startup error). PostgreSQL `sslmode` query parameters (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`) are parsed and mapped to `asyncpg` TLS options.
 
 ```bash
 uv run --project tools/db_server --extra postgres -m tools.db_server.server \
@@ -120,8 +118,7 @@ uv run --project tools/db_server --extra postgres -m tools.db_server.server \
 ```
 
 > [!NOTE]
-> Always pass `--api-key` when starting Postgres remotely. When it is omitted, the API
-> accepts unauthenticated requests.
+> Binding to a non-loopback host without `--api-key` or `ZAY_DB_API_KEY` is refused at startup unless `--allow-unauthenticated` is passed explicitly. On loopback hosts (`127.0.0.1`, `localhost`, `::1`), omitting the key permits unauthenticated local requests.
 
 > [!IMPORTANT]
 > **Transaction Pooling Compatibility:** `tools/db_server/` is hardened for serverless PostgreSQL providers using transaction-mode poolers (such as PgBouncer or Supabase transaction pooling on port 6543). The server acquires an explicit connection per operation (`pool.acquire()`), disables the session-level prepared-statement cache (`statement_cache_size=0` — critical for PgBouncer/Supavisor/Neon), and caps the pool at `min_size=1, max_size=10`.

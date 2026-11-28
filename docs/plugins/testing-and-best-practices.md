@@ -33,11 +33,14 @@ Plugins run in a restricted Lua environment. The following are available:
 - **Safe os subset**: `os.clock()`, `os.date()`, `os.time()`, `os.difftime()`
 
 The following are **blocked** by default: `io`, `debug`, `package`, `loadfile`,
-`dofile`, `os.execute`, `os.remove`, `os.rename`.
+`dofile`, `os.execute`, `os.remove`, `os.rename`, as well as `zay.run_bash`,
+`zay.run_shell`, `zay.delete_path`, and `zay.move_path`. Grant
+`allow_os_execute = true` or `allow_os_remove = true` in `plugin.lua` when
+those capabilities are needed.
 
-Instead of blocked functions, use `zay.*` bridge functions:
+Instead of blocked standard-library functions, use `zay.*` bridge functions:
 - Use `zay.read_file()` instead of `io.open()`
-- Use `zay.run_bash()` instead of `os.execute()`
+- Use `zay.run_bash()` (with `allow_os_execute = true`) instead of `os.execute()`
 - Use `zay.get_env()` instead of `os.getenv()`
 
 ## Testing

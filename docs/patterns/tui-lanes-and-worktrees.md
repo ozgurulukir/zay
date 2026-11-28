@@ -16,6 +16,9 @@ For input failures, `routeKey` logs every key reaching the router and `handleTic
 
 `src/tui.zig` holds `App` lifecycle and `RootWidget`; `src/tui/` is split by concern. See `docs/ARCHITECTURE.md` for the subsystem overview.
 
+- **Plugin store cache (`plugin_store_job.zig`, `#614`):** `installed_cache` is cleared before freeing inventory on `repoint`, `.refreshing`, and `.scanning`, falls back to loaded `PluginManager` instances while the async scan is in flight, and refreshes across every lifecycle transition (`.refreshing` drain, `toggleEnabled`, `forgetMissingPlugin`, `openPlugins`).
+- **Mouse routing and selection (`event_router.zig`, `mouse_selection.zig`, `#611-#613`):** Modal overlays and the diff viewer isolate mouse routing from the underlying transcript; transcript hit-testing aligns with rendered visual geometry and selects full UTF-8 grapheme clusters on word selection.
+
 ### App state grouping pattern
 
 `App` struct fields are grouped into focused sub-structs defined in `src/tui/app_state.zig`: `InputState` (text fields), `PickerStates` (per-picker state), `NavState` (cursors + session action + resume group-by), `ListWidgets` (scrollable list views), `ProviderState` (API keys + registry + connectivity), `InputBuffers` (inline edit buffers), `AtSearchState` (`@`-mention search), `BackgroundModalState` (Ctrl+O modal), `MetricsState` (spinner + diff cache). Each sub-struct owns one concern; accessors on `*App` expose inner fields. When adding new App state, prefer extending an existing sub-struct or adding a new one rather than growing the flat struct — and when the state belongs to an extractable domain concern (one of the spokes below), it goes into that spoke's module instead, with no App field or accessor mirror. The sub-struct rule covers UI-owned state (pickers, buffers, nav, widgets); the extraction rule covers domain state (#298 resolution, 2026-11-13: extraction over facade).
@@ -131,11 +134,11 @@ for the direct-runner behavior and verification result.
 
 Worktrees isolate parallel worker agents and user lanes from the primary repository tree. Five architectural pillars ensure robust, cross-platform stability:
 
-1. **Path Normalization (`src/paths.zig::pathsEqual`):**
-   Path equality checks for workspace borrows, worktree directories, and lane commands use `pathsEqual` from the root leaf `src/paths.zig` (re-exported as `lanes_util.pathsEqual` by `src/tui/lanes.zig` for in-TUI callers; the execution layer imports the leaf directly). This helper operates with zero dynamic allocations, collapses redundant and trailing slashes (`/` vs `\`), and applies ASCII case-folding on Windows (`C:\foo` == `c:/foo/`). Never compare file or worktree paths with byte-level `std.mem.eql`.
+1. **Path Normalization (`src/paths.zig::pathsEqual` / `isSubpathOrEqual`):**
+   Path equality and containment checks for workspace borrows, worktree directories, and lane commands use `pathsEqual` and `isSubpathOrEqual` from the root leaf `src/paths.zig` (re-exported as `lanes_util.pathsEqual` by `src/tui/lanes.zig` for in-TUI callers; the execution layer imports the leaf directly). Both helpers operate with zero dynamic allocations via separator-collapsing walks (`/` vs `\`), handle trailing separators and bare `/` roots, and apply ASCII case-folding on Windows (`C:\foo` == `c:/foo/`). Never compare file or worktree paths with byte-level `std.mem.eql`.
 
 2. **Shell Containment Parity:**
-   Worker agents are strictly root-contained. On POSIX, `bash.zig` validates directory navigation. On Windows, `src/tools/pwsh.zig` injects pre-command function overrides (`cd`, `Set-Location`, `chdir`, `sl`) that resolve target paths with `[System.IO.Path]::GetFullPath`, check boundaries with `$root.TrimEnd('\', '/')`, and reject directory-stack escapes (`Push-Location`, `Pop-Location`).
+   Worker agents are strictly root-contained. On POSIX, `bash.zig` validates directory navigation, marks `_zay_root` `readonly`, and guards against sibling-prefix escapes (`"${_phys#"$_zay_root"/}" = "$_phys"`). On Windows, `src/tools/pwsh.zig` injects `Constant`-scoped `_zay_root` and `Function:\Set-Location` / `Push-Location` / `Pop-Location` overrides that resolve target paths with `[System.IO.Path]::GetFullPath`, check boundaries with `StartsWith("$root\", OrdinalIgnoreCase)`, and reject directory-stack escapes (`Push-Location`, `Pop-Location`). Also, `mergeLane`, `abandonLane`, and `clearWorkspaceBorrowForPath` treat `lane.cancel_job != null` as `InFlightTurn` alongside `lane.turn.isActive()`, and `Thread.deinit` frees `worker.approval`/`worker.queue` using `worker.gpa`.
 
 3. **Windows File Locking & Teardown Protocol:**
    Deleting worktrees on Windows is subject to asynchronous file lock retention by child processes or Windows Defender. All teardown paths (`abandonLane`, `mergeLane`, `deleteSelectedParked`, `rollbackLaneWorktree`, `deleteLaneOp`) call `lane_lifecycle.cleanupLaneWorktreeAndBranch`:

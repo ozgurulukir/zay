@@ -150,7 +150,12 @@ never install into a recreated client (#413). Disconnect-first disable
 transitions follow the same discipline; rediscovery replaces rather than
 appends tool entries.
 
-### Thread-safety
+### Thread-safety and frame integrity
 
 Client-list access and in-flight request accounting are synchronized under the
-manager lock, closing a retire-time use-after-free window (#410).
+manager lock, closing a retire-time use-after-free window (#410). Worker-side
+session-expiry recovery updates error state safely via `setErrorFromWorker`.
+`callTool` validates and compact-serializes `arguments` JSON before framing
+(`InvalidArgumentsJson` on malformed JSON), and `formatRequest` /
+`formatNotification` reject raw `\r` or `\n` bytes in `params` (`InvalidFrame`),
+preventing NDJSON frame injection.

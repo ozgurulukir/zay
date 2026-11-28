@@ -15,8 +15,9 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 Open `/plugins` in the TUI. The Store tab always includes the Zay GitHub
 catalog; when running from a Zay checkout it uses `plugins/store.json`, and
 otherwise it fetches the same catalog from the repository. Plugin packages and
-their catalog live together under `plugins/`. Press `a`, enter another HTTP(S)
-catalog URL, and press Enter to save it and refresh the catalog list. Select a
+their catalog live together under `plugins/`. Press `a`, enter another HTTPS
+catalog URL (plain `http://` is permitted only for loopback hosts: `localhost`,
+`127.0.0.1`, `::1`, `[::1]`), and press Enter to save it and refresh the catalog list. Select a
 plugin and press Enter to stage it into the user's global plugin directory.
 Use Tab to move among Installed, Store, and Sources. Sources shows custom
 catalog status, including stale cached entries and fetch errors. Press Space
@@ -29,10 +30,12 @@ project; restart Zay to apply the change. Press `x` to remove a disabled global
 installation after restarting to unload it, and confirm with `y`. Project
 plugins are not deleted by the Store removal action.
 
-Source identity rules: HTTP(S) catalog URLs are compared exactly, so a
+Source identity rules: store catalog URLs are compared exactly, so a
 trailing slash or different letter case registers as a distinct source;
 local catalog paths treat `/` and `\` as equivalent separators, and local
-catalogs may use either separator in relative package paths. A source is
+catalogs may use either separator in relative package paths. Remote store and
+file URLs must use `https://` (plain `http://` is permitted only for loopback
+hosts, and empty hosts are rejected). A source is
 registered at most once — duplicates cannot accumulate in the catalog
 bundle or the Store UI — and removing a source with `x` purges every
 registration of it.
@@ -50,7 +53,8 @@ resume rediscovers project plugins only when no lane turn is active.
 
 A directory containing `plugin.lua` may provide `prompt.md` instructions.
 These use the manifest name for enablement and are included only for the
-active physical copy loaded by the runtime. Disabled, invalid, failed-init,
+active physical copy loaded by the runtime. Symlinked `prompt.md` files are
+rejected. Disabled, invalid, failed-init,
 and shadowed copies do not contribute tool instructions. A directory with
 `prompt.md` and no manifest is intentionally supported as standalone prompt
 content. Same-project lanes clone the assembled prompt inputs; plugin
@@ -71,8 +75,8 @@ changes take effect at restart or the guarded project-switch boundary.
 | `zay.file_info(path)` | `path` | `{size, type, extension, language, mime_type}` | File metadata |
 | `zay.mkdir(path)` | `path` | `true` or `nil` | Create directory (recursive, with parents) |
 | `zay.copy_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Copy a single file |
-| `zay.move_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Move/rename a file or directory |
-| `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory (recursive opt-in) |
+| `zay.move_path(src, dst)` | `source_path`, `destination_path` | `true` or `nil` | Move/rename a file or directory *(requires `allow_os_remove`)* |
+| `zay.delete_path(path, opts?)` | `path`, `opts.recursive` | `true` or `nil` | Delete file or directory (recursive opt-in) *(requires `allow_os_remove`)* |
 
 Result rows: `search_files` → `{file, line, content}` (content truncated to 200 bytes per line); `find_files` → `{path, name}`. On a mid-walk failure the bridge returns partial data with an `error` string field plus the usual `total_matches`/`truncated` fields — check `result.error` before trusting `results`.
 
@@ -94,8 +98,8 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `zay.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution, gated by the shell safety classifier |
-| `zay.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (pwsh on Windows, bash on POSIX), same gate |
+| `zay.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution, gated by the shell safety classifier *(requires `allow_os_execute`)* |
+| `zay.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (pwsh on Windows, bash on POSIX), same gate *(requires `allow_os_execute`)* |
 | `zay.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, `"native"`) | `string` or `nil, err` | Quote one argument for a shell command line — use it for every interpolated value |
 | `zay.get_env(name)` | `name` | `string` or `nil, err` | Environment variable. Without the `allow_env` permission only a harmless allowlist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`, `TZ`) is readable; other names return `nil` plus a denial message |
 | `zay.get_cwd()` | — | `string` | Current working directory |
@@ -256,8 +260,8 @@ sockets to any plugin regardless of what it declares.
 | `file_access` | Declares the plugin reads/writes files (via `zay.*` bridges) | `false` | advisory only — `io.*` is never exposed |
 | `network_access` | Declares the plugin needs network access | `false` | advisory only — no network API exists in the sandbox |
 | `require_others` | Declares the plugin may `require()` modules | `true` | advisory only — `zay.require` is always scoped to the plugin's own directory |
-| `allow_os_execute` | Allow `os.execute` | `false` | yes |
-| `allow_os_remove` | Allow `os.remove`/`os.rename` (routed to sandboxed `deletePath`/`movePath`) | `false` | yes |
+| `allow_os_execute` | Allow `os.execute`, `zay.run_bash`, and `zay.run_shell` (those fields are `nil` unless granted) | `false` | yes |
+| `allow_os_remove` | Allow `os.remove`/`os.rename`, `zay.delete_path`, and `zay.move_path` (those fields are `nil` unless granted) | `false` | yes |
 | `allow_env` | Allow `zay.get_env` to read arbitrary environment variables; without it only the harmless allowlist above is served | `false` | yes |
 
 Embedded plugins (shipped with Zay) always get full access.

@@ -29,16 +29,25 @@ Additional catalogs are JSON documents with this shape:
       "version": "1.0.0",
       "description": "Short description.",
       "files": [
-        { "path": "plugin.lua", "url": "https://example.com/my-plugin/plugin.lua" },
-        { "path": "init.lua", "url": "https://example.com/my-plugin/init.lua" }
+        {
+          "path": "plugin.lua",
+          "url": "https://example.com/my-plugin/plugin.lua",
+          "sha256": "<64-hex-sha256>",
+          "size": 123
+        },
+        {
+          "path": "init.lua",
+          "url": "https://example.com/my-plugin/init.lua",
+          "sha256": "<64-hex-sha256>",
+          "size": 456
+        }
       ]
     }
   ]
 }
 ```
 
-`plugin.lua` and `init.lua` are required. Remote file paths are relative to the
-plugin package and URLs must be HTTP(S). The checked-in catalog also has a
+`plugin.lua` and `init.lua` are required, and every `files` entry must declare both `sha256` and `size`. Remote file paths are relative to the plugin package, and remote URLs must use `https://` (`http://` is permitted only for loopback hosts: `localhost`, `127.0.0.1`, `::1`, `[::1]`). The checked-in catalog also has a
 `sourceDir` for each package, used only when running from this checkout. Store
 URLs are saved globally in `plugin-stores.json` under Zay's platform config
 directory. The checked-in packages are store sources, not the install
