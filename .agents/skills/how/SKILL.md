@@ -1,85 +1,63 @@
 ---
 name: how
-description: Use for how-does-X-work questions, code walkthroughs before changing something, and placement, ownership, or layering questions in the Zay codebase. Follow repository instructions and verify behavior in source.
+description: Use when the user asks how a Zay subsystem works, needs a code walkthrough before editing, or asks where code belongs across layers (for design rationale or git history, use why).
 ---
 
 # How
 
-Explain runtime behavior and architecture from evidence. Produce a mental model
-that lets a maintainer decide where to edit and what contracts must remain true.
-Use why for motivation and history; use this skill for mechanics, ownership, and
-flow.
+Explain runtime behavior and architecture from source evidence so a maintainer knows where to edit and which contracts hold. Use `how` for mechanics, ownership, and flow; use `why` for design motivation and git history.
 
 ## Discovery order
 
-Read user- and project-level instructions first. If they configure a repository
-index, search service, or other discovery helper, use it according to those
-instructions. Otherwise use standard source search, direct file reads, tests,
-and version-control history. Prefer symbol-aware navigation when available, but
-never make an optional discovery service a prerequisite for answering.
-
-Use literal search for strings, error messages, config keys, and non-code files.
-If an index is stale, unavailable, or incomplete, continue with direct source
-inspection and state the limitation. Never treat a missing indexed result as
-proof that code does not exist.
+1. Read `AGENTS.md` and `docs/CODE_INTELLIGENCE.md`. When graph tools (Codebase Memory / GitNexus) are indexed and available, use them for symbol discovery; otherwise inspect source, tests, and git history directly.
+2. Use literal search (`rg`) for strings, error messages, config keys, and docs.
+3. Verify negative index results with literal search and direct reads before concluding code is absent; note any index staleness or fallback limits.
 
 ## Explain workflow
 
-1. Interpret the question and state a best-guess scope when it is ambiguous.
-2. Identify the actual trigger, state owner, and terminal effect. Start at a
-   public command, route, tool, tick, or test rather than a convenient helper.
-3. Trace the path through types and boundaries. Confirm each important step in
-   source; do not infer behavior from file names.
-4. Mark concurrency, ownership, persistence, and platform transitions. In Zay,
-   check the relevant invariants in docs/PATTERNS.md, especially:
-   - lib/ leaves do not import src/.
-   - execution/AI adapters do not depend on the TUI.
-   - TUI leaf widgets receive props/view models, not App pointers.
-   - Job(T) async families are polled from ticks and joined only at teardown.
-   - session writes persist before cache updates.
-   - lane cwd/worktree comparisons use the shared path helpers.
-5. Present the shortest useful explanation with source paths and symbols.
+1. **Scope** — State the question and best-guess scope if ambiguous.
+2. **Anchor** — Find the real trigger, state owner, and terminal effect (CLI entry, command, tool, tick, or test), not just an internal helper.
+3. **Trace** — Follow types and boundaries in source; confirm behavior from code rather than file names.
+4. **Check invariants** — Consult the relevant page under `docs/patterns/README.md` (especially `architecture-and-layering.md` and `tui-lanes-and-worktrees.md`):
+   - `lib/` leaves never import `src/` (`INV-LEAF-1`).
+   - `src/tools/` and `src/ai/` adapters have zero TUI dependencies.
+   - TUI leaf widgets take props/view models, not `*App` (`INV-WIDGET-1`).
+   - `Job(T)` families are **arm-first**, polled from ticks, and joined only at teardown.
+   - Session writes enqueue/persist before cache updates.
+   - Lane cwd and worktree comparisons use `src/paths.zig`.
+5. **Synthesize** — Present the shortest useful explanation with exact file paths and symbol names.
 
-For Zay, the broad map is lib/ leaves, src/tools and src/ai adapters,
-src/agent orchestration, src/session persistence, and src/tui presentation.
-Confirm the map against docs/ARCHITECTURE.md for the subsystem in question.
+Broad Zay layer map (confirm against `docs/ARCHITECTURE.md` and `docs/index.md`): `lib/` pure leaves; `src/tools/`, `src/ai/`, `src/config/`, `src/db/`, `src/mcp/`, `src/lua/` adapters and boundaries; `src/agent/` and `src/session/` orchestration and persistence; `src/tui/` presentation and lifecycle.
 
 ## Placement questions
 
-When asked where code should live, decide in this order:
+Decide where new code belongs in this order:
 
-- Is it pure, reusable, and presentation-free? Prefer lib/ or a narrow leaf.
-- Is it protocol, shell, schema, or external-I/O adaptation? Keep it at the
-  relevant src/ai, src/tools, src/mcp, src/config, or src/db boundary.
-- Is it turn/session orchestration? Keep it in src/agent or src/session.
-- Is it user interaction, render state, or lifecycle? Keep it in src/tui; leaf
-  widgets should take view models and lifecycle modules should take narrow ctx.
-- Is the proposed module crossing a lower-to-higher layer? Treat that as a
-  design smell and check the documented invariant before editing.
+1. Pure, reusable, presentation-free utility → `lib/` or a narrow leaf module.
+2. Protocol, shell, schema, or external I/O adaptation → `src/ai/`, `src/tools/`, `src/mcp/`, `src/config/`, `src/db/`, or `src/lua/`.
+3. Turn, context, or session orchestration → `src/agent/` or `src/session/`.
+4. User interaction, render state, or UI lifecycle → `src/tui/` (leaf widgets under `src/tui/widgets/` take view models; lifecycle modules take narrow contexts).
+
+Treat any lower-to-higher layer import as a design smell and check `docs/patterns/architecture-and-layering.md` before editing.
 
 ## Critique mode
 
-When the user asks whether the architecture is good, explain the current flow
-first, then evaluate it against explicit invariants and observed call paths.
-Separate:
+When asked whether an architecture is sound, trace the current flow first, then evaluate it using [`references/critique-rubric.md`](references/critique-rubric.md). Classify findings into:
 
-- Act on: a concrete contract violation, cycle, race, leak, or wrong owner.
-- Consider: a real tradeoff with measurable cost but no clear violation.
-- Noted: a valid observation that does not justify a change.
-- Dismissed: a claim not supported by the code or current docs.
+- **Act on** — concrete contract violation, cycle, race, leak, or wrong owner.
+- **Consider** — real tradeoff with measurable cost but no clear violation.
+- **Noted** — valid observation that does not justify a change.
+- **Dismissed** — claim unsupported by code or current docs.
 
-Do not manufacture parallel model opinions or depend on a particular vendor
-workflow. If independent comparison is valuable, make two bounded hypotheses
-and test each against the same source evidence.
+Work directly from source evidence; when comparing alternatives, test at most two bounded hypotheses against the same code.
 
-## Output shape
+## Output
 
-- Overview: what the subsystem does and why the reader should care.
-- Key concepts: only the types and owners needed for the explanation.
-- Flow: trigger to effect, including decisions and async boundaries.
-- Where things live: a short file map with symbols.
-- Gotchas: non-obvious invariants, platform behavior, and failure modes.
-- Evidence note: repository/index freshness and any coverage or fallback limits.
+Adapt to the question, covering exact paths and symbols:
 
-Use exact names and paths. Prefer a compact flow diagram only when it makes
-three or more dependent stages easier to follow.
+- **Overview** — what the subsystem does and why it matters.
+- **Key concepts** — central types and state owners only.
+- **Flow** — trigger to terminal effect, including async/thread boundaries (add a compact diagram only for 3+ dependent stages).
+- **Where things live** — short file/symbol map.
+- **Gotchas** — non-obvious invariants, platform differences, and failure modes.
+- **Evidence note** — index status and any coverage/fallback limits.

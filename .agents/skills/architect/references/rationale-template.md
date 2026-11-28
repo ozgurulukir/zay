@@ -1,35 +1,31 @@
 # Rationale template
 
-The prose that ships alongside the type sketch. One page. Sentence-case headings, no boilerplate. Replace the italic notes with actual content.
+The prose that ships alongside the type sketch. Keep it to one page, sentence-case headings, replacing italic prompts with concrete content.
 
 ## Problem
 
-_One paragraph. What we're trying to do, and what about the existing system or constraints makes the shape non-obvious. If [Phase A](../SKILL.md#phase-a-ground-the-problem) surfaced constraints the design must honor (existing types to interop with, callers we can't break, invariants that crossed our boundary), name them here so the reader sees the same constraints you saw._
+_One paragraph: what we are building, and which constraints surfaced during [Ground](../SKILL.md#ground) make the shape non-obvious (existing types to interop with, callers we cannot break, boundary invariants)._
 
 ## Usage (caller's view)
 
-_Write this first, before the type sketch. Show the README or quickstart the consumer reads, plus two or three realistic call sites in their own code. What they import, what they call, what comes back. The type sketch in [Shape](#shape) is derived from this. The two must agree; when they diverge, reconcile the sketch to the usage, not the reverse. The caller's experience is the spec. The types serve it._
+_Write this first, before the type sketch. Show two or three realistic call sites in caller code: what they import, what they call, and what comes back. Derive the type sketch in [Shape](#shape) from this usage; reconcile types to usage if they diverge._
 
 ## Shape
 
-_The recommended architecture. Data structures first; then how data flows through the signatures. Name the load-bearing decisions: which invariants are encoded in types, where validation lives, what the system deliberately does not do. Cite the principle behind each decision (e.g., `per boundary-discipline`); don't restate it._
-
-## Synthesis decision
-
-_Records which candidate became the base and why, what was adapted from each alternative, and what was rejected and why._
+_The chosen architecture: data structures first, then data flow through signatures. Name load-bearing decisions—which invariants are encoded in types, where validation lives, and what the design deliberately omits—and name the invariant or pattern behind each choice._
 
 ## Tradeoffs accepted
 
-_One bullet per tradeoff the chosen shape makes. Form: "we accept X in exchange for Y." Name anything a future reader might mistake for an oversight, including things that look like premature optimization or premature simplification._
+_One bullet per tradeoff ("We accept X in exchange for Y"). Call out anything a future reader might mistake for an oversight._
 
 ## Alternatives considered
 
-_Required. Name at least one concrete alternative shape, with one line on why it lost. Two or three when the design space had real contenders; one is fine when the constraints forced the answer, with the conclusion phrased as "this was the only viable shape because..." Avoid listing flavors of the same shape. Distinct from "Synthesis decision": this section covers design alternatives the chosen shape considered and rejected, not other runner candidates._
+_Name at least one concrete alternative shape and why it lost (e.g., wrong owner, cross-layer dependency, extra mutable state). Use two or three when real contenders existed; if constraints forced a single viable shape, state why._
 
 ## Open questions and risks
 
-_Things you noticed during the sketch that the human needs to weigh in on, and risks worth flagging before implementation starts. Phrase as questions, not assertions, so the human's answer is the resolution rather than a comment._
+_Decisions needing user input or risks worth flagging before implementation. Phrase each open point as a concrete question._
 
 ## Next implementation step
 
-_The first thing to build against the sketch. One sentence. What you'd start writing immediately after synthesis (or after Phase D sign-off, if a checkpoint was opted into)._
+_One sentence naming the first concrete file/test to write against the sketch._

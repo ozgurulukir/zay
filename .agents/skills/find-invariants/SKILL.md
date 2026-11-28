@@ -1,25 +1,30 @@
 ---
 name: find-invariants
-description: Use when architecting a Zay feature and need to discover, state, and encode its ownership, lifecycle, persistence, concurrency, or boundary invariants.
+description: Use when designing a Zay feature or seam to discover, state, and encode ownership, lifecycle, persistence, concurrency, or boundary invariants before writing code (for Zig coding rules, use tigerstyle).
 ---
 
-The goal is to make the solution's invariants explicit before implementation.
-Ground them in current callers, tests, source, and project instructions. Use a
-configured code index if one is available, but do not require an external
-discovery service to identify or verify an invariant.
+# Find Invariants
 
-For each invariant, record:
+Make every load-bearing invariant explicit and structural before writing implementation code. Ground invariants in current callers, tests, source, `AGENTS.md`, and `docs/patterns/README.md` (using `docs/CODE_INTELLIGENCE.md` graph tools when available, with direct source and git history as the baseline).
 
-- the state or boundary it protects;
-- the smallest owner that can enforce it;
-- whether a union(enum), branded/validated value, narrow context struct, or
-  runtime assertion makes it structural;
-- the failure and teardown behavior;
-- the regression test that proves it.
+## Required fields per invariant
 
-Check the repository's existing contracts before inventing a new one:
-lib/ leaves do not import src/, TUI leaf widgets take view models rather than
-App pointers, Job(T) families are polled and arm-last, session persistence
-precedes cache updates, remote multi-statement writes are atomic batches, and
-worktree paths use pathsEqual. Prefer an invariant that removes branches and
-illegal states over a comment that merely asks callers to remember a rule.
+Record all five fields for each invariant before concluding:
+
+1. **Protected state or boundary** — what corruption, race, leak, or layer violation it prevents.
+2. **Smallest owner** — the narrowest module or struct that can enforce it.
+3. **Structural encoding** — how a `union(enum)`, branded/validated type, narrow context struct, or runtime `assert` makes invalid states unrepresentable or immediately caught.
+4. **Failure and teardown behavior** — rollback, `errdefer`, cancellation, and cleanup guarantees.
+5. **Proving regression test** — the test name and location that exercises both valid and invalid transitions.
+
+## Existing Zay contracts to preserve
+
+Check `docs/patterns/README.md` before inventing a new contract:
+
+- `lib/` leaves never import `src/` (`INV-LEAF-1`).
+- TUI leaf widgets take props/view models rather than `*App` (`INV-WIDGET-1`).
+- `Job(T)` families are **arm-first** (assign the owning slot first, then arm through `&slot`), polled non-blockingly, adopted once, and joined only at teardown.
+- Session persistence enqueues/persists before cache updates, and remote multi-statement writes use atomic batches (`INV-DB-BATCH`).
+- Worktree and workspace comparisons use `src/paths.zig` (`pathsEqual` / `isSubpathOrEqual`).
+
+Encode invariants in types and assertions that eliminate illegal branches rather than comments asking callers to remember rules.

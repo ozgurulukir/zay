@@ -1,45 +1,62 @@
 ---
 name: python-helpers
-description: Targeted exact-match string replacement, multi-edit validation, and search helpers for Python environments.
+description: Use when editing files via Python in shell commands and you need unique-target validation, atomic writes, and Zay visual diff sentinels.
 ---
 
-# Python Helpers Skill
+# Python Helpers
 
-This skill provides robust Python-based file editing and search routines. When Python is available on the system, you can use these snippets for exact multi-line replacement, validation before write, and visual TUI diff rendering.
+Use these Python snippets when editing files through shell commands: they verify that each target string matches uniquely before writing, emit Zay visual diff sentinels (`\x1ezay:diff` / `\x1ezay:end`), and write atomically via a temporary file in the target directory.
 
----
-
-## 1. Exact-Match File Editor (`edit`)
-
-The `edit` routine reads the target file, verifies that `old_text` exists uniquely (or validates multiple sequential replacements), applies the changes, outputs a unified visual diff using Zay's display sentinels (`\x1ezay:diff`), and writes atomically.
-
-### Python Function Definition:
+## 1. Atomic exact-match editor (`edit`)
 
 ```python
 import difflib
 import os
 import sys
+import tempfile
 
 def emit_diff(path: str, old: str, new: str) -> None:
-    lines_old = old.splitlines(keepends=True)
-    lines_new = new.splitlines(keepends=True)
-    diff = difflib.unified_diff(lines_old, lines_new, fromfile=f"a/{path}", tofile=f"b/{path}")
-    diff_text = "".join(diff)
+    diff_text = "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
     if diff_text:
-        # Zay visual diff sentinel (routed to TUI diff panel)
         sys.stdout.write(f"\x1ezay:diff\n{diff_text}\x1ezay:end\n")
         sys.stdout.flush()
 
-def edit(path: str, old_text: str = None, new_text: str = None, edits: list = None) -> None:
+def atomic_write(path: str, content: str) -> None:
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    mode = os.stat(abs_path).st_mode & 0o777
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".edit-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, abs_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+def edit(path: str, old_text: str | None = None, new_text: str | None = None, edits: list[tuple[str, str]] | None = None) -> None:
     if not os.path.exists(path):
         raise FileNotFoundError(f"File '{path}' does not exist.")
-    
+    if edits is None:
+        if old_text is None or new_text is None:
+            raise ValueError("Provide either (old_text, new_text) or edits.")
+        operations = [(old_text, new_text)]
+    else:
+        operations = edits
+
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    operations = edits if edits else [(old_text, new_text)]
     new_content = content
-
     for old, new in operations:
         count = new_content.count(old)
         if count == 0:
@@ -49,33 +66,31 @@ def edit(path: str, old_text: str = None, new_text: str = None, edits: list = No
         new_content = new_content.replace(old, new, 1)
 
     emit_diff(path, content, new_content)
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+    atomic_write(path, new_content)
     print(f"Successfully updated {path}")
 ```
 
----
+## 2. Quick one-liners
 
-## 2. Invocations
+### POSIX Bash
 
-### A. One-Liner Replacement (Linux/macOS Bash)
 ```bash
 python3 -c '
 import sys
-path, old, new = "src/main.ts", "const x = 1;", "const x = 2;"
-with open(path, "r") as f: c = f.read()
+path, old, new = "src/main.zig", "old_line", "new_line"
+with open(path, "r", encoding="utf-8") as f: c = f.read()
 if c.count(old) != 1: sys.exit(f"Target text not unique in {path}")
-with open(path, "w") as f: f.write(c.replace(old, new, 1))
+with open(path, "w", encoding="utf-8") as f: f.write(c.replace(old, new, 1))
 print(f"Updated {path}")
 '
 ```
 
-### B. One-Liner Replacement (Windows PowerShell)
+### Windows PowerShell
+
 ```powershell
 python -c "
 import sys
-path, old, new = 'src/main.ts', 'const x = 1;', 'const x = 2;'
+path, old, new = 'src/main.zig', 'old_line', 'new_line'
 with open(path, 'r', encoding='utf-8') as f: c = f.read()
 if c.count(old) != 1: sys.exit(f'Target text not unique in {path}')
 with open(path, 'w', encoding='utf-8') as f: f.write(c.replace(old, new, 1))
@@ -83,5 +98,4 @@ print(f'Updated {path}')
 "
 ```
 
-### C. Multi-Edit Temp Script (Complex Refactoring)
-For multi-line edits with indentation, write a temporary `.py` script, execute it, and clean up.
+For multi-line indented edits, write a temporary `.py` script, execute it, and delete the script after verification.

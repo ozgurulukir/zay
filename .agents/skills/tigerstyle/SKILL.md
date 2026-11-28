@@ -1,267 +1,53 @@
 ---
 name: tigerstyle
-description: Use when writing or reviewing Zig code in Zay. Apply the repository's Zig 0.16 style, ownership, boundary, concurrency, and test conventions.
+description: Use when writing, editing, or reviewing Zig 0.16 code in Zay to apply the repository's control-flow, assertion, memory, concurrency, and naming conventions.
 ---
 
-## Goals when writing code
+# TigerStyle for Zay
 
-- Write code that is simple and elegant
-- Avoid technical debt at all costs
-- Maximise the safety of the program
+Safety, clarity, and explicit ownership come first. Pair this skill with `docs/DEVELOPMENT.md` (Zig 0.16 API recipes, file header order, and test reachability via `src/root.zig`) and `docs/patterns/README.md` (subsystem invariants).
 
-### Rules
+## Control flow and assertions
 
-- Prefer simple, explicit control flow
-- Avoid recursion unless the data structure requires it and the depth is bounded
-- Minimise abstractions to a few excellent ones, increasing abstractions creates risk of a leaky abstraction
-- Bound queues, buffers, retries, and external work. Do not impose an artificial
-  bound where the protocol or file format is legitimately streaming.
-- Use semantic integer types: `usize` for indexes and lengths, fixed-width types
-  for wire formats, persisted values, and platform-independent limits.
-- Assert meaningful API/state-transition invariants. Do not add assertions for
-  facts already guaranteed by the type system or ordinary loop bounds.
-- For every property you want to enforce, try to find at least two different code paths where an assertion can be added. For example, assert validity of data right before writing it to disk, and also immediately after reading from disk.
-- Split compound assertions: prefer `assert(a); assert(b);` over `assert(a and b);`.
-  The former is simpler to read, and provides more precise information if the condition fails.
-- Use single-line `if` to assert an implication: `if (a) assert(b)`.
-- The golden rule of assertions is to assert the positive space that you do expect AND to
-  assert the negative space that you do not expect because where data moves across the
-  valid/invalid boundary between these spaces is where interesting bugs are often found. This is
-  also why tests must test exhaustively, not only with valid data but also with invalid data,
-  and as valid data becomes invalid.
-- Zay deliberately allocates after startup for sessions, prompts, plugins, and
-  UI state. Make those allocations explicit, scoped, and paired with `defer`
-  or `errdefer`; do not pretend the program is static-memory-only.
-- Declare variables at the smallest possible scope, and minimize the number of variables in
-  scope, to reduce the probability that variables are misused.
-- Keep functions small enough to review, but do not enforce an arbitrary line
-  limit. Extract helpers when they reduce state or clarify ownership.
-- Centralize control flow. When splitting a large function, try to keep all switch/if statements in the "parent" function, and move non-branchy logic fragments to helper functions. Divide responsibility. All control flow should be handled by _one_ function, the rest shouldn't
-  care about control flow at all. In other words,
-  ("push `if`s up and `for`s down").
-  Similarly, centralize state manipulation. Let the parent function keep all relevant state in
-  local variables, and use helpers to compute what needs to change, rather than applying the
-  change directly. Keep leaf functions pure.
-- Whenever your program has to interact with external entities, don't do things directly in
-  reaction to external events. Instead, your program should run at its own pace. Not only does
-  this make your program safer by keeping the control flow of your program under your control, it
-  also improves performance for the same reason (you get to batch, instead of context switching on
-  every event). Additionally, this makes it easier to maintain bounds on work done per time period.
-- Avoid deeply nested or opaque compound conditions; use the shape that makes
-  all meaningful cases obvious. Do not mechanically expand every `else if`.
-  that all cases are handled. Split compound conditions into simple conditions using nested
-  `if/else` branches. Split complex `else if` chains into `else { if { } }` trees. This makes the
-  branches and cases clear. Again, consider whether a single `if` does not also need a matching
-  `else` branch, to ensure that the positive and negative spaces are handled or asserted.
-- State invariants positively. When working with lengths and indexes, this
-  form is easy to get right (and understand):
+- Keep control flow explicit and bounded: bound queues, buffers, retries, and external work (unless a protocol or file format is legitimately streaming), and bound or avoid recursion.
+- Centralize branching and state updates in the parent function ("push `if`s up and `for`s down"); keep leaf helpers pure.
+- Flatten opaque compound conditions into clear `if`/`else` branches so positive and negative cases are both obvious and handled or asserted.
+- State range invariants positively (`if (index < length)` rather than `if (index >= length)`).
+- Handle every Zig error union explicitly; reserve `catch unreachable` for proven invariants.
+- Pass options explicitly at library call sites rather than relying on implicit defaults.
+- Assert API boundaries and state transitions on both sides of a boundary (e.g., before writing and after reading), covering both the valid space and the invalid boundary. Omit assertions already guaranteed by types or loop bounds.
+- Split compound assertions (`assert(a); assert(b);` over `assert(a and b);`), and write implications on one line (`if (a) assert(b);`).
 
-  ```text
-  if (index < length) {
-    // The invariant holds.
-  } else {
-    // The invariant doesn't hold.
-  }
-  ```
+## Memory, concurrency, and types
 
-  This form is harder, and also goes against the grain of how `index` would typically be compared to
-  `length`, for example, in a loop condition:
-
-  ```text
-  if (index >= length) {
-    // It's not true that the invariant holds.
-  }
-  ```
-
-- All errors must be handled. If a path can throw, that exception must be handled.
-- Explicitly pass options to library functions at the call site, instead of relying on the
-  defaults. This improves readability but most of all avoids latent, potentially
-  catastrophic bugs in case the library ever changes its defaults.
+- Make post-startup allocations explicit, tightly scoped, and paired with `defer` or `errdefer`; use blank lines to group allocation and `defer` pairs. Never let an `errdefer` fire after manual `deinit` on an error path, and free buffers explicitly before `return null` inside `catch` blocks.
+- Shrink variable scope: declare variables as close to first use as possible to avoid place-of-check-to-place-of-use gaps and variable misuse.
+- Pass read-only arguments larger than 16 bytes as `*const T` to prevent accidental stack copies.
+- Initialize large or immovable structs in place via out-pointers (`fn init(target: *LargeStruct) !void`); in-place initialization is viral up the enclosing container.
+- Zero padding/buffers cleanly to avoid buffer bleeds or non-deterministic output.
+- Use `std.Io.Mutex` / `std.Io.Condition` for locking; `std.atomic.Mutex` is a spinlock in Zig 0.16 and pegs CPU. Never block the TUI render path; route background work through `Job(T)` (`arm-first`) and bridge conventions.
+- Use `usize` for indexes and lengths, and fixed-width integers for wire formats, persisted data, and cross-platform limits.
+- Prefer `void` over `bool`, `bool` over `u64`, `u64` over `?u64`, and `?u64` over `!u64` to keep call-site branching shallow.
 
 ## Performance
 
-- Be explicit. Minimize dependence on the compiler to do the right thing for you.
+- Batch work and decouple control plane from data plane; optimize for the slowest resource first in order: network, disk, memory, CPU.
+- Extract hot loops into standalone functions taking primitive arguments without `self` so field caching and redundant work stay visible.
 
-  In particular, extract hot loops into stand-alone functions with primitive arguments without
-  `self` (see [an example](https://github.com/tigerbeetle/tigerbeetle/blob/0.16.19/src/lsm/compaction.zig#L1932-L1937)).
-  That way, the compiler doesn't need to prove that it can cache struct's fields in registers, and a
-  human reader can spot redundant computations easier.
+## Naming and layout
 
-- Optimize for the slowest resources first (network, disk, memory, CPU) in that order, after
-  compensating for the frequency of usage, because faster resources may be used many times more. For
-  example, a memory cache miss may be as expensive as a disk fsync, if it happens many times more.
+Follow `docs/DEVELOPMENT.md` casing rules: `camelCase` for functions and methods, `snake_case` for variables, parameters, and constants, `PascalCase` for types, and `const Self = @This();` at the top of modules/structs.
 
-- Distinguish between the control plane and data plane. A clear delineation between control plane
-  and data plane through the use of batching enables a high level of assertion safety without losing
-  performance.
+- Put units and qualifiers last in descending significance so related names align (`latency_ms_max`, `latency_ms_min`).
+- Spell out variable names (`gpa: Allocator`, `arena: Allocator`, `source`/`target` with matching lengths for symmetry) except primitive loop/sort/matrix indexes; use `--long` flags in scripts.
+- Preserve acronym capitalization (`VSRState`, not `VsrState`).
+- Prefix single-caller helpers with the caller's name (`readSector` / `readSectorCallback`), and put callbacks last in parameter lists.
+- Prefer nouns over participles (`replica.pipeline` over `replica.preparing`).
+- Use an options struct when positional arguments share types (`u64, u64`) or accept `null`; pass unique singleton dependencies (`allocator`, `io`) positionally from general to specific.
+- Order file and struct members top-down: fields, then types (ending with `const Self = @This();`), then methods (`init`/`main` first). Extract complex nested types to top-level structs.
+- Write comments as full sentences explaining **why** (invariants, constraints, workarounds), not **what**; inline end-of-line comments may be brief phrases.
 
-- Amortize network, disk, memory and CPU costs by batching accesses.
+## Off-by-one and arithmetic
 
-- Let the CPU be a sprinter doing the 100m. Be predictable. Don't force the CPU to zig zag and
-  change lanes. Give the CPU large enough chunks of work. This comes back to batching.
-
-## Naming Things
-
-- Get the nouns and verbs just right. Great names are the essence of great code, they capture
-  what a thing is or does, and provide a crisp, intuitive mental model. They show that you
-  understand the domain. Take time to find the perfect name, to find nouns and verbs that work
-  together, so that the whole is greater than the sum of its parts.
-
-- Do not abbreviate variable names, unless the variable is a primitive integer type used as an
-  argument to a sort function or matrix calculation. Use long form arguments in scripts: `--force`,
-  not `-f`. Single letter flags are for interactive usage.
-
-- Use proper capitalization for acronyms (`VSRState`, not `VsrState`).
-
-- Add units or qualifiers to variable names, and put the units or qualifiers last, sorted by
-  descending significance, so that the variable starts with the most significant word, and ends with
-  the least significant word. For example, `latency_ms_max` rather than `max_latency_ms`. This will
-  then line up nicely when `latency_ms_min` is added, as well as group all variables that relate to
-  latency.
-
-- Infuse names with meaning. For example, `allocator: Allocator` is a good, if boring name,
-  but `gpa: Allocator` and `arena: Allocator` are excellent. They inform the reader whether
-  `deinit` should be called explicitly.
-
-- When choosing related names, try hard to find names with the same number of characters so that
-  related variables all line up in the source. For example, as arguments to a memcpy function,
-  `source` and `target` are better than `src` and `dest` because they have the second-order effect
-  that any related variables such as `source_offset` and `target_offset` will all line up in
-  calculations and slices. This makes the code symmetrical, with clean blocks that are easier for
-  the eye to parse and for the reader to check.
-
-- When a single function calls out to a helper function or callback, prefix the name of the helper
-  function with the name of the calling function to show the call history. For example,
-  `read_sector()` and `read_sector_callback()`.
-
-- Callbacks go last in the list of parameters. This mirrors control flow: callbacks are also
-  invoked last.
-
-- Order matters for readability (even if it doesn't affect semantics). On the first read, a file
-  is read top-down, so put important things near the top. The `main` function goes first.
-
-  The same goes for objects or structs, the order is fields then types then methods:
-
-  ```text
-  time: Time,
-  process_id: ProcessID,
-
-  const ProcessID = struct { cluster: u128, replica: u8 };
-  const Tracer = @This(); // This alias concludes the types section.
-
-  pub fn init(gpa: std.mem.Allocator, time: Time) !Tracer {
-      ...
-  }
-  ```
-
-  If a nested type is complex, make it a top-level struct.
-
-  At the same time, not everything has a single right order. When in doubt, consider sorting
-  alphabetically, taking advantage of big-endian naming.
-
-- Don't overload names with multiple meanings that are context-dependent.
-
-- Think of how names will be used outside the code, in documentation or communication. For example,
-  a noun is often a better descriptor than an adjective or present participle, because a noun can be
-  directly used in correspondence without having to be rephrased. Compare `replica.pipeline` vs
-  `replica.preparing`. The former can be used directly as a section header in a document or
-  conversation, whereas the latter must be clarified. Noun names compose more clearly for derived
-  identifiers, e.g. `config.pipeline_max`.
-
-- For named arguments: Use it when arguments can be
-  mixed up. A function taking two `u64` must use an options struct. If an argument can be `null`,
-  it should be named so that the meaning of `null` literal at the call site is clear.
-
-  Because dependencies like an allocator or a tracer are singletons with unique types, they should
-  be threaded through constructors positionally, from the most general to the most specific.
-
-- Comments are sentences, with a space after the slash, with a capital letter and a full stop, or a
-  colon if they relate to something that follows. Comments are well-written prose describing the
-  code, not just scribblings in the margin. Comments after the end of a line _can_ be phrases, with
-  no punctuation.
-
-### Cache Invalidation
-
-- Don't duplicate variables or take aliases to them. This will reduce the probability that state
-  gets out of sync.
-
-- If you don't mean a function argument to be copied when passed by value, and if the argument type
-  is more than 16 bytes, then pass the argument as `*const`. This will catch bugs where the caller
-  makes an accidental copy on the stack before calling the function.
-
-- Construct larger structs _in-place_ by passing an _out pointer_ during initialization.
-
-  In-place initializations can assume **pointer stability** and **immovable types** while
-  eliminating intermediate copy-move allocations, which can lead to undesirable stack growth.
-
-  Keep in mind that in-place initializations are viral — if any field is initialized
-  in-place, the entire container struct should be initialized in-place as well.
-
-  **Prefer:**
-
-  ```zig
-  fn init(target: *LargeStruct) !void {
-    target.* = .{
-      // in-place initialization.
-    };
-  }
-
-  fn main() !void {
-    var target: LargeStruct = undefined;
-    try target.init();
-  }
-  ```
-
-  **Over:**
-
-  ```zig
-  fn init() !LargeStruct {
-    return LargeStruct {
-      // moving the initialized object.
-    }
-  }
-
-  fn main() !void {
-    var target = try LargeStruct.init();
-  }
-  ```
-
-- **Shrink the scope** to minimize the number of variables at play and reduce the probability that
-  the wrong variable is used.
-
-- Calculate or check variables close to where/when they are used. **Don't introduce variables before
-  they are needed.** Don't leave them around where they are not. This will reduce the probability of
-  a POCPOU (place-of-check to place-of-use), a distant cousin to the infamous
-  [TOCTOU](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use). Most bugs come down to a
-  semantic gap, caused by a gap in time or space, because it's harder to check code that's not
-  contained along those dimensions.
-
-- Use simpler function signatures and return types to reduce dimensionality at the call site, the
-  number of branches that need to be handled at the call site, because this dimensionality can also
-  be viral, propagating through the call chain. For example, as a return type, `void` trumps `bool`,
-  `bool` trumps `u64`, `u64` trumps `?u64`, and `?u64` trumps `!u64`.
-
-- Treat asynchronous workers and UI ticks as explicit state machines. Never
-  block the render path; use the repository's `Job(T)` and bridge conventions
-  for background work.
-
-- Be on your guard for **[buffer bleeds](https://en.wikipedia.org/wiki/Heartbleed)**. This is a
-  buffer underflow, the opposite of a buffer overflow, where a buffer is not fully utilized, with
-  padding not zeroed correctly. This may not only leak sensitive information, but may cause
-  deterministic guarantees as required by TigerBeetle to be violated.
-
-- Use newlines to **group resource allocation and deallocation**, i.e. before the resource
-  allocation and after the corresponding `defer` statement, to make leaks easier to spot.
-
-### Off-By-One Errors
-
-- The usual suspects for off-by-one errors are casual interactions between an `index`, a `count`
-  or a `size`. These are all primitive integer types, but should be seen as distinct types, with
-  clear rules to cast between them. To go from an `index` to a `count` you need to add one, since
-  indexes are 0-based but counts are 1-based. To go from a `count` to a `size` you need to
-  multiply by the unit. Again, this is why including units and qualifiers in variable names is
-  important.
-
-- Show your intent with respect to division. For example, use `div_exact()`, `div_floor()` or
-  `div_ceil()` to show the reader you've thought through all the interesting scenarios where
-  rounding may be involved.
+- Treat `index` (0-based), `count` (1-based: `index + 1`), and `size` (`count * unit_bytes`) as distinct semantic concepts; convert explicitly.
+- State division intent with Zig builtins (`@divExact`, `@divFloor`, `@divTrunc`) instead of bare `/`.

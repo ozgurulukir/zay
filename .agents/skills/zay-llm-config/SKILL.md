@@ -1,343 +1,106 @@
 ---
 name: zay-llm-config
-description: 'Configure Zay to talk to LLM providers. Use when the user asks how to set up/switch/connect a model or provider, needs to add an API key, point Zay at a custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, vLLM, local gateways), set the default model/base URL, or understand config.json, auth.json, models.dev, or the relevant environment variables.'
+description: Use when setting up, switching, or troubleshooting Zay LLM providers, models, API keys, or custom OpenAI-compatible endpoints (Ollama, LM Studio, OpenRouter, vLLM, /connect, config.json, auth.json, reasoningEffort, env overrides).
 ---
 
 # Configure Zay for LLM Providers
 
-Zay is a terminal coding agent that talks to an OpenAI-compatible model through a
-provider adapter. This skill teaches the full provider/model configuration model:
-where settings live, the four config layers, how API keys are stored, the TUI
-commands, and the common local/cloud setups.
+Zay talks to OpenAI-compatible endpoints (Chat Completions and Responses API) plus built-in OpenAI / Codex OAuth. Authoritative schema and field tables live in `schema/config.schema.json`, `docs/config/README.md`, `docs/config/file-format-and-schema.md`, `docs/config/providers-mcp-and-plugins.md`, `docs/config/compatibility-environment-and-persistence.md`, and `docs/patterns/configuration-sessions-and-persistence.md`.
 
-Zay speaks the **OpenAI wire protocol** (chat-completions and Responses-API). Any
-provider that implements an OpenAI-compatible endpoint works: OpenRouter, Ollama,
-LM Studio, vLLM, Together, DeepSeek, Mistral, Cerebras, Gemini gateways, custom
-`/v1`-style servers, etc. Builtin native support exists for OpenAI / Codex OAuth
-(chat login, no API key).
+## 1. Config layers and paths
 
-**Reference docs:** `docs/CONFIG.md` (configuration architecture, provider,
-database, and environment sections), `schema/config.schema.json`
-(authoritative field names), `docs/MCP.md` (model context protocol servers),
-and `docs/PATTERNS.md` (transport and reasoning invariants). `[[CONFIG]]` in
-repo docs links the wiki version.
+Values merge in order of increasing precedence:
 
----
+1. **Built-in defaults**
+2. **Global config** — compile-time selected (`src/paths.zig::platformConfigDir`):
+   - POSIX: `~/.config/zay/config.json` (`$XDG_CONFIG_HOME` is **not** honored)
+   - Windows: `%APPDATA%\zay\config.json`
+3. **Project config** — `<project>/.zay/config.json`
+4. **Environment variables** — runtime overrides
 
-## 1. The four configuration layers
+Use **camelCase** keys; legacy v1 snake_case keys are accepted at parse time, rejected by `schema/config.schema.json` (`additionalProperties: false`), and rewritten as camelCase on save. Config files are written atomically (`0600` on POSIX) and capped at 32 KB. API keys stay in `auth.json` (never serialized into `config.json`).
 
-Values resolve by merging in order of increasing specificity (later overrides
-earlier):
+## 2. Model selection (`defaultModel`)
 
-1. **Builtin defaults** (compiled in).
-2. **Global config file** — location is **OS-dependent** (see below).
-3. **Project config file** — `<project>/.zay/config.json`, merged over global.
-4. **Environment variables** — override everything.
-
-### Global config & auth dir are platform-selected (compile-time)
-
-The global config tree roots at a single platform-aware directory computed from
-the resolved `home_dir` (`src/paths.zig::platformConfigDir`), and both
-`config.json` and `auth.json` live there:
-
-| OS      | Platform config dir                                       | Global config file             |
-| ------- | --------------------------------------------------------- | ------------------------------ |
-| Windows | `<USERPROFILE>\AppData\Roaming\zay`  (== `%APPDATA%\zay`) | `%APPDATA%\zay\config.json`    |
-| POSIX   | `<home>/.config/zay`                  (XDG base dir)      | `~/.config/zay/config.json`    |
-
-Notes:
-- The branch is selected at **compile time** via `os.is_windows` — the same
-  binary does not remap at runtime; the path you see depends on the OS the
-  process was built & run on.
-- On POSIX the XDG base dir is **hardcoded to `~/.config/zay`**; `$XDG_CONFIG_HOME`
-  is NOT honored (it is not consulted by `platformConfigDir`). If a distro/
-  container overrides `XDG_CONFIG_HOME`, Zay still reads `~/.config/zay`.
-- On Windows it does not use `ProgramData` or `LOCALAPPDATA` scope; it is the
-  per-user roaming dir `AppData\Roaming\zay` under the logged-in user's home.
-
-Keys are **camelCase**; legacy snake_case keys are accepted for backward
-compatibility but are not schema-valid (`zig build --strict` / `zay --strict`
-flags them). Config files are written atomically (temp + rename); editing in the
-TUI and pressing **Ctrl+S** persists to the global config.
-
-**Auth separation:** API keys are NEVER stored in config.json — they live in
-`auth.json` (see §4). Rehydration of a disk-loaded config never carries a key.
-
----
-
-## 2. Provider & model selection (`defaultModel`)
-
-The **single source of truth** for provider + model is the `defaultModel` key, a
-`"<provider>/<model-id>"` string. The provider part is split on the FIRST `/`;
-model ids may themselves contain slashes (e.g. Hugging Face org/model ids).
+`defaultModel` is the single source of truth as `"<provider>/<model-id>"`, split on the first `/` (model IDs may contain slashes):
 
 ```json
 {
-  "defaultModel": "openai/gpt-5.5",
-  "defaultModel": "ollama/llama3.1:8b",
-  "defaultModel": "qwen-cloud/qwen3.7-plus",
-  "defaultModel": "huggingface/meta-llama/Llama-3.1-8B"
+  "defaultModel": "openrouter/anthropic/claude-3.7-sonnet"
 }
 ```
 
-Both parts must be non-empty. The provider name is resolved against custom
-providers, builtin provider labels, and the models.dev catalogue. Top-level
-`baseURL` is a valid override for the active provider; use
-`providers.<name>.baseURL` when the endpoint belongs to a named provider and
-must survive model switches.
+Use top-level `baseURL` for an active override, or `providers.<name>.baseURL` when binding an endpoint to a named provider across model switches.
 
----
+## 3. Providers and per-model settings
 
-## 3. The `providers` block (per-provider config)
+`providers` accepts built-in provider IDs (18 compiled-in entries in `src/config/provider.zig`) and custom provider names (surfaced in `/connect` via the OpenAI-compatible adapter):
 
-`providers` is keyed by provider name. Accepts builtin labels and **custom
-provider names** (which appear in the `/connect` picker and use the
-OpenAI-compatible adapter). Fields:
+- `providers.<name>.baseURL` — endpoint base URL.
+- `providers.<name>.headers` — up to 8 extra outbound headers supporting `{env:VAR}` placeholders; reserved transport headers (`authorization`, `content-type`, `host`, etc.) are rejected.
+- `providers.<name>.models.<id>.reasoningEffort` — `"default"`, `"minimal"`, `"low"`, `"none"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` (OpenRouter top level; Qwen/DashScope clips to valid values; `.minimal` dialect clips `xhigh`→`max`, `minimal`→`low`).
+- `providers.<name>.models.<id>.reasoningOptions` — restricts the `/model` picker cycle.
+- `providers.<name>.models.<id>.contextWindow` — overrides catalogue lookup (essential for local Ollama/LM Studio models).
+- `providers.<name>.models.<id>.maxOutputTokens` — caps `max_tokens` per turn (falls back to `context.maxOutputTokens`).
+- `providers.<name>.responsePolicy` — maps proxy fields (`reasoning`, `reasoning_content`, `reasoning_details`, `thinking`) to `text`, `reasoning`, or `ignore`.
 
-| Field | Meaning |
-| ----- | ------- |
-| `baseURL` | Custom base URL for this provider (legacy `base_url`). |
-| `models.<id>` | Per-model settings keyed by model id (see below). |
-| `headers` | Extra outbound HTTP headers (max 8). Support `{env:VAR}` placeholders; secrets stay in the environment. Reserved transport headers (authorization, content-type, host…) are rejected — credentials belong in `auth.json`. |
+Global / `context` switches relevant to gateways:
 
-Per-model settings under `providers.<name>.models.<id>`:
+- `useResponsesEndpoint: true` — route via Responses API instead of Chat Completions.
+- `strictOutputs: true` — OpenAI-only strict tool schemas; keep `false` for OpenRouter, Ollama, vLLM, and other gateways.
+- `context.disablePromptCache: true` — suppresses cache fields (`cache_control`, `session_id`, `prompt_cache_key`) when a gateway rejects them with HTTP 400.
+- `context.autoContinueOnLengthCut: true` — retries once when a response ends at `finish_reason=length` with no tool calls.
 
-```json
-{
-  "providers": {
-    "openai": {
-      "baseURL": "https://api.openai.com/v1",
-      "models": {
-        "gpt-4o": { "reasoningEffort": "high" }
-      }
-    },
-    "ollama": {
-      "baseURL": "http://localhost:11434",
-      "models": { "llama3.1:8b": {} }
-    }
-  }
-}
-```
+For session database backends (`local_sqlite`, `turso_http`, `d1_http`, `zay_service`), see `docs/config/database-and-roaming.md`.
 
-Common per-model keys:
-- `reasoningEffort` — `"default"` (model decides) / `"none"` (no thinking) /
-  `"low"`/`"medium"`/`"high"`/`"xhigh"` / `"max"` (OpenRouter-only top level;
-  OpenAI-native ignores it; Qwen/DashScope clips to `"medium"`).
-- `reasoningOptions` — array this model supports; the TUI picker filters its
-  cycle to this list.
-- `contextWindow` — token context window; overrides catalogue lookup (needed
-  for local Ollama/LM Studio models the catalogue misses).
-- `maxOutputTokens` — caps `max_tokens` per turn; falls back to
-  `context.maxOutputTokens`.
-Global transport/UI settings use camelCase in new config files:
-`useResponsesEndpoint`, `strictOutputs`, `systemPrompt`, and
-`bashClassifierUrl`. Legacy snake_case spellings are parsed for migration but
-are not schema-valid and are rewritten on save. Strict outputs are opt-in and
-gateway-incompatible; do not enable them for OpenRouter, Ollama, vLLM, or
-similar gateways unless the provider is known to support OpenAI strict tools.
+## 4. Credentials (`auth.json`)
 
-Context-wide settings live under `context`, not under a provider model:
-`disablePromptCache` suppresses cache fields in both wire clients and
-`autoContinueOnLengthCut` retries once after a cap-terminated response with
-no tool calls. The context block also owns request timeouts, concurrent-request
-limits, tool-call limits, and compaction.
-
-Reasoning-effort application is two composed layers (dialect-level clipping +
-Qwen/QwQ model-level clipping) resolved at one named home; you don't need to care
-unless you hit a provider that rejects the reasoning parameter — set
-`reasoningEffort: "none"` or rely on the model-level clip.
-
----
-
-## 4. API keys: `auth.json`
-
-Credentials are stored per-provider in `auth.json` in the platform config dir
-(`~/.config/zay/auth.json` on POSIX, `%APPDATA%\zay\auth.json` on Windows),
-optionally backed by the OS keychain on supported platforms.
-
-Shape used by Zay's own stores:
+Credentials live in `<platformConfigDir>/auth.json` (and the OS keychain on supported platforms via `src/auth/store.zig`), keyed by provider ID under `apiKeys`:
 
 ```json
 {
   "apiKeys": {
-    "openrouter": "sk-or-v1-...",
-    "cerebras": "csk-...",
-    "ollama": ""
+    "openrouter": "sk-or-v1-..."
   }
 }
 ```
 
-(`openaiCodex` OAuth tokens live in a separate `openaiCodex` section — do not
-hand-edit those.)
+The `apiKeys` key must match the provider prefix in `defaultModel`. Set keys via `/connect`, `OPENAI_API_KEY` (runtime override), or `auth.json` (leave `openaiCodex` OAuth entries untouched).
 
-**Key invocation:** the API key Zay sends is selected by provider name at attach
-time. The defaultModel provider part must match the key's label.
+## 5. Environment variables and TUI commands
 
-Ways to set a key:
-- The `/connect` picker prompts for an API key for cloud providers.
-- `OPENAI_API_KEY` env var (runtime override, not persisted).
-- Hand-edit `auth.json` (fine, but prefer the picker so the file stays valid).
+Key overrides (full list in `docs/config/compatibility-environment-and-persistence.md`):
 
----
+- `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`
+- `ZAY_USE_RESPONSES_ENDPOINT`, `ZAY_STRICT_OUTPUTS`, `ZAY_BASH_CLASSIFIER_URL`
+- `ZAY_LOG_FILE`, `ZAY_LOG_MAX_BYTES`, `ZAY_LOG_STDERR_LEVEL` (`debug` surfaces provider/loading logs)
 
-## 5. External database and roaming sessions
+TUI commands:
 
-Session storage can remain local or use a remote backend configured under
-database.backend: local/local_sqlite, turso_http, d1_http, or zay_service.
-Turso and D1 use atomic HTTP batches; zay_service is the companion REST
-service. Remote failures fall back to local sessions.sqlite, and roaming
-sessions bind records to the local host_id and project root. Keep auth tokens
-in config as required by the selected backend and use docs/CONFIG.md for the
-provider-specific URL forms. The database tool is activated when an external
-database backend or service URL is configured.
+- `/connect` — select built-in, models.dev, or custom provider and enter cloud API keys (local providers probe `/v1/models`).
+- `/model` — switch active model and reasoning effort; press **Ctrl+S** inside `/model` to cycle save scope (global / project / session).
+- `/settings` (**Ctrl+S** to open and save) — persists global settings fields (`useResponsesEndpoint`, `systemPrompt`, `bashClassifierUrl`, `toast.enabled`), never `defaultModel`.
 
-## 6. Environment variables
+## 6. Common setups
 
-| Variable | Effect |
-| -------- | ------ |
-| `OPENAI_MODEL` | Sets provider+model selection, e.g. `openrouter/anthropic/claude-3.7-sonnet`. |
-| `OPENAI_BASE_URL` | Overrides the active provider base URL, e.g. `https://openrouter.ai/api`. |
-| `OPENAI_API_KEY` | Runtime API key. |
-| `ZAY_USE_RESPONSES_ENDPOINT` | Force Responses-endpoint routing (`true`/`1`). |
-| `ZAY_STRICT_OUTPUTS` | OpenAI strict structured-outputs — gateway-incompatible (`true`/`1`). |
-| `ZAY_BASH_CLASSIFIER_URL` | External safety classifier URL (optional). |
-| `ZAY_DATABASE_SERVER_URL` / `ZAY_DATABASE_AUTH_TOKEN` | External database service URL and token. |
-| `ZAY_LOG_FILE`, `ZAY_LOG_MAX_BYTES`, `ZAY_LOG_STDERR_LEVEL` | Logging knobs. |
+- **OpenAI / Codex OAuth:** `{ "defaultModel": "openai/gpt-5.5" }` and log in via `/connect` → Codex (no API key).
+- **OpenRouter:** `defaultModel: "openrouter/<org/model>"`, `providers.openrouter.baseURL: "https://openrouter.ai/api/v1"`, key in `apiKeys.openrouter`.
+- **Ollama (local):** `defaultModel: "ollama/llama3.1:8b"`, `providers.ollama.baseURL: "http://localhost:11434"`, plus `models.<id>.contextWindow` if missing from catalogue.
+- **LM Studio / vLLM / custom gateway:** define `providers.<custom>.baseURL: "http://localhost:1234/v1"` and set `defaultModel: "<custom>/<model>"`.
 
-Env vars override every file layer and are the quickest way to point Zay at a
-provider for a one-off run:
-`OPENAI_MODEL=openrouter/anthropic/claude-3.7-sonnet OPENAI_BASE_URL=https://openrouter.ai/api OPENAI_API_KEY=sk-or-... zay`.
+## 7. models.dev catalogue and troubleshooting
 
----
+Zay embeds and caches `models.dev/api.json` (`registry_payload_max_bytes = 16 MiB` shared across network fetch, cache, and `<prefix>/share/zay/api.json`). Custom `providers.<name>` entries are the escape hatch for unlisted models/endpoints.
 
-## 7. TUI commands
+- **401 / missing key:** match `apiKeys.<provider>` to the `defaultModel` prefix, or test with `OPENAI_API_KEY`.
+- **400 on reasoning/cache fields:** set `reasoningEffort: "none"` or `context.disablePromptCache: true`.
+- **Missing tool calls on gateways:** keep `strictOutputs: false`.
+- **Stale config:** restart Zay or re-run `/connect` / `/model`, and inspect `ZAY_LOG_STDERR_LEVEL=debug`.
 
-From the command palette (`/`):
+## Quick checklist
 
-- **`/connect`** — provider picker. Shows builtin providers, custom (user-defined)
-  providers, and models.dev catalogue models. Selecting a cloud provider prompts
-  for an API key (stored via auth). Local providers (Ollama, LM Studio) need no
-  key and probe `/v1/models` to list available models.
-- **`/model`** — switch the active model for the session; the picker reflects
-  `reasoningOptions` constraints and shows the model's context window.
-- **`/parallel`**, `/diff`, `/timeline`, `/undo`, `/help` — misc, not provider.
-
-Editing config in the TUI and hitting **Ctrl+S** persists to the global config
-file.
-
----
-
-## 8. Common setups (playbook)
-
-### a. OpenAI / Codex (native, no key)
-```json
-{ "defaultModel": "openai/gpt-5.5" }
-```
-Login via the Codex OAuth flow (`/connect` → Codex). API key not required.
-
-### b. OpenRouter (aggregator)
-```json
-{
-  "defaultModel": "openrouter/anthropic/claude-3.7-sonnet",
-  "providers": {
-    "openrouter": { "baseURL": "https://openrouter.ai/api/v1" }
-  }
-}
-```
-Key: `sk-or-v1-...` under `apiKeys.openrouter` (or `OPENAI_API_KEY`).
-
-### c. Ollama (local)
-```json
-{
-  "defaultModel": "ollama/llama3.1:8b",
-  "providers": {
-    "ollama": { "baseURL": "http://localhost:11434" }
-  }
-}
-```
-No key. Models list via the Ollama `/v1` OpenAI-compat endpoint. If the model's
-context window is unknown to the catalogue, set it explicitly:
-`"models": { "llama3.1:8b": { "contextWindow": 8192 } }`.
-
-### d. LM Studio (local, OpenAI-compatible)
-```json
-{
-  "defaultModel": "lmstudio/qwen2.5-7b",
-  "providers": {
-    "lmstudio": { "baseURL": "http://localhost:1234/v1" }
-  }
-}
-```
-
-### e. Custom endpoint / vLLM / gateway
-```json
-{
-  "defaultModel": "my-endpoint/my-model",
-  "providers": {
-    "my-endpoint": { "baseURL": "https://my-gateway.example.com/v1" }
-  }
-}
-```
-Custom providers appear in `/connect` and use the OpenAI-compatible adapter. If
-the gateway rejects reasoning fields, set `reasoningEffort: "none"` or disable
-prompt caching with `disablePromptCache: true`.
-
-### f. Qwen / DashScope
-Model id prefix `qwen`/`qwq` triggers Qwen-specific handling (single leading
-system message normalization, reasoning-effort clipping). Use e.g.
-`qwen-cloud/qwen3.7-plus` with `providers.qwen-cloud.baseURL` pointing at the
-DashScope OpenAI-compat endpoint.
-
----
-
-## 9. models.dev catalogue
-
-Zay embeds a models.dev registry (`models.dev.Registry`) used by the provider/
-model pickers to autocomplete providers, base URLs (provider.PROVIDERS.ai), and
-context windows. The picker's `/v1/models` probe refreshes live model lists for a
-provider. If a model/provider isn't in the catalogue, define it manually in the
-`providers` block (this is the intended escape hatch) and set `contextWindow` if
-the catalogue doesn't know it.
-
-The catalogue payload cap is one constant (`registry_payload_max_bytes`, 16 MiB)
-shared by network fetch, disk cache, and vendored `share/zay/api.json`; a 4 MiB+
-api.json is supported (not a per-site-literal issue). If `/connect` shows only
-builtins, suspect a failed registry read (check logs) rather than a missing
-model definition.
-
----
-
-## 10. Debugging & gotchas
-
-- **API key not sent / 401** — key label must match the provider part of
-  `defaultModel`; check `auth.json` `apiKeys` for the right label, or use
-  `OPENAI_API_KEY`.
-- **Gateway 400 on reasoning/caching fields** — some `:free` /
-  gateway-fronted models reject `reasoning_effort` or prompt-cache fields. Set
-  `reasoningEffort: "none"` and/or `disablePromptCache: true` on that model.
-- **Strict structured outputs breaks gateways** — `strictOutputs: true` only
-  works against real OpenAI; OpenRouter/Ollama/vLLM/Together reject or silently
-  break function calling. Disable it unless talking directly to OpenAI.
-- **Local model context too small/large** — the catalogue estimate may be
-  wrong; pin `contextWindow` per model so compaction/swap work correctly.
-- **Responses-API mismatch** — some providers only speak chat-completions (or
-  vice versa). `ZAY_USE_RESPONSES_ENDPOINT` toggles routing; a provider that
-  rejects the endpoint should stay on chat-completions.
-- **Scope of `/connect` changes** — the active model selection may be session
-  scope; use `defaultModel` in config for a persistent default. Save edits with
-  **Ctrl+S** to persist.
-- **Verify what's loaded** — model/config caching: after editing config.json,
-  a running instance may hold stale values; restart Zay to be sure. Logs are the
-  first stop for "wrong provider" — see `ZAY_LOG_STDERR_LEVEL=debug`.
-
----
-
-## 11. Quick checklist — "point Zay at a new LLM"
-
-1. Pick provider name and model id → set `defaultModel` (`"<provider>/<model>"`).
-2. Add `providers.<name>.baseURL` (unless it's a builtin with a default).
-3. If cloud: set the API key via `/connect` (→ `auth.json` `apiKeys.<name>`).
-4. If local / unknown context: set `models.<id>.contextWindow`.
-5. If reasoning/caching 400s: set `reasoningEffort: "none"` / `disablePromptCache`.
-6. Restart (or `/connect`/`/model`) and confirm via the picker probe.
-
+1. Choose `<provider>/<model-id>` and set `defaultModel`.
+2. Add `providers.<provider>.baseURL` for custom or non-default endpoints.
+3. Add `auth.json` `apiKeys.<provider>` (via `/connect`) for authenticated endpoints.
+4. Set `models.<id>.contextWindow` for local/unlisted models, and `reasoningEffort: "none"` / `disablePromptCache: true` if a gateway rejects them.
+5. Restart Zay or probe via `/connect` / `/model`.

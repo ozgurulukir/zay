@@ -1,29 +1,12 @@
-# Current libvaxis/vxfw notes
+# libvaxis and vxfw integration notes
 
-This project uses the pinned libvaxis dependency from build.zig.zon and its
-vxfw widget layer. The application owns the event loop and lifecycle in
-src/tui.zig and src/tui/lifecycle.zig; this reference is intentionally about
-application integration, not a standalone libxev or zig-aio loop.
+Zay uses the pinned `libvaxis` dependency in `build.zig.zon` and its `vxfw` widget layer. Application event loop and lifecycle live in `src/tui.zig` and `src/tui/lifecycle.zig`; use `vxfw` primitives rather than introducing standalone `libxev` or `zig-aio` loops.
 
-## Use the existing framework shape
+## Framework composition
 
-- Inspect neighboring widgets under src/tui/widgets/ and use their
-  vxfw.Widget/draw() composition as the template.
-- Build render-ready props or view models before drawing. Keep I/O, cache
-  refreshes, and state transitions in lifecycle/tick functions.
-- vxfw.TextField.widget() mutates the field, so a caller needs *TextField.
-  Do not make an accessor *const App if it returns a mutable text field.
-- Use the framework's layout, border, text, list, and viewport primitives before
-  adding manual terminal-cell arithmetic.
+- Inspect neighboring widgets under `src/tui/widgets/` and mirror their `vxfw.Widget` / `drawFn` and `DrawContext` → `vxfw.Surface` / `SubSurface` layout.
+- Build render-ready props and view models in `src/tui/root_layout.zig` / `src/tui/lane_column.zig` before constructing leaf widgets (`INV-WIDGET-1` exceptions: `InputProps.input_field: *vxfw.TextField` and `diff.zig`'s `*diff_viewer.State`).
+- `vxfw.TextField.widget()` takes `*Self`, so accessors returning `*vxfw.TextField` require `*App`.
+- Use `panel.Shell`, `panel.listSurface`, and `panel.ViewportWindow` (`src/tui/widgets/panel.zig`) for bordered overlay lists and scroll geometry before writing custom terminal-cell arithmetic.
 
-## Zay-specific boundaries
-
-- Leaf widgets do not reference App; pass values or view models instead.
-- The overlay picker composite is the only documented aliasing exception.
-- Do not introduce custom event-loop code for a widget feature.
-- Keep draw paths free of filesystem, network, and manager access. If visible
-  state changes asynchronously, update a cache in the lifecycle tick and let
-  the next frame render it.
-
-For exact module ownership and regression tests, see the TUI sections in
-docs/PATTERNS.md and docs/ARCHITECTURE.md.
+For exact ownership contracts and regression tests, see `docs/patterns/architecture-and-layering.md` and `docs/patterns/tui-lanes-and-worktrees.md`.

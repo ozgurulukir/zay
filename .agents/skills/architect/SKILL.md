@@ -1,89 +1,56 @@
 ---
 name: architect
-description: Sketch types, signatures, and module structure before code, then stay in the loop while implementation fills in. Use for /architect, design-this requests, or non-trivial changes where the wrong shape would be expensive.
+description: Sketch caller usage, types, module ownership, and invariants before non-trivial implementation.
 disable-model-invocation: true
 ---
 
 # Architect
 
-Design before implementing when the change crosses modules, introduces a new
-state machine, or changes an ownership boundary. The output is a small,
-reviewable contract: caller usage first, then types, signatures, module
-ownership, invariants, and a decision record. Do not design ceremony for a
-one-function fix.
+Design before implementing when a change crosses modules, introduces a state machine, or alters an ownership boundary. Skip this workflow for a one-function fix.
 
-## Start
+## Steps
 
-Keep an explicit phase checklist:
-
-1. Ground
-2. Sketch alternatives
-3. Choose
-4. Implement
-5. Re-ground if the shape fails
+1. **Ground** — Trace every system the change touches.
+2. **Sketch alternatives** — Draft 2–3 distinct shapes in one decision table.
+3. **Choose** — Commit to the smallest shape that prevents invalid states.
+4. **Implement** — Code against the chosen sketch and Zay invariants.
+5. **Re-ground** — Stop and redesign if workarounds repeat or ownership leaks.
 
 ## Ground
 
-Build a traced model of every system the change touches. Use the how skill and
-the repository's own discovery instructions. Use any configured index or search
-helper when available, but keep the design understandable and executable with
-ordinary source reads, tests, and version-control history. Use why only when
-existing rationale or a historical constraint matters.
-
-Record the current caller usage, ownership, lifecycle, error paths, persistence
-boundaries, and platform differences. Read the relevant docs/PATTERNS.md section
-before proposing a new seam.
+Build a traced model of callers, ownership, lifecycle, error paths, persistence boundaries, and Windows/POSIX differences. Use `how` and `AGENTS.md` discovery rules (`docs/CODE_INTELLIGENCE.md` graph tools when available, alongside direct source reads, tests, and git history). Use `why` only when historical rationale or an existing constraint matters. Read the relevant topic page under `docs/patterns/README.md` before proposing a new seam.
 
 ## Sketch alternatives
 
-Write two or three genuinely different shapes, not cosmetic variations. For
-each, derive the type/signature sketch from the caller's usage and show:
+Write two or three genuinely different shapes, not cosmetic variations. Derive each type/signature sketch from caller usage first, and compare them locally in one decision table covering:
 
-- state and ownership;
+- state and memory ownership;
 - module boundaries and imports;
 - success, failure, cancellation, and teardown paths;
-- how tests reach the new logic;
-- which existing invariant it preserves or changes.
-
-Use the principle-exhaust-the-design-space guidance, but compare the alternatives
-locally in one decision table. Do not require a particular runner, model, or
-external orchestration service.
+- test reachability;
+- preserved or changed invariants (use `find-invariants` to make them structural).
 
 ## Choose
 
-Pick the smallest shape that makes invalid states difficult to represent and
-keeps the reader's path short. State the rejected alternatives and why they
-lose: wrong owner, extra mutable state, cross-layer dependency, blocked render
-path, unsafe retry, or unnecessary compatibility code.
+Pick the smallest shape that makes invalid states unrepresentable and keeps the reader's path short. State each rejected alternative and why it loses (wrong owner, extra mutable state, cross-layer import, blocked render path, unsafe retry, or speculative compatibility code).
 
-Proceed without a human checkpoint by default. Pause only when the user
-explicitly asks to see the design before implementation or when a choice would
-cause an irreversible external change.
+Proceed without a human checkpoint by default. Pause only when the user asks to review the design first or when a choice causes an irreversible external change.
 
 ## Implement
 
-Treat the chosen sketch as a contract, not a prison. If implementation needs a
-new parameter or escape hatch, stop and decide whether the sketch missed a
-requirement or the implementation is overreaching. Update the design before
-stacking workarounds.
+Treat the chosen sketch as a contract: if implementation needs a new parameter or escape hatch, update the sketch before stacking workarounds. Preserve Zay's core invariants:
 
-For Zay, preserve the relevant invariants: lib/ does not import src/; TUI leaf
-widgets use props/view models; Job(T) owns App-level async families; remote
-multi-statement session writes are atomic batches; persistence precedes cache
-updates; worktree paths use pathsEqual; and heavy provisioning never blocks the
-render loop.
+- `lib/` leaves never import `src/` (`INV-LEAF-1`).
+- TUI leaf widgets take props/view models, not `*App` (`INV-WIDGET-1`).
+- `Job(T)` families arm first (`arm-first`), poll non-blockingly, adopt once, and cancel only at teardown.
+- Remote multi-statement session writes use atomic batches (`INV-DB-BATCH`); session writes enqueue/persist before cache updates.
+- Worktree/cwd comparisons use `src/paths.zig` (`pathsEqual` / `isSubpathOrEqual`), and heavy provisioning stays off the render path.
 
-## Re-ground when the shape fails
+## Re-ground
 
-Scrap and redesign when the same workaround appears twice, callers understand
-the abstraction's internals, optional fields are always populated in practice,
-or a new lock is compensating for shared ownership that could be removed. First
-re-run how over the implementation, subtract dead weight, then repeat the
-alternative comparison with the new evidence.
+Scrap and redesign when the same workaround appears twice, callers depend on abstraction internals, optional fields are always populated in practice, or a lock compensates for avoidable shared ownership. Re-run `how` over the implementation, subtract dead weight, and repeat the alternative comparison.
 
 ## Output
 
-For a small change, one page is enough: caller usage, type/signature sketch,
-module map, invariants, chosen shape, and rejected alternative. For a larger
-change, keep that package in the planning artifact or design document used by
-the implementation.
+- **Small change**: one page with caller usage, type/signature sketch, module map, invariants, chosen shape, and rejected alternatives.
+- **Larger change**: read [`references/rationale-template.md`](references/rationale-template.md) and write the design package using that structure.
