@@ -10,25 +10,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/hello-world/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/hello-world/init.lua",
           "size": 815,
           "sha256": "f0803a438a128dcf908498e33def846b26da6eb87a05452673b6105abe9995b1"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/hello-world/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/hello-world/plugin.lua",
           "size": 325,
           "sha256": "0ebcff5c28ad52a1427f7dc5dafd083177eac5b4b8d6be9cb2bb2afc3fc55e7b"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/hello-world/prompt.md",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/hello-world/prompt.md",
           "size": 732,
           "sha256": "fb9bcdfdafb00328744367fc403a9e1a2177d04142c4799b34aac67ab9f5f941"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/hello-world/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/hello-world/test.lua",
           "size": 3945,
           "sha256": "1904745e9c8eb450b60f19aefa28c8de396ea699f08d72f3a7131481f5fdceb4"
         }
@@ -43,25 +43,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/todo/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/todo/init.lua",
           "size": 35357,
           "sha256": "c261791da4a894762ea82bd9006de7992144e0d704d8c6b0b846d1ec5a80bfc9"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/todo/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/todo/plugin.lua",
           "size": 315,
           "sha256": "6dd8b9a6a7524d298ef5aceabcdb663d60cb277a9a855b4eeaa13e4256a57f02"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/todo/prompt.md",
-          "size": 5698,
-          "sha256": "f96d9a504b5f6be2e762d8227c6ae5329550ac9fcc7788492ea1f252a6505ca9"
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/todo/prompt.md",
+          "size": 2954,
+          "sha256": "d138fc29b3aa70cc96fceaffc4e7801fa938ffee52683b4577cddad0a93a6f73"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/todo/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/todo/test.lua",
           "size": 17044,
           "sha256": "a1c234aa76a30f2813b81e205785c330c245489d0c77ca6bbfe8290008684f7d"
         }
@@ -76,25 +76,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-tools/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-tools/init.lua",
           "size": 14708,
           "sha256": "3c0b4217b9f3d1560568ef26b18b33521923957b0e50107562907ea4c6f6ad09"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-tools/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-tools/plugin.lua",
           "size": 437,
           "sha256": "c0cce6ee3c279f66c7e5fdadb29bd8feba4e92df48ab711b3cd2467fdb54addb"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-tools/prompt.md",
-          "size": 3021,
-          "sha256": "94d324730266f437416fcd98f002952c605fc5ab12e12deeb75d5921012e439a"
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-tools/prompt.md",
+          "size": 2238,
+          "sha256": "8c9662a1d7bda8580eeb0d08de7ebc394021297c706e0dea1f05b53490d7a5a0"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-tools/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-tools/test.lua",
           "size": 17287,
           "sha256": "bc8acb323a59529ff802889641ff789d58a880261d2ec91b06b288537a38e1e7"
         }
@@ -109,25 +109,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/search-tools/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/search-tools/init.lua",
           "size": 18554,
           "sha256": "89ddbe590b0913bbf1d1125c39ad2804d8dfc3396f56a0ac19a049b7fc10b86d"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/search-tools/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/search-tools/plugin.lua",
           "size": 918,
           "sha256": "69b92e06bd8c9fa063d3165e825fc0245d00688e6864114125f9e030a9749ec9"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/search-tools/prompt.md",
-          "size": 3228,
-          "sha256": "2965872188e4749b2a75b310ecccb39a87f86e63b4f1d1f6b1cd61be59824747"
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/search-tools/prompt.md",
+          "size": 1944,
+          "sha256": "d18aa4c524e7cf54a694c31ecb40822838c74789f061b7bd79ff97c01f6506d3"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/search-tools/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/search-tools/test.lua",
           "size": 39637,
           "sha256": "42b344354aad92e7caecfacc2ba28139cb68d392fe6ed2c55e8665e528fa935e"
         }
@@ -142,25 +142,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-watcher/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-watcher/init.lua",
           "size": 3212,
           "sha256": "956c79e48680c328c76130137cf3c430320e2b664e39ed1d3dc9978e346247b6"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-watcher/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-watcher/plugin.lua",
           "size": 447,
           "sha256": "79e610b3946ca933e6f33c1cf4b0ccdc74e07f48b3efcfb7dedc5d6205217fe3"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-watcher/prompt.md",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-watcher/prompt.md",
           "size": 1961,
           "sha256": "8b616d5db3ec90ba234f65e68339c2f5e6fe2943d9ed9f31f6fbaab0e3ca9720"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/file-watcher/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/file-watcher/test.lua",
           "size": 3790,
           "sha256": "acc330a4781bb988df14dfde12e234309ed4792920f6c8f30f3b05f06d52877a"
         }
@@ -175,25 +175,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/git-tools/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/git-tools/init.lua",
           "size": 7603,
           "sha256": "8f4bfb10023af4b2aae94e3f781df90659a879047974e354fe69ebfab044dbd1"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/git-tools/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/git-tools/plugin.lua",
           "size": 316,
           "sha256": "6ced3fe3f309a8c3085986cd150694d65501b76b74837703868bf868d8705a29"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/git-tools/prompt.md",
-          "size": 2626,
-          "sha256": "55af318f201060de142cbf081d8cbd4cf9529a78bf0284cd41b0d2bb0e885cd7"
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/git-tools/prompt.md",
+          "size": 1671,
+          "sha256": "2969add2026ae2b280e41a75ae8885738718c0c34fdbeb6038012337367622f4"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/git-tools/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/git-tools/test.lua",
           "size": 6626,
           "sha256": "72baa6e55ea7d666034db5f52260999b901486423adb9b609056b57460fb5103"
         }
@@ -208,25 +208,25 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/path-tools/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/path-tools/init.lua",
           "size": 4492,
           "sha256": "f4fda30376c999fc3afdf2f5c2ed08bd187fa87cc9d95b224849aa6cf918a8f2"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/path-tools/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/path-tools/plugin.lua",
           "size": 341,
           "sha256": "f0395c9209d8c4a60286a8afca8ac1c7dc2ffb21a4ba591017c0a5a9288aecd5"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/path-tools/prompt.md",
-          "size": 2185,
-          "sha256": "656c567b938dc9181fae5672b171895352a82b3e578318d4455101914fc2c857"
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/path-tools/prompt.md",
+          "size": 1386,
+          "sha256": "c29c8b81b659b3da55daff269bea9c6e33180fce6024163a69c2a636d9ae4e76"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/path-tools/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/path-tools/test.lua",
           "size": 2881,
           "sha256": "dd1365f03035c4ae3d002c474b003b1b7128ebbda0a23ce63233a698d4a9c3b7"
         }
@@ -241,37 +241,37 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/modular-demo/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/modular-demo/init.lua",
           "size": 771,
           "sha256": "722b9e20e88dde2fa479c51f3622d993ec18de8d2959eee7f15b92ebcf5b56ab"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/modular-demo/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/modular-demo/plugin.lua",
           "size": 162,
           "sha256": "fc672593314a0d07a4376a2fb561608b0bf203af2453f6e8ca9e70d2491c17cc"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/modular-demo/prompt.md",
-          "size": 323,
-          "sha256": "1ac468619fa51dcc27961813efc9f73409174935a4686b7f75ad1f2b2ccb329e"
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/modular-demo/prompt.md",
+          "size": 327,
+          "sha256": "0e05c4b80374b79cd7dc94bdab48bcb9890f145398c4e1d783631dc1a11835f3"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/modular-demo/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/modular-demo/test.lua",
           "size": 1455,
           "sha256": "45fb492f0856084e44d24f9ddc43ae932a97aae31a32c0f5db13e2d11b989ff0"
         },
         {
           "path": "helpers.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/modular-demo/helpers.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/modular-demo/helpers.lua",
           "size": 395,
           "sha256": "fb511dd6160c6374013e7fdbe0976b727f52c56ad9c287578e1f98a45008f060"
         },
         {
           "path": "formatter/init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/modular-demo/formatter/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/modular-demo/formatter/init.lua",
           "size": 268,
           "sha256": "116c4fec95fa067cbad6483238b7620561c23d02094fb7282ce38c214c886914"
         }
@@ -286,31 +286,31 @@
       "files": [
         {
           "path": "init.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/sitting-duck/init.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/sitting-duck/init.lua",
           "size": 39081,
           "sha256": "bb81066b661780fc2c4e7f1885f560dc1bb691c3ec91ab35c77254aacd7f45b5"
         },
         {
           "path": "plugin.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/sitting-duck/plugin.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/sitting-duck/plugin.lua",
           "size": 1252,
           "sha256": "35b7e400dda8f1901e5337247b7ee386b92602acfa7d793fa7085ba1fa387133"
         },
         {
           "path": "prompt.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/sitting-duck/prompt.md",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/sitting-duck/prompt.md",
           "size": 3951,
           "sha256": "cb3f5e4c76f001002492e27b64c67c1d197f335cb7417db9ddf9b6be401a48f0"
         },
         {
           "path": "test.lua",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/sitting-duck/test.lua",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/sitting-duck/test.lua",
           "size": 38563,
           "sha256": "d282ee699f57f02c65dd8df88ab61aed396cc0c937787578d61371aed48d58ea"
         },
         {
           "path": "README.md",
-          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/a1e42624edcd2816abe7c33681905c30f4881a2a/plugins/packages/sitting-duck/README.md",
+          "url": "https://raw.githubusercontent.com/ozgurulukir/zay/41615aa48db10e403ba96ad777a67063d3b9d7c4/plugins/packages/sitting-duck/README.md",
           "size": 4070,
           "sha256": "6338373f2c9f2991adb69a58e9723bb104d78a3048a90df6a70ca7a88806c80b"
         }
