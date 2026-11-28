@@ -3,14 +3,19 @@ prompt history, and saved tool results. The backend may be local SQLite or a
 configured external service.
 
 Actions:
-- `query`: Execute a read-only SELECT query. Select only needed columns and use
+- `query`: Execute a read-only `SELECT` or `WITH` query. Select only needed columns and use
   LIMIT or keyset pagination for large tables.
-- `exec`: Execute SQL statements (INSERT, UPDATE, DELETE, DDL, etc.). Returns changes
-  and `last_insert_rowid`. Protected tool-result tables cannot be accessed.
+- `exec`: Execute SQL statements (`INSERT`, `UPDATE`, `DELETE`, `DDL`, etc.). Returns
+  `changes` and `last_insert_rowid` on external database services, or a completion status on
+  local/fallback backends.
 - `schema`: Inspect tables and columns; optionally pass `table`.
 - `health`: Probe the backend service, engine, and health metrics.
 - `search_tool_result`: Find a case-sensitive literal in a saved tool result.
 - `read_tool_result`: Read a bounded window from a saved large tool result.
+
+Protected tool-result tables (`tool_results`, `tool_result_chunks`) cannot be accessed via
+SQL `query` or `exec`; use `search_tool_result` and `read_tool_result` with the returned
+`result_id` instead.
 
 When asked about older sessions, query the relevant session tables instead of
 assuming a file path. Common tables are `sessions`, `session_entries`, and

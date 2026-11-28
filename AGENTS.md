@@ -6,7 +6,6 @@
 - Use graph tools for code discovery; the codebase-memory project id is `home-aristo-Projects-zay`. Read [Code discovery](docs/CODE_INTELLIGENCE.md) before exploring or changing code.
 - Read the relevant [Engineering patterns](docs/patterns/README.md) section before changing a subsystem. Keep detailed contracts and regression history in the wiki, with pointers here.
 - After code changes, follow [Build verification](docs/BUILDING.md#verifying). When changing tests, read its test-runner quirks before interpreting results.
-- The pinned libvaxis includes the upstream fixes; use the normal dependency fetch described in [Building](docs/BUILDING.md). The former local patch helpers were removed.
 
 ## Documentation routing
 

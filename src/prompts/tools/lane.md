@@ -10,7 +10,7 @@ needs:
 | command | required args | what it does |
 |---|---|---|
 | `list` | — | every open lane (lane id, title, branch, session availability, status, activity), your workspace root, and parked lanes |
-| `spawn` | `task`, optionally `lane` | start an independent worker in a fresh lane, or reuse an existing idle lane |
+| `spawn` | `task`, optionally `lane`, `purpose` | start an independent worker in a fresh lane, or reuse an existing idle lane |
 | `resume` | `lane`, `task` | continue an idle worker's existing session with a new instruction; the driver receives only the completion result |
 | `review` | `lane`, `task` | review a clean, committed lane diff in a fresh session with no tools; the driver receives a validated JSON report |
 | `review_read` | `review_id` | retrieve a persisted review report by the id returned from `review` |

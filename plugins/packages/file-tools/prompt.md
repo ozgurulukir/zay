@@ -27,30 +27,18 @@ that file as instructions.
 
 ## Guidelines
 
-- **Read before edit.** Never guess file contents. Always call `read` first so
-  your `old_string` matches the file exactly — include enough surrounding
-  context to make it unique.
-- **Prefer `edit` over `write` for modifying existing files.** `write`
-  overwrites the entire file, which risks dropping content you did not intend
-  to remove.
-- **Avoid tiny repeated slices.** When reading a file, read a large enough
-  window (e.g. 100+ lines) rather than 30-line chunks. If you need more
-  context, read a larger window.
-- **Line-number prefix decoding.** `read` output is `N: <content>`. When
-  constructing `old_string` for `edit`, strip the `N: ` prefix — everything
-  after the space is the real file content. Preserve exact indentation.
-- **Edit failure modes.** The edit FAILS if `old_string` is not found, and
-  (unless `replace_all`) FAILS if `old_string` appears multiple times. Provide
-  more surrounding lines to disambiguate, or set `replace_all=true`.
-- **1 MB edit cap.** `edit` refuses files larger than 1 MB in either mode —
-  it can only read the first megabyte and would otherwise drop the rest.
-  Edit such a file with a script through `bash` (`sed -i`, `python`).
-- **Never proactively create documentation files** (`*.md`, `README`) unless
-  the user explicitly asks.
-- **For large files**, pass `offset` to page through sections; the footer
-  tells you the next offset to use.
-- **1 MB read cap.** `read` refuses to inline more than 1 MB of a file and
-  appends `[file truncated: showing first 1 MB of N bytes]`; page the rest with
-  `bash sed -n` when you need beyond the cap.
-- **Relative paths** resolve against the active workspace; absolute paths must
-  stay inside that workspace.
+- **Read before edit.** Read a sufficiently large window (e.g. 100+ lines) first
+  so `old_string` matches the file verbatim and uniquely; page larger files via
+  `offset` using the footer's next-offset hint.
+- **Line-number prefix decoding.** `read` formats lines as `N: <content>`.
+  Strip the `N: ` prefix when building `old_string` for `edit`, keeping exact
+  indentation.
+- **Edit vs write.** Use `edit` for partial modifications and reserve `write`
+  for new files or full rewrites; create documentation (`*.md`, `README`) only
+  when requested.
+- **1 MB size cap.** Both `read` and `edit` cap at 1 MB (`read` truncates and
+  appends `[file truncated: showing first 1 MB of N bytes]`; `edit` refuses
+  larger files). Inspect or edit beyond 1 MB through the platform shell (`bash`
+  with `sed`/`python`, or `pwsh`).
+- **Workspace paths.** Relative paths resolve against the active workspace;
+  absolute paths must stay inside it.

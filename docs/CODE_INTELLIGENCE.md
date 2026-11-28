@@ -6,7 +6,7 @@ Prefer `codebase-memory-mcp` graph tools for code discovery: `search_graph`, `tr
 
 ## GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **zay** (1079 symbols, 1222 relationships, 3 execution flows).
+This project is indexed by GitNexus as **zay** (inspect live index stats and freshness via `gitnexus://repo/zay/context`).
 
 > Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 

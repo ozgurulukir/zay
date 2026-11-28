@@ -1,3 +1,7 @@
+# Claude Code Instructions
+
+Follow [AGENTS.md](AGENTS.md) for Zay coding guidelines, documentation routing, and verification gates.
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
